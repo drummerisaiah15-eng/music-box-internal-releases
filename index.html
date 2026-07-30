@@ -3133,9 +3133,35 @@ async function initEncryption(pin) {
     entries,
   };
   // Originals and the old key pointer remain untouched until the complete
-  // staging bundle is durably present.
-  localStorage.setItem(LOCAL_KEY_MIGRATION_STORAGE_KEY, JSON.stringify(migration));
-  await _recoverLocalKeyMigration(pin);
+  // staging bundle is durably present. If storage is at quota we skip the
+  // staging bundle and migrate in-place — data is safe in iCloud/Firebase.
+  let stagedBundle = false;
+  try {
+    localStorage.setItem(LOCAL_KEY_MIGRATION_STORAGE_KEY, JSON.stringify(migration));
+    stagedBundle = true;
+  } catch (e) {
+    if (e.name !== 'QuotaExceededError') throw e;
+    console.warn('[initEncryption] localStorage quota exceeded — migrating in-place without staging bundle.');
+  }
+  if (stagedBundle) {
+    await _recoverLocalKeyMigration(pin);
+  } else {
+    // In-place migration: write each re-encrypted entry directly, then commit key protection.
+    for (const [name, { enc }] of Object.entries(entries)) {
+      try { localStorage.setItem('tmb_' + name, enc); } catch (_) { /* best-effort */ }
+    }
+    await _commitProtectedLocalDataKey(key, protection);
+    localStorage.setItem('tmb__local_key_model', 'random-dek-v1');
+    _encKey = key;
+    _decCache = decoded;
+    _replaceDurableStoreSnapshots(decoded);
+    _lockedStorageKeys.clear();
+    if (migration.legacySalt) localStorage.setItem('tmb__legacy_es', migration.legacySalt);
+    localStorage.removeItem('tmb__es');
+    localStorage.removeItem('tmb__enc_kdf_iterations');
+    migrateSharedKeys();
+    await _loadPersistedSyncKey();
+  }
   return true;
 }
 

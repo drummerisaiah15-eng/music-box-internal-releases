@@ -505,6 +505,10 @@ function createWindow() {
   ]));
 }
 
+// Remove Chromium's localStorage quota so encrypted studio data never hits the
+// 10 MB browser limit. This is safe in a controlled Electron context.
+app.commandLine.appendSwitch('unlimited-storage');
+
 // Single instance lock — prevents duplicate app processes.
 const gotTheLock = app.requestSingleInstanceLock();
 if (!gotTheLock) {
