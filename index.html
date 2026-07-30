@@ -3766,6 +3766,9 @@ let _syncBootstrapComplete = false;
 // Used by ssLoad() to distinguish "no Firebase configured" from "Firebase still connecting":
 // we must not push an empty default workbook while a connection is in progress.
 let _syncConfigured = false;
+// Keys quarantined during bootstrap (MB-009). Their remote data is preserved;
+// sync drain is skipped for these keys until a recovery action is taken.
+const _syncBootstrapFailedKeys = new Set();
 const _firebaseSecretCache = Object.create(null);
 let _firebaseHasStoredPassword = false;
 let _portablePinStale = false;
@@ -4526,12 +4529,6 @@ async function _reconcileRemoteSnapshot(key, snap) {
   updateSyncTimestamp();
   return { exists: true, accepted: true, localPending: isLegacyRemote };
 }
-
-// Keys whose cloud bootstrap failed. These keys are quarantined: their remote
-// data is preserved in place, their local data is preserved, and sync operations
-// for these keys are skipped until the user triggers a recovery action. All other
-// keys continue to sync normally (MB-009).
-const _syncBootstrapFailedKeys = new Set();
 
 async function _bootstrapSync() {
   const results = await Promise.allSettled(getSyncKeys().map(async key => {
