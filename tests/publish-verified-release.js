@@ -510,32 +510,35 @@ async function fetchAnonymousDownload(fetchImpl, rawUrl) {
   const initialUrl = assertHttpsHost(rawUrl, DOWNLOAD_HOST, '/');
   const headers = publicGithubHeaders({ Accept: 'application/octet-stream' });
   assertAnonymousHeaders(headers);
-  let response = await fetchImpl(initialUrl, {
-    method: 'GET',
-    headers,
-    redirect: 'manual',
-    signal: AbortSignal.timeout(ASSET_UPLOAD_TIMEOUT_MS),
-  });
+  // GitHub release downloads can chain two redirects:
+  //   /releases/latest/download/ → /releases/download/vX.Y.Z/ (still github.com)
+  //   /releases/download/vX.Y.Z/ → objects.githubusercontent.com (CDN)
+  // Both hops must stay on trusted GitHub infrastructure.
+  const TRUSTED_HOSTS = new Set([DOWNLOAD_HOST, ...DOWNLOAD_REDIRECT_HOSTS]);
 
-  if ([301, 302, 303, 307, 308].includes(response.status)) {
-    const location = response.headers?.get?.('location');
-    if (!location) fail(`anonymous download redirect omitted Location: ${initialUrl.pathname}`);
-    const redirectUrl = new URL(location, initialUrl);
-    if (
-      redirectUrl.protocol !== 'https:' ||
-      redirectUrl.port ||
-      redirectUrl.username ||
-      redirectUrl.password ||
-      !DOWNLOAD_REDIRECT_HOSTS.has(redirectUrl.hostname)
-    ) {
-      fail(`anonymous download redirected to an untrusted endpoint: ${redirectUrl.href}`);
-    }
-    response = await fetchImpl(redirectUrl, {
+  let url = initialUrl;
+  let response;
+  for (let hop = 0; hop < 3; hop++) {
+    response = await fetchImpl(url, {
       method: 'GET',
       headers,
-      redirect: 'error',
+      redirect: 'manual',
       signal: AbortSignal.timeout(ASSET_UPLOAD_TIMEOUT_MS),
     });
+    if (![301, 302, 303, 307, 308].includes(response.status)) break;
+    const location = response.headers?.get?.('location');
+    if (!location) fail(`anonymous download redirect omitted Location: ${url.pathname}`);
+    const next = new URL(location, url);
+    if (
+      next.protocol !== 'https:' ||
+      next.port ||
+      next.username ||
+      next.password ||
+      !TRUSTED_HOSTS.has(next.hostname)
+    ) {
+      fail(`anonymous download redirected to an untrusted endpoint: ${next.href}`);
+    }
+    url = next;
   }
 
   if (response.status !== 200) {
@@ -543,14 +546,12 @@ async function fetchAnonymousDownload(fetchImpl, rawUrl) {
   }
   if (response.url) {
     const responseUrl = new URL(response.url);
-    const allowedHost = responseUrl.hostname === DOWNLOAD_HOST ||
-      DOWNLOAD_REDIRECT_HOSTS.has(responseUrl.hostname);
     if (
       responseUrl.protocol !== 'https:' ||
       responseUrl.port ||
       responseUrl.username ||
       responseUrl.password ||
-      !allowedHost
+      !TRUSTED_HOSTS.has(responseUrl.hostname)
     ) {
       fail(`anonymous download completed at an untrusted endpoint: ${responseUrl.href}`);
     }
