@@ -2634,9 +2634,6 @@ async function checkPin() {
         console.warn('Pending passcode wrapper update could not resume:', err?.message || err);
         showToast('Portable passcode wrapper update is still pending; local encrypted data is safe.', 'warning');
       });
-      if (isLegacyPin) {
-        setTimeout(() => showToast('Legacy 4-digit passcode accepted. Update it to 6 digits in Settings.', 'warning'), 800);
-      }
     } else {
       _recordPinFailure();
       document.getElementById('pin-error').textContent = 'Incorrect passcode. Try again.';
