@@ -3146,15 +3146,16 @@ async function initEncryption(pin) {
   if (stagedBundle) {
     await _recoverLocalKeyMigration(pin);
   } else {
-    // In-place migration: write each re-encrypted entry directly, then commit key protection.
-    for (const [name, { enc }] of Object.entries(entries)) {
-      try { localStorage.setItem('tmb_' + name, enc); } catch (_) { /* best-effort */ }
+    // In-place migration without staging bundle: write each re-encrypted entry
+    // directly, then commit key protection. Data recoverable from iCloud/Firebase.
+    for (const [name, ciphertext] of Object.entries(entries)) {
+      try { localStorage.setItem('tmb_' + name, ciphertext); } catch (_) { /* best-effort */ }
     }
-    await _commitProtectedLocalDataKey(key, protection);
+    await _commitProtectedLocalDataKey(randomKey, protection);
     localStorage.setItem('tmb__local_key_model', 'random-dek-v1');
-    _encKey = key;
-    _decCache = decoded;
-    _replaceDurableStoreSnapshots(decoded);
+    _encKey = randomKey;
+    // _decCache already holds plaintext values from _fillCache() above
+    _replaceDurableStoreSnapshots(_decCache);
     _lockedStorageKeys.clear();
     if (migration.legacySalt) localStorage.setItem('tmb__legacy_es', migration.legacySalt);
     localStorage.removeItem('tmb__es');
