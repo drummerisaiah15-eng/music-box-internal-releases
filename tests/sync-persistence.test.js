@@ -108,6 +108,7 @@ test('writes held during Firebase bootstrap are drained only after bootstrap com
   const context = contextWith({
     _syncReady: true,
     _syncBootstrapComplete: false,
+    _syncBootstrapFailedKeys: new Set(),
     _syncDeliveryChains: new Map(),
     _syncDeliveryErrors: new Map(),
     _readPendingSyncRecord: () => pending ? { opId: 'pending-op' } : null,
@@ -370,6 +371,7 @@ test('iCloud-applied values create durable Firebase work offline and drain after
     _keyMutationChains: new Map(),
     _syncReady: false,
     _syncBootstrapComplete: false,
+    _syncBootstrapFailedKeys: new Set(),
     _syncDeliveryChains: new Map(),
     _syncDeliveryErrors: new Map(),
     isSyncKey: key => key === 'logs',
