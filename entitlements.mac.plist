@@ -8,13 +8,10 @@
   <!-- Required for Electron's heap -->
   <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
   <true/>
-  <!-- Required for Electron's native modules -->
-  <key>com.apple.security.cs.allow-dyld-environment-variables</key>
-  <true/>
   <!-- Outbound network (Firebase, Microsoft, Anthropic API) -->
   <key>com.apple.security.network.client</key>
   <true/>
-  <!-- Local OAuth callback server on port 8080 -->
+  <!-- Local Microsoft OAuth callback server on a random loopback port -->
   <key>com.apple.security.network.server</key>
   <true/>
 </dict>

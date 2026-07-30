@@ -1,28 +1,122 @@
-// MUST be first — before requiring electron or anything else.
-// Electron's native dialog for uncaughtException is suppressed when
-// a process.on('uncaughtException') handler is installed by user code.
-process.on('uncaughtException', (e) => {
-  if (e.code === 'EADDRINUSE') return; // port in use — skip silently, don't show dialog
-  console.error('[main] Uncaught exception:', e);
-  // don't call process.exit — let Electron decide
-});
-
-const { app, BrowserWindow, shell, ipcMain, session, Menu, dialog } = require('electron');
+const {
+  app,
+  autoUpdater: nativeAutoUpdater,
+  BrowserWindow,
+  dialog,
+  ipcMain,
+  Menu,
+  session,
+  shell,
+  utilityProcess,
+} = require('electron');
 const path = require('path');
+const { fileURLToPath } = require('url');
 const http = require('http');
 const https = require('https');
 const crypto = require('crypto');
-const { execFileSync, execSync, spawn } = require('child_process');
+const { execFile } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const { autoUpdater } = require('electron-updater');
 
+let mainWindow = null;
+let oauthServer = null;
+let pendingOAuth = null;
+let trustedRendererPath = null;
+let trustedVendorRoot = null;
+let allowImmediateQuit = false;
+let gracefulQuitInProgress = false;
+let updateInstallRequested = false;
+let updateCheckPromise = null;
+let updateDownloadPromise = null;
+let appSession = null;
+let ownerAuthFailures = 0;
+let ownerAuthLockedUntil = 0;
+let firebaseRuntimeSecretIssued = false;
+const pendingFlushRequests = new Map();
+
+const MAX_IPC_STRING = 32 * 1024;
+const MAX_SYNC_BYTES = 8 * 1024 * 1024;
+const MAX_IMPORT_BYTES = 20 * 1024 * 1024;
+const MAX_SPREADSHEET_SOURCE_BYTES = 5 * 1024 * 1024;
+const MAX_SPREADSHEET_RESULT_BYTES = 700000;
+const MAX_SPREADSHEET_RECOVERY_BYTES = 8 * 1024 * 1024;
+const MAX_PDF_TEXT_BYTES = 4 * 1024 * 1024;
+const MAX_AI_REQUEST_BYTES = 12 * 1024 * 1024;
+const MAX_AI_RESPONSE_BYTES = 2 * 1024 * 1024;
+const OAUTH_TIMEOUT_MS = 5 * 60 * 1000;
+const APP_SESSION_TTL_MS = 12 * 60 * 60 * 1000;
+
+function _safeRendererSend(channel, payload) {
+  if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()) return;
+  mainWindow.webContents.send(channel, payload);
+}
+
 // ── Auto-updater config ──────────────────────────────────────
-autoUpdater.autoDownload = true;
-autoUpdater.autoInstallOnAppQuit = true; // electron-updater installs on quit
+// Keep updater promises under our control. electron-updater's convenience
+// notifier starts an untracked download promise and its default notification
+// incorrectly promises install-on-exit, which this app intentionally disables.
+autoUpdater.autoDownload = false;
+// Installation is explicit: ordinary quit must never apply an update the user
+// chose to defer, and Restart to Install first waits for pending saves.
+autoUpdater.autoInstallOnAppQuit = false;
+
+function _reportUpdaterError(err) {
+  const message = String(err?.message || 'Unknown update error').slice(0, 500);
+  console.warn('[updater] Error:', message);
+  _safeRendererSend('update-error', message);
+  return message;
+}
+
+function _startUpdateDownload() {
+  if (updateDownloadPromise) return updateDownloadPromise;
+
+  const activeDownload = (async () => {
+    try {
+      await autoUpdater.downloadUpdate();
+      return true;
+    } catch (err) {
+      _reportUpdaterError(err);
+      return false;
+    }
+  })();
+  updateDownloadPromise = activeDownload;
+  // Register both settlement handlers so cleanup never creates a detached
+  // rejected promise. The download itself also converts rejection to `false`.
+  activeDownload.then(
+    () => { if (updateDownloadPromise === activeDownload) updateDownloadPromise = null; },
+    () => { if (updateDownloadPromise === activeDownload) updateDownloadPromise = null; },
+  );
+  return activeDownload;
+}
+
+function _checkForUpdatesAndStartDownload() {
+  if (updateCheckPromise) return updateCheckPromise;
+
+  const activeCheck = (async () => {
+    const result = await autoUpdater.checkForUpdates();
+    if (result?.isUpdateAvailable === true) {
+      // The tracked helper consumes its own rejection and reports a bounded
+      // message to the renderer, so this deliberate background task is safe.
+      void _startUpdateDownload();
+    }
+    return result;
+  })();
+  updateCheckPromise = activeCheck;
+  activeCheck.then(
+    () => { if (updateCheckPromise === activeCheck) updateCheckPromise = null; },
+    () => { if (updateCheckPromise === activeCheck) updateCheckPromise = null; },
+  );
+  return activeCheck;
+}
 
 autoUpdater.on('download-progress', (info) => {
-  if (mainWindow) mainWindow.webContents.send('update-download-progress', info);
+  _safeRendererSend('update-download-progress', {
+    percent: Math.max(0, Math.min(100, Number(info?.percent) || 0)),
+    transferred: Math.max(0, Number(info?.transferred) || 0),
+    total: Math.max(0, Number(info?.total) || 0),
+    bytesPerSecond: Math.max(0, Number(info?.bytesPerSecond) || 0),
+  });
 });
 
 autoUpdater.on('update-downloaded', (info) => {
@@ -33,131 +127,281 @@ autoUpdater.on('update-downloaded', (info) => {
     return;
   }
   console.log(`[updater] update-downloaded: ${downloadedVer}`);
-  if (mainWindow) mainWindow.webContents.send('update-downloaded', downloadedVer);
+  _safeRendererSend('update-downloaded', String(downloadedVer).slice(0, 64));
 });
 
 autoUpdater.on('error', (err) => {
-  console.warn('[updater] Error:', err?.message);
-  if (mainWindow) mainWindow.webContents.send('update-error', err?.message || 'Unknown update error');
+  _reportUpdaterError(err);
 });
 
-// ── Local OAuth callback server (catches Microsoft token redirect) ──
-const OAUTH_HTML = `<!DOCTYPE html>
-<html>
-<head><title>Music Box — Connected</title>
-<style>body{font-family:sans-serif;text-align:center;padding:80px;background:#f5f2ec;color:#1a1a1a}</style>
-</head>
-<body>
-<h2>✅ Microsoft 365 Connected!</h2>
-<p>You can close this tab and return to Music Box.</p>
-<script>
-  const params = new URLSearchParams(window.location.hash.replace(/^#/,''));
-  const token = params.get('access_token');
-  if (token) {
-    fetch('/ms-token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token })
-    });
+// Squirrel.Mac closes windows before Electron's normal `before-quit` event.
+// Only bypass the ordinary save gate after our explicit Restart to Install
+// action has already flushed renderer persistence and invoked quitAndInstall.
+nativeAutoUpdater.on('before-quit-for-update', () => {
+  if (!updateInstallRequested) {
+    console.error('[updater] Ignoring an unexpected before-quit-for-update signal.');
+    return;
   }
-</script>
-</body>
-</html>`;
+  allowImmediateQuit = true;
+  app.isQuitting = true;
+  pendingOAuth = null;
+  _closeOAuthServer();
+});
 
-function startOAuthServer(win, attempt = 0) {
-  // Kill any stale process occupying port 8080 on first attempt
-  if (attempt === 0) {
-    try { execSync('lsof -ti:8080 | xargs kill -9', { stdio: 'ignore' }); } catch (_) {}
+// ── Microsoft OAuth: random loopback port + one-time state ────
+const OAUTH_SUCCESS_HTML = `<!doctype html><html><head><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'">
+<title>Music Box — Connected</title><style>body{font-family:system-ui,sans-serif;text-align:center;padding:80px;background:#f5f2ec;color:#1a1a1a}</style>
+</head><body><h2>Microsoft 365 connected</h2><p>You can close this tab and return to Music Box.</p></body></html>`;
+const OAUTH_ERROR_HTML = `<!doctype html><html><head><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'">
+<title>Music Box — Sign-in failed</title><style>body{font-family:system-ui,sans-serif;text-align:center;padding:80px;background:#f5f2ec;color:#1a1a1a}</style>
+</head><body><h2>Microsoft sign-in failed</h2><p>Close this tab and try connecting again from Music Box.</p></body></html>`;
+
+function _oauthResponse(res, statusCode, html) {
+  res.writeHead(statusCode, {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+    'Referrer-Policy': 'no-referrer',
+    'Cross-Origin-Resource-Policy': 'same-origin',
+  });
+  res.end(html);
+}
+
+function _closeOAuthServer() {
+  if (oauthServer) {
+    try { oauthServer.close(); } catch (_) {}
+    oauthServer = null;
+  }
+}
+
+function _isUuid(value) {
+  return typeof value === 'string' &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function _validTenant(value) {
+  return _isUuid(value) || ['common', 'organizations', 'consumers'].includes(value);
+}
+
+function _validPkceChallenge(value) {
+  return typeof value === 'string' && /^[A-Za-z0-9_-]{43,128}$/.test(value);
+}
+
+async function _beginMicrosoftOAuth({ accountId, tenant, clientId, codeChallenge }) {
+  if (!_validMsAccountId(accountId) || !_validTenant(tenant) ||
+      !_isUuid(clientId) || !_validPkceChallenge(codeChallenge)) {
+    throw new Error('Invalid Microsoft OAuth configuration.');
   }
 
+  _closeOAuthServer();
+  pendingOAuth = null;
+
+  const state = crypto.randomBytes(32).toString('base64url');
   const server = http.createServer((req, res) => {
-    if (req.method === 'POST' && req.url === '/ms-token') {
-      // Legacy implicit flow — access token delivered via POST from the redirect page JS
-      let body = '';
-      req.on('data', d => body += d);
-      req.on('end', () => {
-        try {
-          const { token } = JSON.parse(body);
-          if (token) win.webContents.send('ms-oauth-token', token);
-        } catch(e) {}
-        res.writeHead(200); res.end('OK');
+    if (req.method !== 'GET') {
+      _oauthResponse(res, 405, OAUTH_ERROR_HTML);
+      return;
+    }
+
+    let callback;
+    try {
+      callback = new URL(req.url, pendingOAuth?.redirectUri || 'http://127.0.0.1/');
+    } catch (_) {
+      _oauthResponse(res, 400, OAUTH_ERROR_HTML);
+      return;
+    }
+
+    if (!pendingOAuth || pendingOAuth.callbackReceived ||
+        String(req.headers.host || '').toLowerCase() !== pendingOAuth.expectedHost ||
+        callback.origin !== pendingOAuth.redirectUri ||
+        callback.pathname !== '/' ||
+        callback.searchParams.get('state') !== pendingOAuth.state ||
+        Date.now() > pendingOAuth.expiresAt) {
+      _oauthResponse(res, 400, OAUTH_ERROR_HTML);
+      return;
+    }
+
+    const error = callback.searchParams.get('error');
+    const errorDesc = callback.searchParams.get('error_description');
+    const code = callback.searchParams.get('code');
+    if (error) {
+      _safeRendererSend('ms-auth-error', {
+        error: String(error).slice(0, 100),
+        errorDesc: String(errorDesc || 'Microsoft sign-in was not completed.').slice(0, 500),
       });
-    } else if (req.method === 'GET') {
-      // PKCE auth code flow — code arrives as a query param
-      try {
-        const urlObj = new URL(req.url, 'http://localhost:8080');
-        const code  = urlObj.searchParams.get('code');
-        const error = urlObj.searchParams.get('error');
-        const errorDesc = urlObj.searchParams.get('error_description');
-        if (code) {
-          win.webContents.send('ms-auth-code', { code });
-          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-          res.end(OAUTH_HTML);
-        } else if (error) {
-          win.webContents.send('ms-auth-error', { error, errorDesc });
-          const errHtml = OAUTH_HTML
-            .replace('✅ Microsoft 365 Connected!', '❌ Microsoft Sign-In Failed')
-            .replace('You can close this tab and return to Music Box.', `Error: ${error}<br><small>${errorDesc || ''}</small>`);
-          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-          res.end(errHtml);
-        } else {
-          // No code and no error — direct hit or prefetch. Tell the user nothing happened.
-          win.webContents.send('ms-auth-error', { error: 'no_code', errorDesc: 'The Microsoft redirect did not include an auth code. Try connecting again.' });
-          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-          res.end(OAUTH_HTML.replace('You can close this tab and return to Music Box.', 'No auth code was received. Please close this tab and try again from the app.'));
-        }
-      } catch(_) {
-        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-        res.end(OAUTH_HTML);
-      }
-    } else {
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(OAUTH_HTML);
+      pendingOAuth = null;
+      _oauthResponse(res, 400, OAUTH_ERROR_HTML);
+      setImmediate(_closeOAuthServer);
+      return;
     }
-  });
-  server.on('error', (e) => {
-    if (e.code === 'EADDRINUSE') {
-      server.close();
-      if (attempt < 8) {
-        // OS hasn't released the port yet — retry after a short delay
-        setTimeout(() => startOAuthServer(win, attempt + 1), 250);
-      }
-      // After 8 retries (~2 seconds), give up silently — app still works, just no OAuth callback
-    } else {
-      console.error('OAuth server error:', e);
+    if (!code || code.length > 8192) {
+      _safeRendererSend('ms-auth-error', {
+        error: 'no_code',
+        errorDesc: 'The Microsoft redirect did not include a valid authorization code.',
+      });
+      pendingOAuth = null;
+      _oauthResponse(res, 400, OAUTH_ERROR_HTML);
+      setImmediate(_closeOAuthServer);
+      return;
     }
+
+    pendingOAuth.code = code;
+    pendingOAuth.callbackReceived = true;
+    // Keep the authorization code in main. The renderer receives only the
+    // one-time state needed to finish the PKCE exchange.
+    _safeRendererSend('ms-auth-code', { state: pendingOAuth.state });
+    _oauthResponse(res, 200, OAUTH_SUCCESS_HTML);
+    setImmediate(_closeOAuthServer);
   });
-  server.listen(8080, '127.0.0.1', () => {
-    // unref() prevents the server from keeping the process alive after the window closes
-    server.unref();
+  server.requestTimeout = 5000;
+  server.headersTimeout = 5000;
+  server.maxRequestsPerSocket = 1;
+
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      server.removeListener('error', reject);
+      resolve();
+    });
   });
+  server.unref();
   oauthServer = server;
+
+  const address = server.address();
+  if (!address || typeof address === 'string') {
+    _closeOAuthServer();
+    throw new Error('Could not start the Microsoft sign-in callback.');
+  }
+  // Microsoft treats dynamic ports on registered `http://localhost` desktop
+  // redirect URIs as equivalent. Keep the registered root path while binding
+  // the socket itself to IPv4 loopback only.
+  const redirectUri = `http://localhost:${address.port}`;
+  pendingOAuth = {
+    state,
+    redirectUri,
+    expectedHost: `localhost:${address.port}`,
+    tenant,
+    clientId,
+    accountId,
+    codeChallenge,
+    expiresAt: Date.now() + OAUTH_TIMEOUT_MS,
+    callbackReceived: false,
+    code: null,
+  };
+
+  const authorizeUrl = new URL(`https://login.microsoftonline.com/${tenant}/oauth2/v2.0/authorize`);
+  authorizeUrl.search = new URLSearchParams({
+    client_id: clientId,
+    response_type: 'code',
+    redirect_uri: redirectUri,
+    scope: 'Mail.Read Mail.Send User.Read offline_access',
+    response_mode: 'query',
+    prompt: 'select_account',
+    code_challenge: codeChallenge,
+    code_challenge_method: 'S256',
+    state,
+  }).toString();
+  try {
+    await shell.openExternal(authorizeUrl.toString());
+  } catch (error) {
+    pendingOAuth = null;
+    _closeOAuthServer();
+    throw error;
+  }
+
+  setTimeout(() => {
+    if (pendingOAuth?.state === state && Date.now() >= pendingOAuth.expiresAt) {
+      pendingOAuth = null;
+      _closeOAuthServer();
+    }
+  }, OAUTH_TIMEOUT_MS + 1000).unref();
+
+  return { ok: true, state };
 }
 
 // ── Security: prevent new window navigation ──────────────────
-const _safeExternalUrl = (url) => {
+const EXTERNAL_DESTINATION_ALLOWLIST = new Set([
+  'https://console.anthropic.com/',
+  'https://developers.ringcentral.com/',
+  'https://console.firebase.google.com/',
+  'https://clients.mindbodyonline.com/',
+]);
+
+function _safeExternalUrl(url) {
   try {
     const parsed = new URL(url);
-    return parsed.protocol === 'https:' || parsed.protocol === 'mailto:';
+    if (url.length > 512 || parsed.username || parsed.password ||
+        parsed.protocol !== 'https:' || (parsed.port && parsed.port !== '443') ||
+        parsed.search || parsed.hash) return false;
+    parsed.hostname = parsed.hostname.toLowerCase().replace(/\.$/, '');
+    return EXTERNAL_DESTINATION_ALLOWLIST.has(parsed.toString());
   } catch { return false; }
-};
+}
+
+function _openExternalSafely(url) {
+  return shell.openExternal(url).then(
+    () => true,
+    (err) => {
+      const message = String(err?.message || 'Unknown external-link error').slice(0, 300);
+      console.warn('[external] Failed to open approved URL:', message);
+      return false;
+    },
+  );
+}
+
+function _isExactFileUrl(url, expectedPath) {
+  if (!expectedPath || typeof url !== 'string') return false;
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === 'file:' &&
+      !parsed.username && !parsed.password && !parsed.host &&
+      path.resolve(fileURLToPath(parsed)) === path.resolve(expectedPath);
+  } catch (_) {
+    return false;
+  }
+}
+
+function _isTrustedRendererUrl(url) {
+  return _isExactFileUrl(url, trustedRendererPath);
+}
+
+const TRUSTED_VENDOR_RELATIVE_PATHS = new Set([
+  'firebase-12.15.0/firebase-app-compat.js',
+  'firebase-12.15.0/firebase-firestore-compat.js',
+  'firebase-12.15.0/firebase-auth-compat.js',
+  'firebase-12.15.0/firebase-app-check-compat.js',
+  'sheetjs-0.20.3/xlsx.full.min.js',
+]);
+
+function _isTrustedVendorUrl(url) {
+  if (!trustedVendorRoot || typeof url !== 'string') return false;
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'file:' || parsed.username || parsed.password || parsed.host) return false;
+    const filePath = path.resolve(fileURLToPath(parsed));
+    const relative = path.relative(trustedVendorRoot, filePath).split(path.sep).join('/');
+    return !relative.startsWith('../') && !path.isAbsolute(relative) &&
+      TRUSTED_VENDOR_RELATIVE_PATHS.has(relative);
+  } catch (_) {
+    return false;
+  }
+}
 
 app.on('web-contents-created', (_, contents) => {
   contents.setWindowOpenHandler(({ url }) => {
-    if (_safeExternalUrl(url)) shell.openExternal(url);
+    if (_safeExternalUrl(url)) void _openExternalSafely(url);
     return { action: 'deny' };
   });
 
   contents.on('will-navigate', (event, url) => {
-    if (!url.startsWith('file://') && !url.startsWith('https://login.microsoftonline.com')) {
-      event.preventDefault();
-      if (_safeExternalUrl(url)) shell.openExternal(url);
-    }
+    if (_isTrustedRendererUrl(url)) return;
+    event.preventDefault();
+    if (_safeExternalUrl(url)) void _openExternalSafely(url);
   });
+  contents.on('will-attach-webview', (event) => event.preventDefault());
 });
-
-let mainWindow = null;
-let oauthServer = null;
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -171,24 +415,50 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false,
+      sandbox: true,
       webSecurity: true,
       allowRunningInsecureContent: false,
+      allowFileAccessFromFileURLs: false,
+      allowUniversalAccessFromFileURLs: false,
+      webviewTag: false,
+      plugins: false,
+      experimentalFeatures: false,
+      navigateOnDragDrop: false,
+      devTools: !app.isPackaged,
     },
   });
 
   const htmlPath = app.isPackaged
     ? path.join(process.resourcesPath, 'index.html')
     : path.join(__dirname, 'index.html');
+  trustedRendererPath = path.resolve(htmlPath);
+  trustedVendorRoot = path.resolve(
+    app.isPackaged ? path.join(process.resourcesPath, 'vendor') : path.join(__dirname, 'vendor')
+  );
+
+  // This app does not need camera, microphone, geolocation, notifications,
+  // MIDI, USB, serial, Bluetooth, or other Chromium permission grants.
+  session.defaultSession.setPermissionCheckHandler(() => false);
+  session.defaultSession.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false));
+  session.defaultSession.webRequest.onBeforeRequest(
+    { urls: ['file://*/*'] },
+    (details, callback) => {
+      const isAppDocument = details.resourceType === 'mainFrame' &&
+        _isExactFileUrl(details.url, trustedRendererPath);
+      const isVendorScript = details.resourceType === 'script' &&
+        mainWindow && !mainWindow.isDestroyed() &&
+        details.webContentsId === mainWindow.webContents.id &&
+        _isTrustedVendorUrl(details.url);
+      callback({ cancel: !(isAppDocument || isVendorScript) });
+    }
+  );
   mainWindow.loadFile(htmlPath);
-
-  // Temporary: open DevTools with Cmd+Option+I for debugging
-  const { globalShortcut } = require('electron');
-  globalShortcut.register('CommandOrControl+Option+I', () => {
-    if (mainWindow) mainWindow.webContents.openDevTools();
+  mainWindow.webContents.on('did-start-navigation', (_event, _url, _isInPlace, isMainFrame) => {
+    if (isMainFrame) _resetAppSession();
   });
+  mainWindow.webContents.on('render-process-gone', () => _resetAppSession());
 
-  // Hide instead of close when clicking the red X — keeps OAuth server alive
+  // Hide instead of close when clicking the red X.
   mainWindow.on('close', (e) => {
     if (!app.isQuitting) {
       e.preventDefault();
@@ -196,18 +466,17 @@ function createWindow() {
     }
   });
 
-  mainWindow.on('closed', () => { mainWindow = null; });
-
-  startOAuthServer(mainWindow);
+  mainWindow.on('closed', () => {
+    _resetAppSession();
+    mainWindow = null;
+  });
 
   // Check for updates 5 seconds after launch (only in packaged builds)
   if (app.isPackaged) {
-    setTimeout(() => autoUpdater.checkForUpdatesAndNotify(), 5000);
+    setTimeout(() => {
+      void _checkForUpdatesAndStartDownload().catch(_reportUpdaterError);
+    }, 5000);
   }
-
-  session.defaultSession.webRequest.onBeforeSendHeaders((details, callback) => {
-    callback({ requestHeaders: details.requestHeaders });
-  });
 
   mainWindow.setMenuBarVisibility(false);
 
@@ -236,11 +505,11 @@ function createWindow() {
   ]));
 }
 
-// Single instance lock — prevents a second copy from starting and conflicting on port 8080
+// Single instance lock — prevents duplicate app processes.
 const gotTheLock = app.requestSingleInstanceLock();
 if (!gotTheLock) {
   // Another instance is already running — tell it to show itself, then exit immediately
-  // Do NOT proceed to app.whenReady() or startOAuthServer
+  // Do NOT proceed to app.whenReady().
   app.quit();
 } else {
   app.on('second-instance', () => {
@@ -261,10 +530,17 @@ if (!gotTheLock) {
     });
   });
 
-  app.on('before-quit', () => {
-    app.isQuitting = true;
-    // Close the OAuth server so the process can exit cleanly and free port 8080
-    if (oauthServer) { oauthServer.close(); oauthServer = null; }
+  app.on('before-quit', (event) => {
+    if (allowImmediateQuit) {
+      app.isQuitting = true;
+      pendingOAuth = null;
+      _closeOAuthServer();
+      return;
+    }
+    event.preventDefault();
+    if (gracefulQuitInProgress) return;
+    gracefulQuitInProgress = true;
+    void _finishGracefulQuit();
   });
 
   app.on('window-all-closed', () => {
@@ -272,36 +548,179 @@ if (!gotTheLock) {
   });
 }
 
+function _isPlainObject(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+function _boundedString(value, max = MAX_IPC_STRING) {
+  return typeof value === 'string' && value.length > 0 && value.length <= max &&
+    !value.includes('\0');
+}
+
+function _isTrustedIpcEvent(event) {
+  if (!mainWindow || mainWindow.isDestroyed() || !event?.sender || !event?.senderFrame) return false;
+  if (event.sender !== mainWindow.webContents || event.sender.isDestroyed()) return false;
+  if (event.senderFrame !== event.sender.mainFrame) return false;
+  return _isTrustedRendererUrl(event.senderFrame.url);
+}
+
+function _secureHandle(channel, handler) {
+  ipcMain.handle(channel, async (event, ...args) => {
+    if (!_isTrustedIpcEvent(event)) {
+      throw new Error('Blocked IPC request from an untrusted frame.');
+    }
+    return handler(event, ...args);
+  });
+}
+
+function _requestRendererFlush(timeoutMs = 5000) {
+  if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()) {
+    return Promise.resolve(true);
+  }
+  const requestId = crypto.randomBytes(18).toString('base64url');
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      pendingFlushRequests.delete(requestId);
+      resolve(false);
+    }, timeoutMs);
+    pendingFlushRequests.set(requestId, {
+      finish(ok) {
+        clearTimeout(timer);
+        pendingFlushRequests.delete(requestId);
+        resolve(ok === true);
+      },
+    });
+    _safeRendererSend('lifecycle-flush-request', { requestId });
+  });
+}
+
+_secureHandle('renderer-flush-complete', async (_, result) => {
+  if (!_isPlainObject(result) || !_boundedString(result.requestId, 128) || typeof result.ok !== 'boolean') {
+    throw new Error('Invalid save-flush acknowledgement.');
+  }
+  const pending = pendingFlushRequests.get(result.requestId);
+  if (!pending) return { ok: false };
+  pending.finish(result.ok);
+  return { ok: true };
+});
+
+async function _finishGracefulQuit() {
+  let flushed = await _requestRendererFlush();
+  while (!flushed) {
+    const result = await dialog.showMessageBox(mainWindow || undefined, {
+      type: 'warning',
+      title: 'Music Box could not finish saving',
+      message: 'Some recent changes may still be waiting to save.',
+      detail: 'Retry saving before quitting, cancel, or explicitly quit without the pending changes.',
+      buttons: ['Retry Save', 'Cancel Quit', 'Quit Without Saving'],
+      defaultId: 0,
+      cancelId: 1,
+      noLink: true,
+    });
+    if (result.response === 0) {
+      flushed = await _requestRendererFlush();
+      continue;
+    }
+    if (result.response !== 2) {
+      gracefulQuitInProgress = false;
+      return;
+    }
+    break;
+  }
+  allowImmediateQuit = true;
+  app.isQuitting = true;
+  pendingOAuth = null;
+  _closeOAuthServer();
+  app.quit();
+}
+
 // ── IPC: Manual update check ─────────────────────────────────
-ipcMain.handle('check-for-updates', async () => {
+_secureHandle('check-for-updates', async () => {
   try {
-    const result = await autoUpdater.checkForUpdates();
-    if (result && result.updateInfo) {
-      const current = app.getVersion();
-      const latest  = result.updateInfo.version;
-      if (latest === current) {
-        return { status: 'up-to-date', version: current };
-      }
+    const result = await _checkForUpdatesAndStartDownload();
+    const current = app.getVersion();
+    if (result?.isUpdateAvailable === true && result.updateInfo?.version) {
+      const latest = result.updateInfo.version;
       return { status: 'update-available', current, latest };
     }
-    return { status: 'up-to-date', version: app.getVersion() };
+    return { status: 'up-to-date', version: current };
   } catch (e) {
-    return { status: 'error', message: e.message };
+    return { status: 'error', message: _reportUpdaterError(e) };
   }
 });
 
-ipcMain.handle('get-app-version', () => app.getVersion());
+_secureHandle('get-app-version', () => app.getVersion());
 
 /// ── Policies: file picker ────────────────────────────────────────────────────
-ipcMain.handle('open-file-dialog', async () => {
+const selectedFileCapabilities = new Map();
+const ALLOWED_IMPORT_EXTENSIONS = new Set(['.txt', '.md', '.pdf', '.docx', '.doc']);
+
+function _pruneFileCapabilities() {
+  const now = Date.now();
+  for (const [token, record] of selectedFileCapabilities) {
+    if (record.expiresAt <= now) selectedFileCapabilities.delete(token);
+  }
+}
+
+async function _consumeFileCapability(token) {
+  _pruneFileCapabilities();
+  if (!_boundedString(token, 256) || !token.startsWith('mbfile:')) {
+    throw new Error('Select the document using the file picker before importing it.');
+  }
+  const record = selectedFileCapabilities.get(token);
+  selectedFileCapabilities.delete(token);
+  if (!record || record.expiresAt <= Date.now()) {
+    throw new Error('The selected-file permission expired. Choose the document again.');
+  }
+  const resolved = await fs.promises.realpath(record.path);
+  if (resolved !== record.path) throw new Error('The selected document changed. Choose it again.');
+  const stat = await fs.promises.stat(resolved);
+  if (!stat.isFile() || stat.size > MAX_IMPORT_BYTES) {
+    throw new Error('The selected document must be a file no larger than 20 MB.');
+  }
+  return { filePath: resolved, ext: path.extname(resolved).toLowerCase(), size: stat.size };
+}
+
+function _execFileText(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    execFile(command, args, {
+      encoding: 'utf8',
+      timeout: options.timeout || 30000,
+      maxBuffer: options.maxBuffer || 4 * 1024 * 1024,
+    }, (error, stdout) => {
+      if (error) reject(error);
+      else resolve(stdout || '');
+    });
+  });
+}
+
+_secureHandle('open-file-dialog', async () => {
   const result = await dialog.showOpenDialog(mainWindow, {
     properties: ['openFile'],
     filters: [
       { name: 'Documents', extensions: ['txt', 'md', 'pdf', 'docx', 'doc'] },
-      { name: 'All Files', extensions: ['*'] },
     ],
   });
-  return result; // { canceled, filePaths }
+  if (result.canceled || !result.filePaths?.length) {
+    return { canceled: true, filePaths: [], fileNames: [] };
+  }
+  const selectedPath = await fs.promises.realpath(result.filePaths[0]);
+  const ext = path.extname(selectedPath).toLowerCase();
+  const stat = await fs.promises.stat(selectedPath);
+  if (!ALLOWED_IMPORT_EXTENSIONS.has(ext) || !stat.isFile() || stat.size > MAX_IMPORT_BYTES) {
+    throw new Error('Choose a TXT, Markdown, PDF, DOC, or DOCX file no larger than 20 MB.');
+  }
+  _pruneFileCapabilities();
+  const token = `mbfile:${crypto.randomBytes(24).toString('base64url')}`;
+  selectedFileCapabilities.set(token, {
+    path: selectedPath,
+    expiresAt: Date.now() + 5 * 60 * 1000,
+  });
+  // `filePaths` remains for renderer compatibility but contains only an opaque,
+  // one-time capability. The filesystem path never enters renderer memory.
+  return { canceled: false, filePaths: [token], fileNames: [path.basename(selectedPath)] };
 });
 
 // ── Policies: extract text from file ────────────────────────────────────────
@@ -313,33 +732,71 @@ function _looksLikeText(str) {
   return printable / str.length > 0.65;
 }
 
-ipcMain.handle('read-text-file', async (e, filePath) => {
-  const ext = path.extname(filePath).toLowerCase();
-  if (ext === '.pdf') {
-    // 1. pdf-parse (bundled npm package — works out of the box, no install needed)
+function _parsePdfInUtility(filePath) {
+  return new Promise((resolve, reject) => {
+    const workerPath = path.join(__dirname, 'pdf-worker.js');
+    let settled = false;
+    let child;
+    const finish = (error, result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (child?.pid) child.kill();
+      if (error) reject(error);
+      else resolve(result);
+    };
+    const timer = setTimeout(() => {
+      finish(new Error('PDF extraction timed out after 20 seconds.'));
+    }, 20000);
+
     try {
-      // Use the internal module path to bypass pdf-parse's test file check in production
-      const pdfParse = require('pdf-parse/lib/pdf-parse.js');
-      const buffer = fs.readFileSync(filePath);
-      const data = await pdfParse(buffer);
-      if (data && data.text && _looksLikeText(data.text)) return data.text;
-    } catch (e1) {
-      console.log('[pdf] pdf-parse failed:', e1.message);
+      child = utilityProcess.fork(workerPath, [], {
+        env: {
+          LANG: typeof process.env.LANG === 'string' ? process.env.LANG : 'en_US.UTF-8',
+          LC_ALL: typeof process.env.LC_ALL === 'string' ? process.env.LC_ALL : 'en_US.UTF-8',
+        },
+        execArgv: ['--max-old-space-size=256'],
+        stdio: 'ignore',
+        serviceName: 'Music Box PDF Parser',
+        allowLoadingUnsignedLibraries: false,
+      });
+      child.once('spawn', () => {
+        child.postMessage({ filePath, maxTextBytes: MAX_PDF_TEXT_BYTES });
+      });
+      child.once('message', (message) => {
+        if (!_isPlainObject(message) || message.ok !== true ||
+            typeof message.text !== 'string' ||
+            Buffer.byteLength(message.text, 'utf8') > MAX_PDF_TEXT_BYTES) {
+          finish(new Error(
+            _isPlainObject(message) && typeof message.error === 'string'
+              ? message.error.slice(0, 500)
+              : 'The separate PDF parser returned an invalid result.'
+          ));
+          return;
+        }
+        finish(null, message.text);
+      });
+      child.once('error', () => finish(new Error('The separate PDF parser stopped unexpectedly.')));
+      child.once('exit', (code) => {
+        if (!settled) finish(new Error(`The separate PDF parser exited before completing (${code}).`));
+      });
+    } catch (error) {
+      finish(error);
     }
-    // 2. pdftotext (poppler) — if user happens to have it installed
+  });
+}
+
+_secureHandle('read-text-file', async (_event, capability) => {
+  const { filePath, ext } = await _consumeFileCapability(capability);
+  if (ext === '.pdf') {
+    // Parse untrusted PDF bytes in a bounded utility process. PDF.js expression
+    // evaluation is disabled again inside pdf-worker.js.
     try {
-      // Use execFileSync with an argument array — filePath never touches the shell
-      const out = execFileSync('pdftotext', ['-layout', filePath, '-'], { encoding: 'utf8', timeout: 30000 });
-      if (_looksLikeText(out)) return out;
-    } catch (_) {}
-    // 3. python3 + pdfminer — last resort
-    try {
-      // Pass filePath as a positional argument to avoid any shell/string interpolation
-      const py = 'import sys; from pdfminer.high_level import extract_text; print(extract_text(sys.argv[1]))';
-      const out = execFileSync('python3', ['-c', py, filePath], { encoding: 'utf8', timeout: 30000 });
-      if (_looksLikeText(out)) return out;
-    } catch (_) {}
-    // 4. Nothing worked — ask user to paste manually
+      const text = await _parsePdfInUtility(filePath);
+      if (_looksLikeText(text)) return text;
+    } catch (e1) {
+      console.warn('[pdf] separate parser failed:', String(e1?.message || 'unknown error').slice(0, 500));
+    }
     throw new Error(
       'Could not extract text from this PDF.\n\n' +
       'Paste manually:\n' +
@@ -347,19 +804,180 @@ ipcMain.handle('read-text-file', async (e, filePath) => {
     );
   } else if (ext === '.docx' || ext === '.doc') {
     try {
-      // Use execFileSync with argument array — filePath never touches the shell
-      const out = execFileSync('textutil', ['-convert', 'txt', '-stdout', filePath], { encoding: 'utf8', timeout: 30000 });
+      // Use the fixed macOS system binary and an argument array; neither PATH
+      // lookup nor a shell can redirect the selected file into another tool.
+      const out = await _execFileText('/usr/bin/textutil', ['-convert', 'txt', '-stdout', filePath]);
       if (_looksLikeText(out)) return out;
     } catch (_) {}
     throw new Error('Could not convert this document. Save it as a .txt file and import again.');
   } else {
-    return fs.readFileSync(filePath, 'utf8');
+    return fs.promises.readFile(filePath, 'utf8');
   }
 });
 
+function _parseSpreadsheetInUtility(filePath) {
+  return new Promise((resolve, reject) => {
+    const workerPath = path.join(__dirname, 'spreadsheet-worker.js');
+    const vendorPath = path.join(
+      app.isPackaged ? process.resourcesPath : __dirname,
+      'vendor',
+      'sheetjs-0.20.3',
+      'xlsx.full.min.js'
+    );
+    let settled = false;
+    let child;
+    const finish = (error, result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (child?.pid) child.kill();
+      if (error) reject(error);
+      else resolve(result);
+    };
+    const timer = setTimeout(() => {
+      finish(new Error('Spreadsheet import timed out after 20 seconds.'));
+    }, 20000);
+
+    try {
+      child = utilityProcess.fork(workerPath, [], {
+        env: {
+          LANG: typeof process.env.LANG === 'string' ? process.env.LANG : 'en_US.UTF-8',
+          LC_ALL: typeof process.env.LC_ALL === 'string' ? process.env.LC_ALL : 'en_US.UTF-8',
+        },
+        execArgv: ['--max-old-space-size=256'],
+        stdio: 'ignore',
+        serviceName: 'Music Box Spreadsheet Parser',
+        allowLoadingUnsignedLibraries: false,
+      });
+      child.once('spawn', () => child.postMessage({ filePath, vendorPath }));
+      child.once('message', message => {
+        let serialized = '';
+        try { serialized = JSON.stringify(message); } catch (_) {}
+        if (!_isPlainObject(message) || message.ok !== true ||
+            !Array.isArray(message.sheets) || message.sheets.length < 1 ||
+            Buffer.byteLength(serialized, 'utf8') > MAX_SPREADSHEET_RESULT_BYTES) {
+          finish(new Error(
+            _isPlainObject(message) && typeof message.error === 'string'
+              ? message.error.slice(0, 500)
+              : 'The separate spreadsheet parser returned an invalid result.'
+          ));
+          return;
+        }
+        finish(null, message.sheets);
+      });
+      child.once('error', () => finish(new Error('The separate spreadsheet parser stopped unexpectedly.')));
+      child.once('exit', code => {
+        if (!settled) finish(new Error(`The separate spreadsheet parser exited before completing (${code}).`));
+      });
+    } catch (error) {
+      finish(error);
+    }
+  });
+}
+
+_secureHandle('import-spreadsheet', async () => {
+  _requireAppRole(COMMUNICATION_ROLES);
+  const result = await dialog.showOpenDialog(mainWindow, {
+    properties: ['openFile'],
+    filters: [{ name: 'Spreadsheets', extensions: ['csv', 'xlsx', 'xls'] }],
+  });
+  if (result.canceled || !result.filePaths?.length) return { ok: true, canceled: true };
+  const selectedPath = await fs.promises.realpath(result.filePaths[0]);
+  const extension = path.extname(selectedPath).toLowerCase();
+  const stat = await fs.promises.stat(selectedPath);
+  if (!['.csv', '.xlsx', '.xls'].includes(extension) ||
+      !stat.isFile() || stat.size < 1 || stat.size > MAX_SPREADSHEET_SOURCE_BYTES) {
+    return { ok: false, error: 'Choose a non-empty CSV, XLSX, or XLS file no larger than 5 MB.' };
+  }
+  try {
+    const sheets = await _parseSpreadsheetInUtility(selectedPath);
+    return {
+      ok: true,
+      canceled: false,
+      suggestedName: path.basename(selectedPath, extension).slice(0, 160) || 'Imported Spreadsheet',
+      sheets,
+    };
+  } catch (error) {
+    return { ok: false, error: error?.message || 'The spreadsheet could not be imported.' };
+  }
+});
+
+function _isAllowedHttpsUrl(value, allowedDomains) {
+  try {
+    const parsed = value instanceof URL ? value : new URL(value);
+    if (parsed.protocol !== 'https:' || parsed.username || parsed.password ||
+        (parsed.port && parsed.port !== '443')) return false;
+    const host = parsed.hostname.toLowerCase().replace(/\.$/, '');
+    return allowedDomains.some(domain => host === domain || host.endsWith(`.${domain}`));
+  } catch (_) {
+    return false;
+  }
+}
+
+function _boundedHttpsGet(targetUrl, { allowedDomains, timeout, maxBytes, hops = 0 }) {
+  return new Promise((resolve) => {
+    if (hops > 3 || !_isAllowedHttpsUrl(targetUrl, allowedDomains)) {
+      resolve({ ok: false, error: 'Blocked URL or redirect.' });
+      return;
+    }
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    const req = https.get(targetUrl, {
+      timeout,
+      headers: { 'User-Agent': `MusicBoxInternal/${app.getVersion()}` },
+    }, (res) => {
+      if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+        res.resume();
+        let next;
+        try { next = new URL(res.headers.location, targetUrl); }
+        catch (_) { finish({ ok: false, error: 'Invalid redirect.' }); return; }
+        if (!_isAllowedHttpsUrl(next, allowedDomains)) {
+          finish({ ok: false, error: 'Redirect outside the approved domain was blocked.' });
+          return;
+        }
+        _boundedHttpsGet(next, { allowedDomains, timeout, maxBytes, hops: hops + 1 }).then(finish);
+        return;
+      }
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        res.resume();
+        finish({ ok: false, error: `Remote server returned HTTP ${res.statusCode}.` });
+        return;
+      }
+      const declared = Number(res.headers['content-length']);
+      if (Number.isFinite(declared) && declared > maxBytes) {
+        res.destroy();
+        finish({ ok: false, error: 'Remote response exceeded the size limit.' });
+        return;
+      }
+      let bytes = 0;
+      const chunks = [];
+      res.on('data', (chunk) => {
+        bytes += chunk.length;
+        if (bytes > maxBytes) {
+          res.destroy();
+          finish({ ok: false, error: 'Remote response exceeded the size limit.' });
+          return;
+        }
+        chunks.push(chunk);
+      });
+      res.on('end', () => finish({ ok: true, text: Buffer.concat(chunks).toString('utf8') }));
+      res.on('error', (error) => finish({ ok: false, error: error.message }));
+    });
+    req.on('error', (error) => finish({ ok: false, error: error.message }));
+    req.on('timeout', () => {
+      req.destroy();
+      finish({ ok: false, error: 'Request timed out.' });
+    });
+  });
+}
+
 // ── Fetch Music Box website content (restricted to themusicboxinc.com only) ──
-ipcMain.handle('fetch-musicbox-website', async () => {
-  const ALLOWED_DOMAIN = 'themusicboxinc.com';
+_secureHandle('fetch-musicbox-website', async () => {
+  const ALLOWED_DOMAINS = ['themusicboxinc.com'];
   const URLS = [
     'https://www.themusicboxinc.com/',
     'https://www.themusicboxinc.com/lessons',
@@ -370,27 +988,6 @@ ipcMain.handle('fetch-musicbox-website', async () => {
     'https://www.themusicboxinc.com/faq',
   ];
 
-  const fetchUrl = (url, hops = 0) => new Promise((resolve) => {
-    if (hops > 3) return resolve('');
-    try {
-      const req = https.get(url, { timeout: 8000, headers: { 'User-Agent': 'MusicBoxInternal/1.0' } }, (res) => {
-        if ([301, 302, 307, 308].includes(res.statusCode) && res.headers.location) {
-          const loc = res.headers.location;
-          if (loc.includes(ALLOWED_DOMAIN) || loc.startsWith('/')) {
-            const next = loc.startsWith('/') ? new URL(url).origin + loc : loc;
-            return resolve(fetchUrl(next, hops + 1));
-          }
-          return resolve('');
-        }
-        let data = '';
-        res.on('data', chunk => { if (data.length < 400000) data += chunk; });
-        res.on('end', () => resolve(data));
-      });
-      req.on('error', () => resolve(''));
-      req.on('timeout', () => { req.destroy(); resolve(''); });
-    } catch (_) { resolve(''); }
-  });
-
   const stripHtml = (html) => html
     .replace(/<script[\s\S]*?<\/script>/gi, '')
     .replace(/<style[\s\S]*?<\/style>/gi, '')
@@ -400,40 +997,37 @@ ipcMain.handle('fetch-musicbox-website', async () => {
     .replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
     .replace(/\s{2,}/g, ' ').trim();
 
-  const pages = await Promise.all(URLS.map(url => fetchUrl(url)));
+  const pages = await Promise.all(URLS.map(url =>
+    _boundedHttpsGet(url, {
+      allowedDomains: ALLOWED_DOMAINS,
+      timeout: 8000,
+      maxBytes: 400000,
+    })
+  ));
   const labelled = pages
-    .map((html, i) => { const t = stripHtml(html); return t.length > 100 ? `[${URLS[i]}]\n${t}` : ''; })
+    .map((result, i) => {
+      const t = result.ok ? stripHtml(result.text) : '';
+      return t.length > 100 ? `[${URLS[i]}]\n${t}` : '';
+    })
     .filter(Boolean);
 
   return labelled.join('\n\n---\n\n').slice(0, 60000);
 });
 
 // ── Fetch Google Sheets CSV (restricted to *.google.com only) ──
-ipcMain.handle('fetch-csv', async (_, url) => {
+_secureHandle('fetch-csv', async (_, url) => {
   try {
-    const urlObj = new URL(url);
-    if (!urlObj.hostname.endsWith('.google.com') && urlObj.hostname !== 'google.com') {
+    if (!_boundedString(url, 4096)) return { error: 'Invalid Google Sheets URL.' };
+    const allowedDomains = ['google.com', 'googleapis.com', 'googleusercontent.com'];
+    if (!_isAllowedHttpsUrl(url, allowedDomains)) {
       return { error: 'Only Google Sheets URLs are allowed.' };
     }
-    const doFetch = (targetUrl, hops = 0) => new Promise((resolve) => {
-      if (hops > 3) return resolve({ error: 'Too many redirects' });
-      const req = https.get(targetUrl, { timeout: 15000, headers: { 'User-Agent': 'MusicBoxInternal/1.0' } }, (res) => {
-        if ([301, 302, 307, 308].includes(res.statusCode) && res.headers.location) {
-          const loc = res.headers.location;
-          const next = loc.startsWith('/') ? new URL(targetUrl).origin + loc : loc;
-          const ALLOWED = ['google.com', 'googleapis.com', 'googleusercontent.com'];
-          if (ALLOWED.some(d => next.includes(d))) return resolve(doFetch(next, hops + 1));
-          return resolve({ error: 'Redirect outside Google blocked.' });
-        }
-        let data = '';
-        res.on('data', chunk => { if (data.length < 2000000) data += chunk; });
-        res.on('end', () => resolve({ ok: true, text: data }));
-        res.on('error', e => resolve({ error: e.message }));
-      });
-      req.on('error', e => resolve({ error: e.message }));
-      req.on('timeout', () => { req.destroy(); resolve({ error: 'Request timed out.' }); });
+    const result = await _boundedHttpsGet(url, {
+      allowedDomains,
+      timeout: 15000,
+      maxBytes: 2 * 1024 * 1024,
     });
-    return await doFetch(url);
+    return result.ok ? result : { error: result.error };
   } catch (e) {
     return { error: e.message };
   }
@@ -441,19 +1035,34 @@ ipcMain.handle('fetch-csv', async (_, url) => {
 
 // MB-008: Use standard electron-updater install path — no custom shell scripts.
 // electron-updater handles download verification, extraction, and relaunch.
-ipcMain.handle('quit-and-install', () => {
+_secureHandle('quit-and-install', async () => {
+  if (updateInstallRequested) {
+    return { ok: false, error: 'The update restart is already in progress.' };
+  }
+  const flushed = await _requestRendererFlush();
+  if (!flushed) {
+    return {
+      ok: false,
+      error: 'The update was not installed because pending changes could not be saved. Retry after the save completes.',
+    };
+  }
+  updateInstallRequested = true;
   setImmediate(() => {
     console.log('[updater] quit-and-install: calling autoUpdater.quitAndInstall');
     try {
       autoUpdater.quitAndInstall(false, true);
+      setTimeout(() => {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          updateInstallRequested = false;
+          _safeRendererSend('update-error', 'The updater did not restart the app. Quit and reopen, then try again.');
+        }
+      }, 15000).unref();
     } catch (e) {
-      console.error('[updater] quitAndInstall error:', e?.message);
+      updateInstallRequested = false;
+      const message = String(e?.message || 'Could not install the update.').slice(0, 500);
+      console.error('[updater] quitAndInstall error:', message);
+      _safeRendererSend('update-error', message);
     }
-    // Safety net: if quitAndInstall didn't exit within 5s, force quit.
-    setTimeout(() => {
-      console.log('[updater] fallback: forcing app.quit()');
-      app.quit();
-    }, 5000);
   });
   return { ok: true };
 });
@@ -464,6 +1073,17 @@ ipcMain.handle('quit-and-install', () => {
 // Migration: if the old plain-file key (store-key.bin) still exists, it is
 // read once, re-protected via safeStorage, then deleted.
 let _cachedStoreKey = null;
+
+function _atomicWriteFileSync(targetPath, data, mode = 0o600) {
+  const tmpPath = `${targetPath}.tmp-${process.pid}-${crypto.randomBytes(6).toString('hex')}`;
+  try {
+    fs.writeFileSync(tmpPath, data, { mode });
+    fs.renameSync(tmpPath, targetPath);
+  } catch (error) {
+    try { fs.unlinkSync(tmpPath); } catch (_) {}
+    throw error;
+  }
+}
 
 function _getStoreKey() {
   if (_cachedStoreKey) return _cachedStoreKey;
@@ -478,11 +1098,14 @@ function _getStoreKey() {
     try {
       const encrypted = fs.readFileSync(encKeyPath);
       const keyHex = safeStorage.decryptString(encrypted);
+      if (!/^[0-9a-f]{64}$/i.test(keyHex)) throw new Error('Invalid protected key data.');
       _cachedStoreKey = Buffer.from(keyHex, 'hex');
       return _cachedStoreKey;
     } catch (e) {
-      console.error('[key] safeStorage decrypt failed, regenerating:', e.message);
-      try { fs.unlinkSync(encKeyPath); } catch (_) {}
+      // Never replace a key merely because it could not be decrypted. That
+      // would make every existing encrypted record unrecoverable.
+      console.error('[key] Protected store key could not be opened.');
+      throw new Error('Secure data could not be unlocked with macOS Keychain.');
     }
   }
 
@@ -491,41 +1114,37 @@ function _getStoreKey() {
   if (fs.existsSync(legacyPath)) {
     try {
       key = fs.readFileSync(legacyPath);
-      console.log('[key] Migrating store key from plain file to safeStorage');
     } catch (e) {
-      console.warn('[key] Could not read legacy key:', e.message);
+      throw new Error('The legacy data-encryption key could not be read.');
     }
-    try { fs.unlinkSync(legacyPath); } catch (_) {}
   }
 
   // ── 3. Generate a new key if nothing was found ──
   if (!key || key.length !== 32) {
+    if (key) throw new Error('The legacy data-encryption key is invalid.');
     key = crypto.randomBytes(32);
-    console.log('[key] Generated new 32-byte store key');
   }
 
-  // ── 4. Persist — via safeStorage if available, else 0600 plain file ──
-  if (canEncrypt) {
-    try {
-      const encrypted = safeStorage.encryptString(key.toString('hex'));
-      fs.writeFileSync(encKeyPath, encrypted, { mode: 0o600 });
-      console.log('[key] Store key saved via safeStorage (Keychain)');
-    } catch (e) {
-      console.error('[key] safeStorage encrypt failed, using plain file:', e.message);
-      fs.writeFileSync(legacyPath, key, { mode: 0o600 });
-    }
-  } else {
-    // Linux headless / safeStorage unavailable — fall back to file
-    fs.writeFileSync(legacyPath, key, { mode: 0o600 });
-    console.warn('[key] safeStorage unavailable — key stored as plain file');
+  // ── 4. Persist through safeStorage only. Retain an existing legacy key
+  // until its protected replacement is safely on disk.
+  if (!canEncrypt) {
+    throw new Error('Secure credential storage is unavailable.');
+  }
+  try {
+    const encrypted = safeStorage.encryptString(key.toString('hex'));
+    _atomicWriteFileSync(encKeyPath, encrypted, 0o600);
+    if (fs.existsSync(legacyPath)) fs.unlinkSync(legacyPath);
+  } catch (e) {
+    throw new Error('Could not protect the data-encryption key with macOS Keychain.');
   }
 
   _cachedStoreKey = key;
   return _cachedStoreKey;
 }
 
-ipcMain.handle('keychain-encrypt', async (_, plaintext) => {
+_secureHandle('keychain-encrypt', async (_, plaintext) => {
   try {
+    if (typeof plaintext !== 'string' || Buffer.byteLength(plaintext, 'utf8') > MAX_SYNC_BYTES) return null;
     const key = _getStoreKey();
     const iv  = crypto.randomBytes(12);
     const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
@@ -536,10 +1155,12 @@ ipcMain.handle('keychain-encrypt', async (_, plaintext) => {
   } catch { return null; }
 });
 
-ipcMain.handle('keychain-decrypt', async (_, b64) => {
+_secureHandle('keychain-decrypt', async (_, b64) => {
   try {
+    if (!_boundedString(b64, Math.ceil(MAX_SYNC_BYTES * 1.5)) || !/^[A-Za-z0-9+/=]+$/.test(b64)) return null;
     const key = _getStoreKey();
     const buf = Buffer.from(b64, 'base64');
+    if (buf.length < 29 || buf.length > MAX_SYNC_BYTES + 28) return null;
     const iv  = buf.slice(0, 12);
     const tag = buf.slice(12, 28);
     const enc = buf.slice(28);
@@ -549,180 +1170,1160 @@ ipcMain.handle('keychain-decrypt', async (_, b64) => {
   } catch { return null; }
 });
 
-// ── IPC: iMessage — read from chat.db ────────────────────────
-ipcMain.handle('fetch-imessages', async (_, { dbPath }) => {
-  try {
-    const expandedPath = dbPath.replace(/^~/, os.homedir());
+// ── Main-process credential vault and authenticated app session ──────────────
+function _secretVaultPath() {
+  return path.join(app.getPath('userData'), 'renderer-secrets-v1.bin');
+}
 
-    if (!fs.existsSync(expandedPath)) {
-      return { ok: false, error: 'Database not found at ' + expandedPath + '. Check path in Settings.' };
+function _loadSecretVault() {
+  const { safeStorage } = require('electron');
+  if (!safeStorage.isEncryptionAvailable()) throw new Error('Secure credential storage is unavailable.');
+  const vaultPath = _secretVaultPath();
+  if (!fs.existsSync(vaultPath)) return {};
+  const stat = fs.statSync(vaultPath);
+  if (!stat.isFile() || stat.size > 1024 * 1024) throw new Error('The protected credential vault is invalid.');
+  const cleartext = safeStorage.decryptString(fs.readFileSync(vaultPath));
+  const parsed = JSON.parse(cleartext);
+  if (!_isPlainObject(parsed)) throw new Error('The protected credential vault is invalid.');
+  return parsed;
+}
+
+function _saveSecretVault(vault) {
+  const { safeStorage } = require('electron');
+  if (!safeStorage.isEncryptionAvailable()) throw new Error('Secure credential storage is unavailable.');
+  const serialized = JSON.stringify(vault);
+  if (Object.keys(vault).length > 128 || Buffer.byteLength(serialized, 'utf8') > 512 * 1024) {
+    throw new Error('The protected credential vault exceeds its safety limit.');
+  }
+  const encrypted = safeStorage.encryptString(serialized);
+  _atomicWriteFileSync(_secretVaultPath(), encrypted, 0o600);
+}
+
+const APP_PROFILE_ROLES = Object.freeze({
+  'Elizabeth Chaves': 'Owner',
+  'Carrie Gass': 'Operations & Events',
+  'Ana Chaves': 'Front Desk',
+  'Emma Minnetto': 'Front Desk',
+});
+const COMMUNICATION_ROLES = new Set(['Owner', 'Operations & Events', 'Front Desk']);
+const OWNER_AUTH_VAULT_KEY = 'app_owner_auth_v1';
+const STAFF_PROFILES_VAULT_KEY = 'app_staff_profiles_v1';
+const OWNER_AUTH_ITERATIONS = 310000;
+const OWNER_AUTH_PENDING_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const MAX_CUSTOM_STAFF_PROFILES = 50;
+
+function _normalizeStaffProfileName(value) {
+  if (typeof value !== 'string') throw new Error('Enter a staff name.');
+  const name = value.trim().replace(/\s+/g, ' ');
+  if (name.length < 2 || name.length > 80 ||
+      /[\u0000-\u001F\u007F]/.test(name) ||
+      !/^[\p{L}\p{M}\d .'-]+$/u.test(name)) {
+    throw new Error('Staff names must be 2–80 characters and contain only letters, numbers, spaces, periods, apostrophes, or hyphens.');
+  }
+  if (name.toLocaleLowerCase('en-US') === 'team') {
+    throw new Error('Team is reserved for shared task assignments.');
+  }
+  return name;
+}
+
+function _customStaffProfilesFromVault(vault) {
+  const stored = vault[STAFF_PROFILES_VAULT_KEY];
+  if (stored === undefined) return [];
+  if (!Array.isArray(stored) || stored.length > MAX_CUSTOM_STAFF_PROFILES) {
+    throw new Error('The protected staff-profile list is invalid.');
+  }
+  const seen = new Set(Object.keys(APP_PROFILE_ROLES).map(name => name.toLocaleLowerCase('en-US')));
+  return stored.map(profile => {
+    if (!_isPlainObject(profile) ||
+        !Object.keys(profile).every(key => ['name', 'role', 'createdAt'].includes(key)) ||
+        profile.role !== 'Front Desk' ||
+        !Number.isSafeInteger(profile.createdAt) ||
+        profile.createdAt <= 0) {
+      throw new Error('The protected staff-profile list is invalid.');
     }
+    const name = _normalizeStaffProfileName(profile.name);
+    const folded = name.toLocaleLowerCase('en-US');
+    if (seen.has(folded)) throw new Error('The protected staff-profile list contains a duplicate name.');
+    seen.add(folded);
+    return { name, role: 'Front Desk', createdAt: profile.createdAt };
+  });
+}
 
-    // Copy to temp to avoid lock contention with the Messages app
-    const tmpPath = path.join(os.tmpdir(), 'tmb_chat_copy.db');
-    fs.copyFileSync(expandedPath, tmpPath);
-    try { fs.copyFileSync(expandedPath + '-wal', tmpPath + '-wal'); } catch(e) {}
-    try { fs.copyFileSync(expandedPath + '-shm', tmpPath + '-shm'); } catch(e) {}
+function _allAppProfiles() {
+  const builtIn = Object.entries(APP_PROFILE_ROLES).map(([name, role]) => ({
+    name,
+    role,
+    builtIn: true,
+  }));
+  const custom = _customStaffProfilesFromVault(_loadSecretVault()).map(profile => ({
+    name: profile.name,
+    role: 'Front Desk',
+    builtIn: false,
+  }));
+  return [...builtIn, ...custom];
+}
 
-    // Get conversations with messages from last 90 days (7,776,000,000,000,000 ns)
-    const sql = `
-      SELECT
-        c.ROWID as chat_id,
-        c.chat_identifier,
-        COALESCE(c.display_name, '') as display_name,
-        m.ROWID as msg_id,
-        COALESCE(m.text, '') as text,
-        m.is_from_me,
-        m.is_read,
-        m.date as raw_date,
-        COALESCE(h.id, '') as handle_id
-      FROM chat c
-      JOIN chat_message_join cmj ON c.ROWID = cmj.chat_id
-      JOIN message m ON cmj.message_id = m.ROWID
-      LEFT JOIN handle h ON m.handle_id = h.ROWID
-      WHERE length(trim(COALESCE(m.text, ''))) > 0
-        AND c.ROWID IN (
-          SELECT DISTINCT cmj2.chat_id
-          FROM chat_message_join cmj2
-          JOIN message m2 ON cmj2.message_id = m2.ROWID
-          WHERE m2.date > (SELECT MAX(date) FROM message) - 7776000000000000
-        )
-      ORDER BY c.ROWID, m.date DESC;
-    `;
+function _roleForAppProfile(name) {
+  if (typeof name !== 'string') return null;
+  const builtInRole = APP_PROFILE_ROLES[name];
+  if (builtInRole) return builtInRole;
+  const custom = _customStaffProfilesFromVault(_loadSecretVault());
+  return custom.some(profile => profile.name === name) ? 'Front Desk' : null;
+}
 
-    const output = execFileSync('/usr/bin/sqlite3', ['-json', tmpPath, sql], {
-      encoding: 'utf8',
-      maxBuffer: 20 * 1024 * 1024,
-      timeout: 15000,
+function _resetAppSession() {
+  appSession = null;
+  firebaseRuntimeSecretIssued = false;
+  pendingOAuth = null;
+  _closeOAuthServer();
+}
+
+function _setAppSession(name, role) {
+  firebaseRuntimeSecretIssued = false;
+  appSession = {
+    name,
+    role,
+    webContentsId: mainWindow?.webContents?.id ?? null,
+    expiresAt: Date.now() + APP_SESSION_TTL_MS,
+  };
+  return { ok: true, name, role, expiresAt: appSession.expiresAt };
+}
+
+function _requireAppRole(allowedRoles) {
+  if (!appSession || Date.now() >= appSession.expiresAt ||
+      !mainWindow || mainWindow.isDestroyed() ||
+      appSession.webContentsId !== mainWindow.webContents.id) {
+    _resetAppSession();
+    throw new Error('Sign in to Music Box before using this feature.');
+  }
+  if (!allowedRoles.has(appSession.role)) {
+    throw new Error('This signed-in profile is not authorized for that action.');
+  }
+  appSession.expiresAt = Date.now() + APP_SESSION_TTL_MS;
+  return appSession;
+}
+
+function _validOwnerPin(pin, allowLegacy = true) {
+  return typeof pin === 'string' &&
+    (allowLegacy ? /^\d{4,6}$/.test(pin) : /^\d{6}$/.test(pin));
+}
+
+function _deriveOwnerVerifier(pin, salt, iterations = OWNER_AUTH_ITERATIONS) {
+  return new Promise((resolve, reject) => {
+    crypto.pbkdf2(pin, salt, iterations, 32, 'sha256', (error, result) => {
+      if (error) reject(error);
+      else resolve(result);
     });
+  });
+}
 
-    const rows = JSON.parse(output || '[]');
-    const APPLE_EPOCH = 978307200; // seconds between Unix epoch and Apple epoch (2001-01-01)
+function _validOwnerVerifier(value) {
+  return _isPlainObject(value) &&
+    Number.isSafeInteger(value.iterations) &&
+    value.iterations >= OWNER_AUTH_ITERATIONS && value.iterations <= 2000000 &&
+    typeof value.salt === 'string' && /^[A-Za-z0-9+/]+={0,2}$/.test(value.salt) &&
+    Buffer.from(value.salt, 'base64').length === 16 &&
+    typeof value.verifier === 'string' && /^[A-Za-z0-9+/]+={0,2}$/.test(value.verifier) &&
+    Buffer.from(value.verifier, 'base64').length === 32;
+}
 
-    // Group by chat_id; rows are already DESC by date so [0] = newest
-    const chatsMap = new Map();
-    rows.forEach(row => {
-      const cid = row.chat_id;
-      if (!chatsMap.has(cid)) {
-        chatsMap.set(cid, {
-          chat_id: cid,
-          chat_identifier: row.chat_identifier || '',
-          display_name: row.display_name || '',
-          handle_id: row.handle_id || '',
-          msgs: [],
-          unreadCount: 0,
-        });
-      }
-      const chat = chatsMap.get(cid);
-      // Cap at 60 messages per conversation
-      if (chat.msgs.length < 60) {
-        chat.msgs.push(row);
-        if (!row.is_from_me && !row.is_read) chat.unreadCount++;
-      }
+async function _buildOwnerVerifier(pin) {
+  const salt = crypto.randomBytes(16);
+  const verifier = await _deriveOwnerVerifier(pin, salt);
+  return {
+    iterations: OWNER_AUTH_ITERATIONS,
+    salt: salt.toString('base64'),
+    verifier: verifier.toString('base64'),
+  };
+}
+
+async function _ownerPinMatches(pin, record) {
+  if (!_validOwnerPin(pin) || !_validOwnerVerifier(record)) return false;
+  const expected = Buffer.from(record.verifier, 'base64');
+  const actual = await _deriveOwnerVerifier(
+    pin,
+    Buffer.from(record.salt, 'base64'),
+    record.iterations,
+  );
+  return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+}
+
+function _ownerAuthRecord(vault) {
+  const record = vault[OWNER_AUTH_VAULT_KEY];
+  if (record === undefined) return null;
+  if (!_isPlainObject(record) || record.version !== 1 || !_validOwnerVerifier(record.active)) {
+    throw new Error('The protected owner-authentication record is invalid.');
+  }
+  if (record.pending !== undefined && record.pending !== null &&
+      (!_isPlainObject(record.pending) ||
+       !_boundedString(record.pending.rotationId, 128) ||
+       !Number.isSafeInteger(record.pending.createdAt) ||
+       !_validOwnerVerifier(record.pending.verifier))) {
+    throw new Error('The protected owner-authentication record is invalid.');
+  }
+  return record;
+}
+
+function _recordOwnerAuthFailure() {
+  ownerAuthFailures += 1;
+  if (ownerAuthFailures >= 5) {
+    const delay = ownerAuthFailures >= 10 ? 30 * 60 * 1000 : 5 * 60 * 1000;
+    ownerAuthLockedUntil = Date.now() + delay;
+  }
+}
+
+_secureHandle('app-session-authenticate-owner', async (_, pin) => {
+  if (!_validOwnerPin(pin)) throw new Error('Enter the owner passcode.');
+  if (Date.now() < ownerAuthLockedUntil) {
+    throw new Error('Too many owner-authentication attempts. Try again later.');
+  }
+  const vault = _loadSecretVault();
+  let record = _ownerAuthRecord(vault);
+
+  // Trust-on-first-use (TOFU) upgrade bootstrap: the legacy renderer verifies
+  // its existing PIN before this call, but main cannot retroactively prove that
+  // old renderer state. This is defense-in-depth for subsequent sessions, not a
+  // new cryptographic boundary against a renderer already compromised at first
+  // launch after upgrade.
+  if (!record) {
+    record = { version: 1, active: await _buildOwnerVerifier(pin), pending: null };
+    vault[OWNER_AUTH_VAULT_KEY] = record;
+    _saveSecretVault(vault);
+  } else {
+    let matched = await _ownerPinMatches(pin, record.active);
+    if (!matched && record.pending &&
+        Date.now() - record.pending.createdAt <= OWNER_AUTH_PENDING_MAX_AGE_MS &&
+        await _ownerPinMatches(pin, record.pending.verifier)) {
+      record.active = record.pending.verifier;
+      record.pending = null;
+      vault[OWNER_AUTH_VAULT_KEY] = record;
+      _saveSecretVault(vault);
+      matched = true;
+    }
+    if (!matched) {
+      _recordOwnerAuthFailure();
+      throw new Error('The owner passcode did not match the protected app session.');
+    }
+  }
+
+  ownerAuthFailures = 0;
+  ownerAuthLockedUntil = 0;
+  return _setAppSession('Elizabeth Chaves', APP_PROFILE_ROLES['Elizabeth Chaves']);
+});
+
+_secureHandle('app-session-start-staff', async (_, name) => {
+  const role = _roleForAppProfile(name);
+  if (!role || role === 'Owner') throw new Error('Unknown staff profile.');
+  return _setAppSession(name, role);
+});
+
+_secureHandle('app-session-list-profiles', async () => ({
+  ok: true,
+  profiles: _allAppProfiles(),
+}));
+
+_secureHandle('app-session-add-staff-profile', async (_, requestedName) => {
+  const name = _normalizeStaffProfileName(requestedName);
+  const vault = _loadSecretVault();
+  const profiles = _customStaffProfilesFromVault(vault);
+  const folded = name.toLocaleLowerCase('en-US');
+  const duplicate = _allAppProfiles().some(profile =>
+    profile.name.toLocaleLowerCase('en-US') === folded
+  );
+  if (duplicate) throw new Error('A user with that name already exists.');
+  if (profiles.length >= MAX_CUSTOM_STAFF_PROFILES) {
+    throw new Error(`This Mac already has the maximum of ${MAX_CUSTOM_STAFF_PROFILES} added users.`);
+  }
+  profiles.push({ name, role: 'Front Desk', createdAt: Date.now() });
+  vault[STAFF_PROFILES_VAULT_KEY] = profiles;
+  _saveSecretVault(vault);
+  return { ok: true, profile: { name, role: 'Front Desk', builtIn: false } };
+});
+
+_secureHandle('app-session-end', async () => {
+  _resetAppSession();
+  return { ok: true };
+});
+
+_secureHandle('app-session-status', async () => {
+  if (!appSession || Date.now() >= appSession.expiresAt) {
+    _resetAppSession();
+    return { ok: true, authenticated: false };
+  }
+  return {
+    ok: true,
+    authenticated: true,
+    name: appSession.name,
+    role: appSession.role,
+    expiresAt: appSession.expiresAt,
+  };
+});
+
+_secureHandle('app-session-stage-owner-pin', async (_, request) => {
+  _requireAppRole(new Set(['Owner']));
+  if (!_isPlainObject(request) ||
+      !Object.keys(request).every(key => ['currentPin', 'newPin'].includes(key)) ||
+      !_validOwnerPin(request.currentPin) || !_validOwnerPin(request.newPin, false)) {
+    throw new Error('Invalid owner passcode change.');
+  }
+  const vault = _loadSecretVault();
+  const record = _ownerAuthRecord(vault);
+  if (!record || !await _ownerPinMatches(request.currentPin, record.active)) {
+    throw new Error('The current owner passcode did not match.');
+  }
+  const rotationId = crypto.randomBytes(24).toString('base64url');
+  record.pending = {
+    rotationId,
+    createdAt: Date.now(),
+    verifier: await _buildOwnerVerifier(request.newPin),
+  };
+  vault[OWNER_AUTH_VAULT_KEY] = record;
+  _saveSecretVault(vault);
+  return { ok: true, rotationId };
+});
+
+_secureHandle('app-session-commit-owner-pin', async (_, rotationId) => {
+  _requireAppRole(new Set(['Owner']));
+  if (!_boundedString(rotationId, 128)) throw new Error('Invalid owner passcode change.');
+  const vault = _loadSecretVault();
+  const record = _ownerAuthRecord(vault);
+  if (!record?.pending || record.pending.rotationId !== rotationId) {
+    throw new Error('The pending owner passcode change was not found.');
+  }
+  record.active = record.pending.verifier;
+  record.pending = null;
+  vault[OWNER_AUTH_VAULT_KEY] = record;
+  _saveSecretVault(vault);
+  return { ok: true };
+});
+
+_secureHandle('app-session-cancel-owner-pin', async (_, rotationId) => {
+  _requireAppRole(new Set(['Owner']));
+  if (!_boundedString(rotationId, 128)) throw new Error('Invalid owner passcode change.');
+  const vault = _loadSecretVault();
+  const record = _ownerAuthRecord(vault);
+  if (record?.pending?.rotationId === rotationId) {
+    record.pending = null;
+    vault[OWNER_AUTH_VAULT_KEY] = record;
+    _saveSecretVault(vault);
+  }
+  return { ok: true };
+});
+
+// Firebase must remain renderer-hosted until the sync layer can move behind a
+// backend/main proxy. Remove arbitrary vault reads while keeping this one
+// backward-compatible, purpose-specific runtime configuration path.
+const FIREBASE_SECRET_KEYS_MAIN = Object.freeze({
+  apiKey: 'firebase_api_key',
+  projectId: 'firebase_project_id',
+  appId: 'firebase_app_id',
+  email: 'firebase_email',
+  password: 'firebase_password',
+});
+
+function _validFirebaseConfig(config) {
+  return _isPlainObject(config) &&
+    typeof config.apiKey === 'string' && config.apiKey.length >= 8 && config.apiKey.length <= 512 &&
+    !/[\u0000-\u0020\u007f]/.test(config.apiKey) &&
+    typeof config.projectId === 'string' && /^[a-z0-9][a-z0-9-]{3,62}$/.test(config.projectId) &&
+    (config.appId === '' ||
+      (typeof config.appId === 'string' && config.appId.length <= 512 &&
+       !/[\u0000-\u001f\u007f]/.test(config.appId))) &&
+    typeof config.email === 'string' && config.email.length >= 3 && config.email.length <= 320 &&
+    /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(config.email) &&
+    typeof config.password === 'string' && config.password.length >= 6 &&
+    config.password.length <= 2048 && !config.password.includes('\0');
+}
+
+function _firebaseConfigFromVault(vault) {
+  return {
+    apiKey: typeof vault[FIREBASE_SECRET_KEYS_MAIN.apiKey] === 'string'
+      ? vault[FIREBASE_SECRET_KEYS_MAIN.apiKey] : '',
+    projectId: typeof vault[FIREBASE_SECRET_KEYS_MAIN.projectId] === 'string'
+      ? vault[FIREBASE_SECRET_KEYS_MAIN.projectId] : '',
+    appId: typeof vault[FIREBASE_SECRET_KEYS_MAIN.appId] === 'string'
+      ? vault[FIREBASE_SECRET_KEYS_MAIN.appId] : '',
+    email: typeof vault[FIREBASE_SECRET_KEYS_MAIN.email] === 'string'
+      ? vault[FIREBASE_SECRET_KEYS_MAIN.email] : '',
+    password: typeof vault[FIREBASE_SECRET_KEYS_MAIN.password] === 'string'
+      ? vault[FIREBASE_SECRET_KEYS_MAIN.password] : '',
+  };
+}
+
+_secureHandle('firebase-config-status', async () => {
+  _requireAppRole(COMMUNICATION_ROLES);
+  const config = _firebaseConfigFromVault(_loadSecretVault());
+  return {
+    ok: true,
+    configured: _validFirebaseConfig(config),
+    hasPassword: typeof config.password === 'string' && config.password.length >= 6,
+    config: {
+      apiKey: config.apiKey,
+      projectId: config.projectId,
+      appId: config.appId,
+      email: config.email,
+    },
+  };
+});
+
+_secureHandle('firebase-runtime-config', async () => {
+  _requireAppRole(new Set(['Owner']));
+  if (firebaseRuntimeSecretIssued) {
+    throw new Error('Firebase runtime credentials were already delivered for this owner session.');
+  }
+  const config = _firebaseConfigFromVault(_loadSecretVault());
+  if (_validFirebaseConfig(config)) firebaseRuntimeSecretIssued = true;
+  return { ok: true, configured: _validFirebaseConfig(config), config };
+});
+
+_secureHandle('firebase-configure', async (_, settings) => {
+  _requireAppRole(new Set(['Owner']));
+  if (!_isPlainObject(settings) ||
+      !Object.keys(settings).every(key => ['apiKey', 'projectId', 'appId', 'email', 'password'].includes(key))) {
+    throw new Error('Invalid Firebase configuration.');
+  }
+  const vault = _loadSecretVault();
+  const current = _firebaseConfigFromVault(vault);
+  const config = {
+    apiKey: settings.apiKey,
+    projectId: settings.projectId,
+    appId: settings.appId || '',
+    email: settings.email,
+    password: settings.password || current.password,
+  };
+  if (!_validFirebaseConfig(config)) throw new Error('Enter valid Firebase credentials.');
+  for (const [field, key] of Object.entries(FIREBASE_SECRET_KEYS_MAIN)) {
+    vault[key] = config[field];
+  }
+  _saveSecretVault(vault);
+  firebaseRuntimeSecretIssued = false;
+  return {
+    ok: true,
+    configured: true,
+    config: { ...config, password: '' },
+    hasPassword: true,
+  };
+});
+
+_secureHandle('firebase-clear', async () => {
+  _requireAppRole(new Set(['Owner']));
+  const vault = _loadSecretVault();
+  for (const key of Object.values(FIREBASE_SECRET_KEYS_MAIN)) delete vault[key];
+  _saveSecretVault(vault);
+  firebaseRuntimeSecretIssued = false;
+  return { ok: true, configured: false };
+});
+
+// ── Anthropic proxy ──────────────────────────────────────────────────────────
+// The renderer may submit a newly typed key once, but saved keys, Authorization
+// headers, and API responses never expose credentials back across IPC.
+const ANTHROPIC_SECRET_KEY = 'anthropic_api_key';
+const ANTHROPIC_MODELS = new Set([
+  'claude-opus-4-5',
+  'claude-sonnet-4-6',
+  'claude-haiku-4-5-20251001',
+]);
+const aiCallTimestamps = [];
+let activeAiRequests = 0;
+
+function _validAnthropicKey(value) {
+  return typeof value === 'string' && value.length >= 20 && value.length <= 512 &&
+    value.startsWith('sk-ant-') && !/[\u0000-\u0020\u007f]/.test(value);
+}
+
+function _validateAnthropicContent(content) {
+  if (typeof content === 'string') {
+    return content.length > 0 && Buffer.byteLength(content, 'utf8') <= 2 * 1024 * 1024;
+  }
+  if (!Array.isArray(content) || content.length < 1 || content.length > 64) return false;
+  return content.every((block) => {
+    if (!_isPlainObject(block)) return false;
+    if (block.type === 'text') {
+      return Object.keys(block).every(key => ['type', 'text'].includes(key)) &&
+        typeof block.text === 'string' && block.text.length > 0 &&
+        Buffer.byteLength(block.text, 'utf8') <= 2 * 1024 * 1024;
+    }
+    if (block.type === 'image' && _isPlainObject(block.source)) {
+      return Object.keys(block).every(key => ['type', 'source'].includes(key)) &&
+        Object.keys(block.source).every(key => ['type', 'media_type', 'data'].includes(key)) &&
+        block.source.type === 'base64' &&
+        ['image/jpeg', 'image/png', 'image/gif', 'image/webp'].includes(block.source.media_type) &&
+        typeof block.source.data === 'string' &&
+        block.source.data.length > 0 && block.source.data.length <= 10 * 1024 * 1024 &&
+        /^[A-Za-z0-9+/]+={0,2}$/.test(block.source.data);
+    }
+    return false;
+  });
+}
+
+function _validatedAnthropicPayload(payload) {
+  if (!_isPlainObject(payload) ||
+      !Object.keys(payload).every(key => ['model', 'max_tokens', 'system', 'messages'].includes(key)) ||
+      !ANTHROPIC_MODELS.has(payload.model) ||
+      !Number.isSafeInteger(payload.max_tokens) ||
+      payload.max_tokens < 1 || payload.max_tokens > 4096 ||
+      (payload.system !== undefined &&
+        (typeof payload.system !== 'string' ||
+         Buffer.byteLength(payload.system, 'utf8') > 2 * 1024 * 1024)) ||
+      !Array.isArray(payload.messages) ||
+      payload.messages.length < 1 || payload.messages.length > 20) {
+    throw new Error('Invalid AI request.');
+  }
+  for (const message of payload.messages) {
+    if (!_isPlainObject(message) ||
+        !Object.keys(message).every(key => ['role', 'content'].includes(key)) ||
+        !['user', 'assistant'].includes(message.role) ||
+        !_validateAnthropicContent(message.content)) {
+      throw new Error('Invalid AI message content.');
+    }
+  }
+  const serialized = JSON.stringify(payload);
+  if (Buffer.byteLength(serialized, 'utf8') > MAX_AI_REQUEST_BYTES) {
+    throw new Error('AI request exceeds the 12 MB limit.');
+  }
+  return serialized;
+}
+
+function _consumeAiRateLimit() {
+  const cutoff = Date.now() - 60 * 60 * 1000;
+  while (aiCallTimestamps.length && aiCallTimestamps[0] < cutoff) aiCallTimestamps.shift();
+  if (aiCallTimestamps.length >= 60 || activeAiRequests >= 2) return false;
+  aiCallTimestamps.push(Date.now());
+  return true;
+}
+
+function _anthropicPost(apiKey, body) {
+  return new Promise((resolve) => {
+    const req = https.request({
+      protocol: 'https:',
+      hostname: 'api.anthropic.com',
+      port: 443,
+      path: '/v1/messages',
+      method: 'POST',
+      timeout: 45000,
+      headers: {
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(body, 'utf8'),
+        'user-agent': `MusicBoxInternal/${app.getVersion()}`,
+      },
+    }, (res) => {
+      let bytes = 0;
+      const chunks = [];
+      res.on('data', (chunk) => {
+        bytes += chunk.length;
+        if (bytes > MAX_AI_RESPONSE_BYTES) {
+          req.destroy(new Error('AI response exceeded the 2 MB limit.'));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      res.on('end', () => {
+        let parsed;
+        try { parsed = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
+        catch (_) {
+          resolve({ ok: false, status: res.statusCode, error: 'The AI service returned an invalid response.' });
+          return;
+        }
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          const detail = typeof parsed?.error?.message === 'string'
+            ? parsed.error.message.slice(0, 300)
+            : `HTTP ${res.statusCode}`;
+          resolve({ ok: false, status: res.statusCode, error: `AI request failed: ${detail}` });
+          return;
+        }
+        if (!_isPlainObject(parsed)) {
+          resolve({ ok: false, error: 'The AI service returned an invalid response.' });
+          return;
+        }
+        resolve({ ok: true, data: parsed });
+      });
     });
+    req.on('timeout', () => req.destroy(new Error('AI request timed out.')));
+    req.on('error', (error) => {
+      resolve({ ok: false, error: String(error?.message || 'AI request failed.').slice(0, 300) });
+    });
+    req.end(body);
+  });
+}
 
-    const fmtTime = (unixSec) => {
-      const d = new Date(unixSec * 1000);
-      const now = new Date();
-      const diffDays = Math.floor((now - d) / 86400000);
-      if (diffDays === 0) return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-      if (diffDays === 1) return 'Yesterday';
-      if (diffDays < 7) return d.toLocaleDateString([], { weekday: 'short' });
-      return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
-    };
+_secureHandle('anthropic-key-status', async () => {
+  _requireAppRole(COMMUNICATION_ROLES);
+  const vault = _loadSecretVault();
+  return { ok: true, configured: _validAnthropicKey(vault[ANTHROPIC_SECRET_KEY]) };
+});
 
-    const chats = Array.from(chatsMap.values()).map(chat => {
-      const latest = chat.msgs[0];
-      const latestTs = latest ? (Number(latest.raw_date) / 1e9 + APPLE_EPOCH) : 0;
-      const contactName = chat.display_name || chat.handle_id || chat.chat_identifier;
+_secureHandle('anthropic-key-set', async (_, value) => {
+  _requireAppRole(new Set(['Owner']));
+  if (!_validAnthropicKey(value)) throw new Error('Enter a valid Anthropic API key.');
+  const vault = _loadSecretVault();
+  vault[ANTHROPIC_SECRET_KEY] = value;
+  _saveSecretVault(vault);
+  return { ok: true, configured: true };
+});
 
-      return {
-        id: String(chat.chat_id),
-        from: contactName,
-        phone: chat.chat_identifier,
-        preview: latest?.text?.slice(0, 120) || '',
-        time: latestTs ? fmtTime(latestTs) : '',
-        unread: chat.unreadCount > 0,
-        unreadCount: chat.unreadCount,
-        flagged: false,
-        latestTs,
-        messages: chat.msgs.slice().reverse().map(m => ({
-          id: String(m.msg_id),
-          text: m.text || '',
-          from_me: !!m.is_from_me,
-          time: fmtTime(Number(m.raw_date) / 1e9 + APPLE_EPOCH),
-        })),
-      };
-    }).sort((a, b) => b.latestTs - a.latestTs);
+_secureHandle('anthropic-key-remove', async () => {
+  _requireAppRole(new Set(['Owner']));
+  const vault = _loadSecretVault();
+  delete vault[ANTHROPIC_SECRET_KEY];
+  _saveSecretVault(vault);
+  return { ok: true, configured: false };
+});
 
-    return { ok: true, chats };
-  } catch(e) {
-    return { ok: false, error: e.message };
+_secureHandle('anthropic-message', async (_, payload) => {
+  _requireAppRole(COMMUNICATION_ROLES);
+  let body;
+  try { body = _validatedAnthropicPayload(payload); }
+  catch (error) { return { ok: false, error: error.message }; }
+  const vault = _loadSecretVault();
+  const apiKey = vault[ANTHROPIC_SECRET_KEY];
+  if (!_validAnthropicKey(apiKey)) {
+    return { ok: false, error: 'Add an Anthropic API key in Settings first.' };
+  }
+  if (!_consumeAiRateLimit()) {
+    return { ok: false, error: 'AI request limit reached. Wait before trying again.' };
+  }
+  activeAiRequests++;
+  try {
+    return await _anthropicPost(apiKey, body);
+  } finally {
+    activeAiRequests--;
   }
 });
 
-// ── IPC: iMessage — send via AppleScript ─────────────────────
-ipcMain.handle('send-imessage', async (_, { phone, text }) => {
-  try {
-    // Escape for AppleScript string
-    const safeTxt = text.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
-    const script = [
-      'tell application "Messages"',
-      '  set targetService to 1st service whose service type = iMessage',
-      `  set targetBuddy to buddy "${phone}" of targetService`,
-      `  send "${safeTxt}" to targetBuddy`,
-      'end tell',
-    ].join('\n');
+// ── RingCentral proxy ────────────────────────────────────────────────────────
+// Credentials and OAuth tokens stay in the main-process vault. Only normalized,
+// bounded message records cross into the renderer.
+const RC_SECRET_KEYS = Object.freeze({
+  clientId: 'rc_client_id',
+  clientSecret: 'rc_client_secret',
+  jwt: 'rc_jwt',
+  myPhone: 'rc_my_phone',
+});
+let rcAccessToken = null;
+let rcAccessTokenExpiry = 0;
+let rcTokenInFlight = null;
+let rcFetchInFlight = null;
+const rcSendTimestamps = [];
 
-    execFileSync('/usr/bin/osascript', ['-e', script], { timeout: 12000 });
-    return { ok: true };
-  } catch(e) {
-    return { ok: false, error: e.message };
+function _cleanString(value, max) {
+  return typeof value === 'string'
+    ? value.replace(/[\u0000-\u001f\u007f]/g, '').slice(0, max)
+    : '';
+}
+
+function _normalizeRcPhone(value) {
+  if (typeof value !== 'string' || value.length > 64) return null;
+  const normalized = value.trim().replace(/[\s().-]/g, '');
+  return /^\+[1-9][0-9]{7,14}$/.test(normalized) ? normalized : null;
+}
+
+function _validRcCredentials({ clientId, clientSecret, jwt }) {
+  return typeof clientId === 'string' && clientId.length >= 4 && clientId.length <= 512 &&
+    /^[A-Za-z0-9._~-]+$/.test(clientId) &&
+    typeof clientSecret === 'string' && clientSecret.length >= 8 && clientSecret.length <= 2048 &&
+    !/[\u0000-\u0020\u007f]/.test(clientSecret) &&
+    typeof jwt === 'string' && jwt.length >= 20 && jwt.length <= 32768 &&
+    /^[A-Za-z0-9._~-]+$/.test(jwt);
+}
+
+function _ringCentralRequest({ method, requestPath, headers = {}, body = null, maxBytes = 5 * 1024 * 1024 }) {
+  return new Promise((resolve) => {
+    const req = https.request({
+      protocol: 'https:',
+      hostname: 'platform.ringcentral.com',
+      port: 443,
+      method,
+      path: requestPath,
+      timeout: 20000,
+      headers: {
+        ...headers,
+        'user-agent': `MusicBoxInternal/${app.getVersion()}`,
+        ...(body === null ? {} : { 'content-length': Buffer.byteLength(body, 'utf8') }),
+      },
+    }, (res) => {
+      let bytes = 0;
+      const chunks = [];
+      res.on('data', (chunk) => {
+        bytes += chunk.length;
+        if (bytes > maxBytes) {
+          req.destroy(new Error('RingCentral response exceeded its safety limit.'));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      res.on('end', () => {
+        const raw = Buffer.concat(chunks).toString('utf8');
+        let data = {};
+        if (raw) {
+          try { data = JSON.parse(raw); }
+          catch (_) {
+            resolve({ ok: false, status: res.statusCode, error: 'RingCentral returned an invalid response.' });
+            return;
+          }
+        }
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          const detail = _cleanString(data?.message || data?.error_description || '', 300);
+          resolve({
+            ok: false,
+            status: res.statusCode,
+            error: detail ? `RingCentral request failed: ${detail}` : `RingCentral request failed (HTTP ${res.statusCode}).`,
+          });
+          return;
+        }
+        resolve({ ok: true, status: res.statusCode, data });
+      });
+    });
+    req.on('timeout', () => req.destroy(new Error('RingCentral request timed out.')));
+    req.on('error', (error) => {
+      resolve({ ok: false, error: _cleanString(error?.message || 'RingCentral request failed.', 300) });
+    });
+    if (body !== null) req.write(body);
+    req.end();
+  });
+}
+
+async function _getRcAccessTokenMain(forceRefresh = false) {
+  if (!forceRefresh && rcAccessToken && Date.now() < rcAccessTokenExpiry - 5 * 60 * 1000) {
+    return { ok: true, token: rcAccessToken };
   }
+  if (rcTokenInFlight) return rcTokenInFlight;
+  const request = (async () => {
+    const vault = _loadSecretVault();
+    const credentials = {
+      clientId: vault[RC_SECRET_KEYS.clientId],
+      clientSecret: vault[RC_SECRET_KEYS.clientSecret],
+      jwt: vault[RC_SECRET_KEYS.jwt],
+    };
+    if (!_validRcCredentials(credentials)) {
+      return { ok: false, error: 'Add valid RingCentral credentials in Settings first.' };
+    }
+    const form = new URLSearchParams({
+      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+      assertion: credentials.jwt,
+    }).toString();
+    const result = await _ringCentralRequest({
+      method: 'POST',
+      requestPath: '/restapi/oauth/token',
+      headers: {
+        authorization: `Basic ${Buffer.from(`${credentials.clientId}:${credentials.clientSecret}`, 'utf8').toString('base64')}`,
+        'content-type': 'application/x-www-form-urlencoded',
+      },
+      body: form,
+      maxBytes: 1024 * 1024,
+    });
+    if (!result.ok || typeof result.data?.access_token !== 'string' ||
+        result.data.access_token.length < 20 || result.data.access_token.length > 32768) {
+      return { ok: false, error: result.error || 'RingCentral authentication failed.' };
+    }
+    const expiresIn = Number(result.data.expires_in);
+    rcAccessToken = result.data.access_token;
+    rcAccessTokenExpiry = Date.now() +
+      (Number.isFinite(expiresIn) ? Math.max(300, Math.min(expiresIn, 86400)) : 3600) * 1000;
+    return { ok: true, token: rcAccessToken };
+  })();
+  rcTokenInFlight = request;
+  try {
+    return await request;
+  } finally {
+    if (rcTokenInFlight === request) rcTokenInFlight = null;
+  }
+}
+
+async function _ringCentralAuthedRequest(method, requestPath, body = null) {
+  let auth = await _getRcAccessTokenMain();
+  if (!auth.ok) return auth;
+  const makeRequest = (token) => _ringCentralRequest({
+    method,
+    requestPath,
+    headers: {
+      authorization: `Bearer ${token}`,
+      ...(body === null ? {} : { 'content-type': 'application/json' }),
+    },
+    body: body === null ? null : JSON.stringify(body),
+  });
+  let result = await makeRequest(auth.token);
+  if (result.status === 401) {
+    rcAccessToken = null;
+    rcAccessTokenExpiry = 0;
+    auth = await _getRcAccessTokenMain(true);
+    if (!auth.ok) return auth;
+    result = await makeRequest(auth.token);
+  }
+  return result;
+}
+
+function _normalizeRcMessage(record, forcedDirection = null) {
+  if (!_isPlainObject(record)) return null;
+  const direction = forcedDirection ||
+    (String(record.direction || '').toLowerCase() === 'outbound' ? 'outbound' : 'inbound');
+  const to = Array.isArray(record.to)
+    ? record.to.slice(0, 20).map(item => _cleanString(item?.phoneNumber, 64)).filter(Boolean)
+    : [];
+  const from = _cleanString(record.from?.phoneNumber || '?', 64);
+  return {
+    id: _cleanString(String(record.id || ''), 128),
+    from,
+    fromName: _cleanString(record.from?.name || '', 256),
+    to,
+    body: _cleanString(record.subject || '', 20000),
+    createdAt: _cleanString(record.creationTime || '', 64),
+    direction,
+    readStatus: direction === 'outbound' ? 'Read' : _cleanString(record.readStatus || 'Unread', 32),
+  };
+}
+
+async function _fetchRingCentralDataMain() {
+  const base = '/restapi/v1.0/account/~/extension/~/message-store';
+  const [smsIn, smsOut, voicemail] = await Promise.all([
+    _ringCentralAuthedRequest('GET', `${base}?type=SMS&direction=Inbound&perPage=100`),
+    _ringCentralAuthedRequest('GET', `${base}?type=SMS&direction=Outbound&perPage=100`),
+    _ringCentralAuthedRequest('GET', `${base}?type=VoiceMail&direction=Inbound&perPage=30`),
+  ]);
+  const failed = [smsIn, smsOut, voicemail].find(result => !result.ok);
+  if (failed) return { ok: false, error: failed.error || 'RingCentral refresh failed.' };
+
+  const inbound = Array.isArray(smsIn.data?.records) ? smsIn.data.records.slice(0, 100) : [];
+  const outbound = Array.isArray(smsOut.data?.records) ? smsOut.data.records.slice(0, 100) : [];
+  const allSms = [
+    ...inbound.map(record => _normalizeRcMessage(record, 'inbound')),
+    ...outbound.map(record => _normalizeRcMessage(record, 'outbound')),
+  ].filter(Boolean);
+  const conversations = new Map();
+  for (const message of allSms) {
+    const phone = message.direction === 'inbound' ? message.from : (message.to[0] || 'Unknown');
+    if (!conversations.has(phone)) {
+      conversations.set(phone, {
+        phone,
+        name: message.direction === 'inbound' ? message.fromName : '',
+        messages: [],
+        unread: false,
+      });
+    }
+    const conversation = conversations.get(phone);
+    if (message.fromName && !conversation.name) conversation.name = message.fromName;
+    if (message.direction === 'inbound' && message.readStatus === 'Unread') conversation.unread = true;
+    conversation.messages.push(message);
+  }
+  for (const conversation of conversations.values()) {
+    conversation.messages.sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
+    conversation.lastMsg = conversation.messages[conversation.messages.length - 1] || null;
+  }
+  const voicemailRecords = Array.isArray(voicemail.data?.records)
+    ? voicemail.data.records.slice(0, 30)
+    : [];
+  const voicemails = voicemailRecords.map(record => ({
+    id: _cleanString(String(record?.id || ''), 128),
+    from: _cleanString(record?.from?.phoneNumber || record?.from?.name || 'Unknown', 256),
+    fromName: _cleanString(record?.from?.name || record?.from?.phoneNumber || '', 256),
+    createdAt: _cleanString(record?.creationTime || '', 64),
+    voicemail: { transcript: _cleanString(record?.subject || '', 20000) },
+  }));
+  return {
+    ok: true,
+    data: {
+      messages: allSms.filter(message => message.direction === 'inbound'),
+      voicemails,
+      conversations: Array.from(conversations.values())
+        .sort((a, b) => Date.parse(b.lastMsg?.createdAt || 0) - Date.parse(a.lastMsg?.createdAt || 0))
+        .slice(0, 200),
+    },
+  };
+}
+
+_secureHandle('ringcentral-status', async () => {
+  _requireAppRole(COMMUNICATION_ROLES);
+  const vault = _loadSecretVault();
+  const configured = _validRcCredentials({
+    clientId: vault[RC_SECRET_KEYS.clientId],
+    clientSecret: vault[RC_SECRET_KEYS.clientSecret],
+    jwt: vault[RC_SECRET_KEYS.jwt],
+  });
+  const clientId = typeof vault[RC_SECRET_KEYS.clientId] === 'string' ? vault[RC_SECRET_KEYS.clientId] : '';
+  return {
+    ok: true,
+    configured,
+    myPhone: configured ? (_normalizeRcPhone(vault[RC_SECRET_KEYS.myPhone]) || '') : '',
+    clientIdHint: configured ? `••••${clientId.slice(-4)}` : '',
+  };
+});
+
+_secureHandle('ringcentral-configure', async (_, settings) => {
+  _requireAppRole(new Set(['Owner']));
+  if (!_isPlainObject(settings) ||
+      !Object.keys(settings).every(key => ['clientId', 'clientSecret', 'jwt', 'myPhone', 'clear'].includes(key))) {
+    throw new Error('Invalid RingCentral settings.');
+  }
+  const vault = _loadSecretVault();
+  const requestedClear = settings.clear === true ||
+    [settings.clientId, settings.clientSecret, settings.jwt, settings.myPhone]
+      .every(value => value === '' || value === undefined);
+  if (requestedClear) {
+    for (const key of Object.values(RC_SECRET_KEYS)) delete vault[key];
+    _saveSecretVault(vault);
+    rcAccessToken = null;
+    rcAccessTokenExpiry = 0;
+    return { ok: true, configured: false };
+  }
+  const next = {
+    clientId: settings.clientId || vault[RC_SECRET_KEYS.clientId] || '',
+    clientSecret: settings.clientSecret || vault[RC_SECRET_KEYS.clientSecret] || '',
+    jwt: settings.jwt || vault[RC_SECRET_KEYS.jwt] || '',
+  };
+  if (!_validRcCredentials(next)) {
+    throw new Error('Enter a valid Client ID, Client Secret, and JWT.');
+  }
+  const phoneInput = settings.myPhone === undefined
+    ? (vault[RC_SECRET_KEYS.myPhone] || '')
+    : settings.myPhone;
+  const phone = phoneInput ? _normalizeRcPhone(phoneInput) : '';
+  if (phoneInput && !phone) throw new Error('Enter the RingCentral number in E.164 format, such as +15551234567.');
+  vault[RC_SECRET_KEYS.clientId] = next.clientId;
+  vault[RC_SECRET_KEYS.clientSecret] = next.clientSecret;
+  vault[RC_SECRET_KEYS.jwt] = next.jwt;
+  if (phone) vault[RC_SECRET_KEYS.myPhone] = phone;
+  else delete vault[RC_SECRET_KEYS.myPhone];
+  _saveSecretVault(vault);
+  rcAccessToken = null;
+  rcAccessTokenExpiry = 0;
+  return { ok: true, configured: true, myPhone: phone, clientIdHint: `••••${next.clientId.slice(-4)}` };
+});
+
+_secureHandle('ringcentral-fetch-data', async () => {
+  _requireAppRole(COMMUNICATION_ROLES);
+  if (rcFetchInFlight) return rcFetchInFlight;
+  const request = _fetchRingCentralDataMain();
+  rcFetchInFlight = request;
+  try {
+    return await request;
+  } finally {
+    if (rcFetchInFlight === request) rcFetchInFlight = null;
+  }
+});
+
+_secureHandle('ringcentral-send-sms', async (_, request) => {
+  _requireAppRole(COMMUNICATION_ROLES);
+  if (!_isPlainObject(request) ||
+      !Object.keys(request).every(key => ['phone', 'text'].includes(key))) {
+    return { ok: false, error: 'Invalid text-message request.' };
+  }
+  const phone = _normalizeRcPhone(request.phone);
+  const text = typeof request.text === 'string' ? request.text.trim() : '';
+  if (!phone || !text || text.length > 5000 || text.includes('\0')) {
+    return { ok: false, error: 'Enter a valid recipient and a message no longer than 5,000 characters.' };
+  }
+  const cutoff = Date.now() - 60 * 1000;
+  while (rcSendTimestamps.length && rcSendTimestamps[0] < cutoff) rcSendTimestamps.shift();
+  if (rcSendTimestamps.length >= 10) {
+    return { ok: false, error: 'Text-message rate limit reached. Wait before sending again.' };
+  }
+  const vault = _loadSecretVault();
+  const from = _normalizeRcPhone(vault[RC_SECRET_KEYS.myPhone]);
+  if (!from) return { ok: false, error: 'Add your RingCentral number in Settings first.' };
+  rcSendTimestamps.push(Date.now());
+  const result = await _ringCentralAuthedRequest(
+    'POST',
+    '/restapi/v1.0/account/~/extension/~/sms',
+    { from: { phoneNumber: from }, to: [{ phoneNumber: phone }], text }
+  );
+  if (!result.ok) return { ok: false, error: result.error || 'RingCentral could not send the message.' };
+  const message = _normalizeRcMessage(result.data, 'outbound') || {
+    id: String(Date.now()),
+    from,
+    fromName: '',
+    to: [phone],
+    body: text,
+    createdAt: new Date().toISOString(),
+    direction: 'outbound',
+    readStatus: 'Read',
+  };
+  return { ok: true, message };
 });
 
 // ── IPC: iCloud Drive sync ─────────────────────────────────
-const ICLOUD_DIR = path.join(os.homedir(), 'Library', 'Mobile Documents', 'com~apple~CloudDocs', 'Music Box Internal');
+function _resolveICloudDirectory() {
+  const productionDirectory = path.join(
+    os.homedir(),
+    'Library',
+    'Mobile Documents',
+    'com~apple~CloudDocs',
+    'Music Box Internal'
+  );
+  const override = process.env.MUSIC_BOX_E2E_ICLOUD_DIR;
+  if (app.isPackaged || !override) return productionDirectory;
+
+  const resolvedOverride = fs.realpathSync(path.resolve(override));
+  const resolvedTempRoot = fs.realpathSync(os.tmpdir());
+  const relative = path.relative(resolvedTempRoot, resolvedOverride);
+  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+    throw new Error('MUSIC_BOX_E2E_ICLOUD_DIR must be an existing directory inside the system temporary directory.');
+  }
+  if (!fs.statSync(resolvedOverride).isDirectory()) {
+    throw new Error('MUSIC_BOX_E2E_ICLOUD_DIR must name a directory.');
+  }
+  return resolvedOverride;
+}
+
+const ICLOUD_DIR = _resolveICloudDirectory();
 const ICLOUD_SYNC_PATH = path.join(ICLOUD_DIR, 'sync.json');
+let iCloudWriteChain = Promise.resolve();
 
-ipcMain.handle('read-sync-file', async () => {
+async function _atomicWriteFile(targetPath, contents, mode = 0o600) {
+  const tempPath = path.join(
+    path.dirname(targetPath),
+    `.${path.basename(targetPath)}.tmp-${process.pid}-${crypto.randomBytes(8).toString('hex')}`
+  );
+  let handle = null;
   try {
-    if (!fs.existsSync(ICLOUD_SYNC_PATH)) return { ok: true, data: null };
-    const raw = fs.readFileSync(ICLOUD_SYNC_PATH, 'utf8');
-    return { ok: true, data: JSON.parse(raw) };
+    handle = await fs.promises.open(tempPath, 'wx', mode);
+    await handle.writeFile(contents, 'utf8');
+    await handle.sync();
+    await handle.close();
+    handle = null;
+    await fs.promises.rename(tempPath, targetPath);
+  } catch (error) {
+    if (handle) {
+      try { await handle.close(); } catch (_) {}
+    }
+    try { await fs.promises.unlink(tempPath); } catch (_) {}
+    throw error;
+  }
+}
+
+_secureHandle('read-sync-file', async () => {
+  try {
+    await iCloudWriteChain;
+    let stat;
+    try { stat = await fs.promises.stat(ICLOUD_SYNC_PATH); }
+    catch (error) {
+      if (error.code === 'ENOENT') return { ok: true, data: null };
+      throw error;
+    }
+    if (!stat.isFile() || stat.size > MAX_SYNC_BYTES) {
+      return { ok: false, error: 'The iCloud backup is invalid or exceeds the 8 MB limit.' };
+    }
+    const raw = await fs.promises.readFile(ICLOUD_SYNC_PATH, 'utf8');
+    const data = JSON.parse(raw);
+    if (!_isPlainObject(data)) return { ok: false, error: 'The iCloud backup has an invalid format.' };
+    return { ok: true, data };
   } catch(e) {
     return { ok: false, error: e.message };
   }
 });
 
-ipcMain.handle('write-sync-file', async (_, data) => {
+_secureHandle('write-sync-file', async (_, data) => {
+  if (!_isPlainObject(data)) return { ok: false, error: 'The iCloud backup has an invalid format.' };
+  let serialized;
   try {
-    if (!fs.existsSync(ICLOUD_DIR)) fs.mkdirSync(ICLOUD_DIR, { recursive: true });
-    fs.writeFileSync(ICLOUD_SYNC_PATH, JSON.stringify(data, null, 2), 'utf8');
-    return { ok: true };
-  } catch(e) {
-    return { ok: false, error: e.message };
+    serialized = JSON.stringify(data, null, 2);
+  } catch (_) {
+    return { ok: false, error: 'The iCloud backup could not be serialized.' };
+  }
+  if (Buffer.byteLength(serialized, 'utf8') > MAX_SYNC_BYTES) {
+    return { ok: false, error: 'The iCloud backup exceeds the 8 MB limit.' };
+  }
+  const write = iCloudWriteChain.then(async () => {
+    try {
+      await fs.promises.mkdir(ICLOUD_DIR, { recursive: true, mode: 0o700 });
+      await _atomicWriteFile(ICLOUD_SYNC_PATH, serialized, 0o600);
+      return { ok: true };
+    } catch(e) {
+      return { ok: false, error: e.message };
+    }
+  });
+  iCloudWriteChain = write.then(() => undefined, () => undefined);
+  return write;
+});
+
+_secureHandle('export-spreadsheet-recovery', async (_, contents) => {
+  _requireAppRole(COMMUNICATION_ROLES);
+  if (typeof contents !== 'string' || contents.length < 1 ||
+      Buffer.byteLength(contents, 'utf8') > MAX_SPREADSHEET_RECOVERY_BYTES) {
+    return { ok: false, error: 'The spreadsheet recovery file is invalid or exceeds the 8 MB limit.' };
+  }
+  try {
+    const parsed = JSON.parse(contents);
+    if (!_isPlainObject(parsed)) {
+      return { ok: false, error: 'The spreadsheet recovery file must contain workbook data.' };
+    }
+    const saveResult = await dialog.showSaveDialog(mainWindow || undefined, {
+      title: 'Export Spreadsheet Recovery Data',
+      defaultPath: path.join(
+        app.getPath('documents'),
+        `Music-Box-Spreadsheets-Recovery-${new Date().toISOString().slice(0, 10)}.json`
+      ),
+      filters: [{ name: 'JSON Data', extensions: ['json'] }],
+      properties: ['showOverwriteConfirmation', 'createDirectory'],
+    });
+    if (saveResult.canceled || !saveResult.filePath) {
+      return { ok: true, canceled: true };
+    }
+    const destination = saveResult.filePath.toLowerCase().endsWith('.json')
+      ? saveResult.filePath
+      : `${saveResult.filePath}.json`;
+    await _atomicWriteFile(destination, contents, 0o600);
+    return { ok: true, canceled: false, fileName: path.basename(destination) };
+  } catch (error) {
+    return { ok: false, error: error?.message || 'The recovery file could not be saved.' };
   }
 });
 
-ipcMain.handle('open-external', async (_, url) => {
-  if (!_safeExternalUrl(url)) return { ok: false, error: 'Only https: and mailto: URLs are allowed.' };
+_secureHandle('open-external', async (_, url) => {
+  if (!_safeExternalUrl(url)) return { ok: false, error: 'This external destination is not approved.' };
   try { await shell.openExternal(url); return { ok: true }; }
   catch(e) { return { ok: false, error: e.message }; }
 });
 
-// ── IPC: PDF generation — renders receipt HTML to PDF via Electron ──
-ipcMain.handle('print-to-pdf', async (_, html) => {
-  const tmpFile = path.join(os.tmpdir(), `mb_receipt_${Date.now()}.html`);
-  fs.writeFileSync(tmpFile, html, 'utf8');
-  const pdfWin = new BrowserWindow({
-    show: false,
-    width: 816,
-    height: 1056,
-    webPreferences: { contextIsolation: true, nodeIntegration: false },
-  });
+function _safePdfFileName(value) {
+  const raw = typeof value === 'string' ? value : 'Music-Box-Receipt.pdf';
+  let name = path.basename(raw)
+    .replace(/[\u0000-\u001f\u007f/:\\]/g, '-')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 120);
+  if (!name) name = 'Music-Box-Receipt.pdf';
+  if (!name.toLowerCase().endsWith('.pdf')) name += '.pdf';
+  return name;
+}
+
+// ── IPC: PDF generation — renders receipt HTML in an isolated, networkless
+// window and writes the result only to a user-confirmed save destination.
+_secureHandle('print-to-pdf', async (_, html, suggestedName) => {
+  if (typeof html !== 'string' || html.length < 1 || Buffer.byteLength(html, 'utf8') > 2 * 1024 * 1024) {
+    return { ok: false, error: 'Receipt HTML is invalid or exceeds the 2 MB limit.' };
+  }
+  const nonce = crypto.randomBytes(12).toString('hex');
+  const tmpFile = path.join(os.tmpdir(), `mb-receipt-${nonce}.html`);
+  let pdfWin = null;
   try {
-    await pdfWin.loadURL('file://' + tmpFile);
+    await fs.promises.writeFile(tmpFile, html, { encoding: 'utf8', mode: 0o600 });
+    const pdfSession = session.fromPartition(`pdf-${nonce}`);
+    pdfSession.webRequest.onBeforeRequest(
+      { urls: ['file://*/*', 'http://*/*', 'https://*/*'] },
+      (details, callback) => {
+        const isOwnTopDocument = details.resourceType === 'mainFrame' &&
+          _isExactFileUrl(details.url, tmpFile);
+        callback({ cancel: !isOwnTopDocument });
+      }
+    );
+    pdfWin = new BrowserWindow({
+      show: false,
+      width: 816,
+      height: 1056,
+      webPreferences: {
+        session: pdfSession,
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: true,
+        javascript: false,
+        allowFileAccessFromFileURLs: false,
+        allowUniversalAccessFromFileURLs: false,
+        webviewTag: false,
+        devTools: false,
+      },
+    });
+    await pdfWin.loadFile(tmpFile);
     await new Promise(r => setTimeout(r, 900));
     const pdfBuffer = await pdfWin.webContents.printToPDF({
       pageSize: 'Letter',
@@ -730,11 +2331,27 @@ ipcMain.handle('print-to-pdf', async (_, html) => {
       margins: { marginType: 'custom', top: 0.75, bottom: 0.75, left: 0.75, right: 0.75 },
     });
     pdfWin.destroy();
-    try { fs.unlinkSync(tmpFile); } catch(_) {}
-    return { ok: true, b64: pdfBuffer.toString('base64') };
+    try { await fs.promises.unlink(tmpFile); } catch(_) {}
+    if (pdfBuffer.length > 20 * 1024 * 1024) {
+      return { ok: false, error: 'Generated PDF exceeds the 20 MB limit.' };
+    }
+    const saveResult = await dialog.showSaveDialog(mainWindow || undefined, {
+      title: 'Save Music Box PDF',
+      defaultPath: path.join(app.getPath('documents'), _safePdfFileName(suggestedName)),
+      filters: [{ name: 'PDF Document', extensions: ['pdf'] }],
+      properties: ['showOverwriteConfirmation', 'createDirectory'],
+    });
+    if (saveResult.canceled || !saveResult.filePath) {
+      return { ok: true, canceled: true };
+    }
+    const destination = saveResult.filePath.toLowerCase().endsWith('.pdf')
+      ? saveResult.filePath
+      : `${saveResult.filePath}.pdf`;
+    await _atomicWriteFile(destination, pdfBuffer, 0o600);
+    return { ok: true, canceled: false, fileName: path.basename(destination) };
   } catch(e) {
-    if (!pdfWin.isDestroyed()) pdfWin.destroy();
-    try { fs.unlinkSync(tmpFile); } catch(_) {}
+    if (pdfWin && !pdfWin.isDestroyed()) pdfWin.destroy();
+    try { await fs.promises.unlink(tmpFile); } catch(_) {}
     return { ok: false, error: e.message };
   }
 });
@@ -742,7 +2359,15 @@ ipcMain.handle('print-to-pdf', async (_, html) => {
 // ── IPC: MS PKCE token exchange ───────────────────────────────
 function _msTokenPost(tenant, body) {
   return new Promise((resolve) => {
+    if (!_validTenant(tenant) || !_isPlainObject(body)) {
+      resolve({ ok: false, error: 'invalid_request', error_description: 'Invalid Microsoft token request.' });
+      return;
+    }
     const bodyStr = new URLSearchParams(body).toString();
+    if (Buffer.byteLength(bodyStr, 'utf8') > 128 * 1024) {
+      resolve({ ok: false, error: 'invalid_request', error_description: 'Microsoft token request is too large.' });
+      return;
+    }
     const options = {
       hostname: 'login.microsoftonline.com',
       path: `/${tenant}/oauth2/v2.0/token`,
@@ -752,36 +2377,551 @@ function _msTokenPost(tenant, body) {
         'Content-Length': Buffer.byteLength(bodyStr),
       },
     };
-    let data = '';
+    let settled = false;
+    let bytes = 0;
+    const chunks = [];
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
     const req = https.request(options, (res) => {
-      res.on('data', (d) => { data += d; });
-      res.on('end', () => {
-        try { resolve({ ok: true, ...JSON.parse(data) }); }
-        catch(e) { resolve({ ok: false, error: e.message, raw: data }); }
+      res.on('data', (chunk) => {
+        bytes += chunk.length;
+        if (bytes > 1024 * 1024) {
+          res.destroy();
+          finish({ ok: false, error: 'response_too_large', error_description: 'Microsoft returned an oversized response.' });
+          return;
+        }
+        chunks.push(chunk);
       });
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+          if (!_isPlainObject(parsed)) throw new Error('Invalid response.');
+          if (res.statusCode < 200 || res.statusCode >= 300 || parsed.error) {
+            finish({
+              ok: false,
+              error: String(parsed.error || `http_${res.statusCode}`).slice(0, 100),
+              error_description: String(parsed.error_description || 'Microsoft rejected the token request.').slice(0, 1000),
+            });
+            return;
+          }
+          if (!_boundedString(parsed.access_token, MAX_IPC_STRING)) {
+            finish({ ok: false, error: 'invalid_response', error_description: 'Microsoft did not return a valid access token.' });
+            return;
+          }
+          finish({
+            ok: true,
+            access_token: parsed.access_token,
+            refresh_token: _boundedString(parsed.refresh_token, MAX_IPC_STRING) ? parsed.refresh_token : null,
+            expires_in: Math.max(60, Math.min(86400, Number(parsed.expires_in) || 3600)),
+            token_type: String(parsed.token_type || 'Bearer').slice(0, 32),
+            scope: String(parsed.scope || '').slice(0, 1000),
+          });
+        } catch(e) {
+          finish({ ok: false, error: 'invalid_response', error_description: 'Microsoft returned an invalid token response.' });
+        }
+      });
+      res.on('error', () => finish({ ok: false, error: 'network_error', error_description: 'Microsoft sign-in response failed.' }));
     });
-    req.on('error', (e) => resolve({ ok: false, error: e.message }));
+    req.setTimeout(15000, () => {
+      req.destroy();
+      finish({ ok: false, error: 'timeout', error_description: 'Microsoft sign-in timed out.' });
+    });
+    req.on('error', () => finish({ ok: false, error: 'network_error', error_description: 'Could not reach Microsoft sign-in.' }));
     req.write(bodyStr);
     req.end();
   });
 }
 
-ipcMain.handle('exchange-ms-code', async (_, { code, codeVerifier, tenant, clientId, redirectUri }) => {
-  return _msTokenPost(tenant, {
-    client_id: clientId,
-    code,
-    redirect_uri: redirectUri,
+const MS_ACCOUNT_VAULT_PREFIX = 'microsoft_account_v1_';
+const msRefreshInFlight = new Map();
+const msSendTimestamps = [];
+
+function _validMsAccountId(value) {
+  return typeof value === 'string' && /^[A-Za-z0-9_-]{1,80}$/.test(value);
+}
+
+function _normalizeMsAccountMetadata(value) {
+  if (!_isPlainObject(value) || !_validMsAccountId(value.id) ||
+      !_validTenant(value.tenant) || !_isUuid(value.clientId)) {
+    return null;
+  }
+  return { id: value.id, tenant: value.tenant, clientId: value.clientId };
+}
+
+function _msAccountVaultKey(accountId) {
+  if (!_validMsAccountId(accountId)) throw new Error('Invalid Microsoft account ID.');
+  return MS_ACCOUNT_VAULT_PREFIX + accountId;
+}
+
+function _validMsBearer(value) {
+  return typeof value === 'string' && value.length >= 20 &&
+    value.length <= MAX_IPC_STRING && !/[\u0000-\u0020\u007f]/.test(value);
+}
+
+function _validMsAccountRecord(record) {
+  return _isPlainObject(record) && record.version === 1 &&
+    _validMsAccountId(record.accountId) && _validTenant(record.tenant) &&
+    _isUuid(record.clientId) &&
+    (record.accessToken === null || _validMsBearer(record.accessToken)) &&
+    (record.refreshToken === null || _validMsBearer(record.refreshToken)) &&
+    Number.isSafeInteger(record.expiresAt) && record.expiresAt >= 0;
+}
+
+function _migrateLegacyMsRecord(vault, metadata) {
+  const recordKey = _msAccountVaultKey(metadata.id);
+  const existing = vault[recordKey];
+  if (existing !== undefined) {
+    if (!_validMsAccountRecord(existing)) {
+      throw new Error('The protected Microsoft account record is invalid.');
+    }
+    return existing;
+  }
+
+  const legacyAccessKey = `ms_access_${metadata.id}`;
+  const legacyRefreshKey = `ms_refresh_${metadata.id}`;
+  const legacyExpiryKey = `ms_expiry_${metadata.id}`;
+  const accessToken = vault[legacyAccessKey];
+  const refreshToken = vault[legacyRefreshKey];
+  const expiresAt = Number(vault[legacyExpiryKey] || 0);
+  if (!_validMsBearer(accessToken) && !_validMsBearer(refreshToken)) return null;
+
+  const record = {
+    version: 1,
+    accountId: metadata.id,
+    tenant: metadata.tenant,
+    clientId: metadata.clientId,
+    accessToken: _validMsBearer(accessToken) ? accessToken : null,
+    refreshToken: _validMsBearer(refreshToken) ? refreshToken : null,
+    expiresAt: Number.isSafeInteger(expiresAt) && expiresAt >= 0 ? expiresAt : 0,
+  };
+  vault[recordKey] = record;
+  delete vault[legacyAccessKey];
+  delete vault[legacyRefreshKey];
+  delete vault[legacyExpiryKey];
+  _saveSecretVault(vault);
+  return record;
+}
+
+function _loadMsAccountRecord(accountId) {
+  const vault = _loadSecretVault();
+  const record = vault[_msAccountVaultKey(accountId)];
+  if (record === undefined) return { vault, record: null };
+  if (!_validMsAccountRecord(record)) {
+    throw new Error('The protected Microsoft account record is invalid.');
+  }
+  return { vault, record };
+}
+
+function _msPublicStatus(accountId, record) {
+  const hasAccess = !!record?.accessToken && record.expiresAt > Date.now();
+  const hasRefresh = !!record?.refreshToken;
+  return {
+    accountId,
+    connected: hasAccess || hasRefresh,
+    hasRefresh,
+    expiresAt: hasAccess ? record.expiresAt : 0,
+  };
+}
+
+function _saveMsTokenResult(metadata, result, priorRecord = null) {
+  if (!result?.ok || !_validMsBearer(result.access_token)) {
+    throw new Error('Microsoft did not return a valid access token.');
+  }
+  const vault = _loadSecretVault();
+  const current = priorRecord || vault[_msAccountVaultKey(metadata.id)] || null;
+  const record = {
+    version: 1,
+    accountId: metadata.id,
+    tenant: metadata.tenant,
+    clientId: metadata.clientId,
+    accessToken: result.access_token,
+    refreshToken: _validMsBearer(result.refresh_token)
+      ? result.refresh_token
+      : (_validMsBearer(current?.refreshToken) ? current.refreshToken : null),
+    expiresAt: Date.now() + Math.max(60, Math.min(86400, Number(result.expires_in) || 3600)) * 1000,
+  };
+  vault[_msAccountVaultKey(metadata.id)] = record;
+  for (const kind of ['access', 'refresh', 'expiry']) delete vault[`ms_${kind}_${metadata.id}`];
+  _saveSecretVault(vault);
+  return record;
+}
+
+async function _refreshMicrosoftAccount(accountId, force = false) {
+  if (msRefreshInFlight.has(accountId)) return msRefreshInFlight.get(accountId);
+  const refresh = (async () => {
+    const { record } = _loadMsAccountRecord(accountId);
+    if (!record) return { ok: false, error: 'Microsoft account is not connected.' };
+    if (!force && record.accessToken && record.expiresAt > Date.now() + 10 * 60 * 1000) {
+      return { ok: true, token: record.accessToken, record };
+    }
+    if (!_validMsBearer(record.refreshToken)) {
+      if (record.accessToken && record.expiresAt > Date.now()) {
+        return { ok: true, token: record.accessToken, record };
+      }
+      return { ok: false, error: 'Microsoft sign-in has expired. Reconnect this account.' };
+    }
+    const result = await _msTokenPost(record.tenant, {
+      client_id: record.clientId,
+      refresh_token: record.refreshToken,
+      grant_type: 'refresh_token',
+      scope: 'Mail.Read Mail.Send User.Read offline_access',
+    });
+    if (!result.ok) {
+      return {
+        ok: false,
+        error: String(result.error_description || result.error || 'Microsoft refresh failed.').slice(0, 500),
+      };
+    }
+    const saved = _saveMsTokenResult({
+      id: record.accountId,
+      tenant: record.tenant,
+      clientId: record.clientId,
+    }, result, record);
+    return { ok: true, token: saved.accessToken, record: saved };
+  })();
+  msRefreshInFlight.set(accountId, refresh);
+  try {
+    return await refresh;
+  } finally {
+    if (msRefreshInFlight.get(accountId) === refresh) msRefreshInFlight.delete(accountId);
+  }
+}
+
+function _microsoftGraphRequest({ token, method, requestPath, body = null }) {
+  return new Promise((resolve) => {
+    if (!_validMsBearer(token) || !['GET', 'POST'].includes(method) ||
+        typeof requestPath !== 'string' || !requestPath.startsWith('/v1.0/me/')) {
+      resolve({ ok: false, error: 'Invalid Microsoft Graph request.' });
+      return;
+    }
+    const serialized = body === null ? null : JSON.stringify(body);
+    if (serialized !== null && Buffer.byteLength(serialized, 'utf8') > 1024 * 1024) {
+      resolve({ ok: false, error: 'Microsoft mail request is too large.' });
+      return;
+    }
+    let settled = false;
+    let bytes = 0;
+    const chunks = [];
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+    const req = https.request({
+      protocol: 'https:',
+      hostname: 'graph.microsoft.com',
+      port: 443,
+      method,
+      path: requestPath,
+      timeout: 20000,
+      headers: {
+        authorization: `Bearer ${token}`,
+        accept: 'application/json',
+        ...(serialized === null ? {} : {
+          'content-type': 'application/json',
+          'content-length': Buffer.byteLength(serialized, 'utf8'),
+        }),
+        'user-agent': `MusicBoxInternal/${app.getVersion()}`,
+      },
+    }, (res) => {
+      res.on('data', (chunk) => {
+        bytes += chunk.length;
+        if (bytes > 8 * 1024 * 1024) {
+          res.destroy();
+          finish({ ok: false, error: 'Microsoft Graph response exceeded 8 MB.' });
+          return;
+        }
+        chunks.push(chunk);
+      });
+      res.on('end', () => {
+        const raw = Buffer.concat(chunks).toString('utf8');
+        let parsed = {};
+        if (raw) {
+          try { parsed = JSON.parse(raw); }
+          catch (_) {
+            finish({ ok: false, status: res.statusCode, error: 'Microsoft Graph returned an invalid response.' });
+            return;
+          }
+        }
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          const detail = typeof parsed?.error?.message === 'string'
+            ? parsed.error.message.replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 500)
+            : `HTTP ${res.statusCode}`;
+          finish({ ok: false, status: res.statusCode, error: `Microsoft Graph request failed: ${detail}` });
+          return;
+        }
+        finish({ ok: true, status: res.statusCode, data: parsed });
+      });
+      res.on('error', () => finish({ ok: false, error: 'Microsoft Graph response failed.' }));
+    });
+    req.on('timeout', () => req.destroy(new Error('Microsoft Graph request timed out.')));
+    req.on('error', (error) => {
+      finish({ ok: false, error: String(error?.message || 'Microsoft Graph request failed.').slice(0, 300) });
+    });
+    if (serialized !== null) req.write(serialized);
+    req.end();
+  });
+}
+
+async function _microsoftAuthedGraphRequest(accountId, method, requestPath, body = null) {
+  let auth = await _refreshMicrosoftAccount(accountId);
+  if (!auth.ok) return auth;
+  let result = await _microsoftGraphRequest({ token: auth.token, method, requestPath, body });
+  if (result.status === 401) {
+    auth = await _refreshMicrosoftAccount(accountId, true);
+    if (!auth.ok) return auth;
+    result = await _microsoftGraphRequest({ token: auth.token, method, requestPath, body });
+  }
+  return result;
+}
+
+function _boundedMicrosoftText(value, max) {
+  return typeof value === 'string'
+    ? value.replace(/\0/g, '').slice(0, max)
+    : '';
+}
+
+function _normalizeMicrosoftAddress(value) {
+  if (!_isPlainObject(value?.emailAddress)) return null;
+  const address = _boundedMicrosoftText(value.emailAddress.address, 320).trim();
+  if (!address || !/^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(address)) return null;
+  return {
+    emailAddress: {
+      address,
+      name: _boundedMicrosoftText(value.emailAddress.name, 256),
+    },
+  };
+}
+
+function _normalizeMicrosoftMail(value, folder) {
+  if (!_isPlainObject(value)) return null;
+  const normalized = {
+    id: _boundedMicrosoftText(value.id, 512),
+    conversationId: _boundedMicrosoftText(value.conversationId, 512) || null,
+    subject: _boundedMicrosoftText(value.subject, 1000),
+    bodyPreview: _boundedMicrosoftText(value.bodyPreview, 5000),
+    body: {
+      contentType: value.body?.contentType === 'html' || value.body?.contentType === 'HTML'
+        ? 'html' : 'text',
+      content: _boundedMicrosoftText(value.body?.content, 250000),
+    },
+  };
+  if (folder === 'inbox') {
+    normalized.from = _normalizeMicrosoftAddress(value.from);
+    normalized.receivedDateTime = _boundedMicrosoftText(value.receivedDateTime, 64);
+    normalized.isRead = value.isRead === true;
+    normalized.inferenceClassification =
+      value.inferenceClassification === 'focused' ? 'focused' :
+        (value.inferenceClassification === 'other' ? 'other' : null);
+  } else {
+    normalized.toRecipients = Array.isArray(value.toRecipients)
+      ? value.toRecipients.slice(0, 20).map(_normalizeMicrosoftAddress).filter(Boolean)
+      : [];
+    normalized.sentDateTime = _boundedMicrosoftText(value.sentDateTime, 64);
+  }
+  return normalized.id ? normalized : null;
+}
+
+function _validMicrosoftSendRequest(request) {
+  if (!_isPlainObject(request) ||
+      !Object.keys(request).every(key => ['accountId', 'message', 'saveToSentItems'].includes(key)) ||
+      !_validMsAccountId(request.accountId) || request.saveToSentItems !== true ||
+      !_isPlainObject(request.message) ||
+      !Object.keys(request.message).every(key => ['subject', 'body', 'toRecipients'].includes(key)) ||
+      typeof request.message.subject !== 'string' ||
+      request.message.subject.length > 998 || /[\r\n\0]/.test(request.message.subject) ||
+      !_isPlainObject(request.message.body) ||
+      !Object.keys(request.message.body).every(key => ['contentType', 'content'].includes(key)) ||
+      !['Text', 'HTML'].includes(request.message.body.contentType) ||
+      typeof request.message.body.content !== 'string' ||
+      request.message.body.content.length < 1 ||
+      Buffer.byteLength(request.message.body.content, 'utf8') > 512 * 1024 ||
+      request.message.body.content.includes('\0') ||
+      !Array.isArray(request.message.toRecipients) ||
+      request.message.toRecipients.length < 1 || request.message.toRecipients.length > 20) {
+    return false;
+  }
+  return request.message.toRecipients.every((recipient) => {
+    if (!_isPlainObject(recipient) || !_isPlainObject(recipient.emailAddress) ||
+        !Object.keys(recipient).every(key => key === 'emailAddress') ||
+        !Object.keys(recipient.emailAddress).every(key => ['address', 'name'].includes(key))) {
+      return false;
+    }
+    const address = recipient.emailAddress.address;
+    const name = recipient.emailAddress.name;
+    return typeof address === 'string' && address.length <= 320 &&
+      /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(address) &&
+      (name === undefined ||
+       (typeof name === 'string' && name.length <= 256 && !/[\r\n\0]/.test(name)));
+  });
+}
+
+_secureHandle('begin-ms-oauth', async (_, request) => {
+  _requireAppRole(new Set(['Owner']));
+  if (!_isPlainObject(request)) throw new Error('Invalid Microsoft OAuth request.');
+  return _beginMicrosoftOAuth(request);
+});
+
+_secureHandle('exchange-ms-code', async (_, request) => {
+  _requireAppRole(new Set(['Owner']));
+  if (!_isPlainObject(request)) {
+    return { ok: false, error: 'invalid_request', error_description: 'Invalid Microsoft OAuth exchange.' };
+  }
+  const { accountId, state, codeVerifier } = request;
+  const matchesPending = pendingOAuth &&
+    pendingOAuth.callbackReceived &&
+    Date.now() <= pendingOAuth.expiresAt &&
+    state === pendingOAuth.state &&
+    accountId === pendingOAuth.accountId;
+  if (!matchesPending || !_validPkceChallenge(codeVerifier)) {
+    return { ok: false, error: 'invalid_state', error_description: 'The sign-in attempt expired or did not match this app session.' };
+  }
+  const verifierChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64url');
+  const verifierBuffer = Buffer.from(verifierChallenge);
+  const expectedBuffer = Buffer.from(pendingOAuth.codeChallenge);
+  if (verifierBuffer.length !== expectedBuffer.length ||
+      !crypto.timingSafeEqual(verifierBuffer, expectedBuffer)) {
+    pendingOAuth = null;
+    return { ok: false, error: 'invalid_verifier', error_description: 'The sign-in verifier did not match.' };
+  }
+  const attempt = pendingOAuth;
+  pendingOAuth = null; // One-time use, including failed exchanges.
+  const result = await _msTokenPost(attempt.tenant, {
+    client_id: attempt.clientId,
+    code: attempt.code,
+    redirect_uri: attempt.redirectUri,
     grant_type: 'authorization_code',
     code_verifier: codeVerifier,
     scope: 'Mail.Read Mail.Send User.Read offline_access',
   });
+  if (!result.ok) {
+    return {
+      ok: false,
+      error: String(result.error || 'token_exchange_failed').slice(0, 100),
+      error_description: String(result.error_description || 'Microsoft sign-in failed.').slice(0, 500),
+    };
+  }
+  const record = _saveMsTokenResult({
+    id: attempt.accountId,
+    tenant: attempt.tenant,
+    clientId: attempt.clientId,
+  }, result);
+  return { ok: true, ..._msPublicStatus(attempt.accountId, record) };
 });
 
-ipcMain.handle('refresh-ms-token', async (_, { refreshToken, tenant, clientId }) => {
-  return _msTokenPost(tenant, {
-    client_id: clientId,
-    refresh_token: refreshToken,
-    grant_type: 'refresh_token',
-    scope: 'Mail.Read Mail.Send User.Read offline_access',
+_secureHandle('microsoft-status', async (_, accounts) => {
+  _requireAppRole(COMMUNICATION_ROLES);
+  if (!Array.isArray(accounts) || accounts.length > 20) {
+    throw new Error('Invalid Microsoft account list.');
+  }
+  const metadata = accounts.map(_normalizeMsAccountMetadata);
+  if (metadata.some(value => !value)) throw new Error('Invalid Microsoft account list.');
+  const vault = _loadSecretVault();
+  const statuses = metadata.map((account) => {
+    const record = _migrateLegacyMsRecord(vault, account);
+    return _msPublicStatus(account.id, record);
   });
+  return { ok: true, accounts: statuses };
+});
+
+_secureHandle('microsoft-migrate-legacy', async (_, request) => {
+  _requireAppRole(new Set(['Owner']));
+  if (!_isPlainObject(request) ||
+      !Object.keys(request).every(key =>
+        ['account', 'accessToken', 'refreshToken', 'expiresAt'].includes(key))) {
+    throw new Error('Invalid legacy Microsoft migration.');
+  }
+  const metadata = _normalizeMsAccountMetadata(request.account);
+  if (!metadata || (!_validMsBearer(request.accessToken) && !_validMsBearer(request.refreshToken))) {
+    throw new Error('Invalid legacy Microsoft migration.');
+  }
+  const vault = _loadSecretVault();
+  const key = _msAccountVaultKey(metadata.id);
+  let record = vault[key];
+  if (record !== undefined && !_validMsAccountRecord(record)) {
+    throw new Error('The protected Microsoft account record is invalid.');
+  }
+  if (!record) {
+    const expiresAt = Number(request.expiresAt || 0);
+    record = {
+      version: 1,
+      accountId: metadata.id,
+      tenant: metadata.tenant,
+      clientId: metadata.clientId,
+      accessToken: _validMsBearer(request.accessToken) ? request.accessToken : null,
+      refreshToken: _validMsBearer(request.refreshToken) ? request.refreshToken : null,
+      expiresAt: Number.isSafeInteger(expiresAt) && expiresAt >= 0 ? expiresAt : 0,
+    };
+    vault[key] = record;
+    _saveSecretVault(vault);
+  }
+  return { ok: true, ..._msPublicStatus(metadata.id, record) };
+});
+
+_secureHandle('microsoft-refresh', async (_, accountId) => {
+  _requireAppRole(COMMUNICATION_ROLES);
+  if (!_validMsAccountId(accountId)) throw new Error('Invalid Microsoft account ID.');
+  const result = await _refreshMicrosoftAccount(accountId, true);
+  if (!result.ok) return { ok: false, error: result.error };
+  return { ok: true, ..._msPublicStatus(accountId, result.record) };
+});
+
+_secureHandle('microsoft-fetch-mail', async (_, request) => {
+  _requireAppRole(COMMUNICATION_ROLES);
+  if (!_isPlainObject(request) ||
+      !Object.keys(request).every(key => ['accountId', 'folder', 'limit'].includes(key)) ||
+      !_validMsAccountId(request.accountId) ||
+      !['inbox', 'sent'].includes(request.folder) ||
+      !Number.isSafeInteger(request.limit) || request.limit < 1 || request.limit > 100) {
+    return { ok: false, error: 'Invalid Microsoft mail request.' };
+  }
+  const select = request.folder === 'inbox'
+    ? 'id,conversationId,subject,from,bodyPreview,body,receivedDateTime,isRead,inferenceClassification'
+    : 'id,conversationId,toRecipients,subject,bodyPreview,body,sentDateTime';
+  const folderPath = request.folder === 'inbox' ? 'messages' : 'mailFolders/SentItems/messages';
+  const orderField = request.folder === 'inbox' ? 'receivedDateTime' : 'sentDateTime';
+  const requestPath = `/v1.0/me/${folderPath}?$top=${request.limit}&$select=${select}&$orderby=${orderField}%20desc`;
+  const result = await _microsoftAuthedGraphRequest(request.accountId, 'GET', requestPath);
+  if (!result.ok) return { ok: false, status: result.status, error: result.error };
+  const values = Array.isArray(result.data?.value)
+    ? result.data.value.slice(0, request.limit)
+      .map(value => _normalizeMicrosoftMail(value, request.folder))
+      .filter(Boolean)
+    : [];
+  return { ok: true, value: values };
+});
+
+_secureHandle('microsoft-send-mail', async (_, request) => {
+  _requireAppRole(COMMUNICATION_ROLES);
+  if (!_validMicrosoftSendRequest(request)) {
+    return { ok: false, error: 'Invalid Microsoft send-mail request.' };
+  }
+  const cutoff = Date.now() - 60 * 1000;
+  while (msSendTimestamps.length && msSendTimestamps[0] < cutoff) msSendTimestamps.shift();
+  if (msSendTimestamps.length >= 30) {
+    return { ok: false, error: 'Email rate limit reached. Wait before sending again.' };
+  }
+  msSendTimestamps.push(Date.now());
+  const result = await _microsoftAuthedGraphRequest(
+    request.accountId,
+    'POST',
+    '/v1.0/me/sendMail',
+    { message: request.message, saveToSentItems: true },
+  );
+  if (!result.ok) return { ok: false, status: result.status, error: result.error };
+  return { ok: true };
+});
+
+_secureHandle('microsoft-disconnect', async (_, accountId) => {
+  _requireAppRole(new Set(['Owner']));
+  if (!_validMsAccountId(accountId)) throw new Error('Invalid Microsoft account ID.');
+  const vault = _loadSecretVault();
+  delete vault[_msAccountVaultKey(accountId)];
+  for (const kind of ['access', 'refresh', 'expiry']) delete vault[`ms_${kind}_${accountId}`];
+  _saveSecretVault(vault);
+  msRefreshInFlight.delete(accountId);
+  return { ok: true, accountId, connected: false, hasRefresh: false, expiresAt: 0 };
 });

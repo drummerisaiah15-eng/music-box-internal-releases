@@ -4,14 +4,27 @@
   "description": "The Music Box — Internal Operations",
   "main": "main.js",
   "scripts": {
-    "start": "electron .",
-    "build": "electron-builder --mac",
-    "publish": "electron-builder --mac --publish always"
+    "vendor:prepare": "node tests/prepare-vendor.js",
+    "start": "npm run vendor:prepare && electron .",
+    "test": "node --test tests/*.test.js",
+    "build": "npm run test && npm run vendor:prepare && electron-builder --mac --dir -c.mac.identity=null -c.mac.notarize=false -c.forceCodeSigning=false",
+    "release:build:internal": "node -e \"if (process.env.MUSIC_BOX_RELEASE_DRIVER !== '1' || process.env.GH_TOKEN || !process.env.MUSIC_BOX_SOURCE_CONTENT_MANIFEST) { console.error('Internal release build must be invoked by release.sh without GH_TOKEN and with its source-content manifest.'); process.exit(1); }\" && MUSIC_BOX_RELEASE_VERIFY=1 electron-builder --mac --publish never -c.directories.output=\"${MUSIC_BOX_RELEASE_DIR:?MUSIC_BOX_RELEASE_DIR is required; use ./release.sh}\" && node tests/release-artifact-gate.js \"$MUSIC_BOX_RELEASE_DIR\" --finalize",
+    "publish": "node -e \"console.error('Direct publishing is disabled. Use npm run release.'); process.exit(1)\"",
+    "release": "./release.sh",
+    "release:verify": "node tests/release-artifact-gate.js dist"
   },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "packageManager": "npm@11.13.0",
   "build": {
     "appId": "com.themusicboxinc.internal",
     "productName": "Music Box Internal",
     "copyright": "© 2025 The Music Box",
+    "artifactName": "Music-Box-Internal-${version}-${arch}.${ext}",
+    "forceCodeSigning": true,
+    "afterPack": "tests/harden-electron-fuses.js",
+    "afterAllArtifactBuild": "tests/release-artifact-gate.js",
     "mac": {
       "category": "public.app-category.business",
       "icon": "icon.icns",
@@ -19,9 +32,7 @@
       "gatekeeperAssess": false,
       "entitlements": "entitlements.mac.plist",
       "entitlementsInherit": "entitlements.mac.plist",
-      "notarize": {
-        "teamId": "MULN9RP9V5"
-      },
+      "notarize": true,
       "target": [
         {
           "target": "dmg",
@@ -40,6 +51,7 @@
     },
     "dmg": {
       "title": "Music Box Internal",
+      "sign": true,
       "window": {
         "width": 540,
         "height": 380
@@ -47,16 +59,29 @@
     },
     "files": [
       "main.js",
-      "preload.js"
+      "preload.js",
+      "pdf-worker.js",
+      "spreadsheet-worker.js"
     ],
     "extraResources": [
       {
         "from": "index.html",
         "to": "index.html"
+      },
+      {
+        "from": "vendor",
+        "to": "vendor",
+        "filter": [
+          "**/*.js",
+          "manifest.json"
+        ]
       }
     ],
     "asar": true,
-    "asarUnpack": [],
+    "asarUnpack": [
+      "node_modules/@napi-rs/canvas/**",
+      "node_modules/@napi-rs/canvas-darwin-arm64/**"
+    ],
     "publish": {
       "provider": "github",
       "owner": "drummerisaiah15-eng",
@@ -65,11 +90,18 @@
     }
   },
   "dependencies": {
-    "electron-updater": "^6.8.9",
-    "pdf-parse": "^1.1.1"
+    "electron-updater": "6.8.9",
+    "pdf-parse": "2.4.5"
   },
   "devDependencies": {
-    "electron": "^43.0.0",
-    "electron-builder": "^25.0.0"
+    "@electron/asar": "3.4.1",
+    "@electron/fuses": "1.8.0",
+    "electron": "43.2.0",
+    "electron-builder": "26.15.7",
+    "firebase": "12.15.0",
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
+  },
+  "overrides": {
+    "js-yaml": "5.2.2"
   }
 }
