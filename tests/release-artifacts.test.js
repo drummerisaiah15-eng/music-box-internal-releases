@@ -14,6 +14,7 @@ const {
 const { blake2b } = require('@noble/hashes/blake2.js');
 const yaml = require('js-yaml');
 const test = require('node:test');
+const { before, after } = require('node:test');
 
 const packageMetadata = require('../package.json');
 const {
@@ -41,6 +42,21 @@ const {
   publishAssetsToDraft,
   snapshotReleaseAssets,
 } = require('./publish-verified-release');
+
+// In release mode release.sh exports MUSIC_BOX_PUBLICATION_STATE_FILE pointing
+// to its own staging directory. That causes the publishAssetsToDraft security
+// check (which asserts the state file is inside outDir) to fire before tests
+// can reach their intended assertion. Clear it for the duration of this file.
+let _savedPublicationStateFile;
+before(() => {
+  _savedPublicationStateFile = process.env.MUSIC_BOX_PUBLICATION_STATE_FILE;
+  delete process.env.MUSIC_BOX_PUBLICATION_STATE_FILE;
+});
+after(() => {
+  if (_savedPublicationStateFile !== undefined) {
+    process.env.MUSIC_BOX_PUBLICATION_STATE_FILE = _savedPublicationStateFile;
+  }
+});
 
 const SOURCE_COMMIT = 'a'.repeat(40);
 const SOURCE_TREE = 'b'.repeat(40);

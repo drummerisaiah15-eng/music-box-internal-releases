@@ -31,7 +31,9 @@ test('CSV parser preserves quoted newlines and escaped quotes', () => {
   assert.throws(() => parseCsv('Name,\"unfinished'), /inside a quoted field/);
 });
 
-test('spreadsheet worker parses CSV and XLSX through bounded file inputs', async t => {
+test('spreadsheet worker parses CSV and XLSX through bounded file inputs',
+  { skip: !fs.existsSync(vendorPath) ? 'vendor not prepared — run npm run vendor:prepare' : false },
+  async t => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'music-box-spreadsheet-worker-'));
   t.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
 
