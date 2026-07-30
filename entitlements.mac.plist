@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Required for Electron's V8 JIT -->
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+  <!-- Required for Electron's heap -->
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+  <!-- Required for Electron's native modules -->
+  <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+  <true/>
+  <!-- Outbound network (Firebase, Microsoft, Anthropic API) -->
+  <key>com.apple.security.network.client</key>
+  <true/>
+  <!-- Local OAuth callback server on port 8080 -->
+  <key>com.apple.security.network.server</key>
+  <true/>
+</dict>
+</plist>
