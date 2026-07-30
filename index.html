@@ -1983,7 +1983,7 @@
         <div id="pin-change-section" style="margin-top:20px;padding-top:16px;border-top:1px solid var(--divider);display:none">
           <div style="font-size:13px;font-weight:600;margin-bottom:10px;color:var(--text-secondary)">Owner Passcode (Elizabeth only)</div>
           <div style="display:flex;gap:8px;align-items:center">
-            <input type="password" id="pin-new" class="form-input" inputmode="numeric" minlength="6" maxlength="6" placeholder="New 6-digit code" style="width:190px;letter-spacing:.12em" />
+            <input type="password" id="pin-new" class="form-input" inputmode="numeric" minlength="4" maxlength="6" placeholder="New 4–6 digit code" style="width:190px;letter-spacing:.12em" />
             <button class="btn btn-outline btn-sm" onclick="changePin()">Update Passcode</button>
           </div>
         </div>
@@ -2489,7 +2489,7 @@ function selectLoginUser(name, role) {
     const label = document.getElementById('pin-label');
     if (label) label.textContent = localStorage.getItem(ELIZABETH_PIN_KEY)
       ? `Enter your ${_pinTargetLength}-digit passcode`
-      : 'Create a new 6-digit owner passcode';
+      : 'Create a new 4–6 digit owner passcode';
   } else {
     // Show loading state on the button so the user knows it's working
     const btns = document.querySelectorAll('.login-user-btn');
@@ -2544,7 +2544,9 @@ function pinBackspace() {
 
 function updatePinDots() {
   for (let i = 0; i < 6; i++) {
-    document.getElementById('pd' + i).classList.toggle('filled', i < _pinBuffer.length);
+    const dot = document.getElementById('pd' + i);
+    dot.style.display = i < _pinTargetLength ? '' : 'none';
+    dot.classList.toggle('filled', i < _pinBuffer.length);
   }
 }
 
@@ -5653,7 +5655,13 @@ function ssLoad() {
     const rawLS = localStorage.getItem('tmb_spreadsheets');
     const isEncryptedByOtherProfile = rawLS?.startsWith('E:');
     _ssData = normalizeSpreadsheetWorkbook(ssCreateDefaultData());
-    if (!isEncryptedByOtherProfile) ssSave(); // only push to Firebase if truly empty
+    // Only push the empty default to Firebase if:
+    //   (a) the value isn't encrypted by another profile (local-only guard), AND
+    //   (b) sync is either not active OR the bootstrap has completed.
+    // If sync is active but bootstrap is still in progress, Firebase will deliver
+    // the real data via onSnapshot. Pushing an empty default now would queue a
+    // pending write that blocks the real remote data from being accepted.
+    if (!isEncryptedByOtherProfile && (!_syncReady || _syncBootstrapComplete)) ssSave();
   }
 }
 
