@@ -191,14 +191,24 @@ case "$BUMP" in
     ;;
 esac
 
-if ! "$NODE_BIN" -e "
+# V159-010: the release may build a version that is ALREADY committed. That is
+# the provenance-correct path: SOURCE_COMMIT then genuinely contains the version
+# being shipped, so an external auditor can rebuild the exact artifact from
+# public source. The previous behaviour forced an uncommitted in-place bump,
+# which is why published releases advertised a commit whose package.json carried
+# the wrong version.
+VERSION_ALREADY_COMMITTED=0
+if [[ "$NEXT" == "$CURRENT" ]]; then
+  VERSION_ALREADY_COMMITTED=1
+  echo "Version $NEXT is already committed at HEAD; building it directly (no in-place bump)."
+elif ! "$NODE_BIN" -e "
   const parse = value => value.split('.').map(Number);
   const [next, current] = process.argv.slice(1).map(parse);
   const greater = next.some((part, index) =>
     part > current[index] && next.slice(0, index).every((v, i) => v === current[i]));
   process.exit(greater ? 0 : 1);
 " "$NEXT" "$CURRENT"; then
-  echo "ERROR: Next version $NEXT must be greater than local version $CURRENT." >&2
+  echo "ERROR: Next version $NEXT must be greater than or equal to local version $CURRENT." >&2
   exit 1
 fi
 
@@ -258,17 +268,28 @@ printf 'not-started\n' > "$MUSIC_BOX_PUBLICATION_STATE_FILE"
 cp "$PKG" "${RELEASE_BACKUP_DIR}/package.json"
 cp "$LOCKFILE" "${RELEASE_BACKUP_DIR}/package-lock.json"
 
-echo "Preparing Music Box Internal $CURRENT -> $NEXT from source commit $SOURCE_COMMIT"
-RELEASE_VERSION_MUTATED=1
-"$ENV_BIN" -u GH_TOKEN "$NPM_BIN" version \
-  "$NEXT" --no-git-tag-version --allow-same-version --ignore-scripts
+if (( VERSION_ALREADY_COMMITTED == 1 )); then
+  echo "Preparing Music Box Internal $NEXT from source commit $SOURCE_COMMIT (version already committed)"
+else
+  echo "Preparing Music Box Internal $CURRENT -> $NEXT from source commit $SOURCE_COMMIT"
+  RELEASE_VERSION_MUTATED=1
+  "$ENV_BIN" -u GH_TOKEN "$NPM_BIN" version \
+    "$NEXT" --no-git-tag-version --allow-same-version --ignore-scripts
+fi
 
 if ! "$GIT_BIN" diff --cached --quiet; then
   echo "ERROR: Release preparation unexpectedly changed the Git index." >&2
   exit 1
 fi
 CHANGED_FILES="$("$GIT_BIN" diff --name-only | sort)"
-if [[ "$CHANGED_FILES" != $'package-lock.json\npackage.json' ]]; then
+if (( VERSION_ALREADY_COMMITTED == 1 )); then
+  # Nothing may change: the committed tree is exactly what gets built.
+  if [[ -n "$CHANGED_FILES" ]]; then
+    echo "ERROR: The worktree must stay identical to HEAD when building an already-committed version." >&2
+    printf 'Changed files:\n%s\n' "$CHANGED_FILES" >&2
+    exit 1
+  fi
+elif [[ "$CHANGED_FILES" != $'package-lock.json\npackage.json' ]]; then
   echo "ERROR: Only package.json and package-lock.json may change during release preparation." >&2
   printf 'Changed files:\n%s\n' "$CHANGED_FILES" >&2
   exit 1

@@ -318,7 +318,11 @@ test('spreadsheet typing, paste, and imports have explicit resource bounds', () 
   assert.match(preloadSource, /importFile:\s+\(\) => ipcRenderer\.invoke\('import-spreadsheet'\)/);
   assert.doesNotMatch(namedFunctionSource('ssImportFile'), /FileReader|XLSX\.read/);
   assert.match(namedFunctionSource('ssImportBuildProject'), /normalizeSpreadsheetWorkbook\(next\)/);
-  assert.match(namedFunctionSource('ssImportBuildProject'), /await STORE\.set\('spreadsheets', normalized\)/);
+  // V160-005: import is an explicit whole-workbook replacement, so it uses the
+  // reviewed STORE.replace() path rather than STORE.set(). It must NOT silently
+  // fall back to the collision-unsafe STORE.set() call.
+  assert.match(namedFunctionSource('ssImportBuildProject'), /await STORE\.replace\('spreadsheets', normalized\)/);
+  assert.doesNotMatch(namedFunctionSource('ssImportBuildProject'), /STORE\.set\(/);
   assert.match(namedFunctionSource('ssCellInput'), /_scheduleSpreadsheetSave\(\)/);
   assert.match(namedFunctionSource('ssCellInput'), /rawValue\.length > MAX_SPREADSHEET_CELL_CHARS/);
   assert.match(source, /onpaste="[^"]*MAX_SPREADSHEET_CELL_CHARS/);

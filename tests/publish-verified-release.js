@@ -811,6 +811,11 @@ async function publishAssetsToDraft({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           tag_name: tag,
+          // V159-010: without target_commitish GitHub creates the tag at the
+          // repository default branch, so every historical tag pointed at the
+          // branch head instead of the commit that was actually built. Pin the
+          // tag to the exact source commit this artifact came from.
+          target_commitish: sourceCommit,
           name: `${PRODUCT_NAME_FOR_RELEASE()} ${version}`,
           body: `Verified arm64 build from source commit ${sourceCommit}.`,
           draft: true,
