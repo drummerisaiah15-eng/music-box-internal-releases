@@ -1002,7 +1002,7 @@ test('connected lifecycle flush includes cloud delivery and server bounds stay c
   assert.match(script, /ciphertext\.length > MAX_SYNC_CIPHERTEXT_CHARS/);
   assert.match(script, /resolveSyncConflictsUseCloud/);
   assert.match(script, /resolveSyncConflictsKeepLocal/);
-  assert.match(script, /_createSyncConflictBackup\(keys, 'keep-local'\)/);
+  assert.match(script, /_createSyncConflictBackup\(keys, 'keep-local'/);
   assert.match(script, /restoreLatestSyncConflictBackup/);
   assert.doesNotMatch(
     declaration('_commitEncryptedSnapshot'),
@@ -1361,28 +1361,8 @@ const SYNC_KEYS_REQUIRING_MUTATE = [
 ];
 
 // Known-unsafe sites awaiting conversion, as `key => occurrences`.
-const STORE_SET_DEBT = {
-  staff_notes: 2,
-  todo_items: 1,
-  assigned_tasks: 1,
-  custom_staff: 3,
-  staff_dir_overrides: 1,
-  removed_staff_dir: 1,
-  step_up_receipts: 1,
-  policies: 1,
-  spreadsheets: 1,
-  room_overrides: 2,
-  room_excluded: 2,
-  room_by_instructor: 1,
-  room_time_rules: 1,
-  flagged_emails: 1,
-  deleted_emails: 1,
-  sent_emails: 2,
-  ms_sent_emails: 1,
-  ms_sent_conv_ids: 1,
-  comm_handled_ids: 3,
-  comm_analyzed_ids: 4,
-};
+// H-02: all sync keys were migrated to STORE.replace(); the debt is fully paid.
+const STORE_SET_DEBT = {};
 
 function storeSetCountsByKey() {
   const counts = {};
@@ -1764,4 +1744,285 @@ test('V160-002: every editing entry point is refused while the editor is held', 
   const opensProject = script.slice(script.indexOf('function ssOpenProject('));
   assert.ok(opensProject.slice(0, 300).includes('_ssAwaitingAuthority'),
     'ssOpenProject cannot reach the grid editor while held');
+});
+
+// ─────────────────────────────────────────────────────────────
+// NEW INVARIANTS (v1.1.60 CODEX fixes)
+// ─────────────────────────────────────────────────────────────
+
+test('H-02: STORE.set() is blocked for synchronized keys and STORE.replace() is the migration path', () => {
+  // Guard must appear in set() before any other branching.
+  assert.ok(
+    script.includes("STORE.set() is not allowed for synchronized key"),
+    'set() carries the blocking error message'
+  );
+  // isSyncKey guard is what triggers the block. Find the set() that contains the error.
+  const errIdx = script.indexOf('STORE.set() is not allowed for synchronized key');
+  const setSection = script.slice(script.lastIndexOf('set: (k, v) => {', errIdx));
+  assert.ok(
+    setSection.slice(0, 300).includes('isSyncKey(k)'),
+    'isSyncKey guard appears near the top of set()'
+  );
+  // replace() is the deliberate override path for sync keys.
+  assert.ok(script.includes('replace: (k, v) =>'), 'STORE.replace() property exists');
+  // persistInBackground must now route through replace() so it can write sync keys.
+  assert.ok(
+    script.includes('const write = STORE.replace(key, value);'),
+    'persistInBackground uses replace(), not set()'
+  );
+});
+
+test('H-02: no synchronized key retains a STORE.set() call site', () => {
+  const counts = storeSetCountsByKey();
+  const regressions = [];
+  for (const key of SYNC_KEYS_REQUIRING_MUTATE) {
+    const actual = counts[key] || 0;
+    if (actual > 0) {
+      regressions.push(`${key}: ${actual} STORE.set() call(s) remain — migrate to STORE.replace()`);
+    }
+  }
+  assert.deepEqual(regressions, [], 'all sync-key STORE.set() calls must be migrated');
+});
+
+test('H-03: offline update gate uses _unsyncedSyncKeys() in both branches', () => {
+  // The old guard only checked _readPendingSyncRecord; both branches must now
+  // use _unsyncedSyncKeys() so quarantined/failed/corrupt keys are caught.
+  const flushSection = script.slice(script.indexOf('onFlushRequested'));
+  assert.ok(
+    !flushSection.slice(0, 600).includes('getSyncKeys().some(key =>'),
+    'old partial pending-only check is removed from the flush gate'
+  );
+  // Both the sync-ready and offline paths must use the same complete model.
+  const occurrences = (flushSection.slice(0, 600).match(/_unsyncedSyncKeys\(\)/g) || []).length;
+  assert.ok(occurrences >= 1, 'flush gate calls _unsyncedSyncKeys()');
+});
+
+test('H-04: _createSyncConflictBackup preserves remote snapshot alongside local ciphertext', () => {
+  assert.ok(
+    script.includes('remoteSnapshots = null'),
+    'remoteSnapshots option accepted'
+  );
+  assert.ok(
+    script.includes('remoteRawValue: remoteSnap?.rawValue ?? null'),
+    'remote raw value stored in backup entry'
+  );
+  assert.ok(
+    script.includes('remoteRevision: remoteSnap?.revision ?? null'),
+    'remote revision stored in backup entry'
+  );
+  // Keep This Mac must fetch the remote before creating the backup.
+  const keepLocalFn = declaration('resolveSyncConflictsKeepLocal');
+  assert.ok(
+    keepLocalFn.includes('remoteSnapshots'),
+    'resolveSyncConflictsKeepLocal passes remoteSnapshots to backup'
+  );
+  assert.ok(
+    keepLocalFn.includes('studioRef().collection'),
+    'resolveSyncConflictsKeepLocal fetches remote before backup'
+  );
+});
+
+test('H-07: log entries receive a version stamp and concurrent-edit conflicts are detected', () => {
+  // New entries get version:1.
+  assert.ok(
+    script.includes('version: 1 }'),
+    'new log entries are stamped with version:1'
+  );
+  // The edit mutator must check the stored version against the loaded version.
+  assert.ok(
+    script.includes('currentVersion !== expectedVersion'),
+    'version mismatch check exists in the log edit mutator'
+  );
+  // The conflict error message is actionable.
+  assert.ok(
+    script.includes('edited on another device while this form was open'),
+    'conflict error tells the user to re-open the entry'
+  );
+  // On success, version advances.
+  assert.ok(
+    script.includes('version: currentVersion + 1'),
+    'successful edit increments the version'
+  );
+  // editLog() must capture the version before the form is open.
+  const editLogFn = declaration('editLog');
+  assert.ok(
+    editLogFn.includes('_logEditVersion'),
+    'editLog captures _logEditVersion when loading the form'
+  );
+  // cancelLogEdit() must clear it.
+  const cancelFn = declaration('cancelLogEdit');
+  assert.ok(
+    cancelFn.includes('_logEditVersion = null'),
+    'cancelLogEdit clears _logEditVersion'
+  );
+});
+
+test('H-07: deleteLog writes a tombstone so the deletion propagates across devices', () => {
+  // Tombstone pattern rather than array filter.
+  const deleteLogFn = declaration('deleteLog');
+  assert.ok(
+    deleteLogFn.includes('_deleted: true'),
+    'deleteLog writes _deleted:true tombstone'
+  );
+  assert.ok(
+    deleteLogFn.includes('_deletedAt'),
+    'deleteLog stamps _deletedAt timestamp'
+  );
+  // The old filter-out approach must be gone from deleteLog.
+  assert.ok(
+    !deleteLogFn.includes('logs.filter(l => String(l.id) !== String(id))'),
+    'deleteLog no longer filters the array (would lose tombstone)'
+  );
+  // renderLogs must exclude tombstoned entries from the display.
+  const renderFn = declaration('renderLogs');
+  assert.ok(
+    renderFn.includes('_deleted'),
+    'renderLogs filters out tombstoned entries before display'
+  );
+});
+
+test('H-08: _mergeSpreadsheetEdits throws an explicit conflict when a locally-changed project is deleted remotely', () => {
+  const context = contextWith({});
+  vm.runInContext(`
+    ${declaration('_cloneJson')}
+    ${declaration('_mergeSpreadsheetEdits')}
+    globalThis.mergeApi = { merge: _mergeSpreadsheetEdits };
+  `, context);
+
+  const base = {
+    activeProject: 'p1',
+    projects: [{ id: 'p1', name: 'Schedule', activeId: 's1', sheets: [] }],
+  };
+  // dirtyBase = same as base (what user had when they started editing).
+  const dirtyBase = JSON.parse(JSON.stringify(base));
+  // dirty = user changed the project name locally.
+  const dirty = JSON.parse(JSON.stringify(base));
+  dirty.projects[0].name = 'Changed Name';
+  // Reconciled remote has deleted the project entirely.
+  const reconciledBase = { activeProject: null, projects: [] };
+
+  assert.throws(
+    () => context.mergeApi.merge(reconciledBase, dirtyBase, dirty),
+    /Merge conflict.*deleted on another device/,
+    'structural conflict thrown when locally-changed project was remotely deleted'
+  );
+});
+
+test('H-08: _mergeSpreadsheetEdits throws an explicit conflict when a locally-changed sheet is deleted remotely', () => {
+  const context = contextWith({});
+  vm.runInContext(`
+    ${declaration('_cloneJson')}
+    ${declaration('_mergeSpreadsheetEdits')}
+    globalThis.mergeApi = { merge: _mergeSpreadsheetEdits };
+  `, context);
+
+  const sheet = { id: 's1', name: 'Monday', rows: 2, cols: 2, colWidths: [], cells: {} };
+  const base = {
+    activeProject: 'p1',
+    projects: [{ id: 'p1', name: 'Schedule', activeId: 's1', sheets: [sheet] }],
+  };
+  const dirtyBase = JSON.parse(JSON.stringify(base));
+  // User renamed the sheet locally.
+  const dirty = JSON.parse(JSON.stringify(base));
+  dirty.projects[0].sheets[0].name = 'Monday (edited)';
+  // Remote deleted the sheet.
+  const reconciledBase = JSON.parse(JSON.stringify(base));
+  reconciledBase.projects[0].sheets = [];
+
+  assert.throws(
+    () => context.mergeApi.merge(reconciledBase, dirtyBase, dirty),
+    /Merge conflict.*deleted on another device/,
+    'structural conflict thrown when locally-changed sheet was remotely deleted'
+  );
+});
+
+test('H-08: _mergeSpreadsheetEdits throws when a locally-cleared cell was concurrently changed remotely', () => {
+  const context = contextWith({});
+  vm.runInContext(`
+    ${declaration('_cloneJson')}
+    ${declaration('_mergeSpreadsheetEdits')}
+    globalThis.mergeApi = { merge: _mergeSpreadsheetEdits };
+  `, context);
+
+  const cell = { v: 'original', bg: '', tc: '', b: false };
+  const sheet = { id: 's1', name: 'Sheet', rows: 2, cols: 2, colWidths: [], cells: { '0,0': cell } };
+  const base = {
+    activeProject: 'p1',
+    projects: [{ id: 'p1', name: 'Proj', activeId: 's1', sheets: [sheet] }],
+  };
+  const dirtyBase = JSON.parse(JSON.stringify(base));
+  // User cleared cell 0,0 locally.
+  const dirty = JSON.parse(JSON.stringify(base));
+  delete dirty.projects[0].sheets[0].cells['0,0'];
+  // Remote concurrently changed cell 0,0 to a different value.
+  const reconciledBase = JSON.parse(JSON.stringify(base));
+  reconciledBase.projects[0].sheets[0].cells['0,0'] = { v: 'remote changed', bg: '', tc: '', b: false };
+
+  assert.throws(
+    () => context.mergeApi.merge(reconciledBase, dirtyBase, dirty),
+    /Merge conflict.*cleared on this Mac but changed on another device/,
+    'structural conflict thrown when locally-cleared cell was concurrently modified remotely'
+  );
+});
+
+test('H-09: retryQuarantinedSyncKey refreshes conflict actions after classifier failure', () => {
+  // When the classifier promotes a key to recovery-required, the catch block
+  // must call _updateSyncConflictActions() so the new recovery controls appear.
+  const retryFn = declaration('retryQuarantinedSyncKey');
+  // Find the catch block that handles classifier/reconcile failures.
+  const catchBlock = retryFn.slice(retryFn.indexOf('} catch (err) {'));
+  assert.ok(
+    catchBlock.slice(0, 400).includes('_updateSyncConflictActions()'),
+    'catch block refreshes conflict actions so recovery panel appears after classification'
+  );
+});
+
+test('H-10: listener failures quarantine the key and stop its listener immediately', () => {
+  // _unsubscribeSyncKey must exist.
+  assert.ok(
+    script.includes('function _unsubscribeSyncKey('),
+    '_unsubscribeSyncKey helper exists'
+  );
+  // Per-key Map must be declared.
+  assert.ok(
+    script.includes('const _syncKeyUnsubs = new Map()'),
+    '_syncKeyUnsubs per-key Map declared'
+  );
+  // The snapshot .catch() path (reconcile failure) must unsubscribe.
+  const subscribeFn = declaration('subscribeToSync');
+  // The reconcile .catch() section — search 700 chars to clear the lengthy comments.
+  const catchSection = subscribeFn.slice(subscribeFn.indexOf('.catch(err => {'));
+  assert.ok(
+    catchSection.slice(0, 700).includes('_unsubscribeSyncKey(key)'),
+    'reconcile failure unsubscribes the quarantined key'
+  );
+  // The Firestore listener error callback must quarantine + unsubscribe.
+  const errorCbSection = subscribeFn.slice(subscribeFn.indexOf('}, err => {'));
+  assert.ok(
+    errorCbSection.slice(0, 600).includes('_quarantineSyncKey'),
+    'listener error durably quarantines the key'
+  );
+  assert.ok(
+    errorCbSection.slice(0, 600).includes('_unsubscribeSyncKey(key)'),
+    'listener error stops the listener immediately'
+  );
+});
+
+test('H-11: exportQuarantinedSyncKey requires explicit confirmation before writing plaintext to disk', () => {
+  const exportFn = declaration('exportQuarantinedSyncKey');
+  // The confirm gate must appear after containsPlaintext is set and before exportRecovery().
+  const confirmIdx = exportFn.indexOf('window.confirm(');
+  const exportIdx = exportFn.indexOf('exportRecovery(');
+  assert.ok(confirmIdx >= 0, 'window.confirm() guard exists in exportQuarantinedSyncKey');
+  assert.ok(exportIdx > confirmIdx, 'confirm gate precedes the actual export call');
+  // The confirm message must warn about plaintext.
+  assert.ok(
+    exportFn.includes('UNENCRYPTED'),
+    'confirm dialog uses the word UNENCRYPTED to make the risk explicit'
+  );
+  // Guard is conditional on containsPlaintext — encrypted exports must not be gated.
+  assert.ok(
+    exportFn.includes('bundle.containsPlaintext && !window.confirm('),
+    'confirmation is only required when the export contains plaintext'
+  );
 });

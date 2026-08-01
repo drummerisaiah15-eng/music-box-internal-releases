@@ -3813,7 +3813,55 @@ const STORE = {
       return JSON.parse(raw) ?? def;
     } catch { return def; }
   },
+  // H-02: explicit whole-value replacement for synchronized keys. Callers that
+  // hold a fully-reconciled array/object and intend to overwrite the whole
+  // document must use this instead of set(). set() now throws for sync keys.
+  replace: (k, v) => {
+    if (SHARED_KEYS.has(k)) {
+      try {
+        SHARED.set(k, v);
+        _storeWriteErrors.delete(k);
+        return Promise.resolve(true);
+      } catch (err) {
+        _storeWriteErrors.set(k, err);
+        const rejected = Promise.reject(err);
+        rejected.catch(() => {});
+        return rejected;
+      }
+    }
+    if (!_encKey) {
+      const err = new Error('Data is locked; sign in as the owner before saving');
+      _storeWriteErrors.set(k, err);
+      console.warn('[storage] refused write while locked:', k);
+      const rejected = Promise.reject(err);
+      rejected.catch(() => {});
+      return rejected;
+    }
+    if (_syncResolutionKeys.has(k)) {
+      const err = new Error(`${k} is being reconciled with cloud; retry this change in a moment`);
+      _storeWriteErrors.set(k, err);
+      const rejected = Promise.reject(err);
+      rejected.catch(() => {});
+      return rejected;
+    }
+    const operationId = isSyncKey(k) ? _newOperationId() : null;
+    return _queueEncryptedWrite(k, v, { operationId });
+  },
   set: (k, v) => {
+    // H-02: synchronized keys must never be overwritten whole-document via the
+    // plain set() API. Use mutate() for record-level changes or replace() for
+    // intentional whole-value replacement where the caller owns the full array.
+    if (isSyncKey(k)) {
+      const err = new Error(
+        `STORE.set() is not allowed for synchronized key '${k}'. ` +
+        `Use STORE.mutate() for record-level changes or STORE.replace() for intentional whole-value replacement.`
+      );
+      console.error('[storage] blocked unsafe sync write:', err.message);
+      _storeWriteErrors.set(k, err);
+      const rejected = Promise.reject(err);
+      rejected.catch(() => {});
+      return rejected;
+    }
     // Studio-wide settings go to unencrypted SHARED storage
     if (SHARED_KEYS.has(k)) {
       try {
@@ -3908,7 +3956,8 @@ const STORE = {
 
 const _backgroundSaveNoticeAt = new Map();
 function persistInBackground(key, value, label = 'Background data') {
-  const write = STORE.set(key, value);
+  // H-02: use replace() so sync keys are allowed; set() now throws for them.
+  const write = STORE.replace(key, value);
   write.catch(error => {
     console.warn(`[storage] ${label} was not saved:`, error?.message || error);
     const now = Date.now();
@@ -3956,6 +4005,9 @@ let _firebaseApp = null;
 let _firestoreDb = null;
 let _firebaseAuth = null;
 let _syncUnsubs = [];
+// H-10: per-key unsub functions so we can stop a single listener immediately
+// after quarantine without tearing down every other sync listener.
+const _syncKeyUnsubs = new Map();
 let _syncReady = false;
 let _syncBootstrapComplete = false;
 // True the moment a Firebase connection is attempted (credentials found and SDK loading).
@@ -5183,10 +5235,20 @@ async function saveAllData() {
   }
 }
 
+// H-10: stop exactly one listener without affecting others. Safe to call
+// redundantly; a no-op if the key has no active listener.
+function _unsubscribeSyncKey(key) {
+  const unsub = _syncKeyUnsubs.get(key);
+  if (!unsub) return;
+  _syncKeyUnsubs.delete(key);
+  try { unsub(); } catch {}
+}
+
 function subscribeToSync() {
   if (!_syncReady || !_firestoreDb) return;
   _syncUnsubs.forEach(u => { try { u(); } catch {} });
   _syncUnsubs = [];
+  _syncKeyUnsubs.clear();
 
   getSyncKeys().forEach(key => {
     // V159-009: a quarantined key must not receive live snapshots. Its local and
@@ -5214,14 +5276,26 @@ function subscribeToSync() {
           // later report the key as synced. Also surface the recovery panel.
           _quarantineSyncKey(key, msg);
           _remoteDocPresence.delete(key);
+          // H-10: stop this key's listener immediately — the key is frozen until
+          // an explicit recovery action runs; continued snapshots are unwanted.
+          _unsubscribeSyncKey(key);
           setSyncStatus('error');
           showToast(`Cloud data for ${key} was rejected and local data was preserved.`, 'warning');
           _updateSyncConflictActions();
         });
       }, err => {
-        console.warn('Sync listener error:', err);
+        // H-10: listener-level Firebase errors (permissions, network, SDK bugs)
+        // are durable failures — quarantine the key so recovery controls appear,
+        // and stop the listener to avoid a tight error loop.
+        const msg = err?.message || String(err);
+        console.warn('Sync listener error for', key, ':', msg);
+        _quarantineSyncKey(key, `listener error: ${msg}`);
+        _unsubscribeSyncKey(key);
         setSyncStatus('error');
+        showToast(`Live sync listener for ${key} failed; local data is preserved.`, 'warning');
+        _updateSyncConflictActions();
       });
+    _syncKeyUnsubs.set(key, unsub);
     _syncUnsubs.push(unsub);
   });
 }
@@ -5440,6 +5514,15 @@ async function exportQuarantinedSyncKey(key) {
       'warning'
     );
   }
+  // H-11: require explicit confirmation before writing plaintext to disk.
+  // A legacy remote document contains unencrypted data; the operator must
+  // acknowledge this before the export proceeds.
+  if (bundle.containsPlaintext && !window.confirm(
+    `WARNING: The cloud copy of "${key}" contains UNENCRYPTED legacy data.\n\n` +
+    `Exporting this file will write plaintext data to disk. ` +
+    `Keep it secure and delete it when finished.\n\n` +
+    `Do you want to proceed?`
+  )) { return false; }
   try {
     const result = await window.electronSpreadsheet.exportRecovery(JSON.stringify(bundle, null, 2));
     // H-06: treat cancellation as cancellation, not success. A result of
@@ -5503,6 +5586,9 @@ async function retryQuarantinedSyncKey(key) {
       `${key} still cannot be reconciled and remains quarantined: ${err?.message || err}`,
       'danger'
     );
+    // C-03 / H-09: classifier may have promoted the key to recovery-required;
+    // refresh the conflict panel so the new recovery actions become visible.
+    try { _updateSyncConflictActions(); } catch (_) {}
     return false;
   }
   _clearSyncKeyQuarantine(key);
@@ -5602,7 +5688,10 @@ function _updateSyncConflictActions() {
 }
 
 function _createSyncConflictBackup(keys, resolution, options = {}) {
-  const { requirePending = true } = options;
+  // H-04: remoteSnapshots is a Map<key, { rawValue, revision }> carrying the raw
+  // Firestore document value fetched just before resolution, so both sides of the
+  // conflict are durably preserved in the same snapshot.
+  const { requirePending = true, remoteSnapshots = null } = options;
   const entries = {};
   for (const key of keys) {
     const ciphertext = localStorage.getItem('tmb_' + key);
@@ -5610,11 +5699,15 @@ function _createSyncConflictBackup(keys, resolution, options = {}) {
     if (!ciphertext?.startsWith('E:') || (requirePending && !pending)) {
       throw new Error(`Cannot create an encrypted recovery snapshot for ${key}`);
     }
+    const remoteSnap = remoteSnapshots?.get(key) ?? null;
     entries[key] = {
       ciphertext,
       pending: pending || null,
       revision: _localSyncRevision(key),
       localTimestamp: localStorage.getItem('tmb_' + key + '_local_ts') || '',
+      // Raw Firebase value (already encrypted server-side); null if fetch failed.
+      remoteRawValue: remoteSnap?.rawValue ?? null,
+      remoteRevision: remoteSnap?.revision ?? null,
     };
   }
   const backupId = Date.now().toString(36) + '-' +
@@ -5688,9 +5781,15 @@ async function resolveSyncConflictsUseCloud() {
           if (!latestPending || latestPending.opId !== expectedPending.opId) {
             throw new Error(`${key} changed locally while the conflict was being reviewed`);
           }
-          reviewed.set(key, { decoded, remoteRevision, expectedPending, isLegacyRemote });
+          // H-04: carry the raw Firebase value so both sides land in the snapshot.
+          reviewed.set(key, { decoded, remoteRevision, expectedPending, isLegacyRemote, rawRemoteValue: remote.value });
       }
-      backupId = _createSyncConflictBackup(keys, 'use-cloud');
+      // H-04: build remoteSnapshots so _createSyncConflictBackup preserves the
+      // Firebase copy alongside the local ciphertext in the same backup entry.
+      const remoteSnapshots = new Map(
+        [...reviewed].map(([key, r]) => [key, { rawValue: r.rawRemoteValue, revision: r.remoteRevision }])
+      );
+      backupId = _createSyncConflictBackup(keys, 'use-cloud', { remoteSnapshots });
       for (const [key, review] of reviewed) {
           await _persistRemoteValue(key, review.decoded, review.remoteRevision, {
             propagateToFirebase: review.isLegacyRemote,
@@ -5734,13 +5833,27 @@ async function resolveSyncConflictsKeepLocal() {
     )) return false;
     await _serializeManyKeyMutations(keys, async () => {
       const reviewed = new Map();
+      // H-04: fetch the current remote copy for every key BEFORE overwriting so
+      // both sides of the conflict are preserved in the recovery snapshot.
+      const remoteSnapshots = new Map();
       for (const key of keys) {
           const pending = _readPendingSyncRecord(key);
           if (!pending) throw new Error(`${key} no longer has a pending local copy`);
           const value = await _pendingSyncValue(key, pending);
+          try {
+            const snap = await studioRef().collection('data').doc(key).get();
+            if (snap.exists && snap.data()?.value !== undefined) {
+              const remote = snap.data();
+              const remoteRevision = Number.isSafeInteger(remote.revision) && remote.revision >= 0
+                ? remote.revision : 0;
+              remoteSnapshots.set(key, { rawValue: remote.value, revision: remoteRevision });
+            }
+          } catch (_) {
+            // Remote fetch failure is non-fatal; proceed without it in the snapshot.
+          }
           reviewed.set(key, { pending, value });
       }
-      backupId = _createSyncConflictBackup(keys, 'keep-local');
+      backupId = _createSyncConflictBackup(keys, 'keep-local', { remoteSnapshots });
       for (const [key, review] of reviewed) {
           const result = await syncPush(key, review.value, {
             opId: review.pending.opId,
@@ -5876,6 +5989,7 @@ async function disconnectSync() {
   }
   _syncUnsubs.forEach(u => { try { u(); } catch {} });
   _syncUnsubs = [];
+  _syncKeyUnsubs.clear();
   _syncReady = false;
   _syncBootstrapComplete = false;
   _syncConfigured = false;
@@ -6657,10 +6771,19 @@ function _mergeSpreadsheetEdits(base, dirtyBase, dirty) {
       if (!target) merged.projects.push(_cloneJson(localProject));
       continue;
     }
-    // Removed remotely. A local edit cannot resurrect it here; the remote
-    // deletion is preserved and the local copy stays recoverable in the
-    // encrypted pending record.
-    if (!target) continue;
+    // Removed remotely. If the user also changed the project locally, that is
+    // an explicit structural conflict — silently discarding local work would be
+    // worse than surfacing it so the user can decide.
+    // H-08: throw an explicit merge error rather than silently dropping the edit.
+    if (!target) {
+      if (changed(localProject, origin)) {
+        throw new Error(
+          `Merge conflict: project "${localProject.name || localProject.id}" was deleted on another ` +
+          `device while this Mac was editing it. Use "Keep This Mac" or "Use Cloud" to resolve.`
+        );
+      }
+      continue;
+    }
 
     if (changed(localProject.name, origin.name)) target.name = localProject.name;
     if (changed(localProject.activeId, origin.activeId)) target.activeId = localProject.activeId;
@@ -6675,7 +6798,17 @@ function _mergeSpreadsheetEdits(base, dirtyBase, dirty) {
         if (!targetSheet) target.sheets.push(_cloneJson(localSheet));
         continue;
       }
-      if (!targetSheet) continue;
+      // H-08: sheet deleted remotely while this Mac was editing it — explicit conflict.
+      if (!targetSheet) {
+        if (changed(localSheet, originSheet)) {
+          throw new Error(
+            `Merge conflict: sheet "${localSheet.name || localSheet.id}" in project ` +
+            `"${localProject.name || localProject.id}" was deleted on another device ` +
+            `while this Mac was editing it. Use "Keep This Mac" or "Use Cloud" to resolve.`
+          );
+        }
+        continue;
+      }
 
       if (changed(localSheet.name, originSheet.name)) targetSheet.name = localSheet.name;
       if (changed(localSheet.rows, originSheet.rows)) targetSheet.rows = localSheet.rows;
@@ -6695,7 +6828,18 @@ function _mergeSpreadsheetEdits(base, dirtyBase, dirty) {
       }
       // Cells the user cleared locally.
       for (const cellKey of Object.keys(originCells)) {
-        if (!(cellKey in localCells)) delete targetSheet.cells[cellKey];
+        if (!(cellKey in localCells)) {
+          // H-08: if the remote device concurrently changed this cell, clearing
+          // it locally is a structural conflict — one side's intent must lose.
+          if (changed(targetSheet.cells[cellKey], originCells[cellKey])) {
+            throw new Error(
+              `Merge conflict: cell ${cellKey} in sheet "${localSheet.name || localSheet.id}" ` +
+              `was cleared on this Mac but changed on another device simultaneously. ` +
+              `Use "Keep This Mac" or "Use Cloud" to resolve.`
+            );
+          }
+          delete targetSheet.cells[cellKey];
+        }
       }
     }
 
@@ -7336,7 +7480,7 @@ async function ssImportBuildProject(name, sheets) {
       sheets: builtSheets,
     });
     const normalized = normalizeSpreadsheetWorkbook(next);
-    await STORE.set('spreadsheets', normalized);
+    await STORE.replace('spreadsheets', normalized);
     _ssData = normalized;
     showToast('✅ Imported "' + projectName + '" (' + builtSheets.length + ' sheet' + (builtSheets.length !== 1 ? 's' : '') + ')', 'success');
     ssGoHome();
@@ -8596,7 +8740,7 @@ function getCheckoutState() {
 async function setCheckedOut(idx) {
   const state = getCheckoutState();
   state[idx] = true;
-  await STORE.set(getCheckoutStateKey(), state);
+  await STORE.replace(getCheckoutStateKey(), state);
   return true;
 }
 
@@ -8614,7 +8758,7 @@ function _syncMbCheckoutStatus(schedule) {
     }
   });
   if (changed) {
-    STORE.set(getCheckoutStateKey(), state).catch(error => {
+    STORE.replace(getCheckoutStateKey(), state).catch(error => {
       console.warn('[checkout] automatic status was not saved:', error?.message || error);
     });
   }
@@ -8876,15 +9020,15 @@ async function migrateRoomData() {
     if (isNone(overrides[id])) { excluded.add(id); delete overrides[id]; changed = true; }
   });
   if (changed) {
-    writes.push(STORE.set('room_overrides', overrides));
-    writes.push(STORE.set('room_excluded', [...excluded]));
+    writes.push(STORE.replace('room_overrides', overrides));
+    writes.push(STORE.replace('room_excluded', [...excluded]));
   }
 
   // 2. room_by_instructor: delete any instructor whose default room is 'none'
   const byInstr = STORE.get('room_by_instructor', {});
   let instrChanged = false;
   Object.keys(byInstr).forEach(k => { if (isNone(byInstr[k])) { delete byInstr[k]; instrChanged = true; } });
-  if (instrChanged) writes.push(STORE.set('room_by_instructor', byInstr));
+  if (instrChanged) writes.push(STORE.replace('room_by_instructor', byInstr));
 
   // 3. room_time_rules: drop any rule whose room is 'none'
   const timeRules = STORE.get('room_time_rules', {});
@@ -8893,7 +9037,7 @@ async function migrateRoomData() {
     const filtered = (timeRules[k] || []).filter(r => !isNone(r.room));
     if (filtered.length !== (timeRules[k] || []).length) { timeRules[k] = filtered; rulesChanged = true; }
   });
-  if (rulesChanged) writes.push(STORE.set('room_time_rules', timeRules));
+  if (rulesChanged) writes.push(STORE.replace('room_time_rules', timeRules));
 
   if (writes.length) await Promise.all(writes);
 
@@ -9111,7 +9255,7 @@ async function saveRoomAssignment() {
   }
 
   try {
-    await Promise.all([...writes].map(([key, value]) => STORE.set(key, value)));
+    await Promise.all([...writes].map(([key, value]) => STORE.replace(key, value)));
   } catch (error) {
     showToast(`Room assignment was not fully saved: ${error?.message || error}`, 'danger');
     return false;
@@ -9139,8 +9283,8 @@ async function removeApptFromRoom(e, apptId) {
   delete overrides[String(apptId)];
   try {
     await Promise.all([
-      STORE.set('room_excluded', [...excluded]),
-      STORE.set('room_overrides', overrides),
+      STORE.replace('room_excluded', [...excluded]),
+      STORE.replace('room_overrides', overrides),
     ]);
   } catch (error) {
     showToast(`The room was not fully removed: ${error?.message || error}`, 'danger');
@@ -9507,7 +9651,7 @@ async function toggleEmailFlag(id) {
     ? flagged.filter(flaggedId => flaggedId !== id)
     : [...flagged, id];
   try {
-    await STORE.set('flagged_emails', nextFlagged);
+    await STORE.replace('flagged_emails', nextFlagged);
     email.flagged = nextFlagged.includes(id);
     renderEmailList();
     return true;
@@ -9528,7 +9672,7 @@ async function deleteEmail(id) {
   const deleted = STORE.get('deleted_emails', []);
   if (!deleted.includes(key)) {
     try {
-      await STORE.set('deleted_emails', [...deleted, key]);
+      await STORE.replace('deleted_emails', [...deleted, key]);
     } catch (error) {
       showToast(`Email was not deleted: ${error?.message || error}`, 'danger');
       return false;
@@ -10209,7 +10353,7 @@ async function sendReply(emailId) {
           sentAt: new Date().toISOString(),
         });
         try {
-          await STORE.set('sent_emails', sent.slice(0, 300));
+          await STORE.replace('sent_emails', sent.slice(0, 300));
           await autoCompleteEmailTodos(original);
           showToast('✅ Reply sent via Microsoft 365!', 'success');
         } catch (archiveError) {
@@ -10244,7 +10388,7 @@ async function sendReply(emailId) {
       sentAt: new Date().toISOString(),
     });
     try {
-      await STORE.set('sent_emails', sent.slice(0, 300));
+      await STORE.replace('sent_emails', sent.slice(0, 300));
       await autoCompleteEmailTodos(original);
       showToast('Reply saved (demo mode — connect Microsoft 365 to send for real).', 'info');
     } catch (error) {
@@ -10302,6 +10446,12 @@ function discardReply() {
 // ─────────────────────────────────────────────────────────────
 // DAILY LOG
 // ─────────────────────────────────────────────────────────────
+// H-07: version of the log record that was loaded into the edit form. If another
+// device edits the same record while this one has the form open, the versions
+// will diverge and saveLogEntry() will throw an explicit conflict error instead
+// of silently overwriting the concurrent change.
+let _logEditVersion = null;
+
 async function saveLogEntry() {
   const date = document.getElementById('log-date').value;
   const author = document.getElementById('log-author').value || currentUser() || 'Unknown';
@@ -10316,9 +10466,11 @@ async function saveLogEntry() {
   // more than once (preview + the authoritative in-lock run), and it must
   // produce the same record every time.
   const now = new Date().toISOString();
+  // H-07: capture the version we intend to edit before entering the mutator.
+  const expectedVersion = _logEditVersion;
   const newEntry = editingId
     ? null
-    : { id: _newRecordId(), date, author, body, tags, created: now };
+    : { id: _newRecordId(), date, author, body, tags, created: now, version: 1 };
   try {
     // V160-001: semantic update-by-id / append-by-id applied to the reconciled
     // base inside the per-key lock, so a log another device added while this
@@ -10330,7 +10482,18 @@ async function saveLogEntry() {
         // H-03: throw rather than silently no-op so the catch block surfaces
         // the conflict instead of showing a false "Log entry updated!" success.
         if (idx < 0) throw new Error('Log entry not found — it may have been deleted on another device.');
-        logs[idx] = { ...logs[idx], date, body, tags, updated: now };
+        // H-07: detect concurrent remote edits. If another device changed this
+        // record while this one had the form open, the stored version will have
+        // advanced past what we loaded. Throw an explicit conflict rather than
+        // silently overwriting the concurrent change.
+        const currentVersion = logs[idx].version ?? 0;
+        if (expectedVersion !== null && currentVersion !== expectedVersion) {
+          throw new Error(
+            'Log entry was edited on another device while this form was open. ' +
+            'Cancel and re-open the entry to see the latest version before editing.'
+          );
+        }
+        logs[idx] = { ...logs[idx], date, body, tags, updated: now, version: currentVersion + 1 };
       } else if (!logs.some(l => String(l.id) === String(newEntry.id))) {
         logs.unshift(newEntry);
       }
@@ -10357,6 +10520,9 @@ function editLog(id) {
   const logs = STORE.get('logs', []);
   const l = logs.find(e => String(e.id) === String(id));
   if (!l) return;
+  // H-07: snapshot the record's version so saveLogEntry() can detect if a
+  // concurrent remote edit advanced the version before this save lands.
+  _logEditVersion = l.version ?? 0;
   document.getElementById('log-date').value = l.date;
   document.getElementById('log-body').value = l.body;
   document.getElementById('log-tags').value = (l.tags || []).join(', ');
@@ -10368,6 +10534,7 @@ function editLog(id) {
 }
 
 function cancelLogEdit() {
+  _logEditVersion = null;
   document.getElementById('log-editing-id').value = '';
   document.getElementById('log-body').value = '';
   document.getElementById('log-tags').value = '';
@@ -10388,7 +10555,8 @@ function _logHighlight(escapedHtml, terms) {
 }
 
 function renderLogs() {
-  const logs = STORE.get('logs', []);
+  // H-07: filter out tombstoned entries (_deleted:true) before display.
+  const logs = (STORE.get('logs', [])).filter(l => !l._deleted);
   const rawSearch = boundedText((document.getElementById('log-search')?.value || '').trim(), 256);
   const authorFilter = (document.getElementById('log-author-filter')?.value || '');
   const terms = rawSearch
@@ -10467,12 +10635,18 @@ async function deleteLog(id) {
     // V160-001: delete-by-id against the reconciled base. Filtering a stale
     // snapshot would also erase any log another device added meanwhile.
     // H-03: throw if the record is absent so we don't show false success.
+    // H-07: write a tombstone (_deleted:true) instead of removing the entry so
+    // that other devices receiving the merged log can propagate the deletion
+    // rather than having the entry reappear from their local copy on next sync.
+    const deletedAt = new Date().toISOString();
     await STORE.mutate('logs', current => {
-      const logs = Array.isArray(current) ? current : [];
-      if (!logs.some(l => String(l.id) === String(id))) {
+      const logs = Array.isArray(current) ? _cloneJson(current) : [];
+      const idx = logs.findIndex(l => String(l.id) === String(id));
+      if (idx < 0) {
         throw new Error('Log entry not found — it may have already been deleted on another device.');
       }
-      return logs.filter(l => String(l.id) !== String(id));
+      logs[idx] = { ...logs[idx], _deleted: true, _deletedAt: deletedAt };
+      return logs;
     }, []);
     renderLogs();
     showToast('Entry deleted.', 'success');
@@ -10522,7 +10696,7 @@ async function saveStaffNote() {
   const notes = _cloneJson(STORE.get('staff_notes', []));
   notes.unshift({ id: Date.now(), author, body, priority, created: new Date().toISOString() });
   try {
-    await STORE.set('staff_notes', notes);
+    await STORE.replace('staff_notes', notes);
     bodyElement.value = '';
     renderStaff();
     markStaffNotesRead(); // poster sees their own note as already read
@@ -10628,7 +10802,7 @@ async function deleteNote(id) {
   let notes = STORE.get('staff_notes', []);
   notes = notes.filter(n => String(n.id) !== String(id));
   try {
-    await STORE.set('staff_notes', notes);
+    await STORE.replace('staff_notes', notes);
     renderStaff();
     showToast('Note deleted.', 'success');
     return true;
@@ -10662,7 +10836,7 @@ async function saveStaffDirectoryMember() {
   const id = 'es_' + Date.now();
   list.push({ id, name, email, detail: role || 'Staff', group: 'staff', source: 'manual', removable: true });
   try {
-    await STORE.set('custom_staff', list);
+    await STORE.replace('custom_staff', list);
     cancelStaffDirectoryForm();
     renderStaff();
     showToast(name + ' added to staff directory!', 'success');
@@ -10677,7 +10851,7 @@ async function removeStaffDirectoryMember(id) {
   if (!isElizabeth()) return false;
   const list = STORE.get('custom_staff', []).filter(s => s.id !== id);
   try {
-    await STORE.set('custom_staff', list);
+    await STORE.replace('custom_staff', list);
     renderStaff();
     showToast('Staff member removed.', 'success');
     return true;
@@ -10725,13 +10899,13 @@ async function saveEditStaffMember() {
     if (id.startsWith('b_')) {
       const overrides = STORE.get('staff_dir_overrides', {});
       overrides[id] = { name, email, role: role || '' };
-      await STORE.set('staff_dir_overrides', overrides);
+      await STORE.replace('staff_dir_overrides', overrides);
     } else {
       const list = STORE.get('custom_staff', []);
       const idx = list.findIndex(s => s.id === id);
       if (idx < 0) throw new Error('The staff member no longer exists.');
       list[idx] = { ...list[idx], name, email, detail: role || 'Staff' };
-      await STORE.set('custom_staff', list);
+      await STORE.replace('custom_staff', list);
     }
     document.getElementById('edit-staff-modal').classList.add('hidden');
     renderStaff();
@@ -10751,7 +10925,7 @@ async function deleteEditStaffMember() {
     try {
       if (!removed.includes(id)) {
         removed.push(id);
-        await STORE.set('removed_staff_dir', removed);
+        await STORE.replace('removed_staff_dir', removed);
       }
       document.getElementById('edit-staff-modal').classList.add('hidden');
       renderStaff();
@@ -11951,7 +12125,7 @@ function openNewNoteModal() {
 // TO-DO LIST
 // ─────────────────────────────────────────────────────────────
 function getTodos() { return STORE.get('todo_items', []); }
-function saveTodos(items) { return STORE.set('todo_items', items); }
+function saveTodos(items) { return STORE.replace('todo_items', items); }
 
 async function persistTodos(items, failureLabel = 'To-do change') {
   try {
@@ -12165,7 +12339,7 @@ async function dashDeleteTodo(id) {
 
 // ─── Assigned (profile-specific) tasks ────
 function getAssignedTasks() { return STORE.get('assigned_tasks', []); }
-function saveAssignedTasks(items) { return STORE.set('assigned_tasks', items); }
+function saveAssignedTasks(items) { return STORE.replace('assigned_tasks', items); }
 
 async function persistAssignedTasks(items, failureLabel = 'Task change') {
   try {
@@ -12381,7 +12555,7 @@ function saveStepUpReceipts(receipts) {
     rejected.catch(() => {});
     return rejected;
   }
-  return STORE.set('step_up_receipts', receipts);
+  return STORE.replace('step_up_receipts', receipts);
 }
 
 function renderStepUp() {
@@ -13049,7 +13223,7 @@ async function stepUpDeleteReceipt(id) {
 // ═══════════════════════════════════════════════════════════════════
 
 function getPolicies()       { return STORE.get('policies', []); }
-function savePolicies(arr)   { return STORE.set('policies', arr); }
+function savePolicies(arr)   { return STORE.replace('policies', arr); }
 
 function loadPoliciesPage() { renderPoliciesList(); }
 
@@ -13839,12 +14013,11 @@ function init() {
         includeSync: _syncReady && _syncBootstrapComplete,
         requireSync: _syncReady && _syncBootstrapComplete,
       });
-      if (!_syncReady || !_syncBootstrapComplete) {
-        // Cloud state is unknown; any pending record is undelivered.
-        return !getSyncKeys().some(key => {
-          try { return !!_readPendingSyncRecord(key); } catch { return true; }
-        });
-      }
+      // H-03: use _unsyncedSyncKeys() in both branches so quarantined,
+      // recovery-required, failed, and corrupt keys are caught whether sync
+      // is fully initialised or not. The old offline branch only checked
+      // pending records, allowing a quarantined key with no queued record
+      // to pass as safe-to-update.
       let unsynced;
       try { unsynced = _unsyncedSyncKeys(); } catch { return false; }
       return unsynced.length === 0;
@@ -13967,7 +14140,7 @@ async function markCommHandled(id) {
   const next = new Set(getCommHandled());
   next.add(id);
   try {
-    await STORE.set('comm_handled_ids', [...next]);
+    await STORE.replace('comm_handled_ids', [...next]);
     _commHandled = next;
     return true;
   } catch (error) {
@@ -14420,7 +14593,7 @@ async function refreshCommInbox() {
 function getCommAnalyzedIds() { return new Set(STORE.get('comm_analyzed_ids', [])); }
 async function addCommAnalyzedIds(ids) {
   const existing = STORE.get('comm_analyzed_ids', []);
-  await STORE.set('comm_analyzed_ids', [...new Set([...existing, ...ids])].slice(-500)); // keep last 500
+  await STORE.replace('comm_analyzed_ids', [...new Set([...existing, ...ids])].slice(-500)); // keep last 500
   return true;
 }
 
@@ -14495,7 +14668,7 @@ async function migrateAiTodos() {
   const writes = [];
   if (oldAiCount > 0) {
     writes.push(saveTodos(todos.filter(t => !t.aiAdded || t.emailRef?.msId)));
-    writes.push(STORE.set('comm_analyzed_ids', []));
+    writes.push(STORE.replace('comm_analyzed_ids', []));
   }
   writes.push(STORE.set('ai_todo_v2_migrated', true));
   await Promise.all(writes);
@@ -14511,8 +14684,8 @@ async function migrateAiTodosV3() {
   const writes = [];
   if (hadAi) {
     writes.push(saveTodos(todos.filter(t => !t.aiAdded)));
-    writes.push(STORE.set('comm_analyzed_ids', []));
-    writes.push(STORE.set('comm_handled_ids', []));
+    writes.push(STORE.replace('comm_analyzed_ids', []));
+    writes.push(STORE.replace('comm_handled_ids', []));
   }
   writes.push(STORE.set('ai_todo_v3_migrated', true));
   await Promise.all(writes);
@@ -14527,8 +14700,8 @@ async function commAnalyzeAndAddTodos() {
   if (getTodos().filter(t => t.aiAdded).length === 0) {
     try {
       await Promise.all([
-        STORE.set('comm_analyzed_ids', []),
-        STORE.set('comm_handled_ids', []),
+        STORE.replace('comm_analyzed_ids', []),
+        STORE.replace('comm_handled_ids', []),
       ]);
     } catch (error) {
       console.warn('[AI todo] reset markers were not saved:', error?.message || error);
@@ -14603,8 +14776,8 @@ async function commAnalyzeAndAddTodos() {
     // Persist updated sent emails + conv IDs so the replied-todo sweep has timestamps
     newMsSent.sort((a, b) => new Date(b.sentAt || 0) - new Date(a.sentAt || 0));
     await Promise.all([
-      STORE.set('ms_sent_emails', newMsSent.slice(0, 300)),
-      STORE.set('ms_sent_conv_ids', [...freshRepliedConvIds].slice(-300)),
+      STORE.replace('ms_sent_emails', newMsSent.slice(0, 300)),
+      STORE.replace('ms_sent_conv_ids', [...freshRepliedConvIds].slice(-300)),
     ]);
     candidates = candidates.filter(e => !e.conversationId || !freshRepliedConvIds.has(e.conversationId));
   } catch(e) {
