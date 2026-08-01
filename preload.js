@@ -122,8 +122,11 @@ contextBridge.exposeInMainWorld('electronLifecycle', {
       const requestId = payload?.requestId;
       let ok = false;
       try {
-        await callback();
-        ok = true;
+        // C-01: only acknowledge safe-to-install when the renderer explicitly
+        // returns true. Any other value (false, undefined, void) or a thrown
+        // exception must propagate as ok: false so quitAndInstall is blocked.
+        const result = await callback();
+        ok = result === true;
       } catch (_) {
         ok = false;
       }

@@ -1940,6 +1940,8 @@
           <button class="btn btn-ghost" style="color:var(--danger)" onclick="disconnectSync()" id="sync-disconnect-btn" style="display:none">Disconnect</button>
         </div>
         <div id="sync-last-updated" style="font-size:11.5px;color:var(--text-muted);margin-top:8px"></div>
+        <div id="sync-quarantine-actions" style="display:none;margin-top:12px;padding:12px;border:1px solid #c0392b;border-radius:8px;background:#fdf0f0;font-size:12.5px"></div>
+        <div id="sync-recovery-hold" style="display:none;margin-top:12px;padding:12px;border:1px solid #c0392b;border-radius:8px;background:#fdf0f0;font-size:12.5px"></div>
         <div id="sync-conflict-actions" style="display:none;margin-top:12px;padding:12px;border:1px solid #e0b45c;border-radius:8px;background:#fff8ec">
           <div id="sync-conflict-summary" style="font-size:12.5px;font-weight:600;margin-bottom:8px"></div>
           <div style="font-size:11.5px;color:var(--text-muted);margin-bottom:10px">
@@ -2668,8 +2670,20 @@ async function _purgeLegacyDemoDataOnce() {
     note => !demoNoteBodies.some(body => String(note?.body || '').startsWith(body))
   );
   const writes = [];
-  if (cleanedLogs.length !== safeLogs.length) writes.push(STORE.set('logs', cleanedLogs));
-  if (cleanedNotes.length !== safeNotes.length) writes.push(STORE.set('staff_notes', cleanedNotes));
+  // V160-001: re-apply the demo-purge predicate to the reconciled base rather
+  // than committing a snapshot filtered before the lock.
+  if (cleanedLogs.length !== safeLogs.length) {
+    writes.push(STORE.mutate('logs', current =>
+      (Array.isArray(current) ? current : []).filter(
+        log => !demoLogBodies.some(body => String(log?.body || '').startsWith(body))
+      ), []));
+  }
+  if (cleanedNotes.length !== safeNotes.length) {
+    writes.push(STORE.mutate('staff_notes', current =>
+      (Array.isArray(current) ? current : []).filter(
+        note => !demoNoteBodies.some(body => String(note?.body || '').startsWith(body))
+      ), []));
+  }
   await Promise.all(writes);
   if (writes.length) await STORE.flush(['logs', 'staff_notes']);
   localStorage.setItem('tmb_demo_purged_v1', '1');
@@ -3452,7 +3466,9 @@ async function _drainSyncKey(key) {
 function _scheduleSyncDrain(key) {
   // MB-009: Keys quarantined during bootstrap are not drained — their local and
   // remote data are preserved untouched until a recovery action is taken.
+  // V160-003: a key awaiting poisoned-client recovery must never auto-deliver.
   if (!_syncReady || !_syncBootstrapComplete || _syncBootstrapFailedKeys.has(key) ||
+      _syncRecoveryRequiredKeys.has(key) ||
       !_readPendingSyncRecord(key)) {
     return Promise.resolve(false);
   }
@@ -3473,6 +3489,7 @@ function _scheduleSyncDrain(key) {
     // MB-009: Skip delivery for keys quarantined during bootstrap.
     if (_syncReady && _syncBootstrapComplete && !_syncDeliveryErrors.has(key) &&
         !_syncBootstrapFailedKeys.has(key) &&
+        !_syncRecoveryRequiredKeys.has(key) &&
         _readPendingSyncRecord(key)) {
       queueMicrotask(() => _scheduleSyncDrain(key));
     }
@@ -3480,18 +3497,75 @@ function _scheduleSyncDrain(key) {
   return delivery;
 }
 
+// V159-003: the durable per-key synchronization state. Nothing may report
+// "Synced" for a key that is not 'current'.
+//   current      no pending record, no error
+//   pending      locally saved, not yet delivered
+//   delivering   a delivery is in flight
+//   conflict     cloud and local both preserved, user must choose
+//   quarantined  bootstrap failed for this key; delivery is deliberately skipped
+//   failed       delivery attempted and errored
+function _syncKeyStatus(key) {
+  if (_syncBootstrapFailedKeys.has(key)) return 'quarantined';
+  if (_syncRecoveryRequiredKeys.has(key)) return 'recovery-required';
+  const error = _syncDeliveryErrors.get(key);
+  if (error?.code === 'SYNC_CONFLICT') return 'conflict';
+  if (error) return 'failed';
+  // V160-008: unreadable pending metadata is 'corrupt', never 'current'.
+  let pending;
+  try { pending = _readPendingSyncRecord(key); }
+  catch { return 'corrupt'; }
+  if (!pending) return 'current';
+  if (_syncDeliveryChains.has(key)) return 'delivering';
+  return 'pending';
+}
+
+// Every data set that is not known-delivered. Names only — never contents.
+function _unsyncedSyncKeys() {
+  return getSyncKeys().filter(key => _syncKeyStatus(key) !== 'current');
+}
+
 async function _flushSyncDeliveries(keys = null) {
   const wanted = keys ? new Set(keys) : null;
-  const targets = getSyncKeys().filter(key =>
-    (!wanted || wanted.has(key)) && !!_readPendingSyncRecord(key)
-  );
+  // V160-008: a quarantined key must be reported even when it has NO pending
+  // record. Building targets from pending records alone let a quarantined key
+  // with nothing queued pass the flush as a success.
+  const targets = getSyncKeys().filter(key => {
+    if (wanted && !wanted.has(key)) return false;
+    if (_syncBootstrapFailedKeys.has(key)) return true;
+    if (_syncRecoveryRequiredKeys.has(key)) return true;
+    if (_syncDeliveryErrors.has(key)) return true;
+    try { return !!_readPendingSyncRecord(key); }
+    catch { return true; } // unreadable pending state is not "nothing to do"
+  });
   const deliveries = targets.map(key => _scheduleSyncDrain(key));
   if (deliveries.length) await Promise.allSettled(deliveries);
   const errors = [..._syncDeliveryErrors.entries()]
     .filter(([key]) => !wanted || wanted.has(key));
-  if (errors.length) {
-    throw new Error(errors.map(([key, err]) => `${key}: ${err.message}`).join('; '));
-  }
+
+  // V159-003: _scheduleSyncDrain() returns false for a quarantined key, and a
+  // skipped delivery is NOT a successful one — the pending record is still
+  // sitting on this Mac only. Treating it as success is what let Save All,
+  // Force Sync, and the sync badge claim data had reached Firebase when it had
+  // not. Report every undelivered key explicitly instead.
+  const quarantined = targets.filter(key => _syncBootstrapFailedKeys.has(key));
+  const recovery = targets.filter(key =>
+    !_syncBootstrapFailedKeys.has(key) && _syncRecoveryRequiredKeys.has(key));
+  const stillPending = targets.filter(key =>
+    !_syncBootstrapFailedKeys.has(key) &&
+    !_syncRecoveryRequiredKeys.has(key) &&
+    !_syncDeliveryErrors.has(key) &&
+    !!_readPendingSyncRecord(key)
+  );
+  const problems = [
+    ...errors.map(([key, err]) => `${key}: ${err.message}`),
+    ...quarantined.map(key =>
+      `${key}: quarantined after a failed cloud bootstrap — the local copy is preserved but has NOT been delivered to Firebase`),
+    ...recovery.map(key =>
+      `${key}: held for recovery — this Mac has an unsent copy that was created before it saw the cloud, and delivering it could overwrite real data. Choose Use Cloud or Keep This Mac.`),
+    ...stillPending.map(key => `${key}: still pending delivery to Firebase`),
+  ];
+  if (problems.length) throw new Error(problems.join('; '));
   return true;
 }
 
@@ -3567,6 +3641,91 @@ async function _commitEncryptedSnapshot(k, serialized, snapshot, options = {}) {
     }
     throw commitError;
   }
+}
+
+// V159-002: the authoritative base for a local edit is the value most recently
+// committed for that key — including a remote reconciliation that landed while
+// the edit was queued. Read inside the per-key lock, never before it.
+function _readSyncMutationBase(k, fallback = null) {
+  if (_durableStoreSnapshots.has(k)) return _cloneJson(_durableStoreSnapshots.get(k));
+  if (k in _decCache) return _cloneJson(_decCache[k]);
+  return fallback === null ? null : _cloneJson(fallback);
+}
+
+// V159-002: queue the *operation*, not a precomputed whole-value snapshot.
+// `mutator` receives the reconciled base and returns the next value. Because it
+// runs inside _serializeKeyMutation, a concurrent remote reconcile that commits
+// first is visible to it, so unrelated remote edits survive instead of being
+// silently overwritten by a stale snapshot.
+function _queueEncryptedMutation(k, mutator, options = {}) {
+  const {
+    sync = true,
+    preserveTimestamp = false,
+    operationId = sync && isSyncKey(k) ? _newOperationId() : null,
+    fallbackBase = null,
+  } = options;
+  if (typeof mutator !== 'function') {
+    const err = new Error(`${k} mutation requires a function`);
+    _storeWriteErrors.set(k, err);
+    const rejected = Promise.reject(err);
+    rejected.catch(() => {});
+    return rejected;
+  }
+  if (!_encKey) {
+    const err = new Error('Encrypted storage is locked');
+    _storeWriteErrors.set(k, err);
+    const rejected = Promise.reject(err);
+    rejected.catch(() => {});
+    return rejected;
+  }
+
+  const optimisticToken = {};
+  // Best-effort optimistic value so the UI updates immediately. The durable
+  // value is always recomputed from the reconciled base inside the lock.
+  try {
+    const preview = mutator(_readSyncMutationBase(k, fallbackBase));
+    _optimisticStoreValues.set(k, { token: optimisticToken, value: _cloneJson(preview) });
+  } catch (_) {
+    // A mutator that cannot run against the current base will report the real
+    // error from the locked run below.
+  }
+
+  const write = _serializeKeyMutation(k, async () => {
+    let snapshot = mutator(_readSyncMutationBase(k, fallbackBase));
+    let serialized = JSON.stringify(snapshot);
+    if (serialized === undefined) throw new Error('value is not JSON serializable');
+    snapshot = JSON.parse(serialized);
+    if (sync && isSyncKey(k)) {
+      snapshot = _normalizeSyncValue(k, snapshot);
+      serialized = JSON.stringify(snapshot);
+    }
+    await _commitEncryptedSnapshot(k, serialized, snapshot, {
+      sync,
+      preserveTimestamp,
+      operationId,
+    });
+    const optimistic = _optimisticStoreValues.get(k);
+    if (optimistic?.token === optimisticToken) {
+      _optimisticStoreValues.delete(k);
+    }
+    if (sync && isSyncKey(k) && _syncReady && _syncBootstrapComplete) {
+      _scheduleSyncDrain(k).catch(() => {});
+    }
+    return true;
+  }).catch(err => {
+    const optimistic = _optimisticStoreValues.get(k);
+    if (optimistic?.token === optimisticToken) _optimisticStoreValues.delete(k);
+    _storeWriteErrors.set(k, err);
+    throw err;
+  });
+
+  _storeWriteChains.set(k, write);
+  write.then(
+    () => { if (_storeWriteChains.get(k) === write) _storeWriteChains.delete(k); },
+    () => { if (_storeWriteChains.get(k) === write) _storeWriteChains.delete(k); },
+  );
+  write.catch(() => {});
+  return write;
 }
 
 function _queueEncryptedWrite(k, value, options = {}) {
@@ -3686,6 +3845,44 @@ const STORE = {
     const operationId = isSyncKey(k) ? _newOperationId() : null;
     return _queueEncryptedWrite(k, v, { operationId });
   },
+  // V159-002: preferred API for every synchronized whole-array/whole-object key.
+  // `mutator(current)` runs inside the per-key lock against the reconciled base,
+  // so a concurrent remote change is merged rather than silently overwritten.
+  // Prefer this over set() for logs, notes, todos, tasks, receipts, and similar.
+  mutate: (k, mutator, def = null) => {
+    if (SHARED_KEYS.has(k)) {
+      try {
+        SHARED.set(k, mutator(SHARED.get(k, def)));
+        _storeWriteErrors.delete(k);
+        return Promise.resolve(true);
+      } catch (err) {
+        _storeWriteErrors.set(k, err);
+        const rejected = Promise.reject(err);
+        rejected.catch(() => {});
+        return rejected;
+      }
+    }
+    if (!_encKey) {
+      const err = new Error('Data is locked; sign in as the owner before saving');
+      _storeWriteErrors.set(k, err);
+      console.warn('[storage] refused mutation while locked:', k);
+      const rejected = Promise.reject(err);
+      rejected.catch(() => {});
+      return rejected;
+    }
+    if (_syncResolutionKeys.has(k)) {
+      const err = new Error(`${k} is being reconciled with cloud; retry this change in a moment`);
+      _storeWriteErrors.set(k, err);
+      const rejected = Promise.reject(err);
+      rejected.catch(() => {});
+      return rejected;
+    }
+    const operationId = isSyncKey(k) ? _newOperationId() : null;
+    return _queueEncryptedMutation(k, current => mutator(current ?? def), {
+      operationId,
+      fallbackBase: def,
+    });
+  },
   flush: async (keys = null, options = {}) => {
     const { includeSync = false, requireSync = false } = options;
     const wanted = keys ? new Set(keys) : null;
@@ -3769,6 +3966,249 @@ let _syncConfigured = false;
 // Keys quarantined during bootstrap (MB-009). Their remote data is preserved;
 // sync drain is skipped for these keys until a recovery action is taken.
 const _syncBootstrapFailedKeys = new Set();
+
+// V159-003/V159-009: quarantine must survive a restart. An in-memory-only set
+// meant that relaunching the app silently cleared the "this data set is NOT in
+// the cloud" state, and the next bootstrap could re-run against the same bad
+// data with the user believing everything was fine.
+const SYNC_QUARANTINE_STORAGE_KEY = 'tmb_sync_quarantine_v1';
+const MAX_QUARANTINE_REASON_CHARS = 500;
+
+function _loadSyncQuarantineState() {
+  let raw;
+  try { raw = localStorage.getItem(SYNC_QUARANTINE_STORAGE_KEY); }
+  catch { return {}; }
+  if (!raw) return {};
+  let parsed;
+  try { parsed = JSON.parse(raw); }
+  catch { return {}; }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+  const valid = {};
+  for (const [key, entry] of Object.entries(parsed)) {
+    if (!isSyncKey(key) || !entry || typeof entry !== 'object') continue;
+    const reason = typeof entry.reason === 'string'
+      ? entry.reason.slice(0, MAX_QUARANTINE_REASON_CHARS) : '';
+    const at = typeof entry.at === 'string' ? entry.at : '';
+    valid[key] = { reason, at };
+  }
+  return valid;
+}
+
+function _saveSyncQuarantineState(state) {
+  try {
+    if (!state || !Object.keys(state).length) {
+      localStorage.removeItem(SYNC_QUARANTINE_STORAGE_KEY);
+      return;
+    }
+    localStorage.setItem(SYNC_QUARANTINE_STORAGE_KEY, JSON.stringify(state));
+  } catch (err) {
+    // V160-009: the caller must not silently assume durable quarantine exists.
+    // We keep the in-memory hold (safe for this session) but tell the user that
+    // restart safety is not guaranteed.
+    console.warn('[sync] could not persist quarantine state:', err?.message || err);
+    try {
+      showToast(
+        'This Mac could not durably record which data is unsynchronized. Do not quit or update until cloud sync is healthy.',
+        'danger'
+      );
+    } catch (_) {}
+  }
+}
+
+// Reasons never contain record contents — only the failure message.
+function _quarantineSyncKey(key, reason) {
+  _syncBootstrapFailedKeys.add(key);
+  const state = _loadSyncQuarantineState();
+  state[key] = {
+    reason: String(reason || 'Cloud data could not be loaded').slice(0, MAX_QUARANTINE_REASON_CHARS),
+    at: new Date().toISOString(),
+  };
+  _saveSyncQuarantineState(state);
+}
+
+function _clearSyncKeyQuarantine(key) {
+  _syncBootstrapFailedKeys.delete(key);
+  const state = _loadSyncQuarantineState();
+  if (key in state) {
+    delete state[key];
+    _saveSyncQuarantineState(state);
+  }
+}
+
+// Called during startup, before any drain, so a quarantined key cannot be
+// delivered just because the process restarted.
+function _restoreSyncQuarantineState() {
+  const state = _loadSyncQuarantineState();
+  for (const key of Object.keys(state)) _syncBootstrapFailedKeys.add(key);
+  return state;
+}
+
+function _quarantinedSyncKeys() {
+  return getSyncKeys().filter(key => _syncBootstrapFailedKeys.has(key));
+}
+
+// ─── V160-003: poisoned-client recovery ──────────────────────────────────────
+//
+// A Mac that ran v1.1.59 can hold a durable pending record created BEFORE it
+// ever saw the cloud (MB-001). Such a record has baseRevision 0. A legacy remote
+// document has no `revision` field, so syncPush's transaction also reads
+// current = 0. The CAS check `current !== expectedRevision` therefore PASSES and
+// the pending value replaces the real workbook as schemaVersion 2 revision 1.
+//
+// Ordinary CAS cannot distinguish that from a legitimate legacy upgrade, so it
+// must not be relied on. Any pending record at baseRevision 0 that meets an
+// existing remote document is held for explicit user resolution.
+const SYNC_RECOVERY_STORAGE_KEY = 'tmb_sync_recovery_v1';
+const _syncRecoveryRequiredKeys = new Set();
+
+function _loadSyncRecoveryState() {
+  let raw;
+  try { raw = localStorage.getItem(SYNC_RECOVERY_STORAGE_KEY); }
+  catch { return {}; }
+  if (!raw) return {};
+  let parsed;
+  try { parsed = JSON.parse(raw); }
+  catch { return {}; }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+  const valid = {};
+  for (const [key, entry] of Object.entries(parsed)) {
+    if (!isSyncKey(key) || !entry || typeof entry !== 'object') continue;
+    valid[key] = {
+      kind: entry.kind === 'poisoned-default' ? 'poisoned-default' : 'unverified-local',
+      remoteRevision: Number.isSafeInteger(entry.remoteRevision) ? entry.remoteRevision : 0,
+      remoteKind: typeof entry.remoteKind === 'string' ? entry.remoteKind.slice(0, 32) : '',
+      at: typeof entry.at === 'string' ? entry.at : '',
+    };
+  }
+  return valid;
+}
+
+function _saveSyncRecoveryState(state) {
+  if (!state || !Object.keys(state).length) {
+    localStorage.removeItem(SYNC_RECOVERY_STORAGE_KEY);
+    return;
+  }
+  localStorage.setItem(SYNC_RECOVERY_STORAGE_KEY, JSON.stringify(state));
+}
+
+// Persist BEFORE marking in memory. If persistence fails we must not report a
+// durable hold that would not survive a restart — fail closed by throwing.
+function _markSyncRecoveryRequired(key, kind, remoteRevision, remoteKind) {
+  const state = _loadSyncRecoveryState();
+  state[key] = {
+    kind,
+    remoteRevision: Number.isSafeInteger(remoteRevision) ? remoteRevision : 0,
+    remoteKind: String(remoteKind || '').slice(0, 32),
+    at: new Date().toISOString(),
+  };
+  _saveSyncRecoveryState(state);
+  _syncRecoveryRequiredKeys.add(key);
+}
+
+function _clearSyncRecoveryRequired(key) {
+  _syncRecoveryRequiredKeys.delete(key);
+  const state = _loadSyncRecoveryState();
+  if (key in state) {
+    delete state[key];
+    _saveSyncRecoveryState(state);
+  }
+}
+
+function _restoreSyncRecoveryState() {
+  const state = _loadSyncRecoveryState();
+  for (const key of Object.keys(state)) _syncRecoveryRequiredKeys.add(key);
+  return state;
+}
+
+function _recoveryRequiredSyncKeys() {
+  return getSyncKeys().filter(key => _syncRecoveryRequiredKeys.has(key));
+}
+
+// Exact match against a freshly generated default workbook. ssCreateDefaultData()
+// is fully deterministic (fixed project id `proj_1`, seven named day sheets), so
+// the pristine MB-001 poison value compares equal.
+function _isDefaultWorkbookSnapshot(workbook) {
+  try {
+    const pristine = normalizeSpreadsheetWorkbook(ssCreateDefaultData());
+    return JSON.stringify(normalizeSpreadsheetWorkbook(workbook)) === JSON.stringify(pristine);
+  } catch (_) {
+    return false;
+  }
+}
+
+// Decide whether a pending record may drain against this remote document.
+// Returns null when delivery is safe, otherwise the recovery kind.
+async function _classifyPendingAgainstRemote(key, snap, pending) {
+  if (!pending || !snap?.exists) return null;
+  // A pending record derived from a revision we actually observed is safe:
+  // ordinary CAS will detect any divergence.
+  if (pending.baseRevision !== 0) return null;
+  const remote = snap.data();
+  if (!remote || remote.value === undefined || remote.value === null) return null;
+
+  let remoteKind;
+  try { remoteKind = _syncDocumentKind(remote); }
+  catch { return 'unverified-local'; }
+  const remoteRevision = Number.isSafeInteger(remote.revision) && remote.revision >= 0
+    ? remote.revision : 0;
+  // A versioned remote at revision >= 1 is protected by CAS: expectedRevision 0
+  // will not match, so a conflict is raised normally.
+  if (remoteKind === 'versioned' && remoteRevision >= 1) return null;
+
+  // Legacy remote (effective revision 0) versus a local record that never saw
+  // the cloud. This is the destructive case.
+  if (key === 'spreadsheets') {
+    try {
+      const plaintext = await _aesDecrypt(pending.localCiphertext);
+      if (plaintext !== null && _isDefaultWorkbookSnapshot(JSON.parse(plaintext))) {
+        return 'poisoned-default';
+      }
+    } catch (_) {
+      // Undecidable — hold it rather than risk delivering over real data.
+      return 'unverified-local';
+    }
+  }
+  return 'unverified-local';
+}
+
+// V159-001: an explicit remote-authority lifecycle. A single boolean conflated
+// "not checked yet", "connecting", "auth failed", "staff was denied the runtime
+// credential", and "genuinely not configured" — and every one of those states
+// was treated as "there is no remote workbook", which let a fresh device queue
+// an empty default over real cloud data. Only two states below mean absence.
+//
+//   unknown            nothing has been checked yet
+//   checking           reading stored credentials
+//   unconfigured       authoritatively confirmed: Firebase is not set up
+//   connecting         credentials found, SDK loading
+//   authenticating     signing in
+//   bootstrapping      authenticated, initial fetch in progress
+//   ready-present      bootstrap done, remote documents exist
+//   ready-absent       bootstrap done, remote authoritatively absent
+//   error              network/auth failure, remote state unknown
+//   credential-denied  staff cold start without the owner runtime credential
+//   quarantined        incompatible remote data, recovery required
+let _remoteAuthority = 'unknown';
+// Per-key remote document presence, recorded during bootstrap.
+const _remoteDocPresence = new Map();
+
+function _setRemoteAuthority(state) {
+  _remoteAuthority = state;
+}
+
+// The only question ssLoad() may ask before writing a default workbook.
+function _remoteStateIsAuthoritativelyAbsent(key) {
+  // Incompatible remote data is not absent data; it needs recovery.
+  if (key && _syncBootstrapFailedKeys.has(key)) return false;
+  if (_remoteAuthority === 'unconfigured') return true;
+  if (_remoteAuthority === 'ready-absent') return true;
+  if (_remoteAuthority === 'ready-present') {
+    // Bootstrap completed and other data sets exist, but this specific
+    // document was authoritatively observed to be missing.
+    return key ? _remoteDocPresence.get(key) === false : false;
+  }
+  return false;
+}
 const _firebaseSecretCache = Object.create(null);
 let _firebaseHasStoredPassword = false;
 let _portablePinStale = false;
@@ -4183,15 +4623,43 @@ function setSyncStatus(state) {
     live:       { dot: '#4a7c59', label: '☁ Synced',     bg: '#edf7f1',            show: true  },
     error:      { dot: '#c0392b', label: 'Sync error',   bg: '#fdf0f0',            show: true  },
   };
-  const s = styles[state] || styles.off;
+  let s = styles[state] || styles.off;
+  // V159-003: never display "Synced" while any data set is pending, delivering,
+  // conflicted, quarantined, or failed. Show the count, never the contents.
+  if (state === 'live') {
+    // V160-008: fail CLOSED. A corrupt pending record makes
+    // _readPendingSyncRecord() throw; substituting an empty list here would
+    // display "Synced" over unknown state. Treat any failure as not-synced.
+    let unsynced = [];
+    try { unsynced = _unsyncedSyncKeys(); }
+    catch (_) { unsynced = ['unknown']; }
+    if (unsynced.length) {
+      s = {
+        dot: '#c4922a',
+        label: `⚠ ${unsynced.length} not synced`,
+        bg: '#fff8ec',
+        show: true,
+      };
+      if (chip.title !== undefined) {
+        chip.title = 'Not yet in Firebase: ' + unsynced.join(', ');
+      }
+    } else if (chip.title !== undefined) {
+      chip.title = '';
+    }
+  }
   chip.style.display = s.show ? 'flex' : 'none';
   chip.style.background = s.bg;
   if (dot) dot.style.background = s.dot;
   if (label) label.textContent = s.label;
 
   if (badge) {
-    badge.className = 'api-status ' + (state === 'live' ? 'connected' : state === 'error' ? 'disconnected' : '');
-    badge.innerHTML = `<div class="api-status-dot"></div><span>${state === 'live' ? 'Connected' : state === 'error' ? 'Error' : 'Not connected'}</span>`;
+    // V159-003: "Connected" must not imply "everything is in the cloud".
+    const partial = state === 'live' && s.label !== '☁ Synced';
+    const text = state === 'live'
+      ? (partial ? 'Connected — some data not synced' : 'Connected')
+      : state === 'error' ? 'Error' : 'Not connected';
+    badge.className = 'api-status ' + (partial ? '' : state === 'live' ? 'connected' : state === 'error' ? 'disconnected' : '');
+    badge.innerHTML = `<div class="api-status-dot"></div><span>${escHtml(text)}</span>`;
   }
 
   const forceBtn = document.getElementById('sync-force-btn');
@@ -4204,6 +4672,7 @@ async function initFirebase() {
   // Staff can reuse the already-authenticated Firebase session established
   // during the required owner unlock, but cannot retrieve the saved password.
   if (!isElizabeth() && _syncReady && _firestoreDb && _firebaseAuth?.currentUser) return true;
+  _setRemoteAuthority('checking');
   await _loadFirebaseSecrets({ includePassword: true });
   const apiKey     = _firebaseSecret('firebase_api_key');
   const projectId  = _firebaseSecret('firebase_project_id');
@@ -4211,13 +4680,29 @@ async function initFirebase() {
   const email      = _firebaseSecret('firebase_email');
   let password     = _firebaseSecret('firebase_password');
   if (!apiKey || !projectId || !email || !password) {
+    // V159-001/V159-004: distinguish "Firebase is genuinely not set up" from
+    // "this staff renderer was denied the owner-only runtime credential".
+    // Only the former means there is no remote data to preserve.
+    const configured = !!(apiKey && projectId && email);
+    if (configured && !password) {
+      // The studio is configured; this process simply cannot authenticate.
+      // Remote state is unknown — never treat it as absent.
+      _setRemoteAuthority(isElizabeth() ? 'error' : 'credential-denied');
+    } else {
+      _setRemoteAuthority('unconfigured');
+    }
     setSyncStatus('off');
+    // H-01: the early return for unconfigured/credential-denied must release
+    // the spreadsheet authority hold so that ssLoad() isn't stuck waiting
+    // for a Firebase connection that will never arrive.
+    try { _reevaluateSpreadsheetAuthority(); } catch (_) {}
     return false;
   }
 
   // Credentials confirmed — mark sync as configured so ssLoad() knows not to push
   // an empty default workbook while the connection is in progress.
   _syncConfigured = true;
+  _setRemoteAuthority('connecting');
   setSyncStatus('connecting');
 
   // Wait up to 3s for Firebase SDK to finish loading
@@ -4261,6 +4746,7 @@ async function initFirebase() {
     }
 
     _firebaseAuth = firebase.auth(_firebaseApp);
+    _setRemoteAuthority('authenticating');
     const credential = await _firebaseAuth.signInWithEmailAndPassword(email, password);
     password = '';
     if (!credential?.user?.uid) throw new Error('Firebase authentication did not return a user');
@@ -4272,9 +4758,17 @@ async function initFirebase() {
     await _resumePendingPinRotation({ includeFirebase: true, includeCloud: false });
     await _prepareSyncEncryption();
     _syncReady = true;
+    _setRemoteAuthority('bootstrapping');
     await _bootstrapSync();
+    // V159-001: only now is remote presence authoritatively known.
+    _setRemoteAuthority(
+      [..._remoteDocPresence.values()].some(Boolean) ? 'ready-present' : 'ready-absent'
+    );
     subscribeToSync();
     _syncBootstrapComplete = true;
+    // V160-002: remote authority is now known one way or the other; release the
+    // spreadsheet read-only hold in whichever direction is authoritative.
+    try { _reevaluateSpreadsheetAuthority(); } catch (_) {}
     try {
       await _drainPendingSyncWrites();
       setSyncStatus(_portablePinStale ? 'error' : 'live');
@@ -4289,7 +4783,11 @@ async function initFirebase() {
     _syncReady = false;
     _syncBootstrapComplete = false;
     _syncConfigured = false;
-    _syncBootstrapFailedKeys.clear();
+    // V159-003/009: reassert durable quarantine rather than clearing it.
+    _restoreSyncQuarantineState();
+    // V159-001: a failure leaves remote state unknown, never "absent".
+    _remoteDocPresence.clear();
+    _setRemoteAuthority('error');
     setSyncStatus('error');
     const uidEl = document.getElementById('firebase-auth-uid');
     if (uidEl) uidEl.textContent = 'Sync connection failed: ' + (e?.message || String(e));
@@ -4370,6 +4868,17 @@ async function syncPush(key, value, options = {}) {
     console.warn('Sync push error for', key, e?.message || e);
     throw e;
   }
+}
+
+// V160-001: stable, collision-resistant record identity. `Date.now()` alone
+// collides across devices within a single millisecond, so two Macs can create
+// records that merge logic cannot tell apart. Generate this ONCE, outside any
+// mutator, so a re-run of the mutator against a newer base reuses the same id
+// and stays idempotent.
+function _newRecordId() {
+  return 'r_' + Date.now().toString(36) + '_' +
+    _bytesToB64(crypto.getRandomValues(new Uint8Array(9)))
+      .replace(/[^A-Za-z0-9]/g, '').slice(0, 12);
 }
 
 function _newOperationId() {
@@ -4454,7 +4963,11 @@ function _refreshForSyncKey(key, value) {
       // typing. The per-key write queue still persists that remote value first,
       // but it must not replace the dirty workbook currently shown in the UI.
       if (!_ssDirtyWorkbook) _ssData = normalizeSpreadsheetWorkbook(value);
-      if (document.getElementById('page-spreadsheets')?.classList.contains('active') && !_ssEditCell) ssRender();
+      // V160-002: a real workbook has arrived, so the read-only hold is over.
+      // H-01: use ssGoHome() so the "Checking the cloud" card is replaced on
+      // arrival; ssRender() only refreshes the inner grid, not the home card.
+      _ssAwaitingAuthority = false;
+      if (document.getElementById('page-spreadsheets')?.classList.contains('active') && !_ssEditCell) ssGoHome();
     } catch {}
   }
   if (key === 'step_up_receipts') {
@@ -4531,10 +5044,47 @@ async function _reconcileRemoteSnapshot(key, snap) {
 }
 
 async function _bootstrapSync() {
+  // V159-003/009: reassert quarantine recorded before the last restart, so a
+  // relaunch cannot deliver a data set that was never safe to deliver.
+  _restoreSyncQuarantineState();
+  // V160-003: a hold recorded before the last restart still applies.
+  _restoreSyncRecoveryState();
   const results = await Promise.allSettled(getSyncKeys().map(async key => {
     await _serializeKeyReconcile(key, async () => {
       const ref = studioRef().collection('data').doc(key);
       const snap = await ref.get();
+      // V159-001: record authoritative per-key remote presence.
+      _remoteDocPresence.set(key, !!snap.exists);
+
+      // V160-003: decide BEFORE reconciliation whether this Mac's unsent copy
+      // may ever be delivered against this remote document.
+      const pendingBefore = (() => {
+        try { return _readPendingSyncRecord(key); } catch { return null; }
+      })();
+      const recoveryKind = await _classifyPendingAgainstRemote(key, snap, pendingBefore);
+      if (recoveryKind) {
+        const remote = snap.data() || {};
+        let remoteKind = 'unknown';
+        try { remoteKind = _syncDocumentKind(remote); } catch (_) {}
+        _markSyncRecoveryRequired(
+          key, recoveryKind,
+          Number.isSafeInteger(remote.revision) ? remote.revision : 0,
+          remoteKind
+        );
+        // Surface through the existing conflict UI, which already preserves
+        // both encrypted copies before either side is applied.
+        const err = new SyncConflictError(key, pendingBefore.baseRevision, 0);
+        _syncDeliveryErrors.set(key, err);
+        _surfaceSyncDeliveryError(key, err);
+        showToast(
+          recoveryKind === 'poisoned-default'
+            ? `This Mac has an empty default ${key} workbook that was created before it reached the cloud. It was NOT uploaded. Choose Use Cloud or Keep This Mac in Settings.`
+            : `This Mac has an unsent ${key} copy created before it reached the cloud. It was NOT uploaded. Choose Use Cloud or Keep This Mac in Settings.`,
+          'warning'
+        );
+        _updateSyncConflictActions();
+        return;
+      }
       const reconciled = await _reconcileRemoteSnapshot(key, snap);
       if (!snap.exists && Object.prototype.hasOwnProperty.call(_decCache, key)) {
         _ensureCurrentValuePending(key);
@@ -4543,6 +5093,13 @@ async function _bootstrapSync() {
         const err = new SyncConflictError(key, _localSyncRevision(key), Number(snap.data()?.revision || 0));
         _syncDeliveryErrors.set(key, err);
         _surfaceSyncDeliveryError(key, err);
+      }
+      // V159-009/V160-006: clear a previously recorded quarantine only after
+      // the current remote record has actually been decoded and validated.
+      // Reconciliation alone is not proof — it skips decoding when a local
+      // pending record exists.
+      if (!_syncBootstrapFailedKeys.has(key) || await _remoteRecordIsValid(key, snap)) {
+        _clearSyncKeyQuarantine(key);
       }
     });
   }));
@@ -4556,8 +5113,12 @@ async function _bootstrapSync() {
     .filter(({ result }) => result.status === 'rejected');
 
   for (const { key, result } of failures) {
-    _syncBootstrapFailedKeys.add(key);
     const msg = result.reason?.message || String(result.reason);
+    // V159-003/009: record durably so a restart cannot silently un-quarantine.
+    _quarantineSyncKey(key, msg);
+    // V159-001: a key that failed bootstrap has unknown remote state. Clear any
+    // presence guess so it can never be read as authoritative absence.
+    _remoteDocPresence.delete(key);
     console.warn(`[bootstrap] Quarantined key "${key}" due to sync error: ${msg}`);
     // Surface a user-visible warning without printing record contents.
     if (key === 'spreadsheets') {
@@ -4572,6 +5133,9 @@ async function _bootstrapSync() {
       );
     }
   }
+  // H-05: surface recovery controls immediately after quarantining during
+  // bootstrap — don't wait for an unrelated action to refresh the panel.
+  if (failures.length) try { _updateSyncConflictActions(); } catch (_) {}
 
   // Only throw if ALL keys failed (total sync failure), not for partial failures.
   if (failures.length === getSyncKeys().length) {
@@ -4594,6 +5158,17 @@ async function saveAllData() {
     }
     const pendingCount = keys.filter(key => !!_readPendingSyncRecord(key)).length;
     await STORE.flush(keys, { includeSync: true, requireSync: true });
+    // V159-003: verify after the flush. A quarantined or still-pending key must
+    // never be reported as saved to the cloud.
+    const unsynced = _unsyncedSyncKeys();
+    if (unsynced.length) {
+      if (btn) btn.textContent = '💾 Partial';
+      showToast(
+        `Encrypted local save complete, but ${unsynced.length} data set(s) are NOT in Firebase: ${unsynced.join(', ')}.`,
+        'warning'
+      );
+      return;
+    }
     if (btn) btn.textContent = '💾 Saved ✓';
     showToast(
       `Encrypted local save complete; Firebase acknowledged ${pendingCount} pending write(s), and ${keys.length} data set(s) are current.`,
@@ -4614,6 +5189,9 @@ function subscribeToSync() {
   _syncUnsubs = [];
 
   getSyncKeys().forEach(key => {
+    // V159-009: a quarantined key must not receive live snapshots. Its local and
+    // remote copies stay frozen until an explicit recovery action runs.
+    if (_syncBootstrapFailedKeys.has(key)) return;
     const unsub = studioRef().collection('data').doc(key)
       .onSnapshot(snap => {
         _serializeKeyReconcile(key, async () => {
@@ -4630,9 +5208,15 @@ function subscribeToSync() {
             _scheduleSyncDrain(key).catch(() => {});
           }
         }).catch(err => {
-          console.warn('Sync value rejected for', key, err?.message || err);
+          const msg = err?.message || String(err);
+          console.warn('Sync value rejected for', key, msg);
+          // H-05: durably quarantine so a restart or loadSettings() cannot
+          // later report the key as synced. Also surface the recovery panel.
+          _quarantineSyncKey(key, msg);
+          _remoteDocPresence.delete(key);
           setSyncStatus('error');
           showToast(`Cloud data for ${key} was rejected and local data was preserved.`, 'warning');
+          _updateSyncConflictActions();
         });
       }, err => {
         console.warn('Sync listener error:', err);
@@ -4660,6 +5244,18 @@ async function forceSyncNow() {
     const keys = getSyncKeys().filter(key => Object.prototype.hasOwnProperty.call(_decCache, key));
     const pendingCount = keys.filter(key => !!_readPendingSyncRecord(key)).length;
     await STORE.flush(keys, { includeSync: true, requireSync: true });
+    // V159-003/V160-008: verify across EVERY sync key, not just those already in
+    // _decCache. On a fresh device an invalid remote spreadsheet is quarantined
+    // with no local cache entry, and filtering by _decCache hid it entirely.
+    const unsynced = _unsyncedSyncKeys();
+    if (unsynced.length) {
+      showToast(
+        `Sync incomplete — ${unsynced.length} data set(s) are NOT in Firebase: ${unsynced.join(', ')}. Local copies are preserved.`,
+        'warning'
+      );
+      setSyncStatus('live');
+      return false;
+    }
     showToast(`Firebase acknowledged ${pendingCount} pending write(s); ${keys.length} data set(s) are current.`, 'success');
     updateSyncTimestamp();
     return true;
@@ -4751,6 +5347,178 @@ function _pruneSyncConflictBackups(keepKeys) {
   obsolete.forEach(key => localStorage.removeItem(key));
 }
 
+// V159-009: export the exact local and remote copies of a quarantined data set
+// before any recovery attempt, so neither can be lost by the repair itself.
+// V160-006: quarantine may only clear after the CURRENT remote record has been
+// decrypted, parsed, and normalized. _reconcileRemoteSnapshot() returns early
+// (without decoding) whenever a local pending record exists, so treating its
+// non-throwing return as proof of recovery cleared quarantine on data that was
+// never validated. This validates independently of pending state.
+async function _remoteRecordIsValid(key, snap) {
+  if (!snap?.exists) return true; // an absent remote cannot be incompatible
+  const remote = snap.data();
+  if (!remote || remote.value === undefined || remote.value === null) return false;
+  try {
+    // _syncDocumentKind throws on an unsupported schema; _decodeSyncValue takes
+    // the ENVELOPE (remote.value), not the whole document, and already applies
+    // _normalizeSyncValue to the decoded payload.
+    _syncDocumentKind(remote);
+    const decoded = await _decodeSyncValue(key, remote.value);
+    return decoded !== undefined;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function exportQuarantinedSyncKey(key) {
+  // V160-003: also serves "Export Both" for a key held for poisoned-client
+  // recovery, so the operator can keep the exact local AND remote copies before
+  // choosing a side.
+  if (!_syncBootstrapFailedKeys.has(key) && !_syncRecoveryRequiredKeys.has(key)) {
+    showToast(`${key} is not quarantined or held for recovery.`, 'warning');
+    return false;
+  }
+  if (!window.electronSpreadsheet?.exportRecovery) {
+    showToast('Recovery export is unavailable in this build.', 'danger');
+    return false;
+  }
+  const quarantine = _loadSyncQuarantineState()[key] || {};
+  const recovery = _loadSyncRecoveryState()[key] || null;
+  const bundle = {
+    schema: 'music-box-quarantine-export/1',
+    key,
+    recoveryHold: recovery,
+    exportedAt: new Date().toISOString(),
+    quarantinedAt: quarantine.at || null,
+    reason: quarantine.reason || null,
+    localRevision: _localSyncRevision(key),
+    // Ciphertext only. Plaintext is never written to disk by this path.
+    localCiphertext: localStorage.getItem('tmb_' + key) || null,
+    pendingRecord: (() => {
+      try { return _readPendingSyncRecord(key); } catch { return 'unreadable'; }
+    })(),
+    remoteRecord: null,
+    remoteExists: null,
+    remoteKind: null,
+    containsPlaintext: false,
+  };
+  // V160-007: export the COMPLETE remote record. The previous version looked for
+  // a string `data.value`, but current schema-v2 documents are envelopes keyed
+  // on `ciphertext` — so every healthy remote exported as null while the UI
+  // reported success. Store the whole document verbatim instead of guessing a
+  // field, and flag legacy plaintext explicitly.
+  try {
+    if (_syncReady && _firestoreDb) {
+      const snap = await studioRef().collection('data').doc(key).get();
+      bundle.remoteExists = !!snap.exists;
+      if (snap.exists) {
+        const data = snap.data() || {};
+        // H-06: classify/label the remote record BEFORE assigning it to the
+        // bundle. If _syncDocumentKind() throws (malformed/unexpected schema),
+        // containsPlaintext must be set to true (unknown = treat as plaintext)
+        // so the export file is never falsely labeled as encrypted-only.
+        let remoteKind;
+        try {
+          remoteKind = _syncDocumentKind(data);
+        } catch (_) {
+          remoteKind = 'unknown';
+        }
+        bundle.remoteKind = remoteKind;
+        // A legacy document stores the value unencrypted; an unknown/malformed
+        // document may also contain plaintext — label both conservatively.
+        bundle.containsPlaintext = remoteKind === 'legacy' || remoteKind === 'unknown';
+        bundle.remoteRecord = _cloneJson(data);
+        bundle.remoteRevision = Number.isSafeInteger(data.revision) ? data.revision : 0;
+      }
+    }
+  } catch (err) {
+    bundle.remoteError = err?.message || String(err);
+  }
+  if (bundle.remoteExists === null && bundle.remoteError) {
+    showToast(
+      `Could not read the cloud copy of ${key}; exporting the local copy only.`,
+      'warning'
+    );
+  }
+  try {
+    const result = await window.electronSpreadsheet.exportRecovery(JSON.stringify(bundle, null, 2));
+    // H-06: treat cancellation as cancellation, not success. A result of
+    // {ok: true, canceled: true} previously fell through to the success path.
+    if (result?.canceled) return false;
+    if (result?.ok === false) throw new Error(result.error || 'export failed');
+    showToast(
+      bundle.containsPlaintext
+        ? `Recovery copy for ${key} exported. WARNING: it contains legacy UNENCRYPTED cloud data — store it securely and delete it when finished.`
+        : `Encrypted recovery copy for ${key} exported (local${bundle.remoteRecord ? ' and cloud' : ''}).`,
+      bundle.containsPlaintext ? 'warning' : 'success'
+    );
+    return true;
+  } catch (err) {
+    showToast(`Recovery export failed: ${err?.message || err}`, 'danger');
+    return false;
+  }
+}
+
+// V159-009: retry one quarantined key without reconnecting the whole app.
+async function retryQuarantinedSyncKey(key) {
+  if (!_syncBootstrapFailedKeys.has(key)) {
+    showToast(`${key} is not quarantined.`, 'warning');
+    return false;
+  }
+  if (!_syncReady || !_firestoreDb) {
+    showToast('Connect to cloud sync before retrying.', 'warning');
+    return false;
+  }
+  try {
+    await _serializeKeyReconcile(key, async () => {
+      const snap = await studioRef().collection('data').doc(key).get();
+      _remoteDocPresence.set(key, !!snap.exists);
+      // V160-006: validate the remote record FIRST. _reconcileRemoteSnapshot()
+      // short-circuits when a pending local record exists and would otherwise
+      // let us clear quarantine without ever decoding the bad remote data.
+      if (!await _remoteRecordIsValid(key, snap)) {
+        throw new Error('the cloud copy is still unreadable or incompatible');
+      }
+      // C-03: run the poisoned-client classifier against the freshly fetched
+      // remote BEFORE clearing quarantine. The bootstrap classifier is only
+      // called during _bootstrapSync(); without this check a revision-zero
+      // pending value can be released against a repaired legacy remote.
+      const pending = _readPendingSyncRecord(key);
+      const classification = await _classifyPendingAgainstRemote(key, snap, pending);
+      if (classification) {
+        const remoteData = snap.exists ? (snap.data() || {}) : {};
+        let remoteKind;
+        try { remoteKind = _syncDocumentKind(remoteData); } catch { remoteKind = 'unknown'; }
+        const remoteRevision = Number.isSafeInteger(remoteData.revision) && remoteData.revision >= 0
+          ? remoteData.revision : 0;
+        _markSyncRecoveryRequired(key, classification, remoteRevision, remoteKind);
+        throw new Error(
+          `local copy requires recovery before it can be delivered (${classification})`
+        );
+      }
+      await _reconcileRemoteSnapshot(key, snap);
+    });
+  } catch (err) {
+    showToast(
+      `${key} still cannot be reconciled and remains quarantined: ${err?.message || err}`,
+      'danger'
+    );
+    return false;
+  }
+  _clearSyncKeyQuarantine(key);
+  try { await _flushSyncDeliveries([key]); }
+  catch (err) {
+    showToast(`${key} recovered but is not yet delivered: ${err?.message || err}`, 'warning');
+    _updateSyncConflictActions();
+    return false;
+  }
+  subscribeToSync();
+  showToast(`${key} recovered and is now synchronized.`, 'success');
+  _updateSyncConflictActions();
+  setSyncStatus(_syncBootstrapComplete ? 'live' : 'connecting');
+  return true;
+}
+
 function _updateSyncConflictActions() {
   const wrap = document.getElementById('sync-conflict-actions');
   const summary = document.getElementById('sync-conflict-summary');
@@ -4761,6 +5529,66 @@ function _updateSyncConflictActions() {
       ? `Cloud conflict${keys.length === 1 ? '' : 's'}: ${keys.join(', ')}`
       : '';
   }
+  // V159-003/009: show which data sets are NOT in the cloud, with per-key
+  // recovery actions. Names and failure reasons only — never record contents.
+  const quarantineWrap = document.getElementById('sync-quarantine-actions');
+  if (quarantineWrap) {
+    const quarantined = _quarantinedSyncKeys();
+    quarantineWrap.style.display = quarantined.length ? '' : 'none';
+    if (quarantined.length) {
+      const state = _loadSyncQuarantineState();
+      quarantineWrap.innerHTML = `
+        <div style="font-weight:600;margin-bottom:6px">
+          ⚠ ${quarantined.length} data set(s) are NOT synchronized to the cloud
+        </div>
+        ${quarantined.map(key => `
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:6px 0">
+            <span style="flex:1;min-width:200px">
+              <strong>${escHtml(key)}</strong>
+              <span style="color:var(--text-muted);font-size:12px">
+                ${escHtml(state[key]?.reason || 'Cloud data could not be loaded')}
+              </span>
+            </span>
+            <button class="btn btn-ghost btn-sm" onclick="exportQuarantinedSyncKey('${escAttr(key)}')">Export copies</button>
+            <button class="btn btn-primary btn-sm" onclick="retryQuarantinedSyncKey('${escAttr(key)}')">Retry</button>
+          </div>
+        `).join('')}
+      `;
+    }
+  }
+
+  // V160-003: explain a poisoned-client hold above the Use Cloud / Keep This Mac
+  // buttons, so the choice is made with the consequences visible.
+  const holdWrap = document.getElementById('sync-recovery-hold');
+  if (holdWrap) {
+    const held = _recoveryRequiredSyncKeys();
+    holdWrap.style.display = held.length ? '' : 'none';
+    if (held.length) {
+      const state = _loadSyncRecoveryState();
+      holdWrap.innerHTML = `
+        <div style="font-weight:600;margin-bottom:6px">
+          ⛔ ${held.length} data set(s) are held to prevent overwriting cloud data
+        </div>
+        ${held.map(key => {
+          const entry = state[key] || {};
+          const poisoned = entry.kind === 'poisoned-default';
+          return `<div style="margin:6px 0">
+            <strong>${escHtml(key)}</strong> —
+            ${poisoned
+              ? 'this Mac created an <em>empty default</em> copy before it reached the cloud (the v1.1.59 startup defect). It has NOT been uploaded.'
+              : 'this Mac has an unsent copy created before it reached the cloud. It has NOT been uploaded.'}
+            <div style="color:var(--text-muted);font-size:11.5px;margin-top:2px">
+              Cloud copy: ${escHtml(entry.remoteKind || 'unknown')} format, revision ${escHtml(String(entry.remoteRevision ?? 0))}.
+              ${poisoned ? '<strong>Use Cloud is almost certainly correct here.</strong> Keep This Mac would replace the studio workbook with an empty one.' : ''}
+            </div>
+            <button class="btn btn-ghost btn-sm" style="margin-top:6px"
+                    onclick="exportQuarantinedSyncKey('${escAttr(key)}')">Export both copies first</button>
+          </div>`;
+        }).join('')}
+      `;
+    }
+  }
+
   const recovery = document.getElementById('sync-backup-recovery');
   const recoverySummary = document.getElementById('sync-backup-summary');
   const latest = _latestSyncConflictBackup();
@@ -4870,6 +5698,12 @@ async function resolveSyncConflictsUseCloud() {
           _acknowledgePendingSyncRecord(key, review.expectedPending.opId, review.remoteRevision);
           _syncDeliveryErrors.delete(key);
           _syncConflictNotified.delete(key);
+          // V160-003: the user has explicitly chosen; release the recovery hold.
+          _clearSyncRecoveryRequired(key);
+          // M-01: _persistRemoteValue() tried to schedule the schema migration
+          // drain above, but _scheduleSyncDrain() refused while the recovery
+          // hold was still set. Re-schedule now that the hold is cleared.
+          if (review.isLegacyRemote) _scheduleSyncDrain(key).catch(() => {});
           _refreshForSyncKey(key, review.decoded);
       }
     });
@@ -4917,6 +5751,8 @@ async function resolveSyncConflictsKeepLocal() {
           _acknowledgePendingSyncRecord(key, review.pending.opId, result.revision);
           _syncDeliveryErrors.delete(key);
           _syncConflictNotified.delete(key);
+          // V160-003: the user has explicitly chosen; release the recovery hold.
+          _clearSyncRecoveryRequired(key);
       }
     });
     _updateSyncConflictActions();
@@ -5043,7 +5879,13 @@ async function disconnectSync() {
   _syncReady = false;
   _syncBootstrapComplete = false;
   _syncConfigured = false;
-  _syncBootstrapFailedKeys.clear();
+  // V159-003/009: durable quarantine is the source of truth; reassert it
+  // instead of dropping it, so a reconnect cannot silently clear the state.
+  _restoreSyncQuarantineState();
+  // V159-001: the owner deliberately disconnected. Remote data still exists, so
+  // this is not absence — a later open must not push a default over it.
+  _remoteDocPresence.clear();
+  _setRemoteAuthority('unknown');
   try { await _firebaseAuth?.signOut(); } catch {}
   try { await _firebaseApp?.delete(); } catch {}
   _firebaseApp = null;
@@ -5601,9 +6443,17 @@ let _ssSaveTimer = null;
 let _ssSavePending = Promise.resolve(true);
 let _ssSaveGate = null;
 let _ssDirtyWorkbook = null;
+// V159-002: the durable workbook the current dirty edit session started from.
+let _ssDirtyBase = null;
 let _ssDirtyGeneration = 0;
 let _ssBlockedWorkbook = null;
 let _ssBlockedWorkbookError = '';
+// V160-002: true when the workbook on screen is a FABRICATED default shown only
+// because this Mac has no readable local copy AND remote state is still unknown.
+// Editing it would create a durable pending record at revision 0 — exactly the
+// poisoned-client condition V160-003 has to clean up afterwards. Read-only until
+// authority resolves or the user explicitly chooses to work locally.
+let _ssAwaitingAuthority = false;
 let _ssSelR = 0, _ssSelC = 0, _ssSelR2 = 0, _ssSelC2 = 0;
 let _ssIsSelecting = false;
 let _ssDragOrigin = null;   // {x, y} of mousedown — used for drag threshold
@@ -5677,6 +6527,7 @@ function ssLoad() {
   _ssData = null;
   _ssBlockedWorkbook = null;
   _ssBlockedWorkbookError = '';
+  _ssAwaitingAuthority = false;
   const stored = STORE.get('spreadsheets', null);
   if (stored !== null && stored !== undefined) {
     try {
@@ -5702,22 +6553,75 @@ function ssLoad() {
     const rawLS = localStorage.getItem('tmb_spreadsheets');
     const isEncryptedByOtherProfile = rawLS?.startsWith('E:');
     _ssData = normalizeSpreadsheetWorkbook(ssCreateDefaultData());
-    // Only push the empty default to Firebase when we have authoritatively confirmed
-    // that no remote workbook exists. Specifically:
-    //   (a) The value must not be encrypted by another profile (local-only guard), AND
-    //   (b) Either Firebase was never configured (_syncConfigured === false), meaning
-    //       there is no remote to check, OR the bootstrap has fully completed
-    //       (_syncBootstrapComplete === true), meaning the remote was fetched and
-    //       found absent (STORE.get would have returned data if it existed).
+    // V159-001: persist the empty default ONLY when the remote-authority
+    // lifecycle authoritatively reports that no remote workbook exists —
+    // meaning either Firebase is confirmed unconfigured, or bootstrap completed
+    // and observed this document to be missing.
     //
-    // The critical cases to avoid:
-    //   - _syncConfigured && !_syncBootstrapComplete: Firebase credentials exist but
-    //     we haven't finished fetching remote state. Pushing a default now creates a
-    //     pending record that blocks _reconcileRemoteSnapshot() from accepting the real
-    //     remote workbook. This is the MB-001 failure mode.
-    //   - !_syncReady alone: _syncReady is false both before credentials exist AND
-    //     while connecting, so it cannot distinguish "no Firebase" from "connecting".
-    if (!isEncryptedByOtherProfile && (!_syncConfigured || _syncBootstrapComplete)) ssSave();
+    // Every other state (not yet checked, connecting, authenticating,
+    // bootstrapping, auth/network error, staff credential denial, quarantined)
+    // leaves remote state UNKNOWN. Writing a default in any of those states
+    // creates a durable pending record that survives restarts and blocks
+    // _reconcileRemoteSnapshot() from ever accepting the real remote workbook.
+    // That is the MB-001 data-loss path.
+    if (!isEncryptedByOtherProfile && _remoteStateIsAuthoritativelyAbsent('spreadsheets')) {
+      ssSave();
+    } else {
+      // V160-002: we are showing a workbook this Mac invented. Not saving it was
+      // necessary but not sufficient — the user could still type into it, and
+      // _stageDirtySpreadsheetSave() would durably persist it at revision 0.
+      // Hold the editor read-only until we know what the cloud has.
+      _ssAwaitingAuthority = true;
+    }
+  }
+}
+
+// V160-002: called whenever the spreadsheets authority picture may have changed
+// (bootstrap finished, or a remote workbook arrived). Releases the read-only
+// hold in whichever direction is now authoritative.
+function _reevaluateSpreadsheetAuthority() {
+  if (!_ssAwaitingAuthority) return false;
+  const stored = STORE.get('spreadsheets', null);
+  if (stored !== null && stored !== undefined) {
+    // A real workbook arrived — adopt it and re-enable editing.
+    _ssAwaitingAuthority = false;
+    ssLoad();
+    // H-01: use ssGoHome() so the "Checking the cloud" home card is replaced
+    // by the workbook view, not just the tabs/grid inside it.
+    try { if (document.getElementById('page-spreadsheets')?.classList.contains('active')) ssGoHome(); } catch (_) {}
+    return true;
+  }
+  if (_remoteStateIsAuthoritativelyAbsent('spreadsheets')) {
+    // Remote is confirmed absent, so the default is now legitimate to persist.
+    _ssAwaitingAuthority = false;
+    ssSave();
+    // H-01: same — home card must refresh when absence is confirmed.
+    try { if (document.getElementById('page-spreadsheets')?.classList.contains('active')) ssGoHome(); } catch (_) {}
+    return true;
+  }
+  return false;
+}
+
+// The explicit user choice the audit requires as the third exit from the hold.
+async function ssWorkLocallyAnyway() {
+  if (!_ssAwaitingAuthority) return false;
+  if (!window.confirm(
+    'Start a new local workbook without waiting for the cloud?\n\n' +
+    'If this studio already has a workbook in the cloud, your changes will need ' +
+    'to be merged manually and may conflict. Only do this if you are sure this ' +
+    'Mac should create the workbook.'
+  )) return false;
+  _ssAwaitingAuthority = false;
+  try {
+    await ssSave();
+    showToast('Working locally. This workbook will be reconciled when cloud sync connects.', 'warning');
+    // H-01: ssGoHome() so the "Checking" card is replaced immediately.
+    ssGoHome();
+    return true;
+  } catch (error) {
+    _ssAwaitingAuthority = true;
+    showToast(`Could not start a local workbook: ${error?.message || error}`, 'danger');
+    return false;
   }
 }
 
@@ -5730,6 +6634,96 @@ function ssActiveSheet() {
   const proj = ssActiveProject();
   if (!proj) return null;
   return proj.sheets.find(s => s.id === proj.activeId) || proj.sheets[0];
+}
+
+// V159-002: the editor holds a whole-workbook snapshot taken when typing began.
+// Committing it wholesale erases any remote cell that arrived while the user was
+// typing. Instead, apply the diff the user actually made (dirtyBase -> dirty)
+// onto the base that is durable at commit time, which includes that remote edit.
+function _mergeSpreadsheetEdits(base, dirtyBase, dirty) {
+  if (!base || !dirtyBase || !dirty) return dirty;
+  const changed = (a, b) => JSON.stringify(a) !== JSON.stringify(b);
+  const merged = _cloneJson(base);
+  merged.projects = Array.isArray(merged.projects) ? merged.projects : [];
+  const originProjects = new Map((dirtyBase.projects || []).map(p => [p.id, p]));
+  const localProjects = dirty.projects || [];
+  const targetProjects = new Map(merged.projects.map(p => [p.id, p]));
+
+  for (const localProject of localProjects) {
+    const origin = originProjects.get(localProject.id);
+    const target = targetProjects.get(localProject.id);
+    // Created locally while the remote copy was being reconciled.
+    if (!origin) {
+      if (!target) merged.projects.push(_cloneJson(localProject));
+      continue;
+    }
+    // Removed remotely. A local edit cannot resurrect it here; the remote
+    // deletion is preserved and the local copy stays recoverable in the
+    // encrypted pending record.
+    if (!target) continue;
+
+    if (changed(localProject.name, origin.name)) target.name = localProject.name;
+    if (changed(localProject.activeId, origin.activeId)) target.activeId = localProject.activeId;
+    target.sheets = Array.isArray(target.sheets) ? target.sheets : [];
+    const originSheets = new Map((origin.sheets || []).map(s => [s.id, s]));
+    const targetSheets = new Map(target.sheets.map(s => [s.id, s]));
+
+    for (const localSheet of localProject.sheets || []) {
+      const originSheet = originSheets.get(localSheet.id);
+      const targetSheet = targetSheets.get(localSheet.id);
+      if (!originSheet) {
+        if (!targetSheet) target.sheets.push(_cloneJson(localSheet));
+        continue;
+      }
+      if (!targetSheet) continue;
+
+      if (changed(localSheet.name, originSheet.name)) targetSheet.name = localSheet.name;
+      if (changed(localSheet.rows, originSheet.rows)) targetSheet.rows = localSheet.rows;
+      if (changed(localSheet.cols, originSheet.cols)) targetSheet.cols = localSheet.cols;
+      if (changed(localSheet.colWidths, originSheet.colWidths)) {
+        targetSheet.colWidths = _cloneJson(localSheet.colWidths);
+      }
+
+      const originCells = originSheet.cells || {};
+      const localCells = localSheet.cells || {};
+      targetSheet.cells = targetSheet.cells || {};
+      // Only cells the user actually touched overwrite the reconciled base.
+      for (const cellKey of Object.keys(localCells)) {
+        if (changed(localCells[cellKey], originCells[cellKey])) {
+          targetSheet.cells[cellKey] = _cloneJson(localCells[cellKey]);
+        }
+      }
+      // Cells the user cleared locally.
+      for (const cellKey of Object.keys(originCells)) {
+        if (!(cellKey in localCells)) delete targetSheet.cells[cellKey];
+      }
+    }
+
+    // Sheets deleted locally.
+    for (const sheetId of originSheets.keys()) {
+      if (!(localProject.sheets || []).some(s => s.id === sheetId)) {
+        target.sheets = target.sheets.filter(s => s.id !== sheetId);
+      }
+    }
+    if (!target.sheets.some(s => s.id === target.activeId) && target.sheets.length) {
+      target.activeId = target.sheets[0].id;
+    }
+  }
+
+  // Projects deleted locally.
+  for (const projectId of originProjects.keys()) {
+    if (!localProjects.some(p => p.id === projectId)) {
+      merged.projects = merged.projects.filter(p => p.id !== projectId);
+    }
+  }
+
+  if (changed(dirty.activeProject, dirtyBase.activeProject)) {
+    merged.activeProject = dirty.activeProject;
+  }
+  if (!merged.projects.some(p => p.id === merged.activeProject) && merged.projects.length) {
+    merged.activeProject = merged.projects[0].id;
+  }
+  return merged;
 }
 
 function _releaseSpreadsheetSaveGate(gate) {
@@ -5753,7 +6747,14 @@ function _beginSpreadsheetSaveStage() {
     const generation = _ssDirtyGeneration;
     const dirtySource = _ssDirtyWorkbook;
     if (!dirtySource) return true;
-    const normalized = normalizeSpreadsheetWorkbook(dirtySource);
+    // V159-002: re-read the base *inside* the lock. If a remote reconcile
+    // committed while the user was typing, its cells are in this base and the
+    // merge keeps them alongside the local edit.
+    const reconciledBase = _durableStoreSnapshots.has('spreadsheets')
+      ? _cloneJson(_durableStoreSnapshots.get('spreadsheets'))
+      : null;
+    const merged = _mergeSpreadsheetEdits(reconciledBase, _ssDirtyBase, dirtySource);
+    const normalized = normalizeSpreadsheetWorkbook(merged);
     const serialized = JSON.stringify(normalized);
     const operationId = _newOperationId();
     await _commitEncryptedSnapshot('spreadsheets', serialized, normalized, {
@@ -5765,6 +6766,7 @@ function _beginSpreadsheetSaveStage() {
     }
     if (_ssDirtyGeneration === generation) {
       _ssDirtyWorkbook = null;
+      _ssDirtyBase = null;
       _ssData = normalized;
     }
     return true;
@@ -5775,6 +6777,7 @@ function _beginSpreadsheetSaveStage() {
       if (durable) {
         _ssData = _cloneJson(durable);
         _ssDirtyWorkbook = null;
+        _ssDirtyBase = null;
       }
     }
     showToast(`Spreadsheet changes were not saved: ${error?.message || error}`, 'danger');
@@ -5795,7 +6798,18 @@ function _beginSpreadsheetSaveStage() {
 }
 
 function _stageDirtySpreadsheetSave(delayMs) {
-  if (!_ssData || _ssBlockedWorkbook) return Promise.resolve(false);
+  // V160-002: the single chokepoint every edit path funnels through. Blocking
+  // here means no typing, paste, formatting, structural change, or undo can
+  // durably persist an invented default while remote state is unknown.
+  if (!_ssData || _ssBlockedWorkbook || _ssAwaitingAuthority) return Promise.resolve(false);
+  // V159-002: remember the workbook the user started editing from, so the
+  // commit can tell "the user changed this cell" from "this cell just came
+  // back from the cloud".
+  if (!_ssDirtyWorkbook) {
+    _ssDirtyBase = _durableStoreSnapshots.has('spreadsheets')
+      ? _cloneJson(_durableStoreSnapshots.get('spreadsheets'))
+      : _cloneJson(_ssData);
+  }
   _ssDirtyWorkbook = _ssData;
   _ssDirtyGeneration += 1;
   let gate = _ssSaveGate;
@@ -5857,6 +6871,13 @@ function ssGoHome() {
   if (_ssBlockedWorkbook) {
     document.getElementById('ss-page-sub').textContent = 'Saved data needs recovery before editing';
     document.getElementById('ss-header-actions').innerHTML = '';
+  } else if (_ssAwaitingAuthority) {
+    // V160-002: read-only until we know whether the studio already has a
+    // workbook in the cloud.
+    document.getElementById('ss-page-sub').textContent =
+      'Checking the cloud for this studio’s workbook… editing is paused so nothing is overwritten';
+    document.getElementById('ss-header-actions').innerHTML =
+      `<button class="btn btn-ghost btn-sm" onclick="ssWorkLocallyAnyway()" style="color:var(--text-secondary);border:1.5px solid var(--text-secondary);border-radius:8px;padding:6px 14px">Start a local workbook anyway</button>`;
   } else {
     document.getElementById('ss-page-sub').textContent = 'Your projects — click one to open';
     document.getElementById('ss-header-actions').innerHTML =
@@ -5879,7 +6900,9 @@ async function ssExportBlockedWorkbook() {
 }
 
 function ssOpenProject(id) {
-  if (_ssBlockedWorkbook || !_ssData) return;
+  // V160-002: the home view hides project cards while the hold is active, but
+  // gate the entry point too so no other path can reach the grid editor.
+  if (_ssBlockedWorkbook || _ssAwaitingAuthority || !_ssData) return;
   if (_ssEditCell) ssCommitEdit();
   _ssData.activeProject = id;
   _ssSelR=0;_ssSelC=0;_ssSelR2=0;_ssSelC2=0;_ssEditCell=null;
@@ -5911,6 +6934,23 @@ function ssRenderHomeView() {
       <p style="margin:0 0 8px;line-height:1.5">Music Box did not open or replace this workbook because it failed the safety checks.</p>
       <p style="margin:0 0 16px;color:var(--text-secondary);line-height:1.5">${escHtml(_ssBlockedWorkbookError)}</p>
       <button class="btn btn-primary" onclick="ssExportBlockedWorkbook()">Export Recovery Data</button>
+    </div>`;
+    return;
+  }
+  if (_ssAwaitingAuthority) {
+    // V160-002: never show a clickable fabricated default. Opening a project
+    // here is what led to a durable revision-0 write over real cloud data.
+    grid.innerHTML = `<div class="card" style="grid-column:1/-1;padding:24px;max-width:720px">
+      <h3 style="margin:0 0 10px">Checking the cloud…</h3>
+      <p style="margin:0 0 8px;line-height:1.5">
+        This Mac does not have a saved workbook yet, and Music Box has not finished
+        checking whether this studio already has one in the cloud.
+      </p>
+      <p style="margin:0 0 16px;color:var(--text-secondary);line-height:1.5">
+        Editing is paused for a moment so a blank workbook cannot replace the
+        studio's real one. This usually clears as soon as cloud sync connects.
+      </p>
+      <button class="btn btn-outline" onclick="ssWorkLocallyAnyway()">Start a local workbook anyway</button>
     </div>`;
     return;
   }
@@ -6207,7 +7247,7 @@ function ssDeleteProject(id) {
 let _ssImportInFlight = false;
 
 async function ssImportFile() {
-  if (_ssBlockedWorkbook || _ssImportInFlight || !window.electronSpreadsheet?.importFile) return;
+  if (_ssBlockedWorkbook || _ssAwaitingAuthority || _ssImportInFlight || !window.electronSpreadsheet?.importFile) return;
   _ssImportInFlight = true;
   try {
     const result = await window.electronSpreadsheet.importFile();
@@ -6224,7 +7264,7 @@ async function ssImportFile() {
 }
 
 async function ssImportBuildProject(name, sheets) {
-  if (_ssBlockedWorkbook || !_ssData) return false;
+  if (_ssBlockedWorkbook || _ssAwaitingAuthority || !_ssData) return false;
   if (!Array.isArray(sheets) || !sheets.length || sheets.length > MAX_SPREADSHEET_SHEETS) {
     showToast('That spreadsheet did not contain a safe number of sheets.', 'warning');
     return false;
@@ -9270,19 +10310,36 @@ async function saveLogEntry() {
   const body = bodyElement.value.trim();
   const tags = tagsElement.value.split(',').map(t=>t.trim()).filter(Boolean);
   if (!body) { showToast('Please write something in the log.', 'warning'); return; }
-  const editingId = parseInt(document.getElementById('log-editing-id').value) || null;
-  const logs = _cloneJson(STORE.get('logs', []));
-  if (editingId) {
-    // Update existing entry
-    const idx = logs.findIndex(l => l.id === editingId);
-    if (idx >= 0) logs[idx] = { ...logs[idx], date, body, tags, updated: new Date().toISOString() };
-  } else {
-    const entry = { id: Date.now(), date, author, body, tags, created: new Date().toISOString() };
-    logs.unshift(entry);
-  }
-  logs.sort((a,b) => b.date.localeCompare(a.date) || b.id - a.id);
+  const rawEditingId = document.getElementById('log-editing-id').value;
+  const editingId = rawEditingId ? (parseInt(rawEditingId) || rawEditingId) : null;
+  // V160-001: build the record ONCE, outside the mutator. The mutator may run
+  // more than once (preview + the authoritative in-lock run), and it must
+  // produce the same record every time.
+  const now = new Date().toISOString();
+  const newEntry = editingId
+    ? null
+    : { id: _newRecordId(), date, author, body, tags, created: now };
   try {
-    await STORE.set('logs', logs);
+    // V160-001: semantic update-by-id / append-by-id applied to the reconciled
+    // base inside the per-key lock, so a log another device added while this
+    // one was saving is preserved instead of being overwritten.
+    await STORE.mutate('logs', current => {
+      const logs = Array.isArray(current) ? _cloneJson(current) : [];
+      if (editingId) {
+        const idx = logs.findIndex(l => String(l.id) === String(editingId));
+        // H-03: throw rather than silently no-op so the catch block surfaces
+        // the conflict instead of showing a false "Log entry updated!" success.
+        if (idx < 0) throw new Error('Log entry not found — it may have been deleted on another device.');
+        logs[idx] = { ...logs[idx], date, body, tags, updated: now };
+      } else if (!logs.some(l => String(l.id) === String(newEntry.id))) {
+        logs.unshift(newEntry);
+      }
+      logs.sort((a, b) =>
+        String(b.date).localeCompare(String(a.date)) ||
+        String(b.id).localeCompare(String(a.id))
+      );
+      return logs;
+    }, []);
     bodyElement.value = '';
     tagsElement.value = '';
     cancelLogEdit();
@@ -9406,10 +10463,17 @@ function renderLogs() {
 
 async function deleteLog(id) {
   if (!confirm('Delete this log entry?')) return false;
-  let logs = STORE.get('logs', []);
-  logs = logs.filter(l => String(l.id) !== String(id));
   try {
-    await STORE.set('logs', logs);
+    // V160-001: delete-by-id against the reconciled base. Filtering a stale
+    // snapshot would also erase any log another device added meanwhile.
+    // H-03: throw if the record is absent so we don't show false success.
+    await STORE.mutate('logs', current => {
+      const logs = Array.isArray(current) ? current : [];
+      if (!logs.some(l => String(l.id) === String(id))) {
+        throw new Error('Log entry not found — it may have already been deleted on another device.');
+      }
+      return logs.filter(l => String(l.id) !== String(id));
+    }, []);
     renderLogs();
     showToast('Entry deleted.', 'success');
     return true;
@@ -12315,17 +13379,35 @@ async function pruneOldLogs() {
     return writtenAt >= twoYearCutoffMs;
   });
   const writes = [];
-  if (prunedLogs.length !== logs.length) writes.push(STORE.set('logs', prunedLogs)); // prune entries older than 2 years
+  // V160-001: retention pruning re-evaluates its cutoff against the reconciled
+  // base, so a record another device added during the prune is not erased.
+  if (prunedLogs.length !== logs.length) {
+    writes.push(STORE.mutate('logs', current =>
+      (Array.isArray(current) ? current : []).filter(l => {
+        const writtenAt = new Date(l.created || l.date + 'T12:00:00').getTime();
+        return writtenAt >= twoYearCutoffMs;
+      }), []));
+  }
 
   // Staff Hub messages (keyed by created ISO timestamp)
   const notes = STORE.get('staff_notes', []);
   const prunedNotes = notes.filter(n => new Date(n.created || 0).getTime() >= cutoffMs);
-  if (prunedNotes.length !== notes.length) writes.push(STORE.set('staff_notes', prunedNotes));
+  if (prunedNotes.length !== notes.length) {
+    writes.push(STORE.mutate('staff_notes', current =>
+      (Array.isArray(current) ? current : []).filter(
+        n => new Date(n.created || 0).getTime() >= cutoffMs
+      ), []));
+  }
 
   // Sent emails — delete 30 days after last viewed (viewedAt), or 30 days after sent if never opened
   const sent = STORE.get('sent_emails', []);
   const prunedSent = sent.filter(s => new Date(s.viewedAt || s.sentAt || 0).getTime() >= cutoffMs);
-  if (prunedSent.length !== sent.length) writes.push(STORE.set('sent_emails', prunedSent));
+  if (prunedSent.length !== sent.length) {
+    writes.push(STORE.mutate('sent_emails', current =>
+      (Array.isArray(current) ? current : []).filter(
+        s => new Date(s.viewedAt || s.sentAt || 0).getTime() >= cutoffMs
+      ), []));
+  }
 
   // Per-day email read markers older than 30 days.
   const keysToCheck = Object.keys(localStorage).filter(k => k.startsWith('tmb_read_emails_'));
@@ -12748,12 +13830,24 @@ function init() {
   });
   if (window.electronLifecycle?.onFlushRequested) {
     window.electronLifecycle.onFlushRequested(async () => {
+      // V160-008: fail CLOSED. Returning true here is what let the updater
+      // install over pending or quarantined data. main.js blocks
+      // quitAndInstall() on a false result, and offers the user
+      // Retry / Cancel / Quit Without Saving for an ordinary quit.
       await _flushSpreadsheetSave();
       await STORE.flush(null, {
         includeSync: _syncReady && _syncBootstrapComplete,
-        requireSync: false,
+        requireSync: _syncReady && _syncBootstrapComplete,
       });
-      return true;
+      if (!_syncReady || !_syncBootstrapComplete) {
+        // Cloud state is unknown; any pending record is undelivered.
+        return !getSyncKeys().some(key => {
+          try { return !!_readPendingSyncRecord(key); } catch { return true; }
+        });
+      }
+      let unsynced;
+      try { unsynced = _unsyncedSyncKeys(); } catch { return false; }
+      return unsynced.length === 0;
     });
   }
   // ── Electron: listen for MS OAuth from local OAuth server ────
