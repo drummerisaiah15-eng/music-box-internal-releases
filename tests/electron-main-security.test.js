@@ -457,7 +457,10 @@ test('main does not swallow uncaught exceptions and continue in corrupt state', 
 // contain an apostrophe (e.g. /^[\p{L}\p{M}\d .'-]+$/u). These helpers are
 // plain top-level declarations, so slice to the next declaration instead.
 function sliceFunction(source, name) {
-  const start = source.indexOf(`function ${name}(`);
+  // Prefer the async declaration: starting at `function X(` inside
+  // `async function X(` would silently drop the async keyword.
+  const asyncStart = source.indexOf(`async function ${name}(`);
+  const start = asyncStart >= 0 ? asyncStart : source.indexOf(`function ${name}(`);
   assert.notEqual(start, -1, `${name} exists`);
   const ends = [
     source.indexOf('\nfunction ', start + 1),
@@ -966,4 +969,151 @@ test('directory: the renderer publishes on every profile change and merges on ar
   // Only the owner may publish.
   const fn = renderer.slice(renderer.indexOf('async function publishStaffDirectory('));
   assert.match(fn.slice(0, fn.indexOf('\n}') + 2), /isElizabeth\(\)/);
+});
+
+// --- V159-008: immutable per-device iCloud snapshots -------------------------
+//
+// Runs the real snapshot helpers against a real temp directory, including a
+// genuine two-device concurrent backup.
+
+const osMod = require('node:os');
+const cryptoMod = require('node:crypto');
+
+function snapshotHarness(dir) {
+  const context = vm.createContext({
+    Object, Error, Date, JSON, Set, Array, Number, String, Boolean, Buffer,
+    console, Promise, RegExp,
+    fs: require('node:fs'),
+    path: require('node:path'),
+    os: osMod,
+    crypto: cryptoMod,
+    ICLOUD_DIR: dir,
+    ICLOUD_SYNC_PATH: require('node:path').join(dir, 'sync.json'),
+    MAX_SYNC_BYTES: 8 * 1024 * 1024,
+    app: { getPath: () => dir },
+    _isPlainObject: v => !!v && typeof v === 'object' && !Array.isArray(v),
+  });
+  // Take the real constants straight from main.js — re-typing the regex here
+  // would silently lose its backslashes inside a template literal.
+  const constBlock = main.slice(
+    main.indexOf('const ICLOUD_SNAPSHOT_PREFIX'),
+    main.indexOf('function _backupDeviceId(')
+  );
+  vm.runInContext(`
+    ${constBlock}
+    ${sliceFunction(main, '_backupDeviceId')}
+    ${sliceFunction(main, '_snapshotFileName')}
+    ${sliceFunction(main, '_listBackupSnapshots')}
+    ${sliceFunction(main, '_pruneBackupSnapshots')}
+    ${sliceFunction(main, '_readBackupCandidate')}
+    globalThis.api = {
+      name: (d, when) => _snapshotFileName(d, when),
+      list: () => _listBackupSnapshots(),
+      prune: async () => _pruneBackupSnapshots(await _listBackupSnapshots()),
+      read: () => _readBackupCandidate(),
+      deviceId: () => _backupDeviceId(),
+    };
+  `, context);
+  return context.api;
+}
+
+function tmpDir() {
+  return fs.mkdtempSync(path.join(osMod.tmpdir(), 'mb-icloud-'));
+}
+
+test('V159-008: two Macs backing up concurrently both keep a recovery point', async () => {
+  const dir = tmpDir();
+  const api = snapshotHarness(dir);
+  // Same instant, two different devices — the old shared sync.json would have
+  // left exactly one survivor.
+  const when = new Date('2026-08-01T12:00:00.000Z');
+  const a = api.name('aaaaaaaaaaaa', when);
+  const b = api.name('bbbbbbbbbbbb', when);
+  assert.notEqual(a, b, 'device id keeps concurrent filenames distinct');
+  fs.writeFileSync(path.join(dir, a), JSON.stringify({ from: 'A' }));
+  fs.writeFileSync(path.join(dir, b), JSON.stringify({ from: 'B' }));
+  const listed = [...await api.list()];
+  assert.equal(listed.length, 2, 'both recovery points survive');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('V159-008: the newest snapshot is returned', async () => {
+  const dir = tmpDir();
+  const api = snapshotHarness(dir);
+  fs.writeFileSync(path.join(dir, api.name('aaaaaaaaaaaa', new Date('2026-08-01T10:00:00.000Z'))),
+    JSON.stringify({ pick: 'older' }));
+  fs.writeFileSync(path.join(dir, api.name('bbbbbbbbbbbb', new Date('2026-08-01T11:00:00.000Z'))),
+    JSON.stringify({ pick: 'newer' }));
+  const result = await api.read();
+  assert.equal(result.data.pick, 'newer');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('V159-008: a corrupt newest snapshot never hides an older good one', async () => {
+  const dir = tmpDir();
+  const api = snapshotHarness(dir);
+  fs.writeFileSync(path.join(dir, api.name('aaaaaaaaaaaa', new Date('2026-08-01T10:00:00.000Z'))),
+    JSON.stringify({ pick: 'good' }));
+  fs.writeFileSync(path.join(dir, api.name('bbbbbbbbbbbb', new Date('2026-08-01T11:00:00.000Z'))),
+    '{ truncated json');
+  const result = await api.read();
+  assert.equal(result.data.pick, 'good', 'recovery falls through to the last valid backup');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('V159-008: the legacy shared sync.json is still readable but never rewritten', async () => {
+  const dir = tmpDir();
+  const api = snapshotHarness(dir);
+  fs.writeFileSync(path.join(dir, 'sync.json'), JSON.stringify({ legacy: true }));
+  const result = await api.read();
+  assert.equal(result.legacy, true, 'the pre-existing backup is honoured');
+  assert.equal(result.data.legacy, true);
+  // A snapshot supersedes it once one exists.
+  fs.writeFileSync(path.join(dir, api.name('aaaaaaaaaaaa', new Date())), JSON.stringify({ fresh: 1 }));
+  assert.equal((await api.read()).data.fresh, 1);
+  // The write path must never target the shared filename again.
+  const writeBody = extractHandlerBody(main, 'write-sync-file');
+  assert.doesNotMatch(writeBody, /ICLOUD_SYNC_PATH/,
+    'writes go to per-device snapshots only');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('V159-008: retention is bounded per device and never starves another Mac', async () => {
+  const dir = tmpDir();
+  const api = snapshotHarness(dir);
+  for (let i = 0; i < 9; i++) {
+    fs.writeFileSync(
+      path.join(dir, api.name('aaaaaaaaaaaa', new Date(Date.UTC(2026, 7, 1, 10, i)))),
+      JSON.stringify({ i })
+    );
+  }
+  fs.writeFileSync(path.join(dir, api.name('bbbbbbbbbbbb', new Date(Date.UTC(2026, 7, 1, 9, 0)))),
+    JSON.stringify({ from: 'B' }));
+  await api.prune();
+  const left = [...await api.list()];
+  const aCount = left.filter(s => s.deviceId === 'aaaaaaaaaaaa').length;
+  const bCount = left.filter(s => s.deviceId === 'bbbbbbbbbbbb').length;
+  assert.equal(aCount, 5, 'the chatty device is capped');
+  assert.equal(bCount, 1, "the other Mac's only recovery point is untouched");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('V159-008: unrelated files in the folder are ignored', async () => {
+  const dir = tmpDir();
+  const api = snapshotHarness(dir);
+  for (const junk of ['notes.txt', 'sync-.json', 'sync-bad-name.json', '.DS_Store']) {
+    fs.writeFileSync(path.join(dir, junk), 'x');
+  }
+  assert.deepEqual([...await api.list()], [], 'only well-formed snapshots are considered');
+  assert.equal(await api.read(), null);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('V159-008: the device id is stable and filename-safe', () => {
+  const dir = tmpDir();
+  const api = snapshotHarness(dir);
+  const id = api.deviceId();
+  assert.match(id, /^[a-f0-9]{12}$/, 'hex, bounded, no path characters');
+  assert.equal(id, api.deviceId(), 'stable across calls');
+  fs.rmSync(dir, { recursive: true, force: true });
 });

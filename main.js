@@ -2449,6 +2449,102 @@ const ICLOUD_DIR = _resolveICloudDirectory();
 const ICLOUD_SYNC_PATH = path.join(ICLOUD_DIR, 'sync.json');
 let iCloudWriteChain = Promise.resolve();
 
+// ─── V159-008: immutable per-device backup snapshots ────────────────────────
+//
+// Every Mac previously wrote the same `sync.json`. Two Macs could both report a
+// successful backup while the later write silently replaced the earlier one, so
+// a recovery point vanished. iCloud Drive offers no dependable CAS/generation to
+// coordinate that, so the fix is to stop sharing a filename: each Mac writes its
+// own immutable, timestamped snapshot and both recovery points survive.
+//
+// Legacy `sync.json` is still READ (newest-wins alongside snapshots) so existing
+// backups keep working; it is never written again and never modified.
+const ICLOUD_SNAPSHOT_PREFIX = 'sync-';
+const ICLOUD_SNAPSHOT_SUFFIX = '.json';
+const MAX_SNAPSHOTS_PER_DEVICE = 5;
+const MAX_TOTAL_SNAPSHOTS = 40;
+const SNAPSHOT_NAME_PATTERN =
+  /^sync-([a-z0-9]{4,32})-(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z)\.json$/;
+
+function _backupDeviceId() {
+  // Stable per-Mac, derived from the machine's own identifiers. Not a secret —
+  // it only has to differ between machines so filenames never collide.
+  const seed = `${os.hostname()}|${os.userInfo().username}|${app.getPath('userData')}`;
+  return crypto.createHash('sha256').update(seed).digest('hex').slice(0, 12);
+}
+
+function _snapshotFileName(deviceId, when = new Date()) {
+  const stamp = when.toISOString().replace(/[:.]/g, '-');
+  return `${ICLOUD_SNAPSHOT_PREFIX}${deviceId}-${stamp}${ICLOUD_SNAPSHOT_SUFFIX}`;
+}
+
+async function _listBackupSnapshots() {
+  let names;
+  try { names = await fs.promises.readdir(ICLOUD_DIR); }
+  catch (error) {
+    if (error.code === 'ENOENT') return [];
+    throw error;
+  }
+  return names
+    .map(name => {
+      const match = SNAPSHOT_NAME_PATTERN.exec(name);
+      if (!match) return null;
+      // Recover the ISO instant from the filesystem-safe stamp.
+      const iso = match[2].replace(
+        /^(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z$/,
+        '$1T$2:$3:$4.$5Z'
+      );
+      const at = Date.parse(iso);
+      if (!Number.isFinite(at)) return null;
+      return { name, deviceId: match[1], at };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.at - a.at || (a.name < b.name ? 1 : -1));
+}
+
+// Retention is bounded per device AND overall, so one Mac cannot crowd another's
+// recovery points out of the shared folder.
+async function _pruneBackupSnapshots(snapshots) {
+  const perDevice = new Map();
+  const doomed = [];
+  for (const snapshot of snapshots) {
+    const kept = perDevice.get(snapshot.deviceId) || 0;
+    if (kept >= MAX_SNAPSHOTS_PER_DEVICE) doomed.push(snapshot);
+    else perDevice.set(snapshot.deviceId, kept + 1);
+  }
+  const survivors = snapshots.filter(s => !doomed.includes(s));
+  for (const extra of survivors.slice(MAX_TOTAL_SNAPSHOTS)) doomed.push(extra);
+  for (const snapshot of doomed) {
+    try { await fs.promises.unlink(path.join(ICLOUD_DIR, snapshot.name)); }
+    catch (_) { /* a peer may have pruned it already */ }
+  }
+  return doomed.length;
+}
+
+async function _readBackupCandidate() {
+  const snapshots = await _listBackupSnapshots();
+  for (const snapshot of snapshots) {
+    const full = path.join(ICLOUD_DIR, snapshot.name);
+    try {
+      const stat = await fs.promises.stat(full);
+      if (!stat.isFile() || stat.size > MAX_SYNC_BYTES) continue;
+      const parsed = JSON.parse(await fs.promises.readFile(full, 'utf8'));
+      if (_isPlainObject(parsed)) return { data: parsed, source: snapshot.name, at: snapshot.at };
+    } catch (_) { continue; } // a corrupt snapshot must not hide an older good one
+  }
+  // Fall back to the legacy shared file if no snapshot is usable.
+  try {
+    const stat = await fs.promises.stat(ICLOUD_SYNC_PATH);
+    if (stat.isFile() && stat.size <= MAX_SYNC_BYTES) {
+      const parsed = JSON.parse(await fs.promises.readFile(ICLOUD_SYNC_PATH, 'utf8'));
+      if (_isPlainObject(parsed)) {
+        return { data: parsed, source: 'sync.json', at: stat.mtimeMs, legacy: true };
+      }
+    }
+  } catch (_) {}
+  return null;
+}
+
 async function _atomicWriteFile(targetPath, contents, mode = 0o600) {
   const tempPath = path.join(
     path.dirname(targetPath),
@@ -2474,23 +2570,21 @@ async function _atomicWriteFile(targetPath, contents, mode = 0o600) {
 _secureHandle('read-sync-file', async () => {
   try {
     await iCloudWriteChain;
-    let stat;
-    try { stat = await fs.promises.stat(ICLOUD_SYNC_PATH); }
-    catch (error) {
-      if (error.code === 'ENOENT') return { ok: true, data: null };
-      throw error;
-    }
-    if (!stat.isFile() || stat.size > MAX_SYNC_BYTES) {
-      return { ok: false, error: 'The iCloud backup is invalid or exceeds the 8 MB limit.' };
-    }
-    const raw = await fs.promises.readFile(ICLOUD_SYNC_PATH, 'utf8');
-    const data = JSON.parse(raw);
-    if (!_isPlainObject(data)) return { ok: false, error: 'The iCloud backup has an invalid format.' };
-    return { ok: true, data };
+    // V159-008: read the newest VALID snapshot. A corrupt newest file must not
+    // hide an older good one, and the legacy shared sync.json remains readable.
+    const candidate = await _readBackupCandidate();
+    if (!candidate) return { ok: true, data: null };
+    return {
+      ok: true,
+      data: candidate.data,
+      source: candidate.source,
+      legacy: candidate.legacy === true,
+    };
   } catch(e) {
     return { ok: false, error: e.message };
   }
 });
+
 
 _secureHandle('write-sync-file', async (_, data) => {
   if (!_isPlainObject(data)) return { ok: false, error: 'The iCloud backup has an invalid format.' };
@@ -2506,8 +2600,16 @@ _secureHandle('write-sync-file', async (_, data) => {
   const write = iCloudWriteChain.then(async () => {
     try {
       await fs.promises.mkdir(ICLOUD_DIR, { recursive: true, mode: 0o700 });
-      await _atomicWriteFile(ICLOUD_SYNC_PATH, serialized, 0o600);
-      return { ok: true };
+      // V159-008: never overwrite a shared filename. Each Mac writes its own
+      // immutable snapshot so a concurrent backup on another Mac cannot destroy
+      // this recovery point (and vice versa).
+      const deviceId = _backupDeviceId();
+      const name = _snapshotFileName(deviceId);
+      await _atomicWriteFile(path.join(ICLOUD_DIR, name), serialized, 0o600);
+      let pruned = 0;
+      try { pruned = await _pruneBackupSnapshots(await _listBackupSnapshots()); }
+      catch (_) { /* retention is best-effort; the new snapshot is already safe */ }
+      return { ok: true, snapshot: name, pruned };
     } catch(e) {
       return { ok: false, error: e.message };
     }
