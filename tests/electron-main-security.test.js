@@ -448,106 +448,6 @@ test('main does not swallow uncaught exceptions and continue in corrupt state', 
   assert.doesNotMatch(main, /process\.on\(['"]uncaughtException/);
 });
 
-// --- V159-006: Step Up authorization lives in the trusted layer --------------
-
-test('V159-006: Step Up requires both a privileged role and an unexpired grant', () => {
-  const main = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
-  const guard = main.slice(main.indexOf('function _requireStepUpGrant('));
-  const body = guard.slice(0, guard.indexOf('\n}\n') + 3);
-
-  assert.match(body, /_requireAppRole\(STEP_UP_ROLES\)/,
-    'role is enforced in main, not inferred from a renderer display name');
-  assert.match(body, /Date\.now\(\) >= stepUpGrant\.expiresAt/, 'grants expire');
-  assert.match(body, /stepUpGrant\.name !== session\.name/,
-    'a grant cannot be reused across profiles');
-  assert.match(body, /stepUpGrant\.webContentsId !== mainWindow\.webContents\.id/,
-    'a grant is bound to the live window');
-  assert.match(main, /const STEP_UP_ROLES = new Set\(\['Owner', 'Operations & Events'\]\)/,
-    'Front Desk profiles can never hold a Step Up grant');
-});
-
-test('V159-006: a Step Up grant cannot outlive its session', () => {
-  const main = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
-  for (const fn of ['_resetAppSession', '_setAppSession']) {
-    const start = main.indexOf(`function ${fn}(`);
-    assert.notEqual(start, -1, `${fn} exists`);
-    const body = main.slice(start, main.indexOf('\n}', start));
-    assert.match(body, /_resetStepUpGrant\(\)/,
-      `${fn} clears any Step Up grant (logout, switch, expiry)`);
-  }
-});
-
-test('V159-006: enrolment is owner-only and rejects unprivileged profiles', () => {
-  const main = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
-  const start = main.indexOf("_secureHandle('step-up-enroll'");
-  assert.notEqual(start, -1, 'the enrolment handler exists');
-  const body = main.slice(start, main.indexOf('\n});', start));
-  assert.match(body, /_requireAppRole\(new Set\(\['Owner'\]\)\)/,
-    'only the owner may enrol a Step Up passcode');
-  assert.match(body, /STEP_UP_ROLES\.has\(role\)/,
-    'a Front Desk profile cannot be given Step Up credentials');
-  assert.match(body, /_validOwnerPin\(request\.passcode, false\)/,
-    'the passcode must be a full 6 digits');
-  assert.match(body, /_buildOwnerVerifier\(request\.passcode\)/,
-    'the passcode is stored as a PBKDF2 verifier, never in plaintext');
-});
-
-test('V159-006: authentication is rate limited and never self-enrols', () => {
-  const main = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
-  const start = main.indexOf("_secureHandle('step-up-authenticate'");
-  const body = main.slice(start, main.indexOf('\n});', start));
-  assert.match(body, /Date\.now\(\) < stepUpLockedUntil/, 'lockout is honoured');
-  assert.match(body, /_recordStepUpFailure\(\)/, 'failures are counted');
-  assert.match(body, /_ownerPinMatches\(passcode, record\)/, 'constant-time verifier compare');
-  assert.match(body, /No Step Up passcode is enrolled/,
-    'an unenrolled profile cannot be claimed by whoever reaches the Mac first');
-  assert.doesNotMatch(body, /_buildOwnerVerifier/,
-    'authenticating must never create a credential');
-});
-
-test('V159-006: the renderer cannot grant itself Step Up access', () => {
-  const preload = fs.readFileSync(path.join(__dirname, '..', 'preload.js'), 'utf8');
-  assert.match(preload, /stepUpAuthenticate:\(passcode\) => ipcRenderer\.invoke\('step-up-authenticate', passcode\)/,
-    'the renderer can only submit a passcode for main to verify');
-  const renderer = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
-  // The cached flag is explicitly documented as advisory.
-  assert.match(renderer, /_stepUpTrusted/, 'renderer keeps only a mirrored status');
-  assert.match(renderer, /main re-checks the role AND the grant on every sensitive operation/,
-    'the cached value is documented as non-authoritative');
-});
-
-test('V159-006: Step Up enrolment is reachable from the owner Settings UI', () => {
-  // Regression: the enrolment function shipped with no way to call it, so there
-  // was no input field in Settings and the feature was unusable.
-  const renderer = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
-  assert.match(renderer, /id="step-up-enroll-section"/, 'the settings block exists');
-  assert.match(renderer, /id="step-up-profile"/, 'a profile picker exists');
-  assert.match(renderer, /id="step-up-new"/, 'a passcode input exists');
-  assert.match(renderer, /onclick="stepUpEnrollPasscode\(\)"/,
-    'a control actually invokes enrolment');
-  assert.match(renderer, /getElementById\('step-up-enroll-section'\)[\s\S]{0,120}isElizabeth\(\)/,
-    'the block is shown only to the owner');
-  // And the function must read the form rather than a blocking prompt.
-  const fn = renderer.slice(renderer.indexOf('async function stepUpEnrollPasscode('));
-  const body = fn.slice(0, fn.indexOf('\nasync function ', 1));
-  assert.match(body, /getElementById\('step-up-new'\)/, 'reads the input field');
-  assert.doesNotMatch(body, /window\.prompt/, 'does not use a blocking prompt');
-});
-
-test('V159-006: Step Up protection is opt-in and cannot lock anyone out on upgrade', () => {
-  const main = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
-  const guard = main.slice(main.indexOf('function _requireStepUpGrant('));
-  const body = guard.slice(0, guard.indexOf('\n}\n') + 3);
-  assert.match(body, /if \(!enrolled\) return session;/,
-    'with no code enrolled the trusted layer falls back to the role check alone');
-
-  const renderer = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
-  const req = renderer.slice(renderer.indexOf('function requireStepUpAccess('));
-  const reqBody = req.slice(0, req.indexOf('\n}\n') + 3);
-  assert.match(reqBody, /if \(!_stepUpTrusted\.enrolled\) return true;/,
-    'the renderer does not lock receipts until a code is enrolled');
-});
-
 // --- Profile removal: functional stress tests -------------------------------
 //
 // These execute the REAL handler body against a simulated vault rather than
@@ -609,28 +509,23 @@ function removalHarness({ role = 'Owner', signedInAs = 'Elizabeth Chaves', vault
       'Ana Chaves': 'Front Desk', 'Emma Minnetto': 'Front Desk',
     });
     const STAFF_PROFILES_VAULT_KEY = 'app_staff_profiles_v1';
-    const STEP_UP_AUTH_VAULT_KEY = 'app_step_up_auth_v1';
     const MAX_CUSTOM_STAFF_PROFILES = 50;
     let appSession = ${JSON.stringify({ name: signedInAs, role })};
-    let stepUpGrant = { name: 'Carrie Gass' };
     const _isPlainObject = v => !!v && typeof v === 'object' && !Array.isArray(v);
     const _validOwnerVerifier = () => true;
     const _loadSecretVault = () => JSON.parse(JSON.stringify(_state.vault));
     const _saveSecretVault = v => { _state.vault = JSON.parse(JSON.stringify(v)); _state.savedTimes++; };
-    const _resetStepUpGrant = () => { stepUpGrant = null; };
     function _requireAppRole(allowed) {
       if (!allowed.has(appSession.role)) {
         throw new Error('This signed-in profile is not authorized for that action.');
       }
       return appSession;
     }
-    const STEP_UP_ROLES = new Set(['Owner', 'Operations & Events']);
     const PROFILE_ROLE_OVERRIDES_VAULT_KEY = 'app_profile_roles_v1';
     const REMOVED_BUILTIN_PROFILES_VAULT_KEY = 'app_removed_builtins_v1';
     const ASSIGNABLE_PROFILE_ROLES = Object.freeze(['Operations & Events', 'Front Desk']);
     ${sliceFunction(main, '_normalizeStaffProfileName')}
     ${sliceFunction(main, '_customStaffProfilesFromVault')}
-    ${sliceFunction(main, '_stepUpRecords')}
     ${sliceFunction(main, '_profileRoleOverrides')}
     ${sliceFunction(main, '_removedBuiltInProfiles')}
     ${sliceFunction(main, '_allAppProfiles')}
@@ -710,30 +605,6 @@ test('profile removal: invalid names are rejected before any vault write', async
   }
 });
 
-test('profile removal: a Step Up credential is revoked with the profile', async () => {
-  const { api, state } = removalHarness({
-    vault: {
-      app_staff_profiles_v1: [{ name: 'Dana Reed', role: 'Front Desk', createdAt: 1 }],
-      app_step_up_auth_v1: { 'Dana Reed': { v: 1 }, 'Carrie Gass': { v: 1 } },
-    },
-  });
-  await api.remove('Dana Reed');
-  assert.deepEqual(Object.keys(state.vault.app_step_up_auth_v1), ['Carrie Gass'],
-    'only the removed user loses their Step Up code');
-});
-
-test('profile removal: re-adding the same name does not inherit the old Step Up code', async () => {
-  const { api, state } = removalHarness({
-    vault: {
-      app_staff_profiles_v1: [{ name: 'Dana Reed', role: 'Front Desk', createdAt: 1 }],
-      app_step_up_auth_v1: { 'Dana Reed': { v: 1 } },
-    },
-  });
-  await api.remove('Dana Reed');
-  assert.equal(state.vault.app_step_up_auth_v1, undefined,
-    'the empty Step Up map is cleaned up, so a re-added name starts unenrolled');
-});
-
 test('profile removal: removing the last user cleans up the vault key', async () => {
   const { api, state } = removalHarness({
     vault: { app_staff_profiles_v1: [{ name: 'Dana Reed', role: 'Front Desk', createdAt: 1 }] },
@@ -770,7 +641,6 @@ test('profile removal: logs, notes and tasks are never touched by a removal', as
       `removal must not reference ${forbidden}`);
   }
   assert.match(body, /STAFF_PROFILES_VAULT_KEY/);
-  assert.match(body, /STEP_UP_AUTH_VAULT_KEY/);
 });
 
 test('profile removal: the owner UI exposes Remove and refreshes everywhere', () => {

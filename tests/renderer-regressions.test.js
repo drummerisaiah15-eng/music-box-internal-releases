@@ -401,3 +401,30 @@ test('CSV export neutralizes formula-like text without changing ordinary values'
   assert.equal(sandbox.safe('  +cmd'), "'  +cmd");
   assert.equal(sandbox.safe('@SUM(A1:A2)'), "'@SUM(A1:A2)");
 });
+
+test('deleted logs never surface in any human-visible view', () => {
+  // H-07 tombstones logs instead of removing them, so every read that a person
+  // sees must filter them out. Missing one is how a deleted entry kept showing
+  // on the dashboard "Last Log" card.
+  const visible = namedFunctionSource('getVisibleLogs');
+  assert.match(visible, /filter\(l => !l\?\._deleted\)/, 'the helper drops tombstones');
+
+  for (const fn of ['renderLogs', 'renderYesterdayLog', 'editLog']) {
+    const body = namedFunctionSource(fn);
+    assert.match(body, /getVisibleLogs\(\)/, `${fn} reads through the helper`);
+    assert.doesNotMatch(body, /STORE\.get\('logs'/,
+      `${fn} must not read the raw log array`);
+  }
+
+  // The morning brief card and the AI context window must also be filtered.
+  assert.match(source, /const logs = getVisibleLogs\(\);\s*\n\s*const entry = logs\.slice\(\)/,
+    'the morning brief last-log card is filtered');
+  assert.match(source, /const recentLogs = getVisibleLogs\(\)/,
+    'AI context is not fed deleted entries');
+
+  // Mutation and retention paths deliberately keep the raw array so tombstones
+  // survive to propagate, and can still be pruned.
+  assert.match(namedFunctionSource('deleteLog'), /_deleted: true/);
+  assert.doesNotMatch(namedFunctionSource('deleteLog'), /getVisibleLogs\(\)/,
+    'deletion must operate on the raw array');
+});

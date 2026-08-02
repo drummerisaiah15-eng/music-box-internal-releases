@@ -1992,31 +1992,12 @@
         <div id="manage-profiles-section" style="margin-top:20px;padding-top:16px;border-top:1px solid var(--divider);display:none">
           <div style="font-size:13px;font-weight:600;margin-bottom:6px;color:var(--text-secondary)">Manage Users (Elizabeth only)</div>
           <div style="font-size:11.5px;color:var(--text-muted);margin-bottom:10px;line-height:1.5;max-width:640px">
-            Change anyone's role, or remove their login from this Mac. Removing a
-            user also revokes any Step Up code they had; their past tasks and log
-            entries are kept, only the login is removed. Owner is proved by the
-            owner passcode, so it cannot be reassigned and the last Owner cannot
-            be removed.
+            Change anyone's role, or remove their login from this Mac. Their past
+            tasks and log entries are kept — only the login is removed. Owner is
+            proved by the owner passcode, so it cannot be reassigned and the last
+            Owner cannot be removed.
           </div>
           <div id="manage-profiles-list"></div>
-        </div>
-        <div id="step-up-enroll-section" style="margin-top:20px;padding-top:16px;border-top:1px solid var(--divider);display:none">
-          <div style="font-size:13px;font-weight:600;margin-bottom:6px;color:var(--text-secondary)">Step Up Receipt Access (Elizabeth only)</div>
-          <div style="font-size:11.5px;color:var(--text-muted);margin-bottom:10px;line-height:1.5;max-width:640px">
-            Anyone can select a profile at the login screen, so without a passcode
-            a front-desk user could open Carrie's receipts. Setting a code here
-            requires it before receipts unlock. Leave this unset to keep receipts
-            open to anyone who selects Carrie.
-          </div>
-          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-            <select id="step-up-profile" class="form-select" style="width:210px">
-              <option value="Carrie Gass">Carrie Gass</option>
-              <option value="Elizabeth Chaves">Elizabeth Chaves</option>
-            </select>
-            <input type="password" id="step-up-new" class="form-input" inputmode="numeric" minlength="6" maxlength="6" placeholder="6-digit code" style="width:170px;letter-spacing:.12em" />
-            <button class="btn btn-outline btn-sm" onclick="stepUpEnrollPasscode()">Set Step Up Code</button>
-          </div>
-          <div id="step-up-enroll-status" style="font-size:11.5px;color:var(--text-muted);margin-top:8px"></div>
         </div>
       </div>
 
@@ -2424,7 +2405,6 @@ async function setProfileRole(name, role) {
     if (result?.ok !== true) throw new Error(result?.error || 'The role was not changed.');
     await refreshLoginProfiles();
     renderManageProfiles();
-    await refreshStepUpTrust();
     // Nav and page permissions are role-derived, so re-apply them immediately.
     try { applyRolePermissions(); } catch (_) {}
     if (!result.unchanged) showToast(`${name} is now ${role}.`, 'success');
@@ -2448,15 +2428,13 @@ async function removeLoginUser(name) {
   }
   if (!window.confirm(
     `Remove ${name}?\n\n` +
-    `Their login on this Mac is deleted and any Step Up code is revoked. ` +
-    `Tasks and log entries they created are kept.`
+    `Their login on this Mac is deleted. Tasks and log entries they created are kept.`
   )) return false;
   try {
     const result = await window.electronSession.removeStaffProfile(name);
     if (result?.ok !== true) throw new Error(result?.error || 'The user was not removed.');
     await refreshLoginProfiles();
     renderManageProfiles();
-    await refreshStepUpTrust();
     showToast(`${name} was removed.`, 'success');
     return true;
   } catch (error) {
@@ -2825,10 +2803,6 @@ async function _purgeLegacyDemoDataOnce() {
 function completeLogin(name, role) {
   try {
     sessionStorage.setItem('tmb_session_user', name);
-    // V159-006: a fresh login never carries a Step Up grant. Ask main what this
-    // profile is actually entitled to rather than inferring it from the name.
-    _stepUpTrusted = { eligible: false, enrolled: false, authorized: false };
-    refreshStepUpTrust().catch(() => {});
   // Re-enable any login buttons that were disabled during loading
   document.querySelectorAll('.login-user-btn').forEach(b => { b.disabled = false; b.style.opacity = ''; });
   document.getElementById('login-screen').style.display = 'none';
@@ -6534,9 +6508,7 @@ const PAGE_TITLES = {
 };
 
 function canAccessPage(page) {
-  // V159-006: eligibility (role) decides whether the page is reachable; the
-  // Step Up grant decides whether its contents unlock. Main enforces both.
-  if (page === 'stepup') return isCarrie() || _stepUpTrusted.eligible;
+  if (page === 'stepup') return isCarrie();
   return true;
 }
 
@@ -8228,9 +8200,6 @@ async function loadSettings() {
   const pinSec = document.getElementById('pin-change-section');
   if (pinSec) pinSec.style.display = isElizabeth() ? '' : 'none';
 
-  // V159-006: Step Up enrolment is owner-only, same visibility rule as the PIN.
-  const stepUpSec = document.getElementById('step-up-enroll-section');
-  if (stepUpSec) stepUpSec.style.display = isElizabeth() ? '' : 'none';
 
   const manageSec = document.getElementById('manage-profiles-section');
   if (manageSec) manageSec.style.display = isElizabeth() ? '' : 'none';
@@ -9256,7 +9225,7 @@ function refreshDashboard() {
 }
 
 function renderYesterdayLog() {
-  const logs = STORE.get('logs', []);
+  const logs = getVisibleLogs();
   // Always show the most recently dated log entry
   const entry = logs.slice().sort((a, b) => (b.date || '').localeCompare(a.date || ''))[0];
 
@@ -10805,7 +10774,7 @@ async function saveLogEntry() {
 }
 
 function editLog(id) {
-  const logs = STORE.get('logs', []);
+  const logs = getVisibleLogs();
   const l = logs.find(e => String(e.id) === String(id));
   if (!l) return;
   // H-07: snapshot the record's version so saveLogEntry() can detect if a
@@ -10842,9 +10811,18 @@ function _logHighlight(escapedHtml, terms) {
   );
 }
 
+// H-07: deleted logs are tombstoned (_deleted:true) rather than removed, so the
+// deletion can propagate to other devices instead of the entry reappearing on
+// the next sync. Every human-visible read MUST go through this helper —
+// mutation and retention paths deliberately use the raw array so tombstones
+// survive and can still be pruned.
+function getVisibleLogs() {
+  const logs = STORE.get('logs', []);
+  return (Array.isArray(logs) ? logs : []).filter(l => !l?._deleted);
+}
+
 function renderLogs() {
-  // H-07: filter out tombstoned entries (_deleted:true) before display.
-  const logs = (STORE.get('logs', [])).filter(l => !l._deleted);
+  const logs = getVisibleLogs();
   const rawSearch = boundedText((document.getElementById('log-search')?.value || '').trim(), 256);
   const authorFilter = (document.getElementById('log-author-filter')?.value || '');
   const terms = rawSearch
@@ -11243,7 +11221,7 @@ function showBriefing() {
 
   // Last log entry
   try {
-    const logs = STORE.get('logs', []);
+    const logs = getVisibleLogs();
     const entry = logs.slice().sort((a, b) => (b.date || '').localeCompare(a.date || ''))[0];
     const briefYesterday = document.getElementById('briefing-yesterday');
     if (briefYesterday) {
@@ -12836,110 +12814,14 @@ const MAX_RECEIPT_IMAGE_DIMENSION = 2000;
 const MAX_RECEIPT_DECODED_PIXELS = 60 * 1000 * 1000;
 const SUPPORTED_RECEIPT_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp']);
 
-// V159-006: mirrors the trusted grant held in main. This is a UI convenience
-// only — main re-checks the role AND the grant on every sensitive operation, so
-// tampering with this cached value grants nothing.
-let _stepUpTrusted = { eligible: false, enrolled: false, authorized: false };
-
-async function refreshStepUpTrust() {
-  try {
-    const status = await window.electronSession?.stepUpStatus?.();
-    _stepUpTrusted = {
-      eligible: status?.eligible === true,
-      enrolled: status?.enrolled === true,
-      authorized: status?.authorized === true,
-    };
-  } catch (_) {
-    _stepUpTrusted = { eligible: false, enrolled: false, authorized: false };
-  }
-  try { renderStepUpLockState(); } catch (_) {}
-  return _stepUpTrusted;
-}
-
+// Operations & Events (or Owner) may use Step Up. Role is owner-assignable, so
+// this follows the role rather than a hard-coded name.
 function requireStepUpAccess() {
-  // Role check first so an ineligible profile gets the same message as before.
-  if (!_stepUpTrusted.eligible) {
+  if (!isCarrie()) {
     showToast('This profile does not have access to Step Up Receipts.', 'warning');
-    return false;
-  }
-  // V159-006: enrolment is opt-in. With no Step Up code set, receipts behave
-  // exactly as they did before this update — the owner turns protection on by
-  // setting a code in Settings.
-  if (!_stepUpTrusted.enrolled) return true;
-  if (!_stepUpTrusted.authorized) {
-    showToast('Enter your Step Up code to unlock receipts.', 'warning');
-    try { renderStepUpLockState(); } catch (_) {}
     return false;
   }
   return true;
-}
-
-// Prompt for the Step Up passcode and hand it to main for verification. The
-// passcode never leaves this call and is not retained in renderer state.
-async function stepUpUnlock() {
-  if (!_stepUpTrusted.eligible) {
-    showToast('This profile does not have access to Step Up Receipts.', 'warning');
-    return false;
-  }
-  if (!_stepUpTrusted.enrolled) {
-    showToast(
-      'No Step Up passcode is enrolled for this profile yet. Elizabeth must set one in Settings.',
-      'warning'
-    );
-    return false;
-  }
-  const passcode = window.prompt('Enter your 6-digit Step Up passcode to unlock receipts:');
-  if (passcode === null) return false;
-  try {
-    const result = await window.electronSession.stepUpAuthenticate(String(passcode).trim());
-    if (result?.ok !== true) throw new Error('Step Up authentication failed.');
-    await refreshStepUpTrust();
-    showToast('Step Up unlocked.', 'success');
-    try { renderStepUp(); } catch (_) {}
-    return true;
-  } catch (error) {
-    await refreshStepUpTrust();
-    showToast(`Step Up not unlocked: ${error?.message || error}`, 'danger');
-    return false;
-  }
-}
-
-async function stepUpLock() {
-  try { await window.electronSession?.stepUpRevoke?.(); } catch (_) {}
-  await refreshStepUpTrust();
-  showToast('Step Up locked.', 'info');
-}
-
-// Owner-only enrolment of a Step Up passcode for a privileged profile.
-async function stepUpEnrollPasscode(profileName) {
-  const status = document.getElementById('step-up-enroll-status');
-  const setStatus = (text, danger) => {
-    if (status) {
-      status.textContent = text;
-      status.style.color = danger ? 'var(--danger,#c0392b)' : 'var(--text-muted)';
-    }
-  };
-  const select = document.getElementById('step-up-profile');
-  const input = document.getElementById('step-up-new');
-  const name = String(profileName || select?.value || '').trim();
-  const passcode = String(input?.value || '').trim();
-  if (!name) { setStatus('Choose a profile first.', true); return false; }
-  if (!/^\d{6}$/.test(passcode)) {
-    setStatus('The Step Up code must be exactly 6 digits.', true);
-    return false;
-  }
-  try {
-    await window.electronSession.stepUpEnroll({ name, passcode });
-    if (input) input.value = '';
-    setStatus(`Step Up code set for ${name}. Receipts now require it.`, false);
-    showToast(`Step Up code set for ${name}.`, 'success');
-    await refreshStepUpTrust();
-    return true;
-  } catch (error) {
-    setStatus(`Not set: ${error?.message || error}`, true);
-    showToast(`Step Up code was not set: ${error?.message || error}`, 'danger');
-    return false;
-  }
 }
 
 function getStepUpReceipts() {
@@ -12955,50 +12837,11 @@ function saveStepUpReceipts(receipts) {
   return STORE.replace('step_up_receipts', receipts);
 }
 
-function renderStepUpLockState() {
-  const page = document.getElementById('page-stepup');
-  if (!page) return;
-  // Only lock when a code is actually enrolled — see requireStepUpAccess().
-  const locked = _stepUpTrusted.eligible && _stepUpTrusted.enrolled && !_stepUpTrusted.authorized;
-  let overlay = document.getElementById('stepup-lock-overlay');
-  if (!locked) { if (overlay) overlay.style.display = 'none'; return; }
-  if (!overlay) {
-    overlay = document.createElement('div');
-    overlay.id = 'stepup-lock-overlay';
-    overlay.style.cssText = 'padding:32px;max-width:640px';
-    page.prepend(overlay);
-  }
-  overlay.style.display = '';
-  overlay.innerHTML = `
-    <div class="card" style="padding:24px">
-      <h3 style="margin:0 0 10px">🔒 Step Up is locked</h3>
-      <p style="margin:0 0 8px;line-height:1.5">
-        Selecting a profile is not enough to open receipts. Enter your Step Up
-        passcode to unlock them for this session.
-      </p>
-      <p style="margin:0 0 16px;color:var(--text-secondary);line-height:1.5">
-        ${_stepUpTrusted.enrolled
-          ? 'Access relocks automatically after a period of inactivity, and whenever you log out or switch profiles.'
-          : 'No passcode is enrolled for this profile yet — Elizabeth must set one in Settings first.'}
-      </p>
-      <button class="btn btn-primary" onclick="stepUpUnlock()"
-              ${_stepUpTrusted.enrolled ? '' : 'disabled'}>Unlock Step Up</button>
-    </div>`;
-}
-
 function renderStepUp() {
-  // V159-006: consult main before rendering, so a stale cached grant cannot
-  // leave receipts on screen after the grant expired.
-  refreshStepUpTrust().then(() => {
-    if (_stepUpTrusted.eligible && _stepUpTrusted.enrolled && !_stepUpTrusted.authorized) {
-      renderStepUpLockState();
-    }
-  }).catch(() => {});
   if (!requireStepUpAccess()) {
-    if (!_stepUpTrusted.eligible) navigate('dashboard');
+    navigate('dashboard');
     return;
   }
-  renderStepUpLockState();
   // Initialize rows if empty
   if (_suLineItems.length === 0)   stepUpResetRows();
   stepUpRenderLineItems();
@@ -13845,7 +13688,7 @@ async function policyAskQuestion() {
     const cutoff = new Date();
     cutoff.setDate(cutoff.getDate() - 30);
     const cutoffStr = cutoff.toISOString().slice(0, 10);
-    const recentLogs = (STORE.get('logs', []))
+    const recentLogs = getVisibleLogs()
       .filter(l => (l.date || '') >= cutoffStr)
       .sort((a, b) => (b.date || '').localeCompare(a.date || '') || (b.id || 0) - (a.id || 0))
       .slice(0, 60);

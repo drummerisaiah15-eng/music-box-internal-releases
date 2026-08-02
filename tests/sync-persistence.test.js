@@ -1873,11 +1873,21 @@ test('H-07: deleteLog writes a tombstone so the deletion propagates across devic
     !deleteLogFn.includes('logs.filter(l => String(l.id) !== String(id))'),
     'deleteLog no longer filters the array (would lose tombstone)'
   );
-  // renderLogs must exclude tombstoned entries from the display.
+  // Every human-visible read goes through getVisibleLogs(), which is the single
+  // place tombstones are filtered. renderLogs must not read the raw array.
   const renderFn = declaration('renderLogs');
   assert.ok(
-    renderFn.includes('_deleted'),
-    'renderLogs filters out tombstoned entries before display'
+    renderFn.includes('getVisibleLogs()'),
+    'renderLogs reads through the tombstone-filtering helper'
+  );
+  assert.ok(
+    !renderFn.includes("STORE.get('logs'"),
+    'renderLogs does not read the raw log array'
+  );
+  const visibleFn = declaration('getVisibleLogs');
+  assert.ok(
+    visibleFn.includes('_deleted'),
+    'getVisibleLogs excludes tombstoned entries'
   );
 });
 
