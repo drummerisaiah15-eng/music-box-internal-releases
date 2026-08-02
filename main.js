@@ -32,6 +32,13 @@ let updateDownloadPromise = null;
 let appSession = null;
 let ownerAuthFailures = 0;
 let ownerAuthLockedUntil = 0;
+// V159-006: declared with the other session state because _resetAppSession() and
+// _setAppSession() are defined earlier in the file than the Step Up block and
+// call _resetStepUpGrant(). Keeping these `let`s below those functions would put
+// them in the temporal dead zone on any early call path.
+let stepUpGrant = null;
+let stepUpFailures = 0;
+let stepUpLockedUntil = 0;
 let firebaseRuntimeSecretIssued = false;
 const pendingFlushRequests = new Map();
 
@@ -1277,6 +1284,8 @@ function _roleForAppProfile(name) {
 
 function _resetAppSession() {
   appSession = null;
+  // V159-006: a Step Up grant must never outlive the session that earned it.
+  _resetStepUpGrant();
   firebaseRuntimeSecretIssued = false;
   pendingOAuth = null;
   _closeOAuthServer();
@@ -1284,6 +1293,8 @@ function _resetAppSession() {
 
 function _setAppSession(name, role) {
   firebaseRuntimeSecretIssued = false;
+  // V159-006: switching profiles drops any Step Up authorization.
+  _resetStepUpGrant();
   appSession = {
     name,
     role,
@@ -1375,6 +1386,136 @@ function _recordOwnerAuthFailure() {
     ownerAuthLockedUntil = Date.now() + delay;
   }
 }
+
+// ─── V159-006: trusted-layer Step Up authorization ───────────────────────────
+//
+// `app-session-start-staff` accepts a display name with no proof of identity, so
+// selecting "Carrie Gass" at the login screen previously granted the
+// Operations & Events role — and every Step Up guard lived in the renderer,
+// where it is advisory only. Renderer UI hiding is not an authorization
+// boundary: a tampered renderer could call the same IPC directly.
+//
+// Step Up is, by name, a step-up authentication: profile selection is not enough
+// for the sensitive path. Every Step Up operation that leaves this machine
+// (PDF export, email, AI processing) now requires BOTH a privileged session role
+// AND an unexpired grant produced by verifying a per-profile passcode here in
+// main. Ordinary login is deliberately unchanged, so no one is locked out of
+// normal work.
+const STEP_UP_AUTH_VAULT_KEY = 'app_step_up_auth_v1';
+const STEP_UP_GRANT_TTL_MS = 10 * 60 * 1000;
+const STEP_UP_ROLES = new Set(['Owner', 'Operations & Events']);
+// stepUpGrant / stepUpFailures / stepUpLockedUntil are declared with the other
+// session state near the top of this file — see the note there.
+
+function _resetStepUpGrant() {
+  stepUpGrant = null;
+}
+
+function _stepUpRecords(vault) {
+  const stored = vault[STEP_UP_AUTH_VAULT_KEY];
+  if (stored === undefined) return {};
+  if (!_isPlainObject(stored)) {
+    throw new Error('The protected Step Up authentication record is invalid.');
+  }
+  for (const value of Object.values(stored)) {
+    if (!_validOwnerVerifier(value)) {
+      throw new Error('The protected Step Up authentication record is invalid.');
+    }
+  }
+  return stored;
+}
+
+function _recordStepUpFailure() {
+  stepUpFailures += 1;
+  if (stepUpFailures >= 5) {
+    stepUpLockedUntil = Date.now() + (stepUpFailures >= 10 ? 30 * 60 * 1000 : 5 * 60 * 1000);
+  }
+}
+
+// The single choke point every Step Up-sensitive main handler must call.
+function _requireStepUpGrant() {
+  const session = _requireAppRole(STEP_UP_ROLES);
+  if (!stepUpGrant ||
+      Date.now() >= stepUpGrant.expiresAt ||
+      stepUpGrant.name !== session.name ||
+      !mainWindow || mainWindow.isDestroyed() ||
+      stepUpGrant.webContentsId !== mainWindow.webContents.id) {
+    _resetStepUpGrant();
+    throw new Error('Step Up authentication is required before this action.');
+  }
+  // Sliding expiry while the operator is actively working.
+  stepUpGrant.expiresAt = Date.now() + STEP_UP_GRANT_TTL_MS;
+  return session;
+}
+
+_secureHandle('step-up-status', async () => {
+  // Report only what the UI needs; never leak whether a specific passcode exists
+  // to an unprivileged session.
+  if (!appSession || Date.now() >= appSession.expiresAt || !STEP_UP_ROLES.has(appSession.role)) {
+    return { ok: true, eligible: false, enrolled: false, authorized: false };
+  }
+  const enrolled = Object.prototype.hasOwnProperty.call(
+    _stepUpRecords(_loadSecretVault()), appSession.name
+  );
+  const authorized = !!(stepUpGrant &&
+    Date.now() < stepUpGrant.expiresAt &&
+    stepUpGrant.name === appSession.name &&
+    mainWindow && !mainWindow.isDestroyed() &&
+    stepUpGrant.webContentsId === mainWindow.webContents.id);
+  return { ok: true, eligible: true, enrolled, authorized };
+});
+
+// Owner-only enrolment. The owner sets or resets the Step Up passcode for a
+// privileged profile; there is deliberately no self-service path, so a walk-up
+// cannot claim an unenrolled profile.
+_secureHandle('step-up-enroll', async (_, request) => {
+  _requireAppRole(new Set(['Owner']));
+  if (!_isPlainObject(request)) throw new Error('Invalid Step Up enrolment request.');
+  const name = _normalizeStaffProfileName(request.name);
+  const role = _roleForAppProfile(name);
+  if (!role || !STEP_UP_ROLES.has(role)) {
+    throw new Error('Only Owner or Operations & Events profiles can use Step Up.');
+  }
+  if (!_validOwnerPin(request.passcode, false)) {
+    throw new Error('The Step Up passcode must be exactly 6 digits.');
+  }
+  const vault = _loadSecretVault();
+  const records = { ..._stepUpRecords(vault) };
+  records[name] = await _buildOwnerVerifier(request.passcode);
+  vault[STEP_UP_AUTH_VAULT_KEY] = records;
+  _saveSecretVault(vault);
+  if (stepUpGrant?.name === name) _resetStepUpGrant();
+  return { ok: true, name };
+});
+
+_secureHandle('step-up-authenticate', async (_, passcode) => {
+  const session = _requireAppRole(STEP_UP_ROLES);
+  if (Date.now() < stepUpLockedUntil) {
+    throw new Error('Too many failed Step Up attempts. Try again later.');
+  }
+  const records = _stepUpRecords(_loadSecretVault());
+  const record = records[session.name];
+  if (!record) {
+    throw new Error('No Step Up passcode is enrolled for this profile. The owner must set one first.');
+  }
+  if (!await _ownerPinMatches(passcode, record)) {
+    _recordStepUpFailure();
+    throw new Error('The Step Up passcode did not match.');
+  }
+  stepUpFailures = 0;
+  stepUpLockedUntil = 0;
+  stepUpGrant = {
+    name: session.name,
+    webContentsId: mainWindow?.webContents?.id ?? null,
+    expiresAt: Date.now() + STEP_UP_GRANT_TTL_MS,
+  };
+  return { ok: true, expiresAt: stepUpGrant.expiresAt };
+});
+
+_secureHandle('step-up-revoke', async () => {
+  _resetStepUpGrant();
+  return { ok: true };
+});
 
 _secureHandle('app-session-authenticate-owner', async (_, pin) => {
   if (!_validOwnerPin(pin)) throw new Error('Enter the owner passcode.');

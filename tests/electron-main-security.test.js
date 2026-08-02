@@ -447,3 +447,71 @@ test('AI and RingCentral secrets stay behind dedicated main-process proxies', ()
 test('main does not swallow uncaught exceptions and continue in corrupt state', () => {
   assert.doesNotMatch(main, /process\.on\(['"]uncaughtException/);
 });
+
+// --- V159-006: Step Up authorization lives in the trusted layer --------------
+
+test('V159-006: Step Up requires both a privileged role and an unexpired grant', () => {
+  const main = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  const guard = main.slice(main.indexOf('function _requireStepUpGrant('));
+  const body = guard.slice(0, guard.indexOf('\n}\n') + 3);
+
+  assert.match(body, /_requireAppRole\(STEP_UP_ROLES\)/,
+    'role is enforced in main, not inferred from a renderer display name');
+  assert.match(body, /Date\.now\(\) >= stepUpGrant\.expiresAt/, 'grants expire');
+  assert.match(body, /stepUpGrant\.name !== session\.name/,
+    'a grant cannot be reused across profiles');
+  assert.match(body, /stepUpGrant\.webContentsId !== mainWindow\.webContents\.id/,
+    'a grant is bound to the live window');
+  assert.match(main, /const STEP_UP_ROLES = new Set\(\['Owner', 'Operations & Events'\]\)/,
+    'Front Desk profiles can never hold a Step Up grant');
+});
+
+test('V159-006: a Step Up grant cannot outlive its session', () => {
+  const main = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  for (const fn of ['_resetAppSession', '_setAppSession']) {
+    const start = main.indexOf(`function ${fn}(`);
+    assert.notEqual(start, -1, `${fn} exists`);
+    const body = main.slice(start, main.indexOf('\n}', start));
+    assert.match(body, /_resetStepUpGrant\(\)/,
+      `${fn} clears any Step Up grant (logout, switch, expiry)`);
+  }
+});
+
+test('V159-006: enrolment is owner-only and rejects unprivileged profiles', () => {
+  const main = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  const start = main.indexOf("_secureHandle('step-up-enroll'");
+  assert.notEqual(start, -1, 'the enrolment handler exists');
+  const body = main.slice(start, main.indexOf('\n});', start));
+  assert.match(body, /_requireAppRole\(new Set\(\['Owner'\]\)\)/,
+    'only the owner may enrol a Step Up passcode');
+  assert.match(body, /STEP_UP_ROLES\.has\(role\)/,
+    'a Front Desk profile cannot be given Step Up credentials');
+  assert.match(body, /_validOwnerPin\(request\.passcode, false\)/,
+    'the passcode must be a full 6 digits');
+  assert.match(body, /_buildOwnerVerifier\(request\.passcode\)/,
+    'the passcode is stored as a PBKDF2 verifier, never in plaintext');
+});
+
+test('V159-006: authentication is rate limited and never self-enrols', () => {
+  const main = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  const start = main.indexOf("_secureHandle('step-up-authenticate'");
+  const body = main.slice(start, main.indexOf('\n});', start));
+  assert.match(body, /Date\.now\(\) < stepUpLockedUntil/, 'lockout is honoured');
+  assert.match(body, /_recordStepUpFailure\(\)/, 'failures are counted');
+  assert.match(body, /_ownerPinMatches\(passcode, record\)/, 'constant-time verifier compare');
+  assert.match(body, /No Step Up passcode is enrolled/,
+    'an unenrolled profile cannot be claimed by whoever reaches the Mac first');
+  assert.doesNotMatch(body, /_buildOwnerVerifier/,
+    'authenticating must never create a credential');
+});
+
+test('V159-006: the renderer cannot grant itself Step Up access', () => {
+  const preload = fs.readFileSync(path.join(__dirname, '..', 'preload.js'), 'utf8');
+  assert.match(preload, /stepUpAuthenticate:\(passcode\) => ipcRenderer\.invoke\('step-up-authenticate', passcode\)/,
+    'the renderer can only submit a passcode for main to verify');
+  const renderer = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  // The cached flag is explicitly documented as advisory.
+  assert.match(renderer, /_stepUpTrusted/, 'renderer keeps only a mirrored status');
+  assert.match(renderer, /main re-checks the role AND the grant on every sensitive operation/,
+    'the cached value is documented as non-authoritative');
+});

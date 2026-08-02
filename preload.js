@@ -27,6 +27,12 @@ contextBridge.exposeInMainWorld('electronSession', {
   stageOwnerPin:     (request) => ipcRenderer.invoke('app-session-stage-owner-pin', request),
   commitOwnerPin:    (rotationId) => ipcRenderer.invoke('app-session-commit-owner-pin', rotationId),
   cancelOwnerPin:    (rotationId) => ipcRenderer.invoke('app-session-cancel-owner-pin', rotationId),
+  // V159-006: Step Up authorization is decided in main, not here. The renderer
+  // can only ask for status, submit a passcode, or drop its grant.
+  stepUpStatus:      () => ipcRenderer.invoke('step-up-status'),
+  stepUpEnroll:      (request) => ipcRenderer.invoke('step-up-enroll', request),
+  stepUpAuthenticate:(passcode) => ipcRenderer.invoke('step-up-authenticate', passcode),
+  stepUpRevoke:      () => ipcRenderer.invoke('step-up-revoke'),
 });
 
 // OAuth bridge — main owns the random loopback listener, authorization code,

@@ -2693,6 +2693,10 @@ async function _purgeLegacyDemoDataOnce() {
 function completeLogin(name, role) {
   try {
     sessionStorage.setItem('tmb_session_user', name);
+    // V159-006: a fresh login never carries a Step Up grant. Ask main what this
+    // profile is actually entitled to rather than inferring it from the name.
+    _stepUpTrusted = { eligible: false, enrolled: false, authorized: false };
+    refreshStepUpTrust().catch(() => {});
   // Re-enable any login buttons that were disabled during loading
   document.querySelectorAll('.login-user-btn').forEach(b => { b.disabled = false; b.style.opacity = ''; });
   document.getElementById('login-screen').style.display = 'none';
@@ -6398,7 +6402,9 @@ const PAGE_TITLES = {
 };
 
 function canAccessPage(page) {
-  if (page === 'stepup') return isCarrie();
+  // V159-006: eligibility (role) decides whether the page is reachable; the
+  // Step Up grant decides whether its contents unlock. Main enforces both.
+  if (page === 'stepup') return isCarrie() || _stepUpTrusted.eligible;
   return true;
 }
 
@@ -12681,10 +12687,91 @@ const MAX_RECEIPT_IMAGE_DIMENSION = 2000;
 const MAX_RECEIPT_DECODED_PIXELS = 60 * 1000 * 1000;
 const SUPPORTED_RECEIPT_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp']);
 
+// V159-006: mirrors the trusted grant held in main. This is a UI convenience
+// only — main re-checks the role AND the grant on every sensitive operation, so
+// tampering with this cached value grants nothing.
+let _stepUpTrusted = { eligible: false, enrolled: false, authorized: false };
+
+async function refreshStepUpTrust() {
+  try {
+    const status = await window.electronSession?.stepUpStatus?.();
+    _stepUpTrusted = {
+      eligible: status?.eligible === true,
+      enrolled: status?.enrolled === true,
+      authorized: status?.authorized === true,
+    };
+  } catch (_) {
+    _stepUpTrusted = { eligible: false, enrolled: false, authorized: false };
+  }
+  try { renderStepUpLockState(); } catch (_) {}
+  return _stepUpTrusted;
+}
+
 function requireStepUpAccess() {
-  if (isCarrie()) return true;
-  showToast('This profile does not have access to Step Up Receipts.', 'warning');
-  return false;
+  // Role check first so an ineligible profile gets the same message as before.
+  if (!_stepUpTrusted.eligible) {
+    showToast('This profile does not have access to Step Up Receipts.', 'warning');
+    return false;
+  }
+  if (!_stepUpTrusted.authorized) {
+    showToast('Enter your Step Up passcode to unlock receipts.', 'warning');
+    try { renderStepUpLockState(); } catch (_) {}
+    return false;
+  }
+  return true;
+}
+
+// Prompt for the Step Up passcode and hand it to main for verification. The
+// passcode never leaves this call and is not retained in renderer state.
+async function stepUpUnlock() {
+  if (!_stepUpTrusted.eligible) {
+    showToast('This profile does not have access to Step Up Receipts.', 'warning');
+    return false;
+  }
+  if (!_stepUpTrusted.enrolled) {
+    showToast(
+      'No Step Up passcode is enrolled for this profile yet. Elizabeth must set one in Settings.',
+      'warning'
+    );
+    return false;
+  }
+  const passcode = window.prompt('Enter your 6-digit Step Up passcode to unlock receipts:');
+  if (passcode === null) return false;
+  try {
+    const result = await window.electronSession.stepUpAuthenticate(String(passcode).trim());
+    if (result?.ok !== true) throw new Error('Step Up authentication failed.');
+    await refreshStepUpTrust();
+    showToast('Step Up unlocked.', 'success');
+    try { renderStepUp(); } catch (_) {}
+    return true;
+  } catch (error) {
+    await refreshStepUpTrust();
+    showToast(`Step Up not unlocked: ${error?.message || error}`, 'danger');
+    return false;
+  }
+}
+
+async function stepUpLock() {
+  try { await window.electronSession?.stepUpRevoke?.(); } catch (_) {}
+  await refreshStepUpTrust();
+  showToast('Step Up locked.', 'info');
+}
+
+// Owner-only enrolment of a Step Up passcode for a privileged profile.
+async function stepUpEnrollPasscode(profileName) {
+  const name = profileName || window.prompt('Enrol a Step Up passcode for which profile?');
+  if (!name) return false;
+  const passcode = window.prompt(`Set a 6-digit Step Up passcode for ${name}:`);
+  if (passcode === null) return false;
+  try {
+    await window.electronSession.stepUpEnroll({ name: String(name).trim(), passcode: String(passcode).trim() });
+    showToast(`Step Up passcode set for ${name}.`, 'success');
+    await refreshStepUpTrust();
+    return true;
+  } catch (error) {
+    showToast(`Step Up passcode was not set: ${error?.message || error}`, 'danger');
+    return false;
+  }
 }
 
 function getStepUpReceipts() {
@@ -12700,11 +12787,47 @@ function saveStepUpReceipts(receipts) {
   return STORE.replace('step_up_receipts', receipts);
 }
 
+function renderStepUpLockState() {
+  const page = document.getElementById('page-stepup');
+  if (!page) return;
+  const locked = _stepUpTrusted.eligible && !_stepUpTrusted.authorized;
+  let overlay = document.getElementById('stepup-lock-overlay');
+  if (!locked) { if (overlay) overlay.style.display = 'none'; return; }
+  if (!overlay) {
+    overlay = document.createElement('div');
+    overlay.id = 'stepup-lock-overlay';
+    overlay.style.cssText = 'padding:32px;max-width:640px';
+    page.prepend(overlay);
+  }
+  overlay.style.display = '';
+  overlay.innerHTML = `
+    <div class="card" style="padding:24px">
+      <h3 style="margin:0 0 10px">🔒 Step Up is locked</h3>
+      <p style="margin:0 0 8px;line-height:1.5">
+        Selecting a profile is not enough to open receipts. Enter your Step Up
+        passcode to unlock them for this session.
+      </p>
+      <p style="margin:0 0 16px;color:var(--text-secondary);line-height:1.5">
+        ${_stepUpTrusted.enrolled
+          ? 'Access relocks automatically after a period of inactivity, and whenever you log out or switch profiles.'
+          : 'No passcode is enrolled for this profile yet — Elizabeth must set one in Settings first.'}
+      </p>
+      <button class="btn btn-primary" onclick="stepUpUnlock()"
+              ${_stepUpTrusted.enrolled ? '' : 'disabled'}>Unlock Step Up</button>
+    </div>`;
+}
+
 function renderStepUp() {
+  // V159-006: consult main before rendering, so a stale cached grant cannot
+  // leave receipts on screen after the grant expired.
+  refreshStepUpTrust().then(() => {
+    if (_stepUpTrusted.eligible && !_stepUpTrusted.authorized) renderStepUpLockState();
+  }).catch(() => {});
   if (!requireStepUpAccess()) {
-    navigate('dashboard');
+    if (!_stepUpTrusted.eligible) navigate('dashboard');
     return;
   }
+  renderStepUpLockState();
   // Initialize rows if empty
   if (_suLineItems.length === 0)   stepUpResetRows();
   stepUpRenderLineItems();
