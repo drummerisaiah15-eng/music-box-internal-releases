@@ -1764,10 +1764,14 @@ test('H-02: STORE.set() is blocked for synchronized keys and STORE.replace() is 
     'isSyncKey guard appears near the top of set()'
   );
   // replace() is the deliberate override path for sync keys.
-  assert.ok(script.includes('replace: (k, v) =>'), 'STORE.replace() property exists');
+  // Fix 1: replace() now takes an options bag and demands an explicit
+  // { authoritative } reason for synchronized keys.
+  assert.ok(script.includes('replace: (k, v, options = {}) =>'), 'STORE.replace() property exists');
+  assert.ok(script.includes('requires an explicit { authoritative:'),
+    'and refuses an unclassified whole-value replacement');
   // persistInBackground must now route through replace() so it can write sync keys.
   assert.ok(
-    script.includes('const write = STORE.replace(key, value);'),
+    script.includes('const write = STORE.replace(key, value'),
     'persistInBackground uses replace(), not set()'
   );
 });
@@ -2410,4 +2414,81 @@ test('Fix 3: conflicting versions are surfaced in the log UI', () => {
   assert.match(body, /other version/, 'the operator is told a conflict exists');
   assert.match(body, /resolveLogConflict\(/, 'and can resolve it');
   assert.match(body, /escHtml\(variant\.body/, 'variant text is escaped, never raw');
+});
+
+// --- Fix 1: whole-value replacement must be explicitly classified ------------
+
+function replaceGuardApi(extra = {}) {
+  const context = contextWith({
+    _storeWriteErrors: new Map(),
+    _syncResolutionKeys: new Set(),
+    _encKey: {},
+    SHARED_KEYS: new Set(['firebase_studio_code']),
+    SHARED: { get: () => null, set: () => true },
+    isSyncKey: k => ['logs', 'todo_items'].includes(k),
+    _newOperationId: () => 'op',
+    _queueEncryptedWrite: (k, v, o) => Promise.resolve({ k, v, o }),
+    _queueEncryptedMutation: (k, fn, o) => Promise.resolve({ k, fn, o }),
+    ...extra,
+  });
+  vm.runInContext(`
+    const STORE = { ${
+      script.slice(script.indexOf('  replace: (k, v, options = {}) => {'),
+        script.indexOf('\n  flush:', script.indexOf('  replace: (k, v, options = {}) => {')))
+    } };
+    globalThis.replace = (k, v, o) => STORE.replace(k, v, o);
+  `, context);
+  return context;
+}
+
+test('Fix 1: an unclassified whole-value replace on a sync key is refused', async () => {
+  const api = replaceGuardApi();
+  await assert.rejects(() => api.replace('logs', ['x']),
+    /requires an explicit \{ authoritative/,
+    'a new feature cannot silently regress to stale whole-value replacement');
+  await assert.rejects(() => api.replace('logs', ['x'], { authoritative: 'ok' }),
+    /requires an explicit/, 'a token reason is not accepted');
+});
+
+test('Fix 1: a classified replace is allowed through', async () => {
+  const api = replaceGuardApi();
+  const result = await api.replace('logs', ['x'], { authoritative: 'confirmed workbook import' });
+  assert.equal(result.k, 'logs', 'an explicitly authoritative replacement proceeds');
+});
+
+test('Fix 1: non-synchronized keys are unaffected by the guard', async () => {
+  const api = replaceGuardApi();
+  const result = await api.replace('ui_prefs', { a: 1 });
+  assert.equal(result.k, 'ui_prefs', 'local-only keys need no classification');
+});
+
+test('Fix 1: every production STORE.replace call declares its intent', () => {
+  // The guard fails at runtime, but this catches an unclassified call site the
+  // moment it is written rather than when a user happens to hit that path.
+  const offenders = [];
+  for (const line of script.split('\n')) {
+    if (!line.includes('STORE.replace(')) continue;
+    if (line.includes('Use STORE.mutate')) continue;   // the guard's own message
+    if (line.includes('replace: (k, v, options')) continue; // the definition
+    if (!line.includes('authoritative:')) offenders.push(line.trim().slice(0, 100));
+  }
+  assert.deepEqual(offenders, [],
+    'each whole-value replacement must state why it is authoritative');
+});
+
+test('Fix 1: read-modify-write features use mutate, not replace', () => {
+  // These were converted from stale whole-value replacement to semantic
+  // operations applied to the reconciled base.
+  for (const key of ['deleted_emails', 'comm_handled_ids', 'comm_analyzed_ids', 'staff_notes']) {
+    assert.ok(script.includes(`STORE.mutate('${key}'`),
+      `${key} performs a semantic mutation`);
+  }
+  // Set-membership must union with the base, not overwrite it.
+  const analyzed = script.slice(script.indexOf("STORE.mutate('comm_analyzed_ids'"));
+  assert.match(analyzed.slice(0, 400), /new Set\(Array\.isArray\(current\)/,
+    'the union is taken against the reconciled base');
+  // The new staff note is built once, outside the mutator.
+  const notes = script.slice(script.indexOf('const note = {'));
+  assert.match(notes.slice(0, 300), /_newRecordId\(\)/,
+    'records get collision-resistant ids, not Date.now()');
 });

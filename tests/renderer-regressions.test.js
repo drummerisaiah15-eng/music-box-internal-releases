@@ -321,7 +321,10 @@ test('spreadsheet typing, paste, and imports have explicit resource bounds', () 
   // V160-005: import is an explicit whole-workbook replacement, so it uses the
   // reviewed STORE.replace() path rather than STORE.set(). It must NOT silently
   // fall back to the collision-unsafe STORE.set() call.
-  assert.match(namedFunctionSource('ssImportBuildProject'), /await STORE\.replace\('spreadsheets', normalized\)/);
+  // Fix 1: import is an authoritative whole-workbook replacement and must now
+  // declare that explicitly, so it cannot be mistaken for an ordinary save.
+  assert.match(namedFunctionSource('ssImportBuildProject'),
+    /await STORE\.replace\('spreadsheets', normalized, \{ authoritative: 'confirmed workbook import' \}\)/);
   assert.doesNotMatch(namedFunctionSource('ssImportBuildProject'), /STORE\.set\(/);
   assert.match(namedFunctionSource('ssCellInput'), /_scheduleSpreadsheetSave\(\)/);
   assert.match(namedFunctionSource('ssCellInput'), /rawValue\.length > MAX_SPREADSHEET_CELL_CHARS/);

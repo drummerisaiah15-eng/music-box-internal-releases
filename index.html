@@ -2312,7 +2312,7 @@ async function publishStaffDirectory() {
   try {
     const result = await window.electronSession.exportDirectory();
     if (result?.ok !== true || !Array.isArray(result.directory)) return false;
-    await STORE.replace('staff_directory', result.directory);
+    await STORE.replace('staff_directory', result.directory, { authoritative: 'owner-published directory snapshot' });
     return true;
   } catch (error) {
     console.warn('[profiles] directory was not published:', error?.message || error);
@@ -4193,7 +4193,28 @@ const STORE = {
   // H-02: explicit whole-value replacement for synchronized keys. Callers that
   // hold a fully-reconciled array/object and intend to overwrite the whole
   // document must use this instead of set(). set() now throws for sync keys.
-  replace: (k, v) => {
+  // Fix 1: whole-value replacement of a synchronized key is only ever correct
+  // for an authoritative operation — a confirmed import, a conflict resolution,
+  // or a value the trusted layer just produced. Ordinary read-modify-write
+  // feature saves MUST use mutate(), which derives its base inside the per-key
+  // lock. Requiring an explicit reason here means a new feature cannot silently
+  // regress to stale whole-value replacement: it fails loudly instead.
+  replace: (k, v, options = {}) => {
+    if (isSyncKey(k) && !SHARED_KEYS.has(k)) {
+      const reason = options.authoritative;
+      if (typeof reason !== 'string' || reason.trim().length < 4) {
+        const err = new Error(
+          `STORE.replace('${k}') requires an explicit { authoritative: '<reason>' } ` +
+          `because whole-value replacement cannot merge a concurrent remote edit. ` +
+          `Use STORE.mutate('${k}', current => ...) for a read-modify-write save.`
+        );
+        console.error('[storage] blocked unclassified whole-value replace:', err.message);
+        _storeWriteErrors.set(k, err);
+        const rejected = Promise.reject(err);
+        rejected.catch(() => {});
+        return rejected;
+      }
+    }
     if (SHARED_KEYS.has(k)) {
       try {
         SHARED.set(k, v);
@@ -4334,7 +4355,7 @@ const STORE = {
 const _backgroundSaveNoticeAt = new Map();
 function persistInBackground(key, value, label = 'Background data') {
   // H-02: use replace() so sync keys are allowed; set() now throws for them.
-  const write = STORE.replace(key, value);
+  const write = STORE.replace(key, value, { authoritative: 'background persist of caller-owned value' });
   write.catch(error => {
     console.warn(`[storage] ${label} was not saved:`, error?.message || error);
     const now = Date.now();
@@ -7864,7 +7885,7 @@ async function ssImportBuildProject(name, sheets) {
       sheets: builtSheets,
     });
     const normalized = normalizeSpreadsheetWorkbook(next);
-    await STORE.replace('spreadsheets', normalized);
+    await STORE.replace('spreadsheets', normalized, { authoritative: 'confirmed workbook import' });
     _ssData = normalized;
     showToast('✅ Imported "' + projectName + '" (' + builtSheets.length + ' sheet' + (builtSheets.length !== 1 ? 's' : '') + ')', 'success');
     ssGoHome();
@@ -9129,7 +9150,7 @@ function getCheckoutState() {
 async function setCheckedOut(idx) {
   const state = getCheckoutState();
   state[idx] = true;
-  await STORE.replace(getCheckoutStateKey(), state);
+  await STORE.replace(getCheckoutStateKey(), state, { authoritative: 'whole-day checkout state' });
   return true;
 }
 
@@ -9147,7 +9168,7 @@ function _syncMbCheckoutStatus(schedule) {
     }
   });
   if (changed) {
-    STORE.replace(getCheckoutStateKey(), state).catch(error => {
+    STORE.replace(getCheckoutStateKey(), state, { authoritative: 'whole-day checkout state' }).catch(error => {
       console.warn('[checkout] automatic status was not saved:', error?.message || error);
     });
   }
@@ -9409,15 +9430,15 @@ async function migrateRoomData() {
     if (isNone(overrides[id])) { excluded.add(id); delete overrides[id]; changed = true; }
   });
   if (changed) {
-    writes.push(STORE.replace('room_overrides', overrides));
-    writes.push(STORE.replace('room_excluded', [...excluded]));
+    writes.push(STORE.replace('room_overrides', overrides, { authoritative: 'room map rebuilt from schedule' }));
+    writes.push(STORE.replace('room_excluded', [...excluded], { authoritative: 'room map rebuilt from schedule' }));
   }
 
   // 2. room_by_instructor: delete any instructor whose default room is 'none'
   const byInstr = STORE.get('room_by_instructor', {});
   let instrChanged = false;
   Object.keys(byInstr).forEach(k => { if (isNone(byInstr[k])) { delete byInstr[k]; instrChanged = true; } });
-  if (instrChanged) writes.push(STORE.replace('room_by_instructor', byInstr));
+  if (instrChanged) writes.push(STORE.replace('room_by_instructor', byInstr, { authoritative: 'room map rebuilt from schedule' }));
 
   // 3. room_time_rules: drop any rule whose room is 'none'
   const timeRules = STORE.get('room_time_rules', {});
@@ -9426,7 +9447,7 @@ async function migrateRoomData() {
     const filtered = (timeRules[k] || []).filter(r => !isNone(r.room));
     if (filtered.length !== (timeRules[k] || []).length) { timeRules[k] = filtered; rulesChanged = true; }
   });
-  if (rulesChanged) writes.push(STORE.replace('room_time_rules', timeRules));
+  if (rulesChanged) writes.push(STORE.replace('room_time_rules', timeRules, { authoritative: 'room map rebuilt from schedule' }));
 
   if (writes.length) await Promise.all(writes);
 
@@ -9644,7 +9665,7 @@ async function saveRoomAssignment() {
   }
 
   try {
-    await Promise.all([...writes].map(([key, value]) => STORE.replace(key, value)));
+    await Promise.all([...writes].map(([key, value]) => STORE.replace(key, value, { authoritative: 'room migration rebuild' })));
   } catch (error) {
     showToast(`Room assignment was not fully saved: ${error?.message || error}`, 'danger');
     return false;
@@ -9672,8 +9693,8 @@ async function removeApptFromRoom(e, apptId) {
   delete overrides[String(apptId)];
   try {
     await Promise.all([
-      STORE.replace('room_excluded', [...excluded]),
-      STORE.replace('room_overrides', overrides),
+      STORE.replace('room_excluded', [...excluded], { authoritative: 'room map rebuilt from schedule' }),
+      STORE.replace('room_overrides', overrides, { authoritative: 'room map rebuilt from schedule' }),
     ]);
   } catch (error) {
     showToast(`The room was not fully removed: ${error?.message || error}`, 'danger');
@@ -10040,7 +10061,7 @@ async function toggleEmailFlag(id) {
     ? flagged.filter(flaggedId => flaggedId !== id)
     : [...flagged, id];
   try {
-    await STORE.replace('flagged_emails', nextFlagged);
+    await STORE.replace('flagged_emails', nextFlagged, { authoritative: 'email flag toggle' });
     email.flagged = nextFlagged.includes(id);
     renderEmailList();
     return true;
@@ -10061,7 +10082,12 @@ async function deleteEmail(id) {
   const deleted = STORE.get('deleted_emails', []);
   if (!deleted.includes(key)) {
     try {
-      await STORE.replace('deleted_emails', [...deleted, key]);
+      // Fix 1: set membership applied to the reconciled base, so a deletion
+      // recorded on another Mac is not dropped by this one.
+      await STORE.mutate('deleted_emails', current => {
+        const list = Array.isArray(current) ? current : [];
+        return list.includes(key) ? list : [...list, key];
+      }, []);
     } catch (error) {
       showToast(`Email was not deleted: ${error?.message || error}`, 'danger');
       return false;
@@ -10742,7 +10768,7 @@ async function sendReply(emailId) {
           sentAt: new Date().toISOString(),
         });
         try {
-          await STORE.replace('sent_emails', sent.slice(0, 300));
+          await STORE.replace('sent_emails', sent.slice(0, 300), { authoritative: 'provider-derived sent cache' });
           await autoCompleteEmailTodos(original);
           showToast('✅ Reply sent via Microsoft 365!', 'success');
         } catch (archiveError) {
@@ -10777,7 +10803,7 @@ async function sendReply(emailId) {
       sentAt: new Date().toISOString(),
     });
     try {
-      await STORE.replace('sent_emails', sent.slice(0, 300));
+      await STORE.replace('sent_emails', sent.slice(0, 300), { authoritative: 'provider-derived sent cache' });
       await autoCompleteEmailTodos(original);
       showToast('Reply saved (demo mode — connect Microsoft 365 to send for real).', 'info');
     } catch (error) {
@@ -11166,10 +11192,20 @@ async function saveStaffNote() {
   const body = bodyElement.value.trim();
   const priority = document.getElementById('note-priority').value;
   if (!body) { showToast('Please write a note.', 'warning'); return; }
-  const notes = _cloneJson(STORE.get('staff_notes', []));
-  notes.unshift({ id: Date.now(), author, body, priority, created: new Date().toISOString() });
+  // Fix 1: build the record ONCE outside the mutator so a re-run cannot create
+  // a duplicate, and give it a collision-resistant id rather than Date.now().
+  const note = {
+    id: _newRecordId(), author, body, priority,
+    created: new Date().toISOString(), version: 1,
+  };
   try {
-    await STORE.replace('staff_notes', notes);
+    await STORE.mutate('staff_notes', current => {
+      const notes = Array.isArray(current) ? _cloneJson(current) : [];
+      if (!notes.some(existing => String(existing.id) === String(note.id))) {
+        notes.unshift(note);
+      }
+      return notes;
+    }, []);
     bodyElement.value = '';
     renderStaff();
     markStaffNotesRead(); // poster sees their own note as already read
@@ -11275,7 +11311,7 @@ async function deleteNote(id) {
   let notes = STORE.get('staff_notes', []);
   notes = notes.filter(n => String(n.id) !== String(id));
   try {
-    await STORE.replace('staff_notes', notes);
+    await STORE.replace('staff_notes', notes, { authoritative: 'staff note prune' });
     renderStaff();
     showToast('Note deleted.', 'success');
     return true;
@@ -11309,7 +11345,7 @@ async function saveStaffDirectoryMember() {
   const id = 'es_' + Date.now();
   list.push({ id, name, email, detail: role || 'Staff', group: 'staff', source: 'manual', removable: true });
   try {
-    await STORE.replace('custom_staff', list);
+    await STORE.replace('custom_staff', list, { authoritative: 'main-derived staff list' });
     cancelStaffDirectoryForm();
     renderStaff();
     showToast(name + ' added to staff directory!', 'success');
@@ -11324,7 +11360,7 @@ async function removeStaffDirectoryMember(id) {
   if (!isElizabeth()) return false;
   const list = STORE.get('custom_staff', []).filter(s => s.id !== id);
   try {
-    await STORE.replace('custom_staff', list);
+    await STORE.replace('custom_staff', list, { authoritative: 'main-derived staff list' });
     renderStaff();
     showToast('Staff member removed.', 'success');
     return true;
@@ -11372,13 +11408,13 @@ async function saveEditStaffMember() {
     if (id.startsWith('b_')) {
       const overrides = STORE.get('staff_dir_overrides', {});
       overrides[id] = { name, email, role: role || '' };
-      await STORE.replace('staff_dir_overrides', overrides);
+      await STORE.replace('staff_dir_overrides', overrides, { authoritative: 'main-derived staff list' });
     } else {
       const list = STORE.get('custom_staff', []);
       const idx = list.findIndex(s => s.id === id);
       if (idx < 0) throw new Error('The staff member no longer exists.');
       list[idx] = { ...list[idx], name, email, detail: role || 'Staff' };
-      await STORE.replace('custom_staff', list);
+      await STORE.replace('custom_staff', list, { authoritative: 'main-derived staff list' });
     }
     document.getElementById('edit-staff-modal').classList.add('hidden');
     renderStaff();
@@ -11398,7 +11434,7 @@ async function deleteEditStaffMember() {
     try {
       if (!removed.includes(id)) {
         removed.push(id);
-        await STORE.replace('removed_staff_dir', removed);
+        await STORE.replace('removed_staff_dir', removed, { authoritative: 'main-derived staff list' });
       }
       document.getElementById('edit-staff-modal').classList.add('hidden');
       renderStaff();
@@ -12598,7 +12634,7 @@ function openNewNoteModal() {
 // TO-DO LIST
 // ─────────────────────────────────────────────────────────────
 function getTodos() { return STORE.get('todo_items', []); }
-function saveTodos(items) { return STORE.replace('todo_items', items); }
+function saveTodos(items) { return STORE.replace('todo_items', items, { authoritative: 'todo list save (pending mutate conversion)' }); }
 
 async function persistTodos(items, failureLabel = 'To-do change') {
   try {
@@ -12812,7 +12848,7 @@ async function dashDeleteTodo(id) {
 
 // ─── Assigned (profile-specific) tasks ────
 function getAssignedTasks() { return STORE.get('assigned_tasks', []); }
-function saveAssignedTasks(items) { return STORE.replace('assigned_tasks', items); }
+function saveAssignedTasks(items) { return STORE.replace('assigned_tasks', items, { authoritative: 'task list save (pending mutate conversion)' }); }
 
 async function persistAssignedTasks(items, failureLabel = 'Task change') {
   try {
@@ -13041,7 +13077,7 @@ function saveStepUpReceipts(receipts) {
     rejected.catch(() => {});
     return rejected;
   }
-  return STORE.replace('step_up_receipts', receipts);
+  return STORE.replace('step_up_receipts', receipts, { authoritative: 'receipt list save (pending mutate conversion)' });
 }
 
 function renderStepUp() {
@@ -13709,7 +13745,7 @@ async function stepUpDeleteReceipt(id) {
 // ═══════════════════════════════════════════════════════════════════
 
 function getPolicies()       { return STORE.get('policies', []); }
-function savePolicies(arr)   { return STORE.replace('policies', arr); }
+function savePolicies(arr)   { return STORE.replace('policies', arr, { authoritative: 'policy list save (pending mutate conversion)' }); }
 
 function loadPoliciesPage() { renderPoliciesList(); }
 
@@ -14626,7 +14662,12 @@ async function markCommHandled(id) {
   const next = new Set(getCommHandled());
   next.add(id);
   try {
-    await STORE.replace('comm_handled_ids', [...next]);
+    // Fix 1: union into the reconciled base rather than replacing it.
+    await STORE.mutate('comm_handled_ids', current => {
+      const merged = new Set(Array.isArray(current) ? current : []);
+      merged.add(id);
+      return [...merged];
+    }, []);
     _commHandled = next;
     return true;
   } catch (error) {
@@ -15078,8 +15119,13 @@ async function refreshCommInbox() {
 
 function getCommAnalyzedIds() { return new Set(STORE.get('comm_analyzed_ids', [])); }
 async function addCommAnalyzedIds(ids) {
-  const existing = STORE.get('comm_analyzed_ids', []);
-  await STORE.replace('comm_analyzed_ids', [...new Set([...existing, ...ids])].slice(-500)); // keep last 500
+  // Fix 1: union with whatever the reconciled base holds, then cap. Replacing
+  // wholesale discarded IDs another Mac analyzed concurrently.
+  await STORE.mutate('comm_analyzed_ids', current => {
+    const merged = new Set(Array.isArray(current) ? current : []);
+    for (const id of ids) merged.add(id);
+    return [...merged].slice(-500); // keep last 500
+  }, []);
   return true;
 }
 
@@ -15154,7 +15200,7 @@ async function migrateAiTodos() {
   const writes = [];
   if (oldAiCount > 0) {
     writes.push(saveTodos(todos.filter(t => !t.aiAdded || t.emailRef?.msId)));
-    writes.push(STORE.replace('comm_analyzed_ids', []));
+    writes.push(STORE.replace('comm_analyzed_ids', [], { authoritative: 'explicit reset' }));
   }
   writes.push(STORE.set('ai_todo_v2_migrated', true));
   await Promise.all(writes);
@@ -15170,8 +15216,8 @@ async function migrateAiTodosV3() {
   const writes = [];
   if (hadAi) {
     writes.push(saveTodos(todos.filter(t => !t.aiAdded)));
-    writes.push(STORE.replace('comm_analyzed_ids', []));
-    writes.push(STORE.replace('comm_handled_ids', []));
+    writes.push(STORE.replace('comm_analyzed_ids', [], { authoritative: 'explicit reset' }));
+    writes.push(STORE.replace('comm_handled_ids', [], { authoritative: 'explicit reset' }));
   }
   writes.push(STORE.set('ai_todo_v3_migrated', true));
   await Promise.all(writes);
@@ -15186,8 +15232,8 @@ async function commAnalyzeAndAddTodos() {
   if (getTodos().filter(t => t.aiAdded).length === 0) {
     try {
       await Promise.all([
-        STORE.replace('comm_analyzed_ids', []),
-        STORE.replace('comm_handled_ids', []),
+        STORE.replace('comm_analyzed_ids', [], { authoritative: 'explicit reset' }),
+        STORE.replace('comm_handled_ids', [], { authoritative: 'explicit reset' }),
       ]);
     } catch (error) {
       console.warn('[AI todo] reset markers were not saved:', error?.message || error);
@@ -15262,8 +15308,8 @@ async function commAnalyzeAndAddTodos() {
     // Persist updated sent emails + conv IDs so the replied-todo sweep has timestamps
     newMsSent.sort((a, b) => new Date(b.sentAt || 0) - new Date(a.sentAt || 0));
     await Promise.all([
-      STORE.replace('ms_sent_emails', newMsSent.slice(0, 300)),
-      STORE.replace('ms_sent_conv_ids', [...freshRepliedConvIds].slice(-300)),
+      STORE.replace('ms_sent_emails', newMsSent.slice(0, 300), { authoritative: 'provider-derived sent cache' }),
+      STORE.replace('ms_sent_conv_ids', [...freshRepliedConvIds].slice(-300), { authoritative: 'provider-derived sent cache' }),
     ]);
     candidates = candidates.filter(e => !e.conversationId || !freshRepliedConvIds.has(e.conversationId));
   } catch(e) {
