@@ -1260,26 +1260,80 @@ function _customStaffProfilesFromVault(vault) {
   });
 }
 
+// Owner-managed overrides layered on top of the shipped defaults, so any profile
+// — built-in included — can be re-roled or removed.
+const PROFILE_ROLE_OVERRIDES_VAULT_KEY = 'app_profile_roles_v1';
+const REMOVED_BUILTIN_PROFILES_VAULT_KEY = 'app_removed_builtins_v1';
+// Owner is deliberately NOT assignable: owner login is proved by the single
+// owner passcode, and app-session-authenticate-owner resolves to the built-in
+// owner identity. Granting Owner to another name would create a profile that
+// cannot actually sign in.
+const ASSIGNABLE_PROFILE_ROLES = Object.freeze(['Operations & Events', 'Front Desk']);
+
+function _profileRoleOverrides(vault) {
+  const stored = vault[PROFILE_ROLE_OVERRIDES_VAULT_KEY];
+  if (stored === undefined) return {};
+  if (!_isPlainObject(stored)) {
+    throw new Error('The protected profile-role list is invalid.');
+  }
+  for (const value of Object.values(stored)) {
+    if (!ASSIGNABLE_PROFILE_ROLES.includes(value)) {
+      throw new Error('The protected profile-role list is invalid.');
+    }
+  }
+  return stored;
+}
+
+function _removedBuiltInProfiles(vault) {
+  const stored = vault[REMOVED_BUILTIN_PROFILES_VAULT_KEY];
+  if (stored === undefined) return [];
+  if (!Array.isArray(stored) || stored.length > 32 ||
+      stored.some(name => !Object.prototype.hasOwnProperty.call(APP_PROFILE_ROLES, name))) {
+    throw new Error('The protected removed-profile list is invalid.');
+  }
+  return stored;
+}
+
 function _allAppProfiles() {
-  const builtIn = Object.entries(APP_PROFILE_ROLES).map(([name, role]) => ({
-    name,
-    role,
-    builtIn: true,
-  }));
-  const custom = _customStaffProfilesFromVault(_loadSecretVault()).map(profile => ({
+  const vault = _loadSecretVault();
+  const overrides = _profileRoleOverrides(vault);
+  const removed = new Set(_removedBuiltInProfiles(vault));
+  const builtIn = Object.entries(APP_PROFILE_ROLES)
+    .filter(([name]) => !removed.has(name))
+    .map(([name, role]) => ({
+      name,
+      role: overrides[name] || role,
+      builtIn: true,
+    }));
+  const custom = _customStaffProfilesFromVault(vault).map(profile => ({
     name: profile.name,
-    role: 'Front Desk',
+    role: overrides[profile.name] || 'Front Desk',
     builtIn: false,
   }));
   return [...builtIn, ...custom];
 }
 
+// Names are compared case- and spacing-insensitively everywhere (duplicate
+// detection on add already folds this way), so lookups must too.
+function _findProfileByFoldedName(profiles, name) {
+  const folded = String(name).toLocaleLowerCase('en-US');
+  return profiles.find(
+    profile => profile.name.toLocaleLowerCase('en-US') === folded
+  ) || null;
+}
+
+// At least one Owner must always remain, otherwise nobody can administer the
+// app — no profile management, no Firebase configuration, no passcode rotation.
+function _ownerProfileCount(profiles) {
+  return profiles.filter(profile => profile.role === 'Owner').length;
+}
+
 function _roleForAppProfile(name) {
   if (typeof name !== 'string') return null;
-  const builtInRole = APP_PROFILE_ROLES[name];
-  if (builtInRole) return builtInRole;
-  const custom = _customStaffProfilesFromVault(_loadSecretVault());
-  return custom.some(profile => profile.name === name) ? 'Front Desk' : null;
+  // Resolve through _allAppProfiles() so overrides and removals apply uniformly
+  // — a removed built-in must not keep resolving to its shipped role.
+  const profile = _allAppProfiles().find(entry => entry.name === name);
+  return profile ? profile.role : null;
 }
 
 function _resetAppSession() {
@@ -1606,35 +1660,98 @@ _secureHandle('app-session-add-staff-profile', async (_, requestedName) => {
 _secureHandle('app-session-remove-staff-profile', async (_, requestedName) => {
   _requireAppRole(new Set(['Owner']));
   const name = _normalizeStaffProfileName(requestedName);
-  if (Object.prototype.hasOwnProperty.call(APP_PROFILE_ROLES, name)) {
-    throw new Error('Built-in profiles cannot be removed.');
-  }
   if (appSession && appSession.name === name) {
     throw new Error('You cannot remove the profile that is currently signed in.');
   }
-  const vault = _loadSecretVault();
-  const profiles = _customStaffProfilesFromVault(vault);
-  const folded = name.toLocaleLowerCase('en-US');
-  const remaining = profiles.filter(
-    profile => profile.name.toLocaleLowerCase('en-US') !== folded
-  );
-  if (remaining.length === profiles.length) {
-    throw new Error('That user was not found on this Mac.');
+  const existing = _allAppProfiles();
+  // Case- and spacing-insensitive, matching how names are compared everywhere
+  // else (duplicate detection on add uses the same folding).
+  const target = _findProfileByFoldedName(existing, name);
+  if (!target) throw new Error('That user was not found on this Mac.');
+  // Removing the last Owner would leave nobody able to administer the app.
+  if (target.role === 'Owner' && _ownerProfileCount(existing) <= 1) {
+    throw new Error('The last Owner profile cannot be removed.');
   }
-  if (remaining.length) vault[STAFF_PROFILES_VAULT_KEY] = remaining;
-  else delete vault[STAFF_PROFILES_VAULT_KEY];
+
+  const vault = _loadSecretVault();
+  const canonical = target.name;
+  const folded = canonical.toLocaleLowerCase('en-US');
+  if (target.builtIn) {
+    // Built-ins live in code, so removal is recorded as a suppression list.
+    const removed = _removedBuiltInProfiles(vault);
+    if (!removed.includes(canonical)) {
+      vault[REMOVED_BUILTIN_PROFILES_VAULT_KEY] = [...removed, canonical];
+    }
+  } else {
+    const profiles = _customStaffProfilesFromVault(vault);
+    const remaining = profiles.filter(
+      profile => profile.name.toLocaleLowerCase('en-US') !== folded
+    );
+    if (remaining.length) vault[STAFF_PROFILES_VAULT_KEY] = remaining;
+    else delete vault[STAFF_PROFILES_VAULT_KEY];
+  }
+
+  // A removed profile keeps no role override behind it.
+  const overrides = _profileRoleOverrides(vault);
+  if (Object.prototype.hasOwnProperty.call(overrides, canonical)) {
+    const nextRoles = { ...overrides };
+    delete nextRoles[canonical];
+    if (Object.keys(nextRoles).length) vault[PROFILE_ROLE_OVERRIDES_VAULT_KEY] = nextRoles;
+    else delete vault[PROFILE_ROLE_OVERRIDES_VAULT_KEY];
+  }
 
   // Revoke any Step Up credential belonging to the removed name.
   const stepUp = _stepUpRecords(vault);
-  if (Object.prototype.hasOwnProperty.call(stepUp, name)) {
+  if (Object.prototype.hasOwnProperty.call(stepUp, canonical)) {
     const next = { ...stepUp };
-    delete next[name];
+    delete next[canonical];
     if (Object.keys(next).length) vault[STEP_UP_AUTH_VAULT_KEY] = next;
     else delete vault[STEP_UP_AUTH_VAULT_KEY];
   }
   _saveSecretVault(vault);
-  if (stepUpGrant?.name === name) _resetStepUpGrant();
-  return { ok: true, name, remaining: remaining.length };
+  if (stepUpGrant?.name === canonical) _resetStepUpGrant();
+  // Count from the freshly resolved list: `remaining` only exists on the custom
+  // branch, and built-in removals are recorded as a suppression list instead.
+  return { ok: true, name: canonical, remaining: _allAppProfiles().length };
+});
+
+// Owner-only role assignment. Any profile, built-in included, can be moved
+// between the assignable roles — so Operations & Events is not limited to one
+// person. Owner is not assignable; see ASSIGNABLE_PROFILE_ROLES.
+_secureHandle('app-session-set-profile-role', async (_, request) => {
+  _requireAppRole(new Set(['Owner']));
+  if (!_isPlainObject(request)) throw new Error('Invalid role change request.');
+  const name = _normalizeStaffProfileName(request.name);
+  const role = request.role;
+  if (!ASSIGNABLE_PROFILE_ROLES.includes(role)) {
+    throw new Error(
+      `Role must be one of: ${ASSIGNABLE_PROFILE_ROLES.join(', ')}. ` +
+      `Owner cannot be reassigned because it is proved by the owner passcode.`
+    );
+  }
+  const existing = _allAppProfiles();
+  const target = _findProfileByFoldedName(existing, name);
+  if (!target) throw new Error('That user was not found on this Mac.');
+  if (target.role === role) return { ok: true, name: target.name, role, unchanged: true };
+  if (target.role === 'Owner' && _ownerProfileCount(existing) <= 1) {
+    throw new Error('The last Owner profile cannot be demoted.');
+  }
+
+  const vault = _loadSecretVault();
+  const overrides = { ..._profileRoleOverrides(vault) };
+  const canonical = target.name;
+  const shippedRole = APP_PROFILE_ROLES[canonical];
+  if (shippedRole === role) delete overrides[canonical]; // back to default; store nothing
+  else overrides[canonical] = role;
+  if (Object.keys(overrides).length) vault[PROFILE_ROLE_OVERRIDES_VAULT_KEY] = overrides;
+  else delete vault[PROFILE_ROLE_OVERRIDES_VAULT_KEY];
+  _saveSecretVault(vault);
+
+  // Losing Operations & Events must drop any Step Up authorization immediately.
+  if (!STEP_UP_ROLES.has(role) && stepUpGrant?.name === canonical) _resetStepUpGrant();
+  // A live session whose role just changed must not keep its old privileges.
+  if (appSession?.name === canonical) appSession.role = role;
+  return { ok: true, name: canonical, role };
 });
 
 _secureHandle('app-session-end', async () => {

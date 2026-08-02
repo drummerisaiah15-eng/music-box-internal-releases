@@ -1992,9 +1992,11 @@
         <div id="manage-profiles-section" style="margin-top:20px;padding-top:16px;border-top:1px solid var(--divider);display:none">
           <div style="font-size:13px;font-weight:600;margin-bottom:6px;color:var(--text-secondary)">Manage Users (Elizabeth only)</div>
           <div style="font-size:11.5px;color:var(--text-muted);margin-bottom:10px;line-height:1.5;max-width:640px">
-            Removing a user deletes their login on this Mac and revokes any Step Up
-            code they had. Their past tasks and log entries are kept — only the
-            login is removed. Built-in profiles cannot be removed.
+            Change anyone's role, or remove their login from this Mac. Removing a
+            user also revokes any Step Up code they had; their past tasks and log
+            entries are kept, only the login is removed. Owner is proved by the
+            owner passcode, so it cannot be reassigned and the last Owner cannot
+            be removed.
           </div>
           <div id="manage-profiles-list"></div>
         </div>
@@ -2345,10 +2347,12 @@ async function refreshLoginProfiles() {
     seen.add(folded);
     return { name, role, builtIn: profile.builtIn === true };
   });
-  for (const builtIn of BUILT_IN_LOGIN_PROFILES) {
-    if (!profiles.some(profile => profile.name === builtIn.name && profile.role === builtIn.role)) {
-      throw new Error('A required built-in user profile is missing.');
-    }
+  // Built-in profiles are now removable and re-roleable by the owner, so their
+  // presence is no longer required. What must always hold is that at least one
+  // Owner exists — otherwise nobody can administer the app and the list is
+  // treated as corrupt rather than trusted.
+  if (!profiles.some(profile => profile.role === 'Owner')) {
+    throw new Error('The protected user-profile list has no owner.');
   }
   _loginProfiles = profiles;
   renderLoginProfiles();
@@ -2370,26 +2374,67 @@ function renderManageProfiles() {
   if (!list) return;
   if (!isElizabeth()) { list.innerHTML = ''; return; }
   const signedIn = currentUser();
+  const ownerCount = _loginProfiles.filter(p => p.role === 'Owner').length;
   const rows = _loginProfiles.map(profile => {
-    const removable = profile.builtIn !== true && profile.name !== signedIn;
-    const why = profile.builtIn === true
-      ? 'Built-in'
-      : profile.name === signedIn ? 'Signed in' : '';
-    return `<div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--divider)">
-      <span style="flex:1;min-width:0">
+    const isOwner = profile.role === 'Owner';
+    const lastOwner = isOwner && ownerCount <= 1;
+    // Owner is proved by the owner passcode, so it is not an assignable role.
+    const roleEditable = !isOwner;
+    const removable = profile.name !== signedIn && !lastOwner;
+    const why = profile.name === signedIn ? 'Signed in'
+      : lastOwner ? 'Last owner' : '';
+    const roleCell = roleEditable
+      ? `<select class="form-select" style="width:190px;font-size:12.5px"
+            onchange="setProfileRole(${jsArg(profile.name)}, this.value)">
+           ${['Operations & Events', 'Front Desk'].map(r =>
+             `<option value="${escAttr(r)}" ${r === profile.role ? 'selected' : ''}>${escHtml(r)}</option>`
+           ).join('')}
+         </select>`
+      : `<span style="width:190px;font-size:12.5px;color:var(--text-muted)">Owner</span>`;
+    return `<div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--divider);flex-wrap:wrap">
+      <span style="flex:1;min-width:160px">
         <strong>${escHtml(profile.name)}</strong>
-        <span style="color:var(--text-muted);font-size:11.5px"> — ${escHtml(profile.role)}</span>
+        ${profile.builtIn === true
+          ? '<span style="color:var(--text-muted);font-size:11px"> · built-in</span>' : ''}
       </span>
+      ${roleCell}
       ${removable
         ? `<button class="btn btn-ghost btn-sm" style="color:var(--danger,#c0392b)"
              onclick="removeLoginUser(${jsArg(profile.name)})">Remove</button>`
-        : `<span style="font-size:11.5px;color:var(--text-muted)">${escHtml(why)}</span>`}
+        : `<span style="font-size:11.5px;color:var(--text-muted);width:70px;text-align:right">${escHtml(why)}</span>`}
     </div>`;
   }).join('');
-  const addedCount = _loginProfiles.filter(p => p.builtIn !== true).length;
   list.innerHTML = rows + `<div style="font-size:11.5px;color:var(--text-muted);margin-top:8px">
-    ${addedCount} added user${addedCount === 1 ? '' : 's'} on this Mac.
+    ${_loginProfiles.length} profile${_loginProfiles.length === 1 ? '' : 's'} on this Mac.
+    Owner is set by the owner passcode and cannot be reassigned.
   </div>`;
+}
+
+async function setProfileRole(name, role) {
+  if (!isElizabeth()) {
+    showToast('Only the owner can change roles.', 'warning');
+    return false;
+  }
+  if (!window.electronSession?.setProfileRole) {
+    showToast('Secure user-profile storage is unavailable.', 'danger');
+    return false;
+  }
+  try {
+    const result = await window.electronSession.setProfileRole({ name, role });
+    if (result?.ok !== true) throw new Error(result?.error || 'The role was not changed.');
+    await refreshLoginProfiles();
+    renderManageProfiles();
+    await refreshStepUpTrust();
+    // Nav and page permissions are role-derived, so re-apply them immediately.
+    try { applyRolePermissions(); } catch (_) {}
+    if (!result.unchanged) showToast(`${name} is now ${role}.`, 'success');
+    return true;
+  } catch (error) {
+    // Re-render so the dropdown snaps back to the actual stored role.
+    renderManageProfiles();
+    showToast(`Role was not changed: ${error?.message || error}`, 'danger');
+    return false;
+  }
 }
 
 async function removeLoginUser(name) {
@@ -12596,8 +12641,17 @@ async function persistAssignedTasks(items, failureLabel = 'Task change') {
   }
 }
 
+// Operations & Events capability is now decided by ROLE, not by name. The owner
+// can assign that role to anyone, so hard-coding 'Carrie Gass' would silently
+// deny the capability to whoever else she puts in charge.
+function hasOperationsRole() {
+  return getUserRole(currentUser()) === 'Operations & Events';
+}
+
+// Retained as the historical name used across the UI; role-based since profile
+// roles became owner-assignable.
 function isCarrie() {
-  return currentUser() === 'Carrie Gass' && getUserRole(currentUser()) === 'Operations & Events';
+  return hasOperationsRole();
 }
 // Everyone can add tasks (at minimum Team tasks); Eliz/Carrie can also assign to individuals
 function canAddTasks()   { return !!currentUser(); }

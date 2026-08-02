@@ -351,8 +351,15 @@ test('added Front Desk users appear in task choices without inheriting Carrie or
   assert.match(assignable, /_loginProfiles/);
   assert.match(assignable, /profile\.role !== 'Owner'/);
   assert.match(assignable, /profile\.role === 'Front Desk'/);
-  assert.match(carrie, /currentUser\(\) === 'Carrie Gass'/);
+  // Operations & Events is now an owner-assignable role, so the capability must
+  // follow the ROLE. Pinning it to 'Carrie Gass' would deny access to whoever
+  // else the owner puts in charge — while still never granting it to a plain
+  // Front Desk user, which is what this test actually guards.
+  assert.match(carrie, /hasOperationsRole\(\)/);
   assert.doesNotMatch(carrie, /includes\('carrie'\)/i);
+  const opsRole = namedFunctionSource('hasOperationsRole');
+  assert.match(opsRole, /getUserRole\(currentUser\(\)\) === 'Operations & Events'/);
+  assert.doesNotMatch(opsRole, /'Carrie Gass'/);
   assert.match(namedFunctionSource('canAccessPage'), /page === 'stepup'\) return isCarrie\(\)/);
   assert.match(namedFunctionSource('saveStepUpReceipts'), /if \(!isCarrie\(\)\)/);
   assert.match(namedFunctionSource('renderStepUp'), /requireStepUpAccess\(\)/);

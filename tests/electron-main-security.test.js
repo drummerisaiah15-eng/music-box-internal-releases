@@ -624,9 +624,22 @@ function removalHarness({ role = 'Owner', signedInAs = 'Elizabeth Chaves', vault
       }
       return appSession;
     }
+    const STEP_UP_ROLES = new Set(['Owner', 'Operations & Events']);
+    const PROFILE_ROLE_OVERRIDES_VAULT_KEY = 'app_profile_roles_v1';
+    const REMOVED_BUILTIN_PROFILES_VAULT_KEY = 'app_removed_builtins_v1';
+    const ASSIGNABLE_PROFILE_ROLES = Object.freeze(['Operations & Events', 'Front Desk']);
     ${sliceFunction(main, '_normalizeStaffProfileName')}
     ${sliceFunction(main, '_customStaffProfilesFromVault')}
     ${sliceFunction(main, '_stepUpRecords')}
+    ${sliceFunction(main, '_profileRoleOverrides')}
+    ${sliceFunction(main, '_removedBuiltInProfiles')}
+    ${sliceFunction(main, '_allAppProfiles')}
+    ${sliceFunction(main, '_ownerProfileCount')}
+    ${sliceFunction(main, '_findProfileByFoldedName')}
+    globalThis.setRole = async request => {
+      ${extractHandlerBody(main, 'app-session-set-profile-role')}
+    };
+    globalThis.profiles = () => _allAppProfiles().map(p => p.name + ':' + p.role);
     globalThis.remove = async requestedName => {
       ${extractHandlerBody(main, 'app-session-remove-staff-profile')}
     };
@@ -643,12 +656,22 @@ test('profile removal: removes an added user and leaves the others intact', asyn
   assert.equal(state.savedTimes, 1, 'the vault is written exactly once');
 });
 
-test('profile removal: built-in profiles can never be removed', async () => {
-  for (const name of ['Elizabeth Chaves', 'Carrie Gass', 'Ana Chaves', 'Emma Minnetto']) {
+test('profile removal: built-in profiles can now be removed by the owner', async () => {
+  for (const name of ['Carrie Gass', 'Ana Chaves', 'Emma Minnetto']) {
     const { api } = removalHarness();
-    await assert.rejects(() => api.remove(name), /Built-in profiles cannot be removed/, name);
-    assert.deepEqual([...api.list()], ['Dana Reed', 'Sam Vega'], 'nothing was removed');
+    const result = await api.remove(name);
+    assert.equal(result.ok, true, name);
+    assert.ok(![...api.profiles()].some(p => p.startsWith(name + ':')),
+      `${name} is gone from the resolved profile list`);
   }
+});
+
+test('profile removal: the last Owner can never be removed', async () => {
+  // Signed in as someone else so the self-removal guard is not what blocks it.
+  const { api } = removalHarness({ signedInAs: 'Sam Vega' });
+  await assert.rejects(() => api.remove('Elizabeth Chaves'), /last Owner profile cannot be removed/);
+  assert.ok([...api.profiles()].includes('Elizabeth Chaves:Owner'),
+    'the owner survives, so administration is never lost');
 });
 
 test('profile removal: only the owner may remove a user', async () => {
@@ -769,4 +792,121 @@ test('profile removal: preload exposes removal without widening the surface', ()
   assert.match(preload,
     /removeStaffProfile:\(name\) => ipcRenderer\.invoke\('app-session-remove-staff-profile', name\)/,
     'the renderer can only pass a name; main enforces every rule');
+});
+
+// --- Role assignment: functional stress tests -------------------------------
+
+test('role change: any profile can be given Operations & Events', async () => {
+  // The whole point: Operations & Events is not limited to one person.
+  const { api } = removalHarness();
+  await api.setRole({ name: 'Dana Reed', role: 'Operations & Events' });
+  const list = [...api.profiles()];
+  assert.ok(list.includes('Dana Reed:Operations & Events'), 'the added user is promoted');
+  assert.ok(list.includes('Carrie Gass:Operations & Events'), 'Carrie keeps hers too');
+});
+
+test('role change: a built-in profile can be re-roled', async () => {
+  const { api } = removalHarness();
+  await api.setRole({ name: 'Ana Chaves', role: 'Operations & Events' });
+  assert.ok([...api.profiles()].includes('Ana Chaves:Operations & Events'));
+  await api.setRole({ name: 'Carrie Gass', role: 'Front Desk' });
+  assert.ok([...api.profiles()].includes('Carrie Gass:Front Desk'),
+    'a built-in can also be demoted');
+});
+
+test('role change: returning to the shipped role stores no override', async () => {
+  const { api, state } = removalHarness();
+  await api.setRole({ name: 'Carrie Gass', role: 'Front Desk' });
+  assert.deepEqual(Object.keys(state.vault.app_profile_roles_v1), ['Carrie Gass']);
+  await api.setRole({ name: 'Carrie Gass', role: 'Operations & Events' });
+  assert.equal(state.vault.app_profile_roles_v1, undefined,
+    'the override is cleaned up rather than pinning the default forever');
+});
+
+test('role change: Owner cannot be assigned to anyone', async () => {
+  for (const name of ['Dana Reed', 'Carrie Gass', 'Ana Chaves']) {
+    const { api } = removalHarness();
+    await assert.rejects(() => api.setRole({ name, role: 'Owner' }), /Role must be one of/, name);
+  }
+});
+
+test('role change: the last Owner cannot be demoted', async () => {
+  const { api } = removalHarness();
+  await assert.rejects(
+    () => api.setRole({ name: 'Elizabeth Chaves', role: 'Front Desk' }),
+    /last Owner profile cannot be demoted/
+  );
+  assert.ok([...api.profiles()].includes('Elizabeth Chaves:Owner'));
+});
+
+test('role change: unknown roles and names are rejected', async () => {
+  const { api, state } = removalHarness();
+  for (const role of ['Admin', '', null, 'front desk']) {
+    await assert.rejects(() => api.setRole({ name: 'Dana Reed', role }));
+  }
+  await assert.rejects(() => api.setRole({ name: 'Nobody', role: 'Front Desk' }), /not found/);
+  assert.equal(state.savedTimes, 0, 'no write on any rejected change');
+});
+
+test('role change: only the owner may change roles', async () => {
+  for (const role of ['Front Desk', 'Operations & Events']) {
+    const { api } = removalHarness({ role, signedInAs: 'Sam Vega' });
+    await assert.rejects(
+      () => api.setRole({ name: 'Dana Reed', role: 'Operations & Events' }),
+      /not authorized/
+    );
+  }
+});
+
+test('role change: a no-op change is reported and writes nothing', async () => {
+  const { api, state } = removalHarness();
+  const result = await api.setRole({ name: 'Dana Reed', role: 'Front Desk' });
+  assert.equal(result.unchanged, true);
+  assert.equal(state.savedTimes, 0);
+});
+
+test('role change: removing a re-roled profile clears its override', async () => {
+  const { api, state } = removalHarness();
+  await api.setRole({ name: 'Dana Reed', role: 'Operations & Events' });
+  assert.ok(state.vault.app_profile_roles_v1['Dana Reed']);
+  await api.remove('Dana Reed');
+  assert.equal(state.vault.app_profile_roles_v1, undefined,
+    're-adding the name later must not silently restore elevated access');
+});
+
+test('role change: a removed built-in stops resolving to its shipped role', async () => {
+  const { api } = removalHarness();
+  await api.remove('Carrie Gass');
+  assert.ok(![...api.profiles()].some(p => p.startsWith('Carrie Gass:')));
+});
+
+test('role change: capability checks in the renderer are role-based, not name-based', () => {
+  const renderer = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const fn = renderer.slice(renderer.indexOf('function hasOperationsRole('));
+  const body = fn.slice(0, fn.indexOf('\n}') + 2);
+  assert.match(body, /getUserRole\(currentUser\(\)\) === 'Operations & Events'/,
+    'the capability follows the role');
+  assert.doesNotMatch(body, /Carrie Gass/,
+    'no hard-coded name, or a newly promoted person would get nothing');
+  // isCarrie() is the historical call site name and must delegate.
+  const legacy = renderer.slice(renderer.indexOf('function isCarrie('));
+  assert.match(legacy.slice(0, legacy.indexOf('\n}') + 2), /hasOperationsRole\(\)/);
+});
+
+test('role change: the renderer no longer requires every built-in to exist', () => {
+  const renderer = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  assert.doesNotMatch(renderer, /A required built-in user profile is missing/,
+    'built-ins are removable, so that check would break the app');
+  assert.match(renderer, /The protected user-profile list has no owner/,
+    'but a list with no owner is still treated as corrupt');
+});
+
+test('role change: the owner UI exposes a role control and preload passes it through', () => {
+  const renderer = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  assert.match(renderer, /onchange="setProfileRole\(/, 'a role control exists');
+  assert.match(renderer, /async function setProfileRole\(/, 'the handler exists');
+  assert.match(renderer, /applyRolePermissions\(\)/,
+    'nav and page permissions are re-applied after a role change');
+  assert.match(preload,
+    /setProfileRole:\s+\(request\) => ipcRenderer\.invoke\('app-session-set-profile-role', request\)/);
 });
