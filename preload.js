@@ -24,6 +24,10 @@ contextBridge.exposeInMainWorld('electronSession', {
   addStaffProfile:   (name) => ipcRenderer.invoke('app-session-add-staff-profile', name),
   removeStaffProfile:(name) => ipcRenderer.invoke('app-session-remove-staff-profile', name),
   setProfileRole:    (request) => ipcRenderer.invoke('app-session-set-profile-role', request),
+  // V159-005: the renderer only transports the directory; main re-validates
+  // every field and can never be told to grant Owner.
+  exportDirectory:   () => ipcRenderer.invoke('app-session-export-directory'),
+  importDirectory:   (directory) => ipcRenderer.invoke('app-session-import-directory', directory),
   end:               () => ipcRenderer.invoke('app-session-end'),
   status:            () => ipcRenderer.invoke('app-session-status'),
   stageOwnerPin:     (request) => ipcRenderer.invoke('app-session-stage-owner-pin', request),

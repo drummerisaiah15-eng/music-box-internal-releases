@@ -1556,6 +1556,133 @@ _secureHandle('app-session-remove-staff-profile', async (_, requestedName) => {
   return { ok: true, name: canonical, remaining: _allAppProfiles().length };
 });
 
+// ─── V159-005: synchronized staff directory ─────────────────────────────────
+//
+// Profiles live in each Mac's safeStorage vault, so adds, removals and role
+// changes never reached a second machine. This publishes the owner's profile
+// configuration as an ordinary synchronized dataset and imports it elsewhere.
+//
+// Trust direction matters: main stays authoritative. The renderer transports
+// the directory but cannot decide roles — every field is re-validated here, and
+// Owner can never be granted through an imported record. Otherwise a tampered
+// renderer could promote itself simply by publishing a directory entry.
+const MAX_DIRECTORY_ENTRIES = MAX_CUSTOM_STAFF_PROFILES + 16;
+
+function _directoryEntryId(name) {
+  return 'profile:' + name.toLocaleLowerCase('en-US');
+}
+
+// Snapshot of this Mac's profile configuration, shaped as a tombstoned record
+// list so it merges with the same rules as logs.
+function _buildStaffDirectory() {
+  const vault = _loadSecretVault();
+  const removed = _removedBuiltInProfiles(vault);
+  const now = new Date().toISOString();
+  const entries = _allAppProfiles().map(profile => ({
+    id: _directoryEntryId(profile.name),
+    name: profile.name,
+    role: profile.role,
+    builtIn: profile.builtIn === true,
+    version: 1,
+    updated: now,
+  }));
+  // Removed built-ins travel as tombstones so other Macs apply the removal
+  // rather than resurrecting the profile from their own defaults.
+  for (const name of removed) {
+    entries.push({
+      id: _directoryEntryId(name),
+      name,
+      role: APP_PROFILE_ROLES[name] || 'Front Desk',
+      builtIn: true,
+      _deleted: true,
+      _deletedAt: now,
+      version: 1,
+      updated: now,
+    });
+  }
+  return entries;
+}
+
+function _validDirectoryEntry(entry) {
+  if (!_isPlainObject(entry)) return false;
+  if (typeof entry.name !== 'string') return false;
+  if (entry.role !== 'Owner' && !ASSIGNABLE_PROFILE_ROLES.includes(entry.role)) return false;
+  return true;
+}
+
+// Apply a directory published by the owner's Mac to this Mac's vault.
+function _applyStaffDirectory(entries) {
+  if (!Array.isArray(entries) || entries.length > MAX_DIRECTORY_ENTRIES) {
+    throw new Error('The staff directory is invalid.');
+  }
+  const vault = _loadSecretVault();
+  const custom = [];
+  const overrides = {};
+  const removedBuiltIns = [];
+  const seen = new Set();
+
+  for (const raw of entries) {
+    if (!_validDirectoryEntry(raw)) continue;
+    let name;
+    try { name = _normalizeStaffProfileName(raw.name); } catch { continue; }
+    const folded = name.toLocaleLowerCase('en-US');
+    if (seen.has(folded)) continue;
+    seen.add(folded);
+    const isBuiltIn = Object.prototype.hasOwnProperty.call(APP_PROFILE_ROLES, name);
+
+    if (raw._deleted === true) {
+      // A tombstone for a built-in suppresses it here too. Custom profiles are
+      // simply omitted from the rebuilt list.
+      if (isBuiltIn && APP_PROFILE_ROLES[name] !== 'Owner') removedBuiltIns.push(name);
+      continue;
+    }
+    // Owner is never granted by import: it is proved by the owner passcode and
+    // belongs only to the built-in owner identity.
+    const role = (raw.role === 'Owner' && isBuiltIn && APP_PROFILE_ROLES[name] === 'Owner')
+      ? 'Owner'
+      : (ASSIGNABLE_PROFILE_ROLES.includes(raw.role) ? raw.role : 'Front Desk');
+    if (role !== 'Owner' && APP_PROFILE_ROLES[name] !== role) overrides[name] = role;
+    if (!isBuiltIn) {
+      if (custom.length >= MAX_CUSTOM_STAFF_PROFILES) continue;
+      custom.push({ name, role: 'Front Desk', createdAt: Date.now() });
+    }
+  }
+
+  // Refuse an import that would leave this Mac with no owner.
+  const wouldHaveOwner = Object.entries(APP_PROFILE_ROLES).some(
+    ([name, role]) => role === 'Owner' && !removedBuiltIns.includes(name)
+  );
+  if (!wouldHaveOwner) throw new Error('The staff directory would leave no owner.');
+
+  if (custom.length) vault[STAFF_PROFILES_VAULT_KEY] = custom;
+  else delete vault[STAFF_PROFILES_VAULT_KEY];
+  if (Object.keys(overrides).length) vault[PROFILE_ROLE_OVERRIDES_VAULT_KEY] = overrides;
+  else delete vault[PROFILE_ROLE_OVERRIDES_VAULT_KEY];
+  if (removedBuiltIns.length) vault[REMOVED_BUILTIN_PROFILES_VAULT_KEY] = removedBuiltIns;
+  else delete vault[REMOVED_BUILTIN_PROFILES_VAULT_KEY];
+  _saveSecretVault(vault);
+
+  // A signed-in session whose role just changed must not keep old privileges.
+  if (appSession) {
+    const resolved = _roleForAppProfile(appSession.name);
+    if (!resolved) _resetAppSession();
+    else if (resolved !== appSession.role) appSession.role = resolved;
+  }
+  return _allAppProfiles();
+}
+
+// Owner publishes; any profile may import what the owner published.
+_secureHandle('app-session-export-directory', async () => {
+  _requireAppRole(new Set(['Owner']));
+  return { ok: true, directory: _buildStaffDirectory() };
+});
+
+_secureHandle('app-session-import-directory', async (_, directory) => {
+  _requireAppRole(COMMUNICATION_ROLES);
+  const profiles = _applyStaffDirectory(directory);
+  return { ok: true, profiles };
+});
+
 // Owner-only role assignment. Any profile, built-in included, can be moved
 // between the assignable roles — so Operations & Events is not limited to one
 // person. Owner is not assignable; see ASSIGNABLE_PROFILE_ROLES.

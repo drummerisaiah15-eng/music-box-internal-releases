@@ -2305,6 +2305,37 @@ function populateProfileSelects() {
   if (_loginProfile(selected)) select.value = selected;
 }
 
+// V159-005: publish this Mac's profile configuration so other Macs converge.
+// Owner-only: the export handler enforces that, and main re-validates on import.
+async function publishStaffDirectory() {
+  if (!isElizabeth() || !window.electronSession?.exportDirectory) return false;
+  try {
+    const result = await window.electronSession.exportDirectory();
+    if (result?.ok !== true || !Array.isArray(result.directory)) return false;
+    await STORE.replace('staff_directory', result.directory);
+    return true;
+  } catch (error) {
+    console.warn('[profiles] directory was not published:', error?.message || error);
+    return false;
+  }
+}
+
+// Applies a directory that arrived from another Mac. Main re-validates every
+// field, so a tampered payload cannot grant Owner or invent roles.
+async function importStaffDirectory(directory) {
+  if (!Array.isArray(directory) || !window.electronSession?.importDirectory) return false;
+  try {
+    const result = await window.electronSession.importDirectory(directory);
+    if (result?.ok !== true) return false;
+    await refreshLoginProfiles();
+    try { applyRolePermissions(); } catch (_) {}
+    return true;
+  } catch (error) {
+    console.warn('[profiles] directory was not applied:', error?.message || error);
+    return false;
+  }
+}
+
 async function refreshLoginProfiles() {
   renderLoginProfiles();
   if (!window.electronSession?.listProfiles) {
@@ -2404,6 +2435,7 @@ async function setProfileRole(name, role) {
     const result = await window.electronSession.setProfileRole({ name, role });
     if (result?.ok !== true) throw new Error(result?.error || 'The role was not changed.');
     await refreshLoginProfiles();
+    await publishStaffDirectory();
     renderManageProfiles();
     // Nav and page permissions are role-derived, so re-apply them immediately.
     try { applyRolePermissions(); } catch (_) {}
@@ -2434,6 +2466,7 @@ async function removeLoginUser(name) {
     const result = await window.electronSession.removeStaffProfile(name);
     if (result?.ok !== true) throw new Error(result?.error || 'The user was not removed.');
     await refreshLoginProfiles();
+    await publishStaffDirectory();
     renderManageProfiles();
     showToast(`${name} was removed.`, 'success');
     return true;
@@ -2480,6 +2513,7 @@ async function addLoginUser() {
       throw new Error(result?.error || 'The new user was not added.');
     }
     await refreshLoginProfiles();
+    await publishStaffDirectory();
     hideAddLoginUserForm();
     showToast(`${result.profile.name} was added with Front Desk access.`, 'success');
     return true;
@@ -3558,6 +3592,9 @@ function _surfaceSyncDeliveryError(key, err) {
 // the same guarantees.
 const SYNC_MERGE_STRATEGIES = Object.freeze({
   logs: 'tombstoned-record-list',
+  // V159-005: directory entries carry stable ids, versions and tombstones, so
+  // two Macs editing different profiles merge instead of clobbering.
+  staff_directory: 'tombstoned-record-list',
 });
 const MAX_SYNC_MERGE_ATTEMPTS = 3;
 
@@ -4231,6 +4268,9 @@ const SYNC_BASE_KEYS = Object.freeze([
   'spreadsheets', 'step_up_receipts', 'flagged_emails',
   'comm_analyzed_ids', 'comm_handled_ids', 'rc_read_convs', 'policies',
   'staff_dir_overrides', 'removed_staff_dir',
+  // V159-005: owner-published staff directory so profile adds, removals and
+  // role changes reach every Mac.
+  'staff_directory',
 ]);
 
 function _isCheckoutKey(key) {
@@ -5273,6 +5313,10 @@ function _refreshForSyncKey(key, value) {
       _ssAwaitingAuthority = false;
       if (document.getElementById('page-spreadsheets')?.classList.contains('active') && !_ssEditCell) ssGoHome();
     } catch {}
+  }
+  if (key === 'staff_directory') {
+    // V159-005: another Mac published a profile change; apply it locally.
+    try { importStaffDirectory(value); } catch (_) {}
   }
   if (key === 'step_up_receipts') {
     try { renderStepUpArchive(); } catch {}

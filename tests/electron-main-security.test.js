@@ -780,3 +780,190 @@ test('role change: the owner UI exposes a role control and preload passes it thr
   assert.match(preload,
     /setProfileRole:\s+\(request\) => ipcRenderer\.invoke\('app-session-set-profile-role', request\)/);
 });
+
+// --- V159-005: synchronized staff directory ---------------------------------
+//
+// The renderer transports the directory but must not be able to decide roles.
+// These execute the real _buildStaffDirectory/_applyStaffDirectory against a
+// simulated vault.
+
+function directoryHarness({ role = 'Owner', signedInAs = 'Elizabeth Chaves', vault } = {}) {
+  const state = {
+    vault: vault ?? { app_staff_profiles_v1: [{ name: 'Dana Reed', role: 'Front Desk', createdAt: 1 }] },
+    savedTimes: 0,
+    sessionReset: false,
+  };
+  const context = vm.createContext({
+    Object, Error, Date, JSON, Set, Array, Number, String, Boolean, Buffer, console,
+    _state: state,
+  });
+  vm.runInContext(`
+    const APP_PROFILE_ROLES = Object.freeze({
+      'Elizabeth Chaves': 'Owner', 'Carrie Gass': 'Operations & Events',
+      'Ana Chaves': 'Front Desk', 'Emma Minnetto': 'Front Desk',
+    });
+    const STAFF_PROFILES_VAULT_KEY = 'app_staff_profiles_v1';
+    const PROFILE_ROLE_OVERRIDES_VAULT_KEY = 'app_profile_roles_v1';
+    const REMOVED_BUILTIN_PROFILES_VAULT_KEY = 'app_removed_builtins_v1';
+    const ASSIGNABLE_PROFILE_ROLES = Object.freeze(['Operations & Events', 'Front Desk']);
+    const MAX_CUSTOM_STAFF_PROFILES = 50;
+    const MAX_DIRECTORY_ENTRIES = MAX_CUSTOM_STAFF_PROFILES + 16;
+    let appSession = ${JSON.stringify({ name: signedInAs, role })};
+    const _isPlainObject = v => !!v && typeof v === 'object' && !Array.isArray(v);
+    const _loadSecretVault = () => JSON.parse(JSON.stringify(_state.vault));
+    const _saveSecretVault = v => { _state.vault = JSON.parse(JSON.stringify(v)); _state.savedTimes++; };
+    const _resetAppSession = () => { appSession = null; _state.sessionReset = true; };
+    ${sliceFunction(main, '_normalizeStaffProfileName')}
+    ${sliceFunction(main, '_customStaffProfilesFromVault')}
+    ${sliceFunction(main, '_profileRoleOverrides')}
+    ${sliceFunction(main, '_removedBuiltInProfiles')}
+    ${sliceFunction(main, '_allAppProfiles')}
+    ${sliceFunction(main, '_roleForAppProfile')}
+    ${sliceFunction(main, '_directoryEntryId')}
+    ${sliceFunction(main, '_buildStaffDirectory')}
+    ${sliceFunction(main, '_validDirectoryEntry')}
+    ${sliceFunction(main, '_applyStaffDirectory')}
+    globalThis.build = () => _buildStaffDirectory();
+    globalThis.apply = d => _applyStaffDirectory(d);
+    globalThis.profiles = () => _allAppProfiles().map(p => p.name + ':' + p.role);
+    globalThis.session = () => appSession;
+  `, context);
+  return { api: context, state };
+}
+
+test('directory: a published directory reproduces the owner profile set elsewhere', () => {
+  const source = directoryHarness();
+  const directory = [...source.api.build()].map(e => ({ ...e }));
+  // A second Mac with only its shipped defaults.
+  const target = directoryHarness({ vault: {} });
+  assert.ok(![...target.api.profiles()].includes('Dana Reed:Front Desk'), 'not there yet');
+  target.api.apply(directory);
+  assert.ok([...target.api.profiles()].includes('Dana Reed:Front Desk'),
+    'the added user now exists on the second Mac');
+});
+
+test('directory: a role change propagates', () => {
+  const source = directoryHarness({
+    vault: {
+      app_staff_profiles_v1: [{ name: 'Dana Reed', role: 'Front Desk', createdAt: 1 }],
+      app_profile_roles_v1: { 'Dana Reed': 'Operations & Events' },
+    },
+  });
+  const target = directoryHarness({ vault: {} });
+  target.api.apply([...source.api.build()].map(e => ({ ...e })));
+  assert.ok([...target.api.profiles()].includes('Dana Reed:Operations & Events'));
+});
+
+test('directory: a removed built-in propagates as a tombstone', () => {
+  const source = directoryHarness({
+    vault: { app_removed_builtins_v1: ['Emma Minnetto'] },
+  });
+  const directory = [...source.api.build()].map(e => ({ ...e }));
+  assert.ok(directory.some(e => e.name === 'Emma Minnetto' && e._deleted === true),
+    'the removal travels as a tombstone, not an omission');
+  const target = directoryHarness({ vault: {} });
+  target.api.apply(directory);
+  assert.ok(![...target.api.profiles()].some(p => p.startsWith('Emma Minnetto:')),
+    'the second Mac applies the removal instead of resurrecting from defaults');
+});
+
+test('directory: an imported record can NEVER grant Owner', () => {
+  const target = directoryHarness({ vault: {} });
+  target.api.apply([
+    { id: 'profile:elizabeth chaves', name: 'Elizabeth Chaves', role: 'Owner', builtIn: true },
+    { id: 'profile:mallory', name: 'Mallory', role: 'Owner', builtIn: false },
+    { id: 'profile:ana chaves', name: 'Ana Chaves', role: 'Owner', builtIn: true },
+  ]);
+  const list = [...target.api.profiles()];
+  assert.ok(!list.includes('Mallory:Owner'), 'a forged Owner entry is refused');
+  assert.ok(!list.includes('Ana Chaves:Owner'), 'a built-in cannot be promoted to Owner');
+  assert.ok(list.includes('Elizabeth Chaves:Owner'), 'the real owner is unaffected');
+});
+
+test('directory: a tombstone for the owner is ignored, never applied', () => {
+  // An owner tombstone is dropped outright rather than throwing, so a forged
+  // directory cannot strip administration from a Mac even transiently.
+  const target = directoryHarness({ vault: {} });
+  target.api.apply([
+    { id: 'profile:elizabeth chaves', name: 'Elizabeth Chaves', role: 'Owner',
+      builtIn: true, _deleted: true },
+  ]);
+  assert.ok([...target.api.profiles()].includes('Elizabeth Chaves:Owner'),
+    'the owner survives a malicious or corrupt removal entry');
+  assert.equal(target.state.vault.app_removed_builtins_v1, undefined,
+    'and no owner suppression is recorded');
+});
+
+test('directory: unknown roles fall back to Front Desk rather than being trusted', () => {
+  const target = directoryHarness({ vault: {} });
+  target.api.apply([
+    { id: 'profile:elizabeth chaves', name: 'Elizabeth Chaves', role: 'Owner', builtIn: true },
+    { id: 'profile:dana reed', name: 'Dana Reed', role: 'Superuser', builtIn: false },
+  ]);
+  assert.ok(![...target.api.profiles()].some(p => p.includes('Superuser')));
+});
+
+test('directory: malformed, duplicate and oversized payloads are rejected safely', () => {
+  const target = directoryHarness({ vault: {} });
+  assert.throws(() => target.api.apply('not an array'), /invalid/);
+  assert.throws(() => target.api.apply(new Array(200).fill({ name: 'x', role: 'Front Desk' })), /invalid/);
+  // Junk entries are skipped, not fatal.
+  target.api.apply([
+    { id: 'profile:elizabeth chaves', name: 'Elizabeth Chaves', role: 'Owner', builtIn: true },
+    null, 42, { name: 123, role: 'Front Desk' }, { name: 'ok name', role: null },
+    { id: 'a', name: 'Dana Reed', role: 'Front Desk' },
+    { id: 'b', name: 'dana reed', role: 'Operations & Events' },
+  ]);
+  const danas = [...target.api.profiles()].filter(p => p.toLowerCase().startsWith('dana reed:'));
+  assert.equal(danas.length, 1, 'case-duplicate entries collapse to one');
+});
+
+test('directory: a signed-in session loses privileges the import revokes', () => {
+  const target = directoryHarness({
+    role: 'Operations & Events', signedInAs: 'Carrie Gass', vault: {},
+  });
+  target.api.apply([
+    { id: 'profile:elizabeth chaves', name: 'Elizabeth Chaves', role: 'Owner', builtIn: true },
+    { id: 'profile:carrie gass', name: 'Carrie Gass', role: 'Front Desk', builtIn: true },
+  ]);
+  assert.equal(target.api.session().role, 'Front Desk',
+    'the live session is downgraded immediately, not at next login');
+});
+
+test('directory: a session whose profile was removed is ended', () => {
+  const target = directoryHarness({
+    role: 'Front Desk', signedInAs: 'Emma Minnetto', vault: {},
+  });
+  target.api.apply([
+    { id: 'profile:elizabeth chaves', name: 'Elizabeth Chaves', role: 'Owner', builtIn: true },
+    { id: 'profile:emma minnetto', name: 'Emma Minnetto', role: 'Front Desk',
+      builtIn: true, _deleted: true },
+  ]);
+  assert.equal(target.state.sessionReset, true, 'the removed profile is signed out');
+});
+
+test('directory: export is owner-only, import is validated in main', () => {
+  const exportBody = extractHandlerBody(main, 'app-session-export-directory');
+  assert.match(exportBody, /_requireAppRole\(new Set\(\['Owner'\]\)\)/,
+    'only the owner publishes');
+  const importBody = extractHandlerBody(main, 'app-session-import-directory');
+  assert.match(importBody, /_applyStaffDirectory\(directory\)/,
+    'import runs through the validating applier, not a raw vault write');
+  assert.match(preload,
+    /exportDirectory:\s+\(\) => ipcRenderer\.invoke\('app-session-export-directory'\)/);
+  assert.match(preload,
+    /importDirectory:\s+\(directory\) => ipcRenderer\.invoke\('app-session-import-directory', directory\)/);
+});
+
+test('directory: the renderer publishes on every profile change and merges on arrival', () => {
+  const renderer = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  assert.match(renderer, /'staff_directory',/, 'it is a synchronized key');
+  assert.match(renderer, /staff_directory: 'tombstoned-record-list'/,
+    'two Macs editing different profiles merge instead of clobbering');
+  assert.match(renderer, /if \(key === 'staff_directory'\)/, 'arrivals are applied');
+  const publishes = (renderer.match(/await publishStaffDirectory\(\);/g) || []).length;
+  assert.equal(publishes, 3, 'add, remove and role change each publish');
+  // Only the owner may publish.
+  const fn = renderer.slice(renderer.indexOf('async function publishStaffDirectory('));
+  assert.match(fn.slice(0, fn.indexOf('\n}') + 2), /isElizabeth\(\)/);
+});
