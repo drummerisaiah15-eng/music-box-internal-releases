@@ -4048,9 +4048,27 @@ function _queueEncryptedWrite(k, value, options = {}) {
     return rejected;
   }
 
+  // P0/§3: this value was computed from a base the caller read BEFORE the
+  // per-key lock. If a remote reconciliation commits while we wait, committing
+  // this snapshot anyway silently erases the remote edit — and the pending
+  // record then adopts the NEWER revision as its base, so Firebase CAS accepts
+  // it with no conflict. Bind the write to the revision it was actually derived
+  // from and fail closed if that moved.
+  const guardRevision = (sync && isSyncKey(k) && !preserveTimestamp)
+    ? _localSyncRevision(k)
+    : null;
+
   const optimisticToken = {};
   _optimisticStoreValues.set(k, { token: optimisticToken, value: snapshot });
   const write = _serializeKeyMutation(k, async () => {
+    if (guardRevision !== null) {
+      const currentRevision = _localSyncRevision(k);
+      if (currentRevision !== guardRevision) {
+        // Whole-value replacement carries no merge intent, so we cannot rebase
+        // it. Surface an explicit conflict; both copies remain intact.
+        throw new SyncConflictError(k, guardRevision, currentRevision);
+      }
+    }
     await _commitEncryptedSnapshot(k, serialized, snapshot, {
       sync,
       preserveTimestamp,

@@ -58,7 +58,8 @@ service cloud.firestore {
         'rc_read_convs',
         'policies',
         'staff_dir_overrides',
-        'removed_staff_dir'
+        'removed_staff_dir',
+        'staff_directory'
       ];
     }
 

@@ -2141,3 +2141,147 @@ test('C-02: rebase re-queues at the remote revision, not the superseded one', ()
   assert.ok(body.includes('_serializeKeyMutation(key'),
     'the rebase commits inside the per-key lock');
 });
+
+// --- §3: whole-value replacement must fail closed, not lose remote edits -----
+
+test('P0/§3: a stale STORE.replace cannot silently overwrite a remote edit', async () => {
+  // Reproduces the audited sequence: remote reconciles to revision 6 while a
+  // precomputed local replacement waits behind the per-key lock. Before the fix
+  // the local value committed anyway AND its pending record claimed revision 6,
+  // so Firebase CAS would have accepted it with no conflict.
+  const localStorage = new MemoryStorage({
+    tmb_logs: 'E:["base"]',
+    tmb_logs_revision: '0',
+  });
+  const pending = {};
+  let remoteStartedResolve, releaseRemote;
+  const remoteStarted = new Promise(r => { remoteStartedResolve = r; });
+  const gate = new Promise(r => { releaseRemote = r; });
+  const context = contextWith({
+    localStorage,
+    _encKey: {},
+    _decCache: Object.assign(Object.create(null), { logs: ['base'] }),
+    _durableStoreSnapshots: new Map([['logs', ['base']]]),
+    _cloneJson: v => JSON.parse(JSON.stringify(v)),
+    _lockedStorageKeys: new Set(),
+    _storeWriteChains: new Map(),
+    _storeWriteErrors: new Map(),
+    _keyMutationChains: new Map(),
+    _optimisticStoreValues: new Map(),
+    _syncReady: false,
+    _syncBootstrapComplete: false,
+    isSyncKey: k => k === 'logs',
+    _newOperationId: () => 'op-local',
+    _aesEncrypt: async p => 'E:' + p,
+    _aesDecrypt: async c => c.slice(2),
+    _normalizeSyncValue: (_k, v) => JSON.parse(JSON.stringify(v)),
+    _scheduleSyncDrain: async () => false,
+    _writePendingSyncRecord: (k, op, ct) => {
+      pending[k] = { opId: op, localCiphertext: ct,
+        baseRevision: Number(localStorage.getItem('tmb_' + k + '_revision') || 0) };
+      return pending[k];
+    },
+    _markRemote: () => remoteStartedResolve(),
+  });
+  vm.runInContext(`
+    ${declaration('_serializeKeyMutation')}
+    ${declaration('_serializeKeyReconcile')}
+    ${declaration('_localSyncRevision')}
+    ${classDeclaration('SyncConflictError')}
+    ${declaration('_commitEncryptedSnapshot')}
+    ${declaration('_persistRemoteValue')}
+    ${declaration('_queueEncryptedWrite')}
+    globalThis.api = {
+      remote: g => _serializeKeyReconcile('logs', async () => {
+        _markRemote(); await g;
+        return _persistRemoteValue('logs', ['base', 'REMOTE'], 6);
+      }),
+      // Exactly what STORE.replace() does: hand a precomputed value onward.
+      replaceLocal: () => _queueEncryptedWrite('logs', ['base', 'LOCAL'],
+        { operationId: 'op-local' }),
+      cached: () => _decCache.logs,
+    };
+  `, context);
+
+  const remote = context.api.remote(gate);
+  await remoteStarted;
+  let conflictCode = null;
+  const local = context.api.replaceLocal().catch(e => { conflictCode = e?.code; });
+  await new Promise(r => setImmediate(r));
+  releaseRemote();
+  await Promise.all([remote, local]);
+
+  assert.deepEqual([...context.api.cached()], ['base', 'REMOTE'],
+    'the remote edit must survive a stale whole-value replacement');
+  assert.equal(conflictCode, 'SYNC_CONFLICT',
+    'the stale replacement raises an explicit conflict instead of committing');
+});
+
+test('P0/§3: a replacement derived from the current revision still commits', async () => {
+  // The guard must not break ordinary replacement when nothing raced.
+  const localStorage = new MemoryStorage({
+    tmb_logs: 'E:["base"]',
+    tmb_logs_revision: '3',
+  });
+  const context = contextWith({
+    localStorage,
+    _encKey: {},
+    _decCache: Object.assign(Object.create(null), { logs: ['base'] }),
+    _durableStoreSnapshots: new Map([['logs', ['base']]]),
+    _cloneJson: v => JSON.parse(JSON.stringify(v)),
+    _lockedStorageKeys: new Set(),
+    _storeWriteChains: new Map(),
+    _storeWriteErrors: new Map(),
+    _keyMutationChains: new Map(),
+    _optimisticStoreValues: new Map(),
+    _syncReady: false,
+    _syncBootstrapComplete: false,
+    isSyncKey: k => k === 'logs',
+    _newOperationId: () => 'op-local',
+    _aesEncrypt: async p => 'E:' + p,
+    _normalizeSyncValue: (_k, v) => JSON.parse(JSON.stringify(v)),
+    _scheduleSyncDrain: async () => false,
+    _writePendingSyncRecord: () => ({}),
+  });
+  vm.runInContext(`
+    ${declaration('_serializeKeyMutation')}
+    ${declaration('_localSyncRevision')}
+    ${classDeclaration('SyncConflictError')}
+    ${declaration('_commitEncryptedSnapshot')}
+    ${declaration('_queueEncryptedWrite')}
+    globalThis.api = {
+      replace: () => _queueEncryptedWrite('logs', ['base', 'LOCAL'], { operationId: 'op' }),
+      cached: () => _decCache.logs,
+    };
+  `, context);
+
+  await context.api.replace();
+  assert.deepEqual([...context.api.cached()], ['base', 'LOCAL'],
+    'an uncontended replacement is unaffected by the guard');
+});
+
+test('P0/§6: the client and Firestore rule key allowlists are identical', () => {
+  // The client shipped `staff_directory` in SYNC_BASE_KEYS while firestore.rules
+  // omitted it, so deploying the rules rejected every directory write.
+  const rules = fs.readFileSync(path.join(__dirname, '..', 'firestore.rules'), 'utf8');
+  const clientBlock = script.slice(
+    script.indexOf('const SYNC_BASE_KEYS'),
+    script.indexOf(']);', script.indexOf('const SYNC_BASE_KEYS'))
+  );
+  const rulesBlock = rules.slice(
+    rules.indexOf('function baseDataKey'),
+    rules.indexOf('];', rules.indexOf('function baseDataKey'))
+  );
+  const names = block => [...block.matchAll(/'([a-z0-9_]+)'/g)].map(m => m[1]).sort();
+  const client = names(clientBlock);
+  const server = names(rulesBlock);
+  assert.ok(client.includes('staff_directory'), 'the client syncs staff_directory');
+  assert.deepEqual(
+    client.filter(k => !server.includes(k)), [],
+    'every client sync key must be allowed by firestore.rules'
+  );
+  assert.deepEqual(
+    server.filter(k => !client.includes(k)), [],
+    'firestore.rules must not allow keys the client never syncs'
+  );
+});
