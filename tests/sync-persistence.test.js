@@ -2050,6 +2050,9 @@ function mergeApi() {
     const SYNC_MERGE_STRATEGIES = Object.freeze({ logs: 'tombstoned-record-list' });
     ${declaration('_canAutoMergeSyncKey')}
     ${declaration('_recordSortTime')}
+    ${declaration('_recordContentKey')}
+    ${declaration('_mergeConflictVariants')}
+    ${declaration('_mergeDivergentRecords')}
     ${declaration('_mergeTombstonedRecordLists')}
     globalThis.m = {
       merge: (a, b) => _mergeTombstonedRecordLists(a, b),
@@ -2284,4 +2287,127 @@ test('P0/§6: the client and Firestore rule key allowlists are identical', () =>
     server.filter(k => !client.includes(k)), [],
     'firestore.rules must not allow keys the client never syncs'
   );
+});
+
+// --- Fix 3: logs converge without losing a version --------------------------
+//
+// Two devices editing the same record from the same base both reach version 2.
+// The previous merge picked one whole record by timestamp/JSON order and the
+// other body vanished with no conflict.
+
+function logMergeApi() {
+  const context = contextWith({ _cloneJson: v => JSON.parse(JSON.stringify(v)) });
+  vm.runInContext(`
+    ${declaration('_recordSortTime')}
+    ${declaration('_recordContentKey')}
+    ${declaration('_mergeConflictVariants')}
+    ${declaration('_mergeDivergentRecords')}
+    ${declaration('_mergeTombstonedRecordLists')}
+    globalThis.m = (a, b) => _mergeTombstonedRecordLists(a, b);
+  `, context);
+  return (a, b) => JSON.parse(JSON.stringify(context.m(a, b)));
+}
+
+const LOG_BASE = { id: 'r1', body: 'ORIG', created: '2026-08-01T09:00:00.000Z', version: 1 };
+const edit = (body, at, over = {}) => [{
+  ...LOG_BASE, body, updated: at, version: 2, baseVersion: 1, ...over,
+}];
+
+test('Fix 3: same log edited on two devices preserves BOTH bodies', () => {
+  const merge = logMergeApi();
+  const A = edit('A BODY', '2026-08-01T10:00:00.000Z');
+  const B = edit('B BODY', '2026-08-01T10:00:01.000Z');
+  for (const [label, result] of [['A,B', merge(A, B)], ['B,A', merge(B, A)]]) {
+    const text = JSON.stringify(result);
+    assert.ok(text.includes('A BODY'), `${label}: A's body survives`);
+    assert.ok(text.includes('B BODY'), `${label}: B's body survives`);
+    assert.ok(result[0]._conflicts?.length, `${label}: an explicit conflict is raised`);
+  }
+});
+
+test('Fix 3: divergent merges converge identically on both devices', () => {
+  const merge = logMergeApi();
+  const A = edit('A', '2026-08-01T10:00:00.000Z');
+  const B = edit('B', '2026-08-01T10:00:01.000Z');
+  const C = edit('C', '2026-08-01T10:00:02.000Z');
+  const s = v => JSON.stringify(v);
+  assert.equal(s(merge(A, B)), s(merge(B, A)), 'commutative');
+  assert.equal(s(merge(merge(A, B), C)), s(merge(A, merge(B, C))), 'associative');
+  assert.equal(s(merge(merge(A, B), merge(A, B))), s(merge(A, B)), 'idempotent');
+  // Every delivery order must land on the same value, or the Macs disagree.
+  const orders = [merge(merge(A, B), C), merge(merge(C, A), B), merge(A, merge(B, C))];
+  assert.equal(new Set(orders.map(s)).size, 1, 'all delivery orders converge');
+  for (const body of ['A', 'B', 'C']) {
+    assert.ok(s(orders[0]).includes(`"${body}"`), `body ${body} is recoverable`);
+  }
+});
+
+test('Fix 3: a descendant edit fast-forwards instead of conflicting', () => {
+  const merge = logMergeApi();
+  const v2 = edit('A', '2026-08-01T10:00:00.000Z');
+  const v3 = [{ ...LOG_BASE, body: 'A2', version: 3, baseVersion: 2,
+    updated: '2026-08-01T11:00:00.000Z' }];
+  for (const result of [merge(v2, v3), merge(v3, v2)]) {
+    assert.equal(result[0].body, 'A2', 'the descendant wins');
+    assert.ok(!result[0]._conflicts, 'ancestry is not a conflict');
+  }
+});
+
+test('Fix 3: delete versus edit preserves both intentions', () => {
+  const merge = logMergeApi();
+  const del = [{ ...LOG_BASE, _deleted: true, _deletedAt: '2026-08-01T12:00:00.000Z' }];
+  const ed = edit('EDITED', '2026-08-01T11:00:00.000Z');
+  for (const result of [merge(del, ed), merge(ed, del)]) {
+    assert.equal(result[0]._deleted, true, 'the deletion stands, nothing is resurrected');
+    assert.ok(JSON.stringify(result[0]).includes('EDITED'),
+      'the concurrent edit remains recoverable');
+  }
+});
+
+test('Fix 3: independent records still merge without conflict', () => {
+  const merge = logMergeApi();
+  const A = [LOG_BASE, { id: 'r2', body: 'only-A', created: 'x', version: 1 }];
+  const B = [LOG_BASE, { id: 'r3', body: 'only-B', created: 'y', version: 1 }];
+  const result = merge(A, B);
+  assert.deepEqual([...result].map(r => r.id).sort(), ['r1', 'r2', 'r3']);
+  assert.ok(!result.some(r => r._conflicts), 'unrelated additions never conflict');
+});
+
+test('Fix 3: identical edits on both devices are not a conflict', () => {
+  const merge = logMergeApi();
+  const same = edit('SAME', '2026-08-01T10:00:00.000Z');
+  const result = merge(same, JSON.parse(JSON.stringify(same)));
+  assert.ok(!result[0]._conflicts, 'the same content from both sides is not divergent');
+});
+
+test('Fix 3: resolving a conflict supersedes every version in play', () => {
+  // The resolution must outrank all conflicting versions, or the other device
+  // would merge it straight back into a conflict.
+  const renderer = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const fn = renderer.slice(renderer.indexOf('async function resolveLogConflict('));
+  const body = fn.slice(0, fn.indexOf('\nasync function ', 1));
+  assert.match(body, /Math\.max\(/, 'it takes the highest version in play');
+  assert.match(body, /version: highest \+ 1/, 'and bumps past it');
+  assert.match(body, /baseVersion: highest/, 'recording the base it superseded');
+  assert.match(body, /delete base\._conflicts/, 'the conflict is cleared only on resolve');
+  assert.match(body, /STORE\.mutate\('logs'/, 'resolution goes through the safe primitive');
+});
+
+test('Fix 3: edits record the base version they derived from', () => {
+  const renderer = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const fn = renderer.slice(renderer.indexOf('async function saveLogEntry('));
+  const body = fn.slice(0, fn.indexOf('\nasync function ', 1));
+  assert.match(body, /baseVersion: currentVersion/,
+    'without this the merge cannot tell a descendant from a rival edit');
+  assert.match(body, /editedBy: _deviceId\(\)/, 'conflict metadata identifies the device');
+});
+
+test('Fix 3: conflicting versions are surfaced in the log UI', () => {
+  const renderer = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  assert.match(renderer, /_renderLogConflicts\(l\)/, 'log entries render their conflicts');
+  const fn = renderer.slice(renderer.indexOf('function _renderLogConflicts('));
+  const body = fn.slice(0, fn.indexOf('\nasync function ', 1));
+  assert.match(body, /other version/, 'the operator is told a conflict exists');
+  assert.match(body, /resolveLogConflict\(/, 'and can resolve it');
+  assert.match(body, /escHtml\(variant\.body/, 'variant text is escaped, never raw');
 });

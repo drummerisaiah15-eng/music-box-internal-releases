@@ -3608,6 +3608,83 @@ function _recordSortTime(record) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
+// Fix 3: the content of a record, ignoring merge bookkeeping. Two edits are
+// "divergent" when they changed the same record from the same base into
+// different content — picking one by timestamp or JSON order silently destroys
+// the other person's work.
+function _recordContentKey(record) {
+  const bare = { ...record };
+  delete bare._conflicts;
+  delete bare._supersededEdit;
+  return JSON.stringify(Object.keys(bare).sort().map(k => [k, bare[k]]));
+}
+
+// Conflict variants are stored on the surviving record. The list is sorted and
+// de-duplicated so the merge stays commutative, associative and idempotent —
+// without that, two Macs could converge on different "current" values.
+function _mergeConflictVariants(...groups) {
+  const seen = new Map();
+  for (const group of groups) {
+    for (const variant of group || []) {
+      if (!variant) continue;
+      const bare = { ...variant };
+      delete bare._conflicts;
+      seen.set(_recordContentKey(bare), bare);
+    }
+  }
+  return [...seen.entries()]
+    .sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0))
+    .map(entry => entry[1]);
+}
+
+// Fix 3: resolve two live versions of the same record.
+//
+// A record edited from a base it actually saw fast-forwards (its baseVersion
+// matches the other side's version, so it is a descendant, not a rival). Anything
+// else that differs in content is a genuine conflict: keep a deterministic
+// winner so devices converge, but carry every losing body in `_conflicts` so
+// nothing is destroyed and an operator can resolve it later.
+function _mergeDivergentRecords(a, b) {
+  const aKey = _recordContentKey(a);
+  const bKey = _recordContentKey(b);
+  const carried = _mergeConflictVariants(a?._conflicts, b?._conflicts);
+
+  // Identical content: nothing diverged; just carry any inherited variants.
+  if (aKey === bKey) {
+    const merged = _cloneJson(a);
+    if (carried.length) merged._conflicts = carried;
+    else delete merged._conflicts;
+    return merged;
+  }
+
+  const av = a?.version ?? 0;
+  const bv = b?.version ?? 0;
+  const aBase = a?.baseVersion;
+  const bBase = b?.baseVersion;
+
+  // Divergence needs EVIDENCE, not just difference. Two edits diverged if they
+  // were derived from the same base, or if they reached the same version with
+  // different content. Anything else is an ordinary sequential edit and must
+  // fast-forward — records written before `baseVersion` existed carry no
+  // ancestry data at all, and treating those as conflicts would flood the log
+  // with false conflicts on legacy data.
+  const sameBase = Number.isFinite(aBase) && Number.isFinite(bBase) && aBase === bBase;
+  const divergent = sameBase || av === bv;
+  if (!divergent) {
+    const winner = _cloneJson(av > bv ? a : b);
+    if (carried.length) winner._conflicts = carried;
+    else delete winner._conflicts;
+    return winner;
+  }
+
+  // Divergent. Deterministic winner by content key so both Macs agree, with the
+  // loser preserved as a recoverable variant.
+  const winner = _cloneJson(aKey >= bKey ? a : b);
+  const loser = aKey >= bKey ? b : a;
+  winner._conflicts = _mergeConflictVariants(carried, [loser]);
+  return winner;
+}
+
 // Deterministic and symmetric: merge(a, b) always equals merge(b, a).
 function _mergeTombstonedRecordLists(localList, remoteList) {
   const local = Array.isArray(localList) ? localList : [];
@@ -3644,24 +3721,17 @@ function _mergeTombstonedRecordLists(localList, remoteList) {
         // Spread `dead` first so the live record's newer CONTENT wins, then
         // force the tombstone markers back on. Spreading `dead` last would let
         // its stale fields clobber the very edit we are trying to preserve.
-        return liveVersion > deadVersion
-          ? {
-              ...dead,
-              ...live,
-              _deleted: true,
-              _deletedAt: dead._deletedAt,
-              _supersededEdit: true,
-            }
+        // Fix 3: preserve BOTH intentions. The tombstone stays authoritative so
+        // nothing is resurrected, but the concurrent edit is kept as a
+        // recoverable variant rather than being dropped or flattened away.
+        const base = liveVersion > deadVersion
+          ? { ...dead, ...live, _deleted: true, _deletedAt: dead._deletedAt, _supersededEdit: true }
           : _cloneJson(dead);
+        const variants = _mergeConflictVariants(dead._conflicts, live._conflicts, [live]);
+        if (variants.length) base._conflicts = variants;
+        return base;
       }
-      const av = a?.version ?? 0;
-      const bv = b?.version ?? 0;
-      if (av !== bv) return av > bv ? a : b;
-      const at = _recordSortTime(a);
-      const bt = _recordSortTime(b);
-      if (at !== bt) return at > bt ? a : b;
-      // Final deterministic tie-break so both devices reach the same answer.
-      return JSON.stringify(a) >= JSON.stringify(b) ? a : b;
+      return _mergeDivergentRecords(a, b);
     })));
   }
   return merged;
@@ -10812,7 +10882,17 @@ async function saveLogEntry() {
             'Cancel and re-open the entry to see the latest version before editing.'
           );
         }
-        logs[idx] = { ...logs[idx], date, body, tags, updated: now, version: currentVersion + 1 };
+        // Fix 3: record the version this edit was derived from. The merge uses
+        // it to tell a descendant (fast-forward) from a rival edit made against
+        // the same base (genuine conflict).
+        logs[idx] = {
+          ...logs[idx],
+          date, body, tags,
+          updated: now,
+          version: currentVersion + 1,
+          baseVersion: currentVersion,
+          editedBy: _deviceId(),
+        };
       } else if (!logs.some(l => String(l.id) === String(newEntry.id))) {
         logs.unshift(newEntry);
       }
@@ -10949,12 +11029,77 @@ function renderLogs() {
       </div>
       <div class="log-entry-body" style="white-space:pre-wrap">${bodyHtml}</div>
       ${tagsHtml ? `<div class="log-tags">${tagsHtml}</div>` : ''}
+      ${_renderLogConflicts(l)}
       <div style="margin-top:12px;display:flex;gap:8px">
         ${l.author === (currentUser() || '') ? `<button class="btn btn-ghost btn-sm" style="font-size:11px" onclick="editLog(${jsArg(l.id)})">Edit</button>` : ''}
         <button class="btn btn-ghost btn-sm" style="font-size:11px;color:var(--danger)" onclick="deleteLog(${jsArg(l.id)})">Delete</button>
       </div>
     </div>`;
   }).join('');
+}
+
+// Fix 3: a divergent edit is kept in `_conflicts` rather than discarded. Show it
+// so the operator can decide, instead of one body silently disappearing.
+function _renderLogConflicts(entry) {
+  const variants = Array.isArray(entry?._conflicts) ? entry._conflicts : [];
+  if (!variants.length) return '';
+  return `
+    <div style="margin-top:10px;padding:10px;border:1px solid #e0b45c;border-radius:8px;background:#fff8ec">
+      <div style="font-size:12px;font-weight:600;margin-bottom:6px">
+        ⚠ ${variants.length} other version${variants.length === 1 ? '' : 's'} of this entry
+        ${entry._deleted ? 'were edited elsewhere before it was deleted' : 'were written on another Mac at the same time'}
+      </div>
+      ${variants.map((variant, index) => `
+        <div style="margin:6px 0;padding:6px 8px;background:var(--bg);border-radius:6px">
+          <div style="font-size:11px;color:var(--text-muted);margin-bottom:2px">
+            ${escHtml(variant.author || 'Unknown')}${variant.updated ? ' · ' + escHtml(new Date(variant.updated).toLocaleString()) : ''}
+          </div>
+          <div style="white-space:pre-wrap;font-size:13px">${escHtml(variant.body || '')}</div>
+          ${entry._deleted ? '' : `<button class="btn btn-ghost btn-sm" style="font-size:11px;margin-top:4px"
+             onclick="resolveLogConflict(${jsArg(entry.id)}, ${index})">Keep this version instead</button>`}
+        </div>
+      `).join('')}
+      ${entry._deleted ? '' : `<button class="btn btn-ghost btn-sm" style="font-size:11px"
+         onclick="resolveLogConflict(${jsArg(entry.id)}, -1)">Keep the version shown above</button>`}
+    </div>`;
+}
+
+// Promote one variant to be the record, discarding the conflict only once the
+// operator has explicitly chosen. index -1 keeps the currently shown version.
+async function resolveLogConflict(id, index) {
+  try {
+    await STORE.mutate('logs', current => {
+      const logs = Array.isArray(current) ? _cloneJson(current) : [];
+      const idx = logs.findIndex(l => String(l.id) === String(id));
+      if (idx < 0) throw new Error('That log entry no longer exists.');
+      const entry = logs[idx];
+      const variants = Array.isArray(entry._conflicts) ? entry._conflicts : [];
+      const chosen = index >= 0 ? variants[index] : null;
+      if (index >= 0 && !chosen) throw new Error('That version is no longer available.');
+      // Bump past every version in play so the resolution supersedes each side
+      // on the other devices rather than re-conflicting with them.
+      const highest = Math.max(
+        entry.version ?? 0,
+        ...variants.map(v => v?.version ?? 0)
+      );
+      const base = chosen ? { ...entry, ...chosen } : { ...entry };
+      delete base._conflicts;
+      logs[idx] = {
+        ...base,
+        version: highest + 1,
+        baseVersion: highest,
+        updated: new Date().toISOString(),
+        editedBy: _deviceId(),
+      };
+      return logs;
+    }, []);
+    renderLogs();
+    showToast('Log conflict resolved.', 'success');
+    return true;
+  } catch (error) {
+    showToast(`Conflict was not resolved: ${error?.message || error}`, 'danger');
+    return false;
+  }
 }
 
 async function deleteLog(id) {
