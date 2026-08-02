@@ -1433,8 +1433,17 @@ function _recordStepUpFailure() {
 }
 
 // The single choke point every Step Up-sensitive main handler must call.
+//
+// Enrolment is OPT-IN. If the owner has not set a Step Up code for this profile,
+// the role check alone applies and behaviour matches the previous release, so
+// installing this update cannot lock anyone out of receipts they could already
+// reach. Setting a code is what turns the protection on.
 function _requireStepUpGrant() {
   const session = _requireAppRole(STEP_UP_ROLES);
+  const enrolled = Object.prototype.hasOwnProperty.call(
+    _stepUpRecords(_loadSecretVault()), session.name
+  );
+  if (!enrolled) return session;
   if (!stepUpGrant ||
       Date.now() >= stepUpGrant.expiresAt ||
       stepUpGrant.name !== session.name ||

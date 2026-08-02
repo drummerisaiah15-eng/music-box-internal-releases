@@ -515,3 +515,35 @@ test('V159-006: the renderer cannot grant itself Step Up access', () => {
   assert.match(renderer, /main re-checks the role AND the grant on every sensitive operation/,
     'the cached value is documented as non-authoritative');
 });
+
+test('V159-006: Step Up enrolment is reachable from the owner Settings UI', () => {
+  // Regression: the enrolment function shipped with no way to call it, so there
+  // was no input field in Settings and the feature was unusable.
+  const renderer = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  assert.match(renderer, /id="step-up-enroll-section"/, 'the settings block exists');
+  assert.match(renderer, /id="step-up-profile"/, 'a profile picker exists');
+  assert.match(renderer, /id="step-up-new"/, 'a passcode input exists');
+  assert.match(renderer, /onclick="stepUpEnrollPasscode\(\)"/,
+    'a control actually invokes enrolment');
+  assert.match(renderer, /getElementById\('step-up-enroll-section'\)[\s\S]{0,120}isElizabeth\(\)/,
+    'the block is shown only to the owner');
+  // And the function must read the form rather than a blocking prompt.
+  const fn = renderer.slice(renderer.indexOf('async function stepUpEnrollPasscode('));
+  const body = fn.slice(0, fn.indexOf('\nasync function ', 1));
+  assert.match(body, /getElementById\('step-up-new'\)/, 'reads the input field');
+  assert.doesNotMatch(body, /window\.prompt/, 'does not use a blocking prompt');
+});
+
+test('V159-006: Step Up protection is opt-in and cannot lock anyone out on upgrade', () => {
+  const main = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  const guard = main.slice(main.indexOf('function _requireStepUpGrant('));
+  const body = guard.slice(0, guard.indexOf('\n}\n') + 3);
+  assert.match(body, /if \(!enrolled\) return session;/,
+    'with no code enrolled the trusted layer falls back to the role check alone');
+
+  const renderer = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const req = renderer.slice(renderer.indexOf('function requireStepUpAccess('));
+  const reqBody = req.slice(0, req.indexOf('\n}\n') + 3);
+  assert.match(reqBody, /if \(!_stepUpTrusted\.enrolled\) return true;/,
+    'the renderer does not lock receipts until a code is enrolled');
+});

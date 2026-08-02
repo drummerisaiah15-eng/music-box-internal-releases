@@ -1989,6 +1989,24 @@
             <button class="btn btn-outline btn-sm" onclick="changePin()">Update Passcode</button>
           </div>
         </div>
+        <div id="step-up-enroll-section" style="margin-top:20px;padding-top:16px;border-top:1px solid var(--divider);display:none">
+          <div style="font-size:13px;font-weight:600;margin-bottom:6px;color:var(--text-secondary)">Step Up Receipt Access (Elizabeth only)</div>
+          <div style="font-size:11.5px;color:var(--text-muted);margin-bottom:10px;line-height:1.5;max-width:640px">
+            Anyone can select a profile at the login screen, so without a passcode
+            a front-desk user could open Carrie's receipts. Setting a code here
+            requires it before receipts unlock. Leave this unset to keep receipts
+            open to anyone who selects Carrie.
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <select id="step-up-profile" class="form-select" style="width:210px">
+              <option value="Carrie Gass">Carrie Gass</option>
+              <option value="Elizabeth Chaves">Elizabeth Chaves</option>
+            </select>
+            <input type="password" id="step-up-new" class="form-input" inputmode="numeric" minlength="6" maxlength="6" placeholder="6-digit code" style="width:170px;letter-spacing:.12em" />
+            <button class="btn btn-outline btn-sm" onclick="stepUpEnrollPasscode()">Set Step Up Code</button>
+          </div>
+          <div id="step-up-enroll-status" style="font-size:11.5px;color:var(--text-muted);margin-top:8px"></div>
+        </div>
       </div>
 
       <!-- App Updates -->
@@ -8096,6 +8114,10 @@ async function loadSettings() {
   const pinSec = document.getElementById('pin-change-section');
   if (pinSec) pinSec.style.display = isElizabeth() ? '' : 'none';
 
+  // V159-006: Step Up enrolment is owner-only, same visibility rule as the PIN.
+  const stepUpSec = document.getElementById('step-up-enroll-section');
+  if (stepUpSec) stepUpSec.style.display = isElizabeth() ? '' : 'none';
+
   // Load saved API config (display status only – don't expose stored keys)
   // Check if any MS account has a saved token (persisted across restarts)
   await migrateLegacyMsAccount();
@@ -12713,8 +12735,12 @@ function requireStepUpAccess() {
     showToast('This profile does not have access to Step Up Receipts.', 'warning');
     return false;
   }
+  // V159-006: enrolment is opt-in. With no Step Up code set, receipts behave
+  // exactly as they did before this update — the owner turns protection on by
+  // setting a code in Settings.
+  if (!_stepUpTrusted.enrolled) return true;
   if (!_stepUpTrusted.authorized) {
-    showToast('Enter your Step Up passcode to unlock receipts.', 'warning');
+    showToast('Enter your Step Up code to unlock receipts.', 'warning');
     try { renderStepUpLockState(); } catch (_) {}
     return false;
   }
@@ -12759,17 +12785,32 @@ async function stepUpLock() {
 
 // Owner-only enrolment of a Step Up passcode for a privileged profile.
 async function stepUpEnrollPasscode(profileName) {
-  const name = profileName || window.prompt('Enrol a Step Up passcode for which profile?');
-  if (!name) return false;
-  const passcode = window.prompt(`Set a 6-digit Step Up passcode for ${name}:`);
-  if (passcode === null) return false;
+  const status = document.getElementById('step-up-enroll-status');
+  const setStatus = (text, danger) => {
+    if (status) {
+      status.textContent = text;
+      status.style.color = danger ? 'var(--danger,#c0392b)' : 'var(--text-muted)';
+    }
+  };
+  const select = document.getElementById('step-up-profile');
+  const input = document.getElementById('step-up-new');
+  const name = String(profileName || select?.value || '').trim();
+  const passcode = String(input?.value || '').trim();
+  if (!name) { setStatus('Choose a profile first.', true); return false; }
+  if (!/^\d{6}$/.test(passcode)) {
+    setStatus('The Step Up code must be exactly 6 digits.', true);
+    return false;
+  }
   try {
-    await window.electronSession.stepUpEnroll({ name: String(name).trim(), passcode: String(passcode).trim() });
-    showToast(`Step Up passcode set for ${name}.`, 'success');
+    await window.electronSession.stepUpEnroll({ name, passcode });
+    if (input) input.value = '';
+    setStatus(`Step Up code set for ${name}. Receipts now require it.`, false);
+    showToast(`Step Up code set for ${name}.`, 'success');
     await refreshStepUpTrust();
     return true;
   } catch (error) {
-    showToast(`Step Up passcode was not set: ${error?.message || error}`, 'danger');
+    setStatus(`Not set: ${error?.message || error}`, true);
+    showToast(`Step Up code was not set: ${error?.message || error}`, 'danger');
     return false;
   }
 }
@@ -12790,7 +12831,8 @@ function saveStepUpReceipts(receipts) {
 function renderStepUpLockState() {
   const page = document.getElementById('page-stepup');
   if (!page) return;
-  const locked = _stepUpTrusted.eligible && !_stepUpTrusted.authorized;
+  // Only lock when a code is actually enrolled — see requireStepUpAccess().
+  const locked = _stepUpTrusted.eligible && _stepUpTrusted.enrolled && !_stepUpTrusted.authorized;
   let overlay = document.getElementById('stepup-lock-overlay');
   if (!locked) { if (overlay) overlay.style.display = 'none'; return; }
   if (!overlay) {
@@ -12821,7 +12863,9 @@ function renderStepUp() {
   // V159-006: consult main before rendering, so a stale cached grant cannot
   // leave receipts on screen after the grant expired.
   refreshStepUpTrust().then(() => {
-    if (_stepUpTrusted.eligible && !_stepUpTrusted.authorized) renderStepUpLockState();
+    if (_stepUpTrusted.eligible && _stepUpTrusted.enrolled && !_stepUpTrusted.authorized) {
+      renderStepUpLockState();
+    }
   }).catch(() => {});
   if (!requireStepUpAccess()) {
     if (!_stepUpTrusted.eligible) navigate('dashboard');
