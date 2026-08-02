@@ -1594,6 +1594,49 @@ _secureHandle('app-session-add-staff-profile', async (_, requestedName) => {
   return { ok: true, profile: { name, role: 'Front Desk', builtIn: false } };
 });
 
+// Owner-only removal of an added Front Desk profile.
+//
+// Deliberate constraints:
+//  - built-in profiles are structural and cannot be removed;
+//  - the signed-in profile cannot delete itself out from under the session;
+//  - any Step Up credential for the name is revoked with it, so re-adding the
+//    same name later does not silently inherit the old passcode;
+//  - task history is NOT touched. Assigned tasks reference a display name, and
+//    deleting the records would destroy studio history rather than a login.
+_secureHandle('app-session-remove-staff-profile', async (_, requestedName) => {
+  _requireAppRole(new Set(['Owner']));
+  const name = _normalizeStaffProfileName(requestedName);
+  if (Object.prototype.hasOwnProperty.call(APP_PROFILE_ROLES, name)) {
+    throw new Error('Built-in profiles cannot be removed.');
+  }
+  if (appSession && appSession.name === name) {
+    throw new Error('You cannot remove the profile that is currently signed in.');
+  }
+  const vault = _loadSecretVault();
+  const profiles = _customStaffProfilesFromVault(vault);
+  const folded = name.toLocaleLowerCase('en-US');
+  const remaining = profiles.filter(
+    profile => profile.name.toLocaleLowerCase('en-US') !== folded
+  );
+  if (remaining.length === profiles.length) {
+    throw new Error('That user was not found on this Mac.');
+  }
+  if (remaining.length) vault[STAFF_PROFILES_VAULT_KEY] = remaining;
+  else delete vault[STAFF_PROFILES_VAULT_KEY];
+
+  // Revoke any Step Up credential belonging to the removed name.
+  const stepUp = _stepUpRecords(vault);
+  if (Object.prototype.hasOwnProperty.call(stepUp, name)) {
+    const next = { ...stepUp };
+    delete next[name];
+    if (Object.keys(next).length) vault[STEP_UP_AUTH_VAULT_KEY] = next;
+    else delete vault[STEP_UP_AUTH_VAULT_KEY];
+  }
+  _saveSecretVault(vault);
+  if (stepUpGrant?.name === name) _resetStepUpGrant();
+  return { ok: true, name, remaining: remaining.length };
+});
+
 _secureHandle('app-session-end', async () => {
   _resetAppSession();
   return { ok: true };

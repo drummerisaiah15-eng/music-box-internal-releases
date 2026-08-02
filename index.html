@@ -1989,6 +1989,15 @@
             <button class="btn btn-outline btn-sm" onclick="changePin()">Update Passcode</button>
           </div>
         </div>
+        <div id="manage-profiles-section" style="margin-top:20px;padding-top:16px;border-top:1px solid var(--divider);display:none">
+          <div style="font-size:13px;font-weight:600;margin-bottom:6px;color:var(--text-secondary)">Manage Users (Elizabeth only)</div>
+          <div style="font-size:11.5px;color:var(--text-muted);margin-bottom:10px;line-height:1.5;max-width:640px">
+            Removing a user deletes their login on this Mac and revokes any Step Up
+            code they had. Their past tasks and log entries are kept — only the
+            login is removed. Built-in profiles cannot be removed.
+          </div>
+          <div id="manage-profiles-list"></div>
+        </div>
         <div id="step-up-enroll-section" style="margin-top:20px;padding-top:16px;border-top:1px solid var(--divider);display:none">
           <div style="font-size:13px;font-weight:600;margin-bottom:6px;color:var(--text-secondary)">Step Up Receipt Access (Elizabeth only)</div>
           <div style="font-size:11.5px;color:var(--text-muted);margin-bottom:10px;line-height:1.5;max-width:640px">
@@ -2344,11 +2353,71 @@ async function refreshLoginProfiles() {
   _loginProfiles = profiles;
   renderLoginProfiles();
   populateProfileSelects();
+  // Keep the owner's Manage Users list in step with every profile change,
+  // whichever path caused it (add, remove, or a fresh load).
+  try { renderManageProfiles(); } catch (_) {}
   if (currentUser()) {
     renderMyTasks();
     try { renderStaff(); } catch (_) {}
   }
   return true;
+}
+
+// Owner-only list of removable (added) profiles. Built-ins are shown as locked
+// so it is obvious why they have no Remove control, rather than just absent.
+function renderManageProfiles() {
+  const list = document.getElementById('manage-profiles-list');
+  if (!list) return;
+  if (!isElizabeth()) { list.innerHTML = ''; return; }
+  const signedIn = currentUser();
+  const rows = _loginProfiles.map(profile => {
+    const removable = profile.builtIn !== true && profile.name !== signedIn;
+    const why = profile.builtIn === true
+      ? 'Built-in'
+      : profile.name === signedIn ? 'Signed in' : '';
+    return `<div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--divider)">
+      <span style="flex:1;min-width:0">
+        <strong>${escHtml(profile.name)}</strong>
+        <span style="color:var(--text-muted);font-size:11.5px"> — ${escHtml(profile.role)}</span>
+      </span>
+      ${removable
+        ? `<button class="btn btn-ghost btn-sm" style="color:var(--danger,#c0392b)"
+             onclick="removeLoginUser(${jsArg(profile.name)})">Remove</button>`
+        : `<span style="font-size:11.5px;color:var(--text-muted)">${escHtml(why)}</span>`}
+    </div>`;
+  }).join('');
+  const addedCount = _loginProfiles.filter(p => p.builtIn !== true).length;
+  list.innerHTML = rows + `<div style="font-size:11.5px;color:var(--text-muted);margin-top:8px">
+    ${addedCount} added user${addedCount === 1 ? '' : 's'} on this Mac.
+  </div>`;
+}
+
+async function removeLoginUser(name) {
+  if (!isElizabeth()) {
+    showToast('Only the owner can remove users.', 'warning');
+    return false;
+  }
+  if (!window.electronSession?.removeStaffProfile) {
+    showToast('Secure user-profile storage is unavailable.', 'danger');
+    return false;
+  }
+  if (!window.confirm(
+    `Remove ${name}?\n\n` +
+    `Their login on this Mac is deleted and any Step Up code is revoked. ` +
+    `Tasks and log entries they created are kept.`
+  )) return false;
+  try {
+    const result = await window.electronSession.removeStaffProfile(name);
+    if (result?.ok !== true) throw new Error(result?.error || 'The user was not removed.');
+    await refreshLoginProfiles();
+    renderManageProfiles();
+    await refreshStepUpTrust();
+    showToast(`${name} was removed.`, 'success');
+    return true;
+  } catch (error) {
+    showToast(`${name} was not removed: ${error?.message || error}`, 'danger');
+    return false;
+  }
 }
 
 function showAddLoginUserForm() {
@@ -8117,6 +8186,10 @@ async function loadSettings() {
   // V159-006: Step Up enrolment is owner-only, same visibility rule as the PIN.
   const stepUpSec = document.getElementById('step-up-enroll-section');
   if (stepUpSec) stepUpSec.style.display = isElizabeth() ? '' : 'none';
+
+  const manageSec = document.getElementById('manage-profiles-section');
+  if (manageSec) manageSec.style.display = isElizabeth() ? '' : 'none';
+  renderManageProfiles();
 
   // Load saved API config (display status only – don't expose stored keys)
   // Check if any MS account has a saved token (persisted across restarts)

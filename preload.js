@@ -22,6 +22,7 @@ contextBridge.exposeInMainWorld('electronSession', {
   startStaff:        (name) => ipcRenderer.invoke('app-session-start-staff', name),
   listProfiles:      () => ipcRenderer.invoke('app-session-list-profiles'),
   addStaffProfile:   (name) => ipcRenderer.invoke('app-session-add-staff-profile', name),
+  removeStaffProfile:(name) => ipcRenderer.invoke('app-session-remove-staff-profile', name),
   end:               () => ipcRenderer.invoke('app-session-end'),
   status:            () => ipcRenderer.invoke('app-session-status'),
   stageOwnerPin:     (request) => ipcRenderer.invoke('app-session-stage-owner-pin', request),

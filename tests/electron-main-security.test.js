@@ -547,3 +547,226 @@ test('V159-006: Step Up protection is opt-in and cannot lock anyone out on upgra
   assert.match(reqBody, /if \(!_stepUpTrusted\.enrolled\) return true;/,
     'the renderer does not lock receipts until a code is enrolled');
 });
+
+// --- Profile removal: functional stress tests -------------------------------
+//
+// These execute the REAL handler body against a simulated vault rather than
+// pattern-matching source, so guard regressions actually fail.
+
+// extractFunction() brace-matches and is confused by regex literals that
+// contain an apostrophe (e.g. /^[\p{L}\p{M}\d .'-]+$/u). These helpers are
+// plain top-level declarations, so slice to the next declaration instead.
+function sliceFunction(source, name) {
+  const start = source.indexOf(`function ${name}(`);
+  assert.notEqual(start, -1, `${name} exists`);
+  const ends = [
+    source.indexOf('\nfunction ', start + 1),
+    source.indexOf('\nasync function ', start + 1),
+    source.indexOf('\nconst ', start + 1),
+    source.indexOf('\n_secureHandle(', start + 1),
+  ].filter(i => i > 0);
+  return source.slice(start, ends.length ? Math.min(...ends) : source.length);
+}
+
+function extractHandlerBody(source, channel) {
+  const marker = `_secureHandle('${channel}'`;
+  const start = source.indexOf(marker);
+  assert.notEqual(start, -1, `${channel} handler exists`);
+  const braceStart = source.indexOf('{', source.indexOf('=>', start));
+  let depth = 0, quote = null, escaped = false;
+  for (let i = braceStart; i < source.length; i++) {
+    const c = source[i];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (c === '\\') escaped = true;
+      else if (c === quote) quote = null;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === '`') { quote = c; continue; }
+    if (c === '{') depth++;
+    else if (c === '}') { depth--; if (!depth) return source.slice(braceStart + 1, i); }
+  }
+  throw new Error(`could not extract ${channel}`);
+}
+
+function removalHarness({ role = 'Owner', signedInAs = 'Elizabeth Chaves', vault } = {}) {
+  const state = {
+    vault: vault ?? {
+      app_staff_profiles_v1: [
+        { name: 'Dana Reed', role: 'Front Desk', createdAt: 1 },
+        { name: 'Sam Vega', role: 'Front Desk', createdAt: 2 },
+      ],
+    },
+    savedTimes: 0,
+  };
+  const context = vm.createContext({
+    Object, Error, Date, JSON, Set, Array, Number, String, Boolean, Buffer, console,
+    _state: state,
+  });
+  vm.runInContext(`
+    const APP_PROFILE_ROLES = Object.freeze({
+      'Elizabeth Chaves': 'Owner', 'Carrie Gass': 'Operations & Events',
+      'Ana Chaves': 'Front Desk', 'Emma Minnetto': 'Front Desk',
+    });
+    const STAFF_PROFILES_VAULT_KEY = 'app_staff_profiles_v1';
+    const STEP_UP_AUTH_VAULT_KEY = 'app_step_up_auth_v1';
+    const MAX_CUSTOM_STAFF_PROFILES = 50;
+    let appSession = ${JSON.stringify({ name: signedInAs, role })};
+    let stepUpGrant = { name: 'Carrie Gass' };
+    const _isPlainObject = v => !!v && typeof v === 'object' && !Array.isArray(v);
+    const _validOwnerVerifier = () => true;
+    const _loadSecretVault = () => JSON.parse(JSON.stringify(_state.vault));
+    const _saveSecretVault = v => { _state.vault = JSON.parse(JSON.stringify(v)); _state.savedTimes++; };
+    const _resetStepUpGrant = () => { stepUpGrant = null; };
+    function _requireAppRole(allowed) {
+      if (!allowed.has(appSession.role)) {
+        throw new Error('This signed-in profile is not authorized for that action.');
+      }
+      return appSession;
+    }
+    ${sliceFunction(main, '_normalizeStaffProfileName')}
+    ${sliceFunction(main, '_customStaffProfilesFromVault')}
+    ${sliceFunction(main, '_stepUpRecords')}
+    globalThis.remove = async requestedName => {
+      ${extractHandlerBody(main, 'app-session-remove-staff-profile')}
+    };
+    globalThis.list = () => _customStaffProfilesFromVault(_loadSecretVault()).map(p => p.name);
+  `, context);
+  return { api: context, state };
+}
+
+test('profile removal: removes an added user and leaves the others intact', async () => {
+  const { api, state } = removalHarness();
+  const result = await api.remove('Dana Reed');
+  assert.equal(result.ok, true);
+  assert.deepEqual([...api.list()], ['Sam Vega']);
+  assert.equal(state.savedTimes, 1, 'the vault is written exactly once');
+});
+
+test('profile removal: built-in profiles can never be removed', async () => {
+  for (const name of ['Elizabeth Chaves', 'Carrie Gass', 'Ana Chaves', 'Emma Minnetto']) {
+    const { api } = removalHarness();
+    await assert.rejects(() => api.remove(name), /Built-in profiles cannot be removed/, name);
+    assert.deepEqual([...api.list()], ['Dana Reed', 'Sam Vega'], 'nothing was removed');
+  }
+});
+
+test('profile removal: only the owner may remove a user', async () => {
+  for (const role of ['Front Desk', 'Operations & Events']) {
+    const { api } = removalHarness({ role, signedInAs: 'Sam Vega' });
+    await assert.rejects(() => api.remove('Dana Reed'), /not authorized/, role);
+    assert.deepEqual([...api.list()], ['Dana Reed', 'Sam Vega']);
+  }
+});
+
+test('profile removal: the signed-in profile cannot delete itself', async () => {
+  const { api } = removalHarness({ signedInAs: 'Dana Reed' });
+  await assert.rejects(() => api.remove('Dana Reed'), /currently signed in/);
+  assert.deepEqual([...api.list()], ['Dana Reed', 'Sam Vega']);
+});
+
+test('profile removal: an unknown user is reported, not silently accepted', async () => {
+  const { api, state } = removalHarness();
+  await assert.rejects(() => api.remove('Nobody Here'), /was not found/);
+  assert.equal(state.savedTimes, 0, 'no write happens on a failed removal');
+});
+
+test('profile removal: matching is case- and whitespace-insensitive', async () => {
+  for (const variant of ['dana reed', 'DANA REED', '  Dana   Reed  ']) {
+    const { api } = removalHarness();
+    await api.remove(variant);
+    assert.deepEqual([...api.list()], ['Sam Vega'], `matched "${variant}"`);
+  }
+});
+
+test('profile removal: invalid names are rejected before any vault write', async () => {
+  for (const bad of ['', 'x', 'A'.repeat(81), 'Team', 'bad<name>']) {
+    const { api, state } = removalHarness();
+    await assert.rejects(() => api.remove(bad));
+    assert.equal(state.savedTimes, 0, `no write for ${JSON.stringify(bad)}`);
+  }
+});
+
+test('profile removal: a Step Up credential is revoked with the profile', async () => {
+  const { api, state } = removalHarness({
+    vault: {
+      app_staff_profiles_v1: [{ name: 'Dana Reed', role: 'Front Desk', createdAt: 1 }],
+      app_step_up_auth_v1: { 'Dana Reed': { v: 1 }, 'Carrie Gass': { v: 1 } },
+    },
+  });
+  await api.remove('Dana Reed');
+  assert.deepEqual(Object.keys(state.vault.app_step_up_auth_v1), ['Carrie Gass'],
+    'only the removed user loses their Step Up code');
+});
+
+test('profile removal: re-adding the same name does not inherit the old Step Up code', async () => {
+  const { api, state } = removalHarness({
+    vault: {
+      app_staff_profiles_v1: [{ name: 'Dana Reed', role: 'Front Desk', createdAt: 1 }],
+      app_step_up_auth_v1: { 'Dana Reed': { v: 1 } },
+    },
+  });
+  await api.remove('Dana Reed');
+  assert.equal(state.vault.app_step_up_auth_v1, undefined,
+    'the empty Step Up map is cleaned up, so a re-added name starts unenrolled');
+});
+
+test('profile removal: removing the last user cleans up the vault key', async () => {
+  const { api, state } = removalHarness({
+    vault: { app_staff_profiles_v1: [{ name: 'Dana Reed', role: 'Front Desk', createdAt: 1 }] },
+  });
+  await api.remove('Dana Reed');
+  assert.equal(state.vault.app_staff_profiles_v1, undefined, 'no empty array is left behind');
+  assert.deepEqual([...api.list()], []);
+});
+
+test('profile removal: repeated removal is safe and never double-writes', async () => {
+  const { api, state } = removalHarness();
+  await api.remove('Dana Reed');
+  await assert.rejects(() => api.remove('Dana Reed'), /was not found/);
+  assert.equal(state.savedTimes, 1);
+  assert.deepEqual([...api.list()], ['Sam Vega']);
+});
+
+test('profile removal: removing every user in turn leaves a consistent vault', async () => {
+  const { api, state } = removalHarness();
+  await api.remove('Dana Reed');
+  await api.remove('Sam Vega');
+  assert.deepEqual([...api.list()], []);
+  assert.equal(state.vault.app_staff_profiles_v1, undefined);
+  assert.equal(state.savedTimes, 2);
+});
+
+test('profile removal: logs, notes and tasks are never touched by a removal', async () => {
+  const body = extractHandlerBody(main, 'app-session-remove-staff-profile');
+  // Deleting a login must never delete the logs, notes or tasks that person
+  // created. The handler may only ever touch the two credential vault keys.
+  for (const forbidden of ['logs', 'staff_notes', 'assigned_tasks', 'todo_items',
+                           'step_up_receipts', 'policies', 'STORE']) {
+    assert.doesNotMatch(body, new RegExp(`\\b${forbidden}\\b`),
+      `removal must not reference ${forbidden}`);
+  }
+  assert.match(body, /STAFF_PROFILES_VAULT_KEY/);
+  assert.match(body, /STEP_UP_AUTH_VAULT_KEY/);
+});
+
+test('profile removal: the owner UI exposes Remove and refreshes everywhere', () => {
+  const renderer = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  assert.match(renderer, /id="manage-profiles-section"/, 'the settings block exists');
+  assert.match(renderer, /id="manage-profiles-list"/, 'the list container exists');
+  assert.match(renderer, /onclick="removeLoginUser\(/, 'a Remove control invokes removal');
+  assert.match(renderer, /getElementById\('manage-profiles-section'\)[\s\S]{0,140}isElizabeth\(\)/,
+    'the block is owner-only');
+  const refresh = renderer.slice(renderer.indexOf('async function refreshLoginProfiles('));
+  const body = refresh.slice(0, refresh.indexOf('\nfunction ', 1));
+  assert.match(body, /renderLoginProfiles\(\)/, 'login screen refreshes');
+  assert.match(body, /populateProfileSelects\(\)/, 'task dropdowns refresh');
+  assert.match(body, /renderManageProfiles\(\)/, 'the manage list refreshes');
+  assert.match(body, /renderMyTasks\(\)/, 'task views refresh');
+});
+
+test('profile removal: preload exposes removal without widening the surface', () => {
+  assert.match(preload,
+    /removeStaffProfile:\(name\) => ipcRenderer\.invoke\('app-session-remove-staff-profile', name\)/,
+    'the renderer can only pass a name; main enforces every rule');
+});
