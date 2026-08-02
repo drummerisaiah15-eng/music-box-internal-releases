@@ -3432,7 +3432,134 @@ function _surfaceSyncDeliveryError(key, err) {
   showToast(`Cloud save for ${key} is still pending: ${err?.message || err}`, 'warning');
 }
 
+// ─── C-02: automatic two-device merge on CAS conflict ────────────────────────
+//
+// STORE.mutate() only fixes the single-renderer ordering where a remote value
+// commits locally before the local mutation derives its base. It does NOT help
+// when two Macs each queue a pending write from the same revision: one wins the
+// CAS transaction, the other gets SYNC_CONFLICT, and whole-value resolution then
+// discards one side's records.
+//
+// A union-by-id merge is only SOUND when deletion is explicit. If a collection
+// removes records by absence, union would resurrect anything the other device
+// deleted — trading lost writes for lost deletes. So auto-merge is opt-in per
+// key and requires tombstones (`_deleted: true`), stable ids, and a `version`
+// counter. Today only `logs` satisfies that; add a key here only after giving it
+// the same guarantees.
+const SYNC_MERGE_STRATEGIES = Object.freeze({
+  logs: 'tombstoned-record-list',
+});
+const MAX_SYNC_MERGE_ATTEMPTS = 3;
+
+function _canAutoMergeSyncKey(key) {
+  return SYNC_MERGE_STRATEGIES[key] === 'tombstoned-record-list';
+}
+
+function _recordSortTime(record) {
+  const stamp = record?._deletedAt || record?.updated || record?.created || '';
+  const parsed = Date.parse(stamp);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+// Deterministic and symmetric: merge(a, b) always equals merge(b, a).
+function _mergeTombstonedRecordLists(localList, remoteList) {
+  const local = Array.isArray(localList) ? localList : [];
+  const remote = Array.isArray(remoteList) ? remoteList : [];
+  const byId = new Map();
+  const order = [];
+  const note = record => {
+    const id = String(record?.id ?? '');
+    if (!id) return;
+    if (!byId.has(id)) order.push(id);
+    byId.set(id, [...(byId.get(id) || []), record]);
+  };
+  remote.forEach(note);
+  local.forEach(note);
+
+  const merged = [];
+  for (const id of order) {
+    const versions = byId.get(id) || [];
+    // Present on only one side: that side created it. Absence is never a
+    // deletion, so keeping it cannot resurrect anything.
+    if (versions.length === 1) { merged.push(_cloneJson(versions[0])); continue; }
+
+    merged.push(_cloneJson(versions.reduce((a, b) => {
+      const aDead = a?._deleted === true;
+      const bDead = b?._deleted === true;
+      // A tombstone always wins over a live record — resurrecting a deleted
+      // entry is worse than dropping a concurrent edit. The edit is not lost:
+      // its fields are carried under the tombstone so it can be recovered.
+      if (aDead !== bDead) {
+        const dead = aDead ? a : b;
+        const live = aDead ? b : a;
+        const liveVersion = live?.version ?? 0;
+        const deadVersion = dead?.version ?? 0;
+        // Spread `dead` first so the live record's newer CONTENT wins, then
+        // force the tombstone markers back on. Spreading `dead` last would let
+        // its stale fields clobber the very edit we are trying to preserve.
+        return liveVersion > deadVersion
+          ? {
+              ...dead,
+              ...live,
+              _deleted: true,
+              _deletedAt: dead._deletedAt,
+              _supersededEdit: true,
+            }
+          : _cloneJson(dead);
+      }
+      const av = a?.version ?? 0;
+      const bv = b?.version ?? 0;
+      if (av !== bv) return av > bv ? a : b;
+      const at = _recordSortTime(a);
+      const bt = _recordSortTime(b);
+      if (at !== bt) return at > bt ? a : b;
+      // Final deterministic tie-break so both devices reach the same answer.
+      return JSON.stringify(a) >= JSON.stringify(b) ? a : b;
+    })));
+  }
+  return merged;
+}
+
+// Rebase this Mac's pending value onto the current remote value, then re-queue
+// it at the remote revision so the next CAS attempt can succeed.
+async function _rebasePendingOnRemote(key) {
+  if (!_canAutoMergeSyncKey(key)) return false;
+  const snap = await studioRef().collection('data').doc(key).get();
+  if (!snap.exists) return false;
+  const remote = snap.data();
+  if (!remote || remote.value === undefined || remote.value === null) return false;
+  const remoteRevision = Number.isSafeInteger(remote.revision) && remote.revision >= 0
+    ? remote.revision : 0;
+  const remoteValue = await _decodeSyncValue(key, remote.value);
+
+  return _serializeKeyMutation(key, async () => {
+    const pending = _readPendingSyncRecord(key);
+    if (!pending) return false;
+    if (pending.baseRevision >= remoteRevision) return false;
+    const plaintext = await _aesDecrypt(pending.localCiphertext);
+    if (plaintext === null) return false;
+    const localValue = _normalizeSyncValue(key, JSON.parse(plaintext));
+    const merged = _normalizeSyncValue(key, _mergeTombstonedRecordLists(localValue, remoteValue));
+    const serialized = JSON.stringify(merged);
+
+    // Drop the stale pending record FIRST so _writePendingSyncRecord derives a
+    // fresh baseRevision from the remote revision we just observed, instead of
+    // inheriting the superseded one.
+    localStorage.removeItem(_pendingSyncStorageKey(key));
+    await _commitEncryptedSnapshot(key, serialized, merged, {
+      sync: true,
+      preserveTimestamp: true,
+      operationId: _newOperationId(),
+      remoteRevision,
+    });
+    _decCache[key] = merged;
+    _refreshForSyncKey(key, merged);
+    return true;
+  });
+}
+
 async function _drainSyncKey(key) {
+  let mergeAttempts = 0;
   while (_syncReady && _syncBootstrapComplete) {
     const pending = _readPendingSyncRecord(key);
     if (!pending) {
@@ -3450,11 +3577,26 @@ async function _drainSyncKey(key) {
     try { value = _normalizeSyncValue(key, JSON.parse(plaintext)); }
     catch (err) { throw new Error(`Pending sync value for ${key} is invalid: ${err?.message || err}`); }
 
-    const result = await syncPush(key, value, {
-      opId: pending.opId,
-      expectedRevision: pending.baseRevision,
-      supersededOpIds: pending.supersededOpIds,
-    });
+    let result;
+    try {
+      result = await syncPush(key, value, {
+        opId: pending.opId,
+        expectedRevision: pending.baseRevision,
+        supersededOpIds: pending.supersededOpIds,
+      });
+    } catch (err) {
+      // C-02: another device committed first. For a tombstoned record list we
+      // can combine both sets of changes automatically and retry, instead of
+      // forcing the user into a whole-value Use Cloud / Keep This Mac choice
+      // that necessarily discards one side.
+      if (err?.code === 'SYNC_CONFLICT' && _canAutoMergeSyncKey(key) &&
+          mergeAttempts < MAX_SYNC_MERGE_ATTEMPTS) {
+        mergeAttempts += 1;
+        if (await _rebasePendingOnRemote(key)) continue;
+      }
+      throw err;
+    }
+    mergeAttempts = 0;
     _acknowledgePendingSyncRecord(key, pending.opId, result.revision);
     _syncDeliveryErrors.delete(key);
     _syncConflictNotified.delete(key);

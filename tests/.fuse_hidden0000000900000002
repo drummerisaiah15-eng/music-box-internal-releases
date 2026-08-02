@@ -2067,8 +2067,8 @@ test('C-02: the merge is symmetric, so both devices converge', () => {
   const m = mergeApi();
   const a = [REC('base'), REC('A')];
   const b = [REC('base'), REC('B')];
-  const ab = JSON.stringify([...m.merge(a, b)].map(r => r.id).sort());
-  const ba = JSON.stringify([...m.merge(b, a)].map(r => r.id).sort());
+  const ab = JSON.stringify(m.merge(a, b).map(r => r.id).sort());
+  const ba = JSON.stringify(m.merge(b, a).map(r => r.id).sort());
   assert.equal(ab, ba, 'merge(a,b) and merge(b,a) agree');
 });
 
