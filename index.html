@@ -2963,7 +2963,7 @@ function applyRolePermissions() {
   if (navSystemLabel) navSystemLabel.style.display = '';
   // Step Up Receipts nav: Carrie only
   const navStepup = document.getElementById('nav-stepup');
-  if (navStepup) navStepup.style.display = isCarrie() ? '' : 'none';
+  if (navStepup) navStepup.style.display = canAccessStepUp() ? '' : 'none';
   document.querySelectorAll('.owner-settings-section').forEach(section => {
     section.style.display = liz ? '' : 'none';
   });
@@ -3619,22 +3619,57 @@ function _recordContentKey(record) {
   return JSON.stringify(Object.keys(bare).sort().map(k => [k, bare[k]]));
 }
 
+// P0-4/P1-1: a conflict variant is identified by a stable digest of its content,
+// so a resolution recorded on one Mac can name exactly which variants it settled.
+function _conflictVariantId(variant) {
+  const bare = { ...variant };
+  delete bare._conflicts;
+  delete bare._resolvedConflicts;
+  const key = _recordContentKey(bare);
+  let hash = 5381;
+  for (let i = 0; i < key.length; i++) hash = ((hash * 33) ^ key.charCodeAt(i)) >>> 0;
+  return 'cv_' + hash.toString(36) + '_' + key.length.toString(36);
+}
+
+// Unbounded conflict history could eventually make the synchronized document too
+// large to save. Keep the newest variants; the cap is deliberately generous.
+const MAX_CONFLICT_VARIANTS = 50;
+const MAX_RESOLVED_CONFLICT_IDS = 200;
+
 // Conflict variants are stored on the surviving record. The list is sorted and
 // de-duplicated so the merge stays commutative, associative and idempotent —
 // without that, two Macs could converge on different "current" values.
-function _mergeConflictVariants(...groups) {
+//
+// `resolvedIds` names variants an operator has already settled. A stale peer
+// that still carries them must not be able to reattach them.
+function _mergeConflictVariants(groups, resolvedIds = []) {
+  const settled = new Set(resolvedIds);
   const seen = new Map();
   for (const group of groups) {
     for (const variant of group || []) {
       if (!variant) continue;
       const bare = { ...variant };
       delete bare._conflicts;
+      delete bare._resolvedConflicts;
+      const id = _conflictVariantId(bare);
+      if (settled.has(id)) continue; // already resolved; never reattach
       seen.set(_recordContentKey(bare), bare);
     }
   }
   return [...seen.entries()]
     .sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0))
-    .map(entry => entry[1]);
+    .map(entry => entry[1])
+    .slice(-MAX_CONFLICT_VARIANTS);
+}
+
+// Resolution markers are a growing set, so they are unioned, sorted for
+// determinism, and bounded like the variants they retire.
+function _mergeResolvedConflictIds(...groups) {
+  const ids = new Set();
+  for (const group of groups) {
+    for (const id of group || []) if (typeof id === 'string') ids.add(id);
+  }
+  return [...ids].sort().slice(-MAX_RESOLVED_CONFLICT_IDS);
 }
 
 // Fix 3: resolve two live versions of the same record.
@@ -3647,14 +3682,22 @@ function _mergeConflictVariants(...groups) {
 function _mergeDivergentRecords(a, b) {
   const aKey = _recordContentKey(a);
   const bKey = _recordContentKey(b);
-  const carried = _mergeConflictVariants(a?._conflicts, b?._conflicts);
+  // P1-1: resolution markers travel with the record. A stale peer carrying an
+  // already-settled variant must not be able to reattach it after resolution.
+  const resolvedIds = _mergeResolvedConflictIds(a?._resolvedConflicts, b?._resolvedConflicts);
+  const carried = _mergeConflictVariants([a?._conflicts, b?._conflicts], resolvedIds);
+  const applyMarkers = record => {
+    if (resolvedIds.length) record._resolvedConflicts = resolvedIds;
+    else delete record._resolvedConflicts;
+    return record;
+  };
 
   // Identical content: nothing diverged; just carry any inherited variants.
   if (aKey === bKey) {
     const merged = _cloneJson(a);
     if (carried.length) merged._conflicts = carried;
     else delete merged._conflicts;
-    return merged;
+    return applyMarkers(merged);
   }
 
   const av = a?.version ?? 0;
@@ -3674,15 +3717,17 @@ function _mergeDivergentRecords(a, b) {
     const winner = _cloneJson(av > bv ? a : b);
     if (carried.length) winner._conflicts = carried;
     else delete winner._conflicts;
-    return winner;
+    return applyMarkers(winner);
   }
 
   // Divergent. Deterministic winner by content key so both Macs agree, with the
   // loser preserved as a recoverable variant.
   const winner = _cloneJson(aKey >= bKey ? a : b);
   const loser = aKey >= bKey ? b : a;
-  winner._conflicts = _mergeConflictVariants(carried, [loser]);
-  return winner;
+  const variants = _mergeConflictVariants([carried, [loser]], resolvedIds);
+  if (variants.length) winner._conflicts = variants;
+  else delete winner._conflicts;
+  return applyMarkers(winner);
 }
 
 // Deterministic and symmetric: merge(a, b) always equals merge(b, a).
@@ -3727,8 +3772,10 @@ function _mergeTombstonedRecordLists(localList, remoteList) {
         const base = liveVersion > deadVersion
           ? { ...dead, ...live, _deleted: true, _deletedAt: dead._deletedAt, _supersededEdit: true }
           : _cloneJson(dead);
-        const variants = _mergeConflictVariants(dead._conflicts, live._conflicts, [live]);
+        const settled = _mergeResolvedConflictIds(dead._resolvedConflicts, live._resolvedConflicts);
+        const variants = _mergeConflictVariants([dead._conflicts, live._conflicts, [live]], settled);
         if (variants.length) base._conflicts = variants;
+        if (settled.length) base._resolvedConflicts = settled;
         return base;
       }
       return _mergeDivergentRecords(a, b);
@@ -6661,7 +6708,7 @@ const PAGE_TITLES = {
 };
 
 function canAccessPage(page) {
-  if (page === 'stepup') return isCarrie();
+  if (page === 'stepup') return canAccessStepUp();
   return true;
 }
 
@@ -11112,8 +11159,16 @@ async function resolveLogConflict(id, index) {
         entry.version ?? 0,
         ...variants.map(v => v?.version ?? 0)
       );
+      // P1-1: record every variant this resolution retires, so a stale peer
+      // reconnecting later cannot reattach the conflict the operator settled.
+      const settledIds = _mergeResolvedConflictIds(
+        entry._resolvedConflicts,
+        variants.map(v => _conflictVariantId(v)),
+        [_conflictVariantId(entry)]
+      );
       const base = chosen ? { ...entry, ...chosen } : { ...entry };
       delete base._conflicts;
+      base._resolvedConflicts = settledIds;
       logs[idx] = {
         ...base,
         version: highest + 1,
@@ -13061,10 +13116,18 @@ const MAX_RECEIPT_IMAGE_DIMENSION = 2000;
 const MAX_RECEIPT_DECODED_PIXELS = 60 * 1000 * 1000;
 const SUPPORTED_RECEIPT_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp']);
 
-// Operations & Events (or Owner) may use Step Up. Role is owner-assignable, so
-// this follows the role rather than a hard-coded name.
+// P1-6: Step Up is available to the Owner AND to Operations & Events. The
+// comment here previously claimed that while the check delegated to
+// hasOperationsRole(), which matches Operations only — so Elizabeth was denied
+// access to her own studio's receipts. Role is owner-assignable, so this
+// follows the role, never a hard-coded name.
+function canAccessStepUp() {
+  const role = getUserRole(currentUser());
+  return role === 'Owner' || role === 'Operations & Events';
+}
+
 function requireStepUpAccess() {
-  if (!isCarrie()) {
+  if (!canAccessStepUp()) {
     showToast('This profile does not have access to Step Up Receipts.', 'warning');
     return false;
   }
@@ -13072,11 +13135,11 @@ function requireStepUpAccess() {
 }
 
 function getStepUpReceipts() {
-  return isCarrie() ? STORE.get('step_up_receipts', []) : [];
+  return canAccessStepUp() ? STORE.get('step_up_receipts', []) : [];
 }
 
 function saveStepUpReceipts(receipts) {
-  if (!isCarrie()) {
+  if (!canAccessStepUp()) {
     const rejected = Promise.reject(new Error('This profile is not authorized to save Step Up receipts.'));
     rejected.catch(() => {});
     return rejected;

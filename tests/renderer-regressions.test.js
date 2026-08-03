@@ -363,8 +363,15 @@ test('added Front Desk users appear in task choices without inheriting Carrie or
   const opsRole = namedFunctionSource('hasOperationsRole');
   assert.match(opsRole, /getUserRole\(currentUser\(\)\) === 'Operations & Events'/);
   assert.doesNotMatch(opsRole, /'Carrie Gass'/);
-  assert.match(namedFunctionSource('canAccessPage'), /page === 'stepup'\) return isCarrie\(\)/);
-  assert.match(namedFunctionSource('saveStepUpReceipts'), /if \(!isCarrie\(\)\)/);
+  // P1-6: Step Up is gated on Owner OR Operations & Events. Pinning these to
+  // isCarrie() locked Elizabeth out of her own studio's receipts. Front Desk
+  // still gains nothing — that is what this test actually guards.
+  assert.match(namedFunctionSource('canAccessPage'), /page === 'stepup'\) return canAccessStepUp\(\)/);
+  assert.match(namedFunctionSource('saveStepUpReceipts'), /if \(!canAccessStepUp\(\)\)/);
+  const stepUpGate = namedFunctionSource('canAccessStepUp');
+  assert.match(stepUpGate, /'Owner'/);
+  assert.match(stepUpGate, /'Operations & Events'/);
+  assert.doesNotMatch(stepUpGate, /Front Desk/);
   assert.match(namedFunctionSource('renderStepUp'), /requireStepUpAccess\(\)/);
   assert.match(source, /class="settings-section owner-settings-section" id="owner-ai-settings"/);
   assert.match(source, /id="owner-microsoft-settings"/);

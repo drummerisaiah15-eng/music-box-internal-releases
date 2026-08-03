@@ -2055,6 +2055,8 @@ function mergeApi() {
     ${declaration('_canAutoMergeSyncKey')}
     ${declaration('_recordSortTime')}
     ${declaration('_recordContentKey')}
+    ${declaration('_conflictVariantId')}
+    ${declaration('_mergeResolvedConflictIds')}
     ${declaration('_mergeConflictVariants')}
     ${declaration('_mergeDivergentRecords')}
     ${declaration('_mergeTombstonedRecordLists')}
@@ -2304,6 +2306,8 @@ function logMergeApi() {
   vm.runInContext(`
     ${declaration('_recordSortTime')}
     ${declaration('_recordContentKey')}
+    ${declaration('_conflictVariantId')}
+    ${declaration('_mergeResolvedConflictIds')}
     ${declaration('_mergeConflictVariants')}
     ${declaration('_mergeDivergentRecords')}
     ${declaration('_mergeTombstonedRecordLists')}
@@ -2491,4 +2495,108 @@ test('Fix 1: read-modify-write features use mutate, not replace', () => {
   const notes = script.slice(script.indexOf('const note = {'));
   assert.match(notes.slice(0, 300), /_newRecordId\(\)/,
     'records get collision-resistant ids, not Date.now()');
+});
+
+// --- P1-1 / P1-6: resolution markers and Step Up access ---------------------
+
+function conflictMergeApi() {
+  const context = contextWith({ _cloneJson: v => JSON.parse(JSON.stringify(v)) });
+  vm.runInContext(`
+    ${declaration('_recordSortTime')}
+    ${declaration('_recordContentKey')}
+    ${declaration('_conflictVariantId')}
+    ${declaration('_mergeResolvedConflictIds')}
+    ${declaration('_mergeConflictVariants')}
+    ${declaration('_mergeDivergentRecords')}
+    ${declaration('_mergeTombstonedRecordLists')}
+    globalThis.api = {
+      merge: (a, b) => _mergeTombstonedRecordLists(a, b),
+      cvId: v => _conflictVariantId(v),
+    };
+  `, context);
+  return {
+    merge: (a, b) => JSON.parse(JSON.stringify(context.api.merge(a, b))),
+    cvId: v => context.api.cvId(v),
+  };
+}
+
+const CB = { id: 'r1', created: '2026-08-01T09:00:00.000Z' };
+
+test('P1-1: a stale peer cannot reattach a conflict the operator resolved', () => {
+  const { merge, cvId } = conflictMergeApi();
+  const A = [{ ...CB, body: 'A BODY', version: 2, baseVersion: 1, updated: '2026-08-01T10:00:00.000Z' }];
+  const B = [{ ...CB, body: 'B BODY', version: 2, baseVersion: 1, updated: '2026-08-01T10:00:01.000Z' }];
+  const conflicted = merge(A, B);
+  assert.ok(conflicted[0]._conflicts?.length, 'precondition: a conflict exists');
+
+  // Operator resolves, recording every variant the resolution retires.
+  const settled = [...conflicted[0]._conflicts.map(cvId), cvId(conflicted[0])];
+  const resolved = [{ ...CB, body: 'A BODY', version: 3, baseVersion: 2,
+    updated: '2026-08-01T11:00:00.000Z', _resolvedConflicts: settled }];
+
+  // A peer that merged but never saw the resolution reconnects.
+  for (const [label, out] of [
+    ['resolved,stale', merge(resolved, conflicted)],
+    ['stale,resolved', merge(conflicted, resolved)],
+  ]) {
+    assert.ok(!out[0]._conflicts?.length, `${label}: the resolved conflict does not return`);
+    assert.equal(out[0].body, 'A BODY', `${label}: the resolution stands`);
+    assert.ok(out[0]._resolvedConflicts?.length, `${label}: the marker propagates`);
+  }
+});
+
+test('P1-1: an UNresolved variant is still preserved after a resolution', () => {
+  // Resolving one conflict must not suppress a genuinely new divergence.
+  const { merge, cvId } = conflictMergeApi();
+  const A = [{ ...CB, body: 'A', version: 2, baseVersion: 1, updated: '2026-08-01T10:00:00.000Z' }];
+  const B = [{ ...CB, body: 'B', version: 2, baseVersion: 1, updated: '2026-08-01T10:00:01.000Z' }];
+  const conflicted = merge(A, B);
+  const settled = [...conflicted[0]._conflicts.map(cvId), cvId(conflicted[0])];
+  const resolved = [{ ...CB, body: 'A', version: 3, baseVersion: 2,
+    updated: '2026-08-01T11:00:00.000Z', _resolvedConflicts: settled }];
+  // A third device diverges from the resolved value.
+  const fresh = [{ ...CB, body: 'C', version: 3, baseVersion: 2, updated: '2026-08-01T12:00:00.000Z' }];
+  const out = merge(resolved, fresh);
+  assert.ok(JSON.stringify(out).includes('"C"'), 'the new divergence is kept');
+  assert.ok(out[0]._conflicts?.length, 'and raises a fresh conflict');
+});
+
+test('P1-1: resolution markers converge and stay bounded', () => {
+  const { merge, cvId } = conflictMergeApi();
+  const mk = (body, ids) => [{ ...CB, body, version: 3, baseVersion: 2,
+    updated: '2026-08-01T11:00:00.000Z', _resolvedConflicts: ids }];
+  const a = mk('X', ['cv_a', 'cv_b']);
+  const b = mk('X', ['cv_b', 'cv_c']);
+  const ab = merge(a, b), ba = merge(b, a);
+  assert.deepEqual([...ab[0]._resolvedConflicts], ['cv_a', 'cv_b', 'cv_c'], 'union, sorted');
+  assert.equal(JSON.stringify(ab), JSON.stringify(ba), 'marker merging is commutative');
+  assert.ok(script.includes('MAX_RESOLVED_CONFLICT_IDS'), 'markers are bounded');
+  assert.ok(script.includes('MAX_CONFLICT_VARIANTS'), 'variants are bounded');
+  assert.match(cvId({ id: 'r1', body: 'x' }), /^cv_[a-z0-9]+_[a-z0-9]+$/, 'stable variant digest');
+});
+
+test('P1-1: resolveLogConflict records the variants it retires', () => {
+  const renderer = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const fn = renderer.slice(renderer.indexOf('async function resolveLogConflict('));
+  const body = fn.slice(0, fn.indexOf('\nasync function ', 1));
+  assert.match(body, /_mergeResolvedConflictIds\(/, 'it accumulates resolution markers');
+  assert.match(body, /_conflictVariantId\(/, 'identified by stable digest');
+  assert.match(body, /base\._resolvedConflicts = settledIds/, 'and persists them on the record');
+});
+
+test('P1-6: Step Up is available to Owner AND Operations, not Operations alone', () => {
+  const renderer = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const fn = renderer.slice(renderer.indexOf('function canAccessStepUp('));
+  const body = fn.slice(0, fn.indexOf('\n}') + 2);
+  assert.match(body, /role === 'Owner'/, 'the owner is not locked out of her own receipts');
+  assert.match(body, /role === 'Operations & Events'/, 'Operations keeps access');
+  // Every Step Up gate must use it — a missed one silently denies the owner.
+  for (const gate of ['requireStepUpAccess', 'getStepUpReceipts', 'saveStepUpReceipts']) {
+    const g = renderer.slice(renderer.indexOf(`function ${gate}(`));
+    assert.match(g.slice(0, 260), /canAccessStepUp\(\)/, `${gate} uses the shared gate`);
+  }
+  assert.match(renderer, /if \(page === 'stepup'\) return canAccessStepUp\(\);/, 'route gate');
+  assert.match(renderer, /navStepup\.style\.display = canAccessStepUp\(\)/, 'nav gate');
+  // Front Desk must still be denied.
+  assert.doesNotMatch(body, /Front Desk/, 'Front Desk gains nothing');
 });
