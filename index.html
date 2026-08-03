@@ -1356,6 +1356,7 @@
             <span id="log-result-count" style="font-size:12px;color:var(--text-muted);white-space:nowrap"></span>
           </div>
         </div>
+        <div id="log-deleted-recovery" style="display:none"></div>
         <div id="log-entries"></div>
       </div>
     </div>
@@ -5429,6 +5430,12 @@ function _refreshForSyncKey(key, value) {
   if (key === 'logs') {
     try { renderLogs(); } catch {}
     try { renderYesterdayLog(); } catch {}
+    // P1-9: the Morning Brief is a modal rendered once on open. After an async
+    // restore it kept showing "No log entries" until reopened.
+    try { _refreshOpenBriefing(); } catch {}
+  }
+  if (key === 'todo_items' || key === 'assigned_tasks') {
+    try { _refreshOpenBriefing(); } catch {}
   }
   if (key === 'staff_notes' || key === 'custom_staff' || key === 'staff_dir_overrides' || key === 'removed_staff_dir') {
     try { renderStaff(); } catch {}
@@ -6684,11 +6691,17 @@ function getProfileStaffDirectory() {
   return _loginProfiles
     .filter(profile => profile.role !== 'Owner' || profile.name === 'Elizabeth Chaves')
     .map(profile => {
+      // P1-7: built-in entries carry their SHIPPED role. Returning them intact
+      // meant an owner-assigned role change (e.g. Ana -> Operations & Events)
+      // still displayed as Front Desk in Staff Hub. The live reconciled role
+      // from _loginProfiles wins; only presentation fields come from the
+      // built-in entry.
       const builtIn = builtInByName.get(profile.name);
-      return builtIn || {
+      return {
+        ...(builtIn || {}),
         name: profile.name,
-        role: 'Front Desk',
-        initials: _profileInitials(profile.name),
+        role: profile.role,
+        initials: builtIn?.initials || _profileInitials(profile.name),
       };
     });
 }
@@ -9195,10 +9208,38 @@ function getCheckoutState() {
   return STORE.get(getCheckoutStateKey(), {});
 }
 
-async function setCheckedOut(idx) {
-  const state = getCheckoutState();
-  state[idx] = true;
-  await STORE.replace(getCheckoutStateKey(), state, { authoritative: 'whole-day checkout state' });
+// P1-8: checkout used to be stored as state[arrayIndex]. Inserting or reordering
+// a lesson moved every flag to a different lesson. Key by the provider's stable
+// id where available, otherwise a deterministic composite of the fields that
+// identify a booking within a single day.
+function _lessonCheckoutKey(lesson) {
+  if (!lesson) return null;
+  const stable = lesson.mbId || lesson.appointmentId || lesson.id;
+  if (stable) return 'ls:' + String(stable);
+  return 'lc:' + [lesson.time, lesson.name, lesson.instructor]
+    .map(part => String(part ?? '').trim().toLowerCase()).join('|');
+}
+
+// Legacy state is index-keyed. Resolve it against the schedule so an existing
+// day's checkouts are not lost the first time this runs.
+function isLessonCheckedOut(state, lesson, idx) {
+  if (!state) return false;
+  const key = _lessonCheckoutKey(lesson);
+  if (key && state[key]) return true;
+  return !!state[idx]; // legacy index entry
+}
+
+async function setCheckedOut(idx, lesson = null) {
+  const schedule = _cachedSchedule || DEMO_SCHEDULE;
+  const target = lesson || schedule[idx];
+  const key = _lessonCheckoutKey(target);
+  if (!key) throw new Error('That lesson could not be identified for checkout.');
+  await STORE.mutate(getCheckoutStateKey(), current => {
+    const state = (current && typeof current === 'object' && !Array.isArray(current))
+      ? { ...current } : {};
+    state[key] = true;
+    return state;
+  }, {});
   return true;
 }
 
@@ -9210,8 +9251,10 @@ function _syncMbCheckoutStatus(schedule) {
   const state = getCheckoutState();
   let changed = false;
   schedule.forEach((lesson, idx) => {
-    if (!state[idx] && lesson.mbType === 'appointment' && lesson.mbStatus === 'Completed') {
-      state[idx] = true;
+    const key = _lessonCheckoutKey(lesson);
+    if (key && !isLessonCheckedOut(state, lesson, idx) &&
+        lesson.mbType === 'appointment' && lesson.mbStatus === 'Completed') {
+      state[key] = true;
       changed = true;
     }
   });
@@ -9235,7 +9278,7 @@ function getCheckoutNeeded() {
   return schedule.map((lesson, idx) => ({
     lesson, idx,
     endMin: getLessonEndMinutes(lesson),
-    checkedOut: !!state[idx],
+    checkedOut: isLessonCheckedOut(state, lesson, idx),
   })).filter(item =>
     item.endMin <= now &&
     item.endMin >= cutoff &&
@@ -9333,7 +9376,7 @@ function renderScheduleCheckout() {
   el.innerHTML = schedule.map((lesson, idx) => {
     const endMin = getLessonEndMinutes(lesson);
     const ended = endMin <= now;
-    const checkedOut = !!state[idx];
+    const checkedOut = isLessonCheckedOut(state, lesson, idx);
     const isAppt = !lesson.mbType || lesson.mbType === 'appointment';
     return `
       <div class="checkout-item">
@@ -11040,6 +11083,16 @@ function getVisibleLogs() {
   return (Array.isArray(logs) ? logs : []).filter(l => !l?._deleted);
 }
 
+// P1-2: delete-versus-edit keeps the concurrent edit under a tombstoned record,
+// but getVisibleLogs() filters every tombstone — so the preserved body existed
+// in storage with no way to reach it. These are the tombstoned records that
+// still carry an unresolved edit, surfaced in a recovery list.
+function getRecoverableDeletedLogs() {
+  const logs = STORE.get('logs', []);
+  return (Array.isArray(logs) ? logs : [])
+    .filter(l => l?._deleted && Array.isArray(l._conflicts) && l._conflicts.length);
+}
+
 function renderLogs() {
   const logs = getVisibleLogs();
   const rawSearch = boundedText((document.getElementById('log-search')?.value || '').trim(), 256);
@@ -11092,6 +11145,7 @@ function renderLogs() {
     return;
   }
 
+  _renderDeletedLogRecovery();
   document.getElementById('log-entries').innerHTML = visibleLogs.map(l => {
     const bodyHtml   = _logHighlight(escHtml(l.body), terms);
     const authorHtml = _logHighlight(escHtml(l.author), terms);
@@ -11183,6 +11237,111 @@ async function resolveLogConflict(id, index) {
     return true;
   } catch (error) {
     showToast(`Conflict was not resolved: ${error?.message || error}`, 'danger');
+    return false;
+  }
+}
+
+// P1-2: a tombstoned record can still carry a concurrent edit that was never
+// resolved. renderLogs() filters tombstones, so without this the preserved body
+// was unreachable through the app. Show it with explicit recovery actions.
+function _renderDeletedLogRecovery() {
+  const host = document.getElementById('log-deleted-recovery');
+  if (!host) return;
+  const recoverable = getRecoverableDeletedLogs();
+  if (!recoverable.length) { host.style.display = 'none'; host.innerHTML = ''; return; }
+  host.style.display = '';
+  host.innerHTML = `
+    <div style="padding:12px;border:1px solid #e0b45c;border-radius:8px;background:#fff8ec;margin-bottom:14px">
+      <div style="font-size:13px;font-weight:600;margin-bottom:6px">
+        ⚠ ${recoverable.length} deleted entr${recoverable.length === 1 ? 'y was' : 'ies were'}
+        edited on another Mac before being deleted
+      </div>
+      <div style="font-size:11.5px;color:var(--text-muted);margin-bottom:10px">
+        The deletion was applied, but the other person's version is kept here so
+        nothing is lost. Restore it, or confirm the deletion to dismiss.
+      </div>
+      ${recoverable.map(entry => entry._conflicts.map((variant, index) => `
+        <div style="margin:8px 0;padding:8px;background:var(--bg);border-radius:6px">
+          <div style="font-size:11px;color:var(--text-muted);margin-bottom:2px">
+            ${escHtml(variant.author || entry.author || 'Unknown')}
+            ${variant.updated ? ' · ' + escHtml(new Date(variant.updated).toLocaleString()) : ''}
+          </div>
+          <div style="white-space:pre-wrap;font-size:13px">${escHtml(variant.body || '')}</div>
+          <div style="display:flex;gap:8px;margin-top:6px">
+            <button class="btn btn-ghost btn-sm" style="font-size:11px"
+              onclick="restoreDeletedLog(${jsArg(entry.id)}, ${index})">Restore this version</button>
+            <button class="btn btn-ghost btn-sm" style="font-size:11px;color:var(--text-muted)"
+              onclick="confirmLogDeletion(${jsArg(entry.id)})">Keep deleted</button>
+          </div>
+        </div>
+      `).join('')).join('')}
+    </div>`;
+}
+
+// Bring a preserved version back as the live record.
+async function restoreDeletedLog(id, index) {
+  try {
+    await STORE.mutate('logs', current => {
+      const logs = Array.isArray(current) ? _cloneJson(current) : [];
+      const idx = logs.findIndex(l => String(l.id) === String(id));
+      if (idx < 0) throw new Error('That entry no longer exists.');
+      const entry = logs[idx];
+      const variants = Array.isArray(entry._conflicts) ? entry._conflicts : [];
+      const chosen = variants[index];
+      if (!chosen) throw new Error('That version is no longer available.');
+      const highest = Math.max(entry.version ?? 0, ...variants.map(v => v?.version ?? 0));
+      const restored = { ...entry, ...chosen };
+      delete restored._deleted;
+      delete restored._deletedAt;
+      delete restored._supersededEdit;
+      delete restored._conflicts;
+      logs[idx] = {
+        ...restored,
+        version: highest + 1,
+        baseVersion: highest,
+        updated: new Date().toISOString(),
+        editedBy: _deviceId(),
+        _resolvedConflicts: _mergeResolvedConflictIds(
+          entry._resolvedConflicts,
+          variants.map(v => _conflictVariantId(v)),
+          [_conflictVariantId(entry)]
+        ),
+      };
+      return logs;
+    }, []);
+    renderLogs();
+    showToast('Entry restored.', 'success');
+    return true;
+  } catch (error) {
+    showToast(`Entry was not restored: ${error?.message || error}`, 'danger');
+    return false;
+  }
+}
+
+// Accept the deletion and retire the preserved versions so it stops reappearing.
+async function confirmLogDeletion(id) {
+  if (!confirm('Keep this entry deleted and dismiss the preserved version?')) return false;
+  try {
+    await STORE.mutate('logs', current => {
+      const logs = Array.isArray(current) ? _cloneJson(current) : [];
+      const idx = logs.findIndex(l => String(l.id) === String(id));
+      if (idx < 0) throw new Error('That entry no longer exists.');
+      const entry = logs[idx];
+      const variants = Array.isArray(entry._conflicts) ? entry._conflicts : [];
+      const settled = _mergeResolvedConflictIds(
+        entry._resolvedConflicts,
+        variants.map(v => _conflictVariantId(v))
+      );
+      const next = { ...entry, _resolvedConflicts: settled };
+      delete next._conflicts;
+      logs[idx] = next;
+      return logs;
+    }, []);
+    renderLogs();
+    showToast('Deletion confirmed.', 'success');
+    return true;
+  } catch (error) {
+    showToast(`Deletion was not confirmed: ${error?.message || error}`, 'danger');
     return false;
   }
 }
@@ -11513,6 +11672,15 @@ async function deleteEditStaffMember() {
 // ─────────────────────────────────────────────────────────────
 // BRIEFING MODAL
 // ─────────────────────────────────────────────────────────────
+// P1-9: re-render the Morning Brief only while it is actually open, so a
+// background sync cannot pop the modal open on its own.
+function _refreshOpenBriefing() {
+  const modal = document.getElementById('briefing-modal');
+  if (!modal || modal.classList.contains('hidden')) return false;
+  showBriefing();
+  return true;
+}
+
 function showBriefing() {
   // Open modal first — nothing below can block it
   const briefingModal = document.getElementById('briefing-modal');

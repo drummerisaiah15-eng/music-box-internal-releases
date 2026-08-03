@@ -492,3 +492,87 @@ test('§8: the owner passcode UI states the real length requirement', () => {
   assert.match(script, /Create a new \$\{_pinTargetLength\}-digit owner passcode/,
     'the creation prompt tracks the length actually collected');
 });
+
+// --- P1-2 / P1-7 / P1-8 / P1-9 ----------------------------------------------
+
+test('P1-2: a deleted log that still carries an edit stays operator-reachable', () => {
+  // Delete-versus-edit preserves the concurrent edit under a tombstone, but
+  // getVisibleLogs() filters every tombstone — so the body existed in storage
+  // with no path to it through the app.
+  const context = vm.createContext({
+    STORE: {
+      get: () => ([
+        { id: 'a', body: 'live' },
+        { id: 'b', body: 'gone', _deleted: true },                                  // no edit to recover
+        { id: 'c', body: 'gone', _deleted: true, _conflicts: [{ body: 'edited' }] }, // recoverable
+      ]),
+    },
+    Array,
+  });
+  vm.runInContext(`
+    ${namedFunctionSource('getVisibleLogs')}
+    ${namedFunctionSource('getRecoverableDeletedLogs')}
+    globalThis.api = { visible: () => getVisibleLogs(), recoverable: () => getRecoverableDeletedLogs() };
+  `, context);
+  assert.deepEqual([...context.api.visible()].map(l => l.id), ['a'],
+    'tombstones stay out of the normal list');
+  assert.deepEqual([...context.api.recoverable()].map(l => l.id), ['c'],
+    'only tombstones carrying an unresolved edit are offered for recovery');
+
+  // And the UI must actually render and act on them.
+  assert.match(source, /id="log-deleted-recovery"/, 'a recovery surface exists');
+  assert.match(script, /_renderDeletedLogRecovery\(\)/, 'renderLogs draws it');
+  assert.match(script, /onclick="restoreDeletedLog\(/, 'restore action');
+  assert.match(script, /onclick="confirmLogDeletion\(/, 'keep-deleted action');
+  const confirmFn = script.slice(script.indexOf('async function confirmLogDeletion('));
+  assert.match(confirmFn.slice(0, 900), /_mergeResolvedConflictIds\(/,
+    'confirming deletion retires the variants so they stop reappearing');
+});
+
+test('P1-7: Staff Hub shows the live role, not the shipped built-in role', () => {
+  const fn = namedFunctionSource('getProfileStaffDirectory');
+  assert.match(fn, /role: profile\.role/,
+    'the reconciled role wins over the immutable built-in entry');
+  assert.doesNotMatch(fn, /return builtIn \|\|/,
+    'returning the built-in entry intact re-introduced the stale role');
+});
+
+test('P1-8: checkout is keyed by lesson identity, not array position', () => {
+  const context = vm.createContext({ String, Array });
+  vm.runInContext(`
+    ${namedFunctionSource('_lessonCheckoutKey')}
+    ${namedFunctionSource('isLessonCheckedOut')}
+    globalThis.api = { key: l => _lessonCheckoutKey(l), on: (s, l, i) => isLessonCheckedOut(s, l, i) };
+  `, context);
+
+  const lessonB = { mbId: 'appt-B', time: '10:00', name: 'B', instructor: 'X' };
+  const key = context.api.key(lessonB);
+  const state = { [key]: true };
+
+  // B was at index 0; inserting A before it shifts B to index 1.
+  assert.equal(context.api.on(state, lessonB, 1), true,
+    'the flag follows the lesson through a reorder');
+  const lessonA = { mbId: 'appt-A', time: '09:00', name: 'A', instructor: 'X' };
+  assert.equal(context.api.on(state, lessonA, 0), false,
+    'and does not transfer to whichever lesson now sits at the old index');
+
+  // Legacy index-keyed state must still resolve so an in-progress day is kept.
+  assert.equal(context.api.on({ 3: true }, lessonA, 3), true, 'legacy index entries still read');
+  // A lesson with no provider id still gets a stable composite key.
+  const noId = { time: '11:00', name: 'C', instructor: 'Y' };
+  assert.equal(context.api.key(noId), context.api.key({ ...noId }), 'composite key is deterministic');
+  assert.notEqual(context.api.key(noId), context.api.key({ ...noId, time: '12:00' }));
+
+  assert.match(namedFunctionSource('setCheckedOut'), /STORE\.mutate\(getCheckoutStateKey\(\)/,
+    'checkout writes merge into the reconciled base rather than replacing the day');
+});
+
+test('P1-9: an open Morning Brief refreshes when its data arrives', () => {
+  const fn = namedFunctionSource('_refreshOpenBriefing');
+  assert.match(fn, /classList\.contains\('hidden'\)/,
+    'it only re-renders while the modal is actually open');
+  assert.match(fn, /showBriefing\(\)/);
+  const refresh = namedFunctionSource('_refreshForSyncKey');
+  assert.match(refresh, /_refreshOpenBriefing\(\)/,
+    'restored logs/tasks re-render the open brief instead of leaving it stale');
+});
