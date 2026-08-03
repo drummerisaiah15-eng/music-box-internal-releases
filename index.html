@@ -1985,7 +1985,7 @@
         <div id="pin-change-section" style="margin-top:20px;padding-top:16px;border-top:1px solid var(--divider);display:none">
           <div style="font-size:13px;font-weight:600;margin-bottom:10px;color:var(--text-secondary)">Owner Passcode (Elizabeth only)</div>
           <div style="display:flex;gap:8px;align-items:center">
-            <input type="password" id="pin-new" class="form-input" inputmode="numeric" minlength="4" maxlength="6" placeholder="New 4–6 digit code" style="width:190px;letter-spacing:.12em" />
+            <input type="password" id="pin-new" class="form-input" inputmode="numeric" minlength="6" maxlength="6" placeholder="New 6-digit code" style="width:190px;letter-spacing:.12em" />
             <button class="btn btn-outline btn-sm" onclick="changePin()">Update Passcode</button>
           </div>
         </div>
@@ -2635,7 +2635,7 @@ function selectLoginUser(name, role) {
     const label = document.getElementById('pin-label');
     if (label) label.textContent = localStorage.getItem(ELIZABETH_PIN_KEY)
       ? `Enter your ${_pinTargetLength}-digit passcode`
-      : 'Create a new 4–6 digit owner passcode';
+      : `Create a new ${_pinTargetLength}-digit owner passcode`;
   } else {
     // Show loading state on the button so the user knows it's working
     const btns = document.querySelectorAll('.login-user-btn');
@@ -8394,10 +8394,11 @@ async function loadSettings() {
   if (fbAppCheckEl && fbAppCheck) fbAppCheckEl.value = fbAppCheck;
   setSyncStatus(_syncReady ? 'live' : (fbKey && fbProj ? 'connecting' : 'off'));
   if (_syncReady) updateSyncTimestamp();
-
-  // Phone numbers list
-  renderPhoneNumbersList();
-
+  // §8: a call to an undefined phone-number list renderer used to sit here — a
+  // leftover from a removed feature. It threw a ReferenceError as the last
+  // statement of loadSettings(), so `await loadSettings()` in disconnectSync()
+  // rejected and that function reported failure after having succeeded. No
+  // phone-number UI remains anywhere, so the call is removed, not stubbed.
 }
 
 function setApiStatus(elId, connected) {
@@ -9906,8 +9907,11 @@ async function loadClients()  {}
 async function loadRevenue()  {}
 function filterClients()      {}
 function switchClientsTab()   {}
-function renderRevenueLiveContent()  {}
-function renderRevenueDemoContent()  {}
+// §8 item 15: empty stubs for renderRevenueLiveContent/renderRevenueDemoContent
+// used to sit here, duplicating the real implementations declared below. Later
+// declarations win, so behaviour was correct only by accident of ordering —
+// moving this block down would have silently replaced both with no-ops. The
+// stubs are removed; the real implementations remain the only declarations.
 let _cachedClients = null;
 let _cachedSchedule = null;
 

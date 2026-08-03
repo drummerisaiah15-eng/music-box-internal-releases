@@ -431,3 +431,57 @@ test('deleted logs never surface in any human-visible view', () => {
   assert.doesNotMatch(namedFunctionSource('deleteLog'), /getVisibleLogs\(\)/,
     'deletion must operate on the raw array');
 });
+
+// --- §8 functional defects --------------------------------------------------
+
+test('§8: loadSettings has no undefined function call left in it', () => {
+  // renderPhoneNumbersList() was called as the last statement of loadSettings()
+  // but never defined, so it threw a ReferenceError every time Settings loaded.
+  // `await loadSettings()` in disconnectSync() therefore rejected and reported
+  // failure after the disconnect had actually succeeded.
+  assert.doesNotMatch(script, /renderPhoneNumbersList/,
+    'the dead reference is gone, not stubbed');
+
+  // Guard the wider class: every plain `name();` statement inside loadSettings
+  // must resolve to something the script actually declares.
+  const body = namedFunctionSource('loadSettings');
+  const declared = new Set([
+    ...[...script.matchAll(/^(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(/gm)].map(m => m[1]),
+    ...[...script.matchAll(/(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\(/g)].map(m => m[1]),
+  ]);
+  const missing = [];
+  for (const m of body.matchAll(/^\s{2}([A-Za-z_$][\w$]*)\(\);?$/gm)) {
+    if (!declared.has(m[1])) missing.push(m[1]);
+  }
+  assert.deepEqual(missing, [], 'loadSettings calls only functions that exist');
+});
+
+test('§8 item 15: no duplicate top-level function declarations', () => {
+  // Two histories independently rewrote the persistence and merge code, so a
+  // duplicate declaration would silently shadow the tested implementation.
+  const counts = new Map();
+  for (const m of script.matchAll(/^(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(/gm)) {
+    counts.set(m[1], (counts.get(m[1]) || 0) + 1);
+  }
+  const duplicates = [...counts.entries()].filter(([, n]) => n > 1).map(([name]) => name);
+  assert.deepEqual(duplicates, [],
+    'a redeclared top-level function would shadow the one under test');
+});
+
+test('§8: the owner passcode UI states the real length requirement', () => {
+  // main.js requires a NEW passcode to be exactly 6 digits
+  // (_validOwnerPin(newPin, false)), and changePin() enforces /^\d{6}$/.
+  // Advertising "4–6" invited a save the backend would reject. 4–6 remains
+  // tolerated only for EXISTING logins.
+  assert.match(mainSource, /_validOwnerPin\(request\.newPin, false\)/,
+    'main still requires exactly 6 for a new passcode');
+  assert.match(namedFunctionSource('changePin'), /\^\\d\{6\}\$/,
+    'the renderer enforces the same rule');
+  assert.doesNotMatch(source, /4–6 digit|4-6 digit/,
+    'no UI text promises a length the backend will reject');
+  assert.match(source, /minlength="6" maxlength="6" placeholder="New 6-digit code"/,
+    'the settings field matches the rule it is validated against');
+  // The first-run label must follow the actual target length, not a literal.
+  assert.match(script, /Create a new \$\{_pinTargetLength\}-digit owner passcode/,
+    'the creation prompt tracks the length actually collected');
+});
