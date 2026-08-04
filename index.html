@@ -6822,7 +6822,24 @@ function normalizeSpreadsheetWorkbook(value) {
       }],
     };
   }
-  if (!Object.keys(source).every(key => ['activeProject', 'projects'].includes(key)) ||
+  // P0-1: conflicts travel WITH the workbook so they survive sync and restart.
+  // Validated and bounded below; stripped if malformed rather than rejected, so
+  // bad conflict metadata can never make a valid workbook unloadable.
+  if (source._conflicts !== undefined) {
+    if (!Array.isArray(source._conflicts) || source._conflicts.length > MAX_SPREADSHEET_CONFLICTS) {
+      delete source._conflicts;
+    } else {
+      const kept = source._conflicts.filter(entry =>
+        entry && typeof entry === 'object' && !Array.isArray(entry) &&
+        typeof entry.id === 'string' && entry.id.length > 0 && entry.id.length <= 128 &&
+        ['cell', 'sheet', 'project'].includes(entry.kind) &&
+        typeof entry.projectId === 'string' && entry.projectId.length <= 128
+      ).slice(-MAX_SPREADSHEET_CONFLICTS);
+      if (kept.length) source._conflicts = kept;
+      else delete source._conflicts;
+    }
+  }
+  if (!Object.keys(source).every(key => ['activeProject', 'projects', '_conflicts'].includes(key)) ||
       typeof source.activeProject !== 'string' ||
       !Array.isArray(source.projects) ||
       source.projects.length < 1 ||
@@ -7215,124 +7232,254 @@ function ssActiveSheet() {
   return proj.sheets.find(s => s.id === proj.activeId) || proj.sheets[0];
 }
 
+// ─── P0-1: spreadsheet operation model ───────────────────────────────────────
+//
+// The old merge compared the local workbook against the base the editor started
+// from, but never asked whether the REMOTE side had also changed that same
+// target. So a cell edited on both Macs silently kept the local value, and a
+// local sheet/project deletion removed a sheet the other Mac had just edited.
+//
+// Edits are now expressed as typed operations carrying the value they were
+// derived from. Applying an operation compares that base against what the
+// reconciled workbook actually holds, which is what makes divergence detectable
+// rather than invisible.
+const MAX_SPREADSHEET_CONFLICTS = 200;
+
+function _ssCellsOf(workbook, projectId, sheetId) {
+  const project = (workbook?.projects || []).find(p => p.id === projectId);
+  const sheet = (project?.sheets || []).find(s => s.id === sheetId);
+  return sheet?.cells || null;
+}
+
+function _ssConflictId(parts) {
+  const key = parts.join('|');
+  let hash = 5381;
+  for (let i = 0; i < key.length; i++) hash = ((hash * 33) ^ key.charCodeAt(i)) >>> 0;
+  return 'sc_' + hash.toString(36);
+}
+
+// Derive the user's intent as operations: base -> next.
+function _deriveSpreadsheetOperations(base, next) {
+  const ops = [];
+  if (!base || !next) return ops;
+  const baseProjects = new Map((base.projects || []).map(p => [p.id, p]));
+  const nextProjects = new Map((next.projects || []).map(p => [p.id, p]));
+
+  for (const [projectId, baseProject] of baseProjects) {
+    if (!nextProjects.has(projectId)) {
+      ops.push({ kind: 'project.delete', projectId });
+      continue;
+    }
+    const nextProject = nextProjects.get(projectId);
+    const baseSheets = new Map((baseProject.sheets || []).map(s => [s.id, s]));
+    const nextSheets = new Map((nextProject.sheets || []).map(s => [s.id, s]));
+    for (const [sheetId, baseSheet] of baseSheets) {
+      if (!nextSheets.has(sheetId)) {
+        ops.push({ kind: 'sheet.delete', projectId, sheetId });
+        continue;
+      }
+      const nextSheet = nextSheets.get(sheetId);
+      const baseCells = baseSheet.cells || {};
+      const nextCells = nextSheet.cells || {};
+      for (const key of new Set([...Object.keys(baseCells), ...Object.keys(nextCells)])) {
+        const before = baseCells[key] ?? null;
+        const after = nextCells[key] ?? null;
+        if (JSON.stringify(before) === JSON.stringify(after)) continue;
+        ops.push({
+          kind: after === null ? 'cell.clear' : 'cell.set',
+          projectId, sheetId, target: key, base: before, value: after,
+        });
+      }
+    }
+  }
+  return ops;
+}
+
+// Apply operations to the reconciled workbook, recording a conflict wherever the
+// remote side changed the same target away from the base the operation assumed.
+// Deterministic: both Macs pick the same winner, so they converge.
+function _applySpreadsheetOperations(target, ops) {
+  const workbook = _cloneJson(target);
+  const conflicts = [];
+  const note = entry => {
+    if (!conflicts.some(existing => existing.id === entry.id)) conflicts.push(entry);
+  };
+
+  for (const op of ops) {
+    if (op.kind === 'project.delete') {
+      const project = (workbook.projects || []).find(p => p.id === op.projectId);
+      if (!project) continue; // already gone — idempotent
+      // The deletion holds (matching log delete-vs-edit), but the remote content
+      // is preserved so nothing is destroyed.
+      note({
+        id: _ssConflictId(['project', op.projectId]),
+        kind: 'project', projectId: op.projectId,
+        remote: _cloneJson(project), at: new Date().toISOString(),
+      });
+      workbook.projects = workbook.projects.filter(p => p.id !== op.projectId);
+      continue;
+    }
+    if (op.kind === 'sheet.delete') {
+      const project = (workbook.projects || []).find(p => p.id === op.projectId);
+      const sheet = (project?.sheets || []).find(s => s.id === op.sheetId);
+      if (!sheet) continue; // already gone — idempotent
+      note({
+        id: _ssConflictId(['sheet', op.projectId, op.sheetId]),
+        kind: 'sheet', projectId: op.projectId, sheetId: op.sheetId,
+        remote: _cloneJson(sheet), at: new Date().toISOString(),
+      });
+      project.sheets = project.sheets.filter(s => s.id !== op.sheetId);
+      if (!project.sheets.some(s => s.id === project.activeId) && project.sheets.length) {
+        project.activeId = project.sheets[0].id;
+      }
+      continue;
+    }
+
+    // Cell operations.
+    const cells = _ssCellsOf(workbook, op.projectId, op.sheetId);
+    if (!cells) continue; // the sheet is gone; the structural conflict covers it
+    const current = cells[op.target] ?? null;
+    const currentKey = JSON.stringify(current);
+    const baseKey = JSON.stringify(op.base ?? null);
+    const valueKey = JSON.stringify(op.value ?? null);
+
+    if (currentKey === valueKey) continue;        // already applied — idempotent
+    if (op.kind === 'cell.clear' && currentKey !== baseKey) {
+      // H-08: preserved fail-closed behaviour. A clear has no value to keep, so
+      // silently dropping the remote change would destroy it outright.
+      throw new Error(
+        'Merge conflict: a cell was cleared on this Mac but changed on another device'
+      );
+    }
+    if (currentKey === baseKey) {                  // remote untouched — apply
+      if (op.value === null) delete cells[op.target];
+      else cells[op.target] = _cloneJson(op.value);
+      continue;
+    }
+    // Both sides changed this cell away from the same base: a real conflict.
+    // Winner is decided by content so both Macs agree; the loser is preserved.
+    const localWins = valueKey >= currentKey;
+    note({
+      id: _ssConflictId(['cell', op.projectId, op.sheetId, op.target]),
+      kind: 'cell', projectId: op.projectId, sheetId: op.sheetId, target: op.target,
+      base: _cloneJson(op.base ?? null),
+      local: _cloneJson(op.value ?? null),
+      remote: _cloneJson(current),
+      at: new Date().toISOString(),
+    });
+    if (localWins) {
+      if (op.value === null) delete cells[op.target];
+      else cells[op.target] = _cloneJson(op.value);
+    }
+  }
+  return { workbook, conflicts };
+}
+
 // V159-002: the editor holds a whole-workbook snapshot taken when typing began.
 // Committing it wholesale erases any remote cell that arrived while the user was
 // typing. Instead, apply the diff the user actually made (dirtyBase -> dirty)
 // onto the base that is durable at commit time, which includes that remote edit.
 function _mergeSpreadsheetEdits(base, dirtyBase, dirty) {
   if (!base || !dirtyBase || !dirty) return dirty;
-  const changed = (a, b) => JSON.stringify(a) !== JSON.stringify(b);
-  const merged = _cloneJson(base);
-  merged.projects = Array.isArray(merged.projects) ? merged.projects : [];
-  const originProjects = new Map((dirtyBase.projects || []).map(p => [p.id, p]));
-  const localProjects = dirty.projects || [];
-  const targetProjects = new Map(merged.projects.map(p => [p.id, p]));
 
-  for (const localProject of localProjects) {
+  // P0-1: the user's changes are derived as typed operations carrying the value
+  // each was made against, then applied to the reconciled base. That comparison
+  // is what makes a concurrent remote change to the same target detectable —
+  // the previous diff-and-overwrite could not see it, so same-cell edits and
+  // delete-versus-edit silently discarded one side.
+  // H-08: preserved fail-closed behaviour for the opposite direction — the
+  // remote deleted something this Mac changed. Refusing the save keeps the local
+  // edit intact for the operator instead of quietly discarding it.
+  const remoteProjects = new Map((base.projects || []).map(p => [p.id, p]));
+  const originProjects = new Map((dirtyBase.projects || []).map(p => [p.id, p]));
+  for (const localProject of dirty.projects || []) {
     const origin = originProjects.get(localProject.id);
-    const target = targetProjects.get(localProject.id);
-    // Created locally while the remote copy was being reconciled.
-    if (!origin) {
-      if (!target) merged.projects.push(_cloneJson(localProject));
-      continue;
-    }
-    // Removed remotely. If the user also changed the project locally, that is
-    // an explicit structural conflict — silently discarding local work would be
-    // worse than surfacing it so the user can decide.
-    // H-08: throw an explicit merge error rather than silently dropping the edit.
-    if (!target) {
-      if (changed(localProject, origin)) {
-        throw new Error(
-          `Merge conflict: project "${localProject.name || localProject.id}" was deleted on another ` +
-          `device while this Mac was editing it. Use "Keep This Mac" or "Use Cloud" to resolve.`
-        );
+    if (!origin) continue; // created locally; not a deletion conflict
+    const changedLocally = JSON.stringify(localProject) !== JSON.stringify(origin);
+    if (!remoteProjects.has(localProject.id)) {
+      if (changedLocally) {
+        throw new Error('Merge conflict: this project was deleted on another device');
       }
       continue;
     }
-
-    if (changed(localProject.name, origin.name)) target.name = localProject.name;
-    if (changed(localProject.activeId, origin.activeId)) target.activeId = localProject.activeId;
-    target.sheets = Array.isArray(target.sheets) ? target.sheets : [];
-    const originSheets = new Map((origin.sheets || []).map(s => [s.id, s]));
-    const targetSheets = new Map(target.sheets.map(s => [s.id, s]));
-
+    const remoteProject = remoteProjects.get(localProject.id);
+    const remoteSheets = new Set((remoteProject.sheets || []).map(sh => sh.id));
+    const originSheets = new Map((origin.sheets || []).map(sh => [sh.id, sh]));
     for (const localSheet of localProject.sheets || []) {
       const originSheet = originSheets.get(localSheet.id);
-      const targetSheet = targetSheets.get(localSheet.id);
-      if (!originSheet) {
-        if (!targetSheet) target.sheets.push(_cloneJson(localSheet));
+      if (!originSheet) continue; // created locally
+      if (remoteSheets.has(localSheet.id)) continue;
+      if (JSON.stringify(localSheet) !== JSON.stringify(originSheet)) {
+        throw new Error('Merge conflict: this sheet was deleted on another device');
+      }
+    }
+  }
+
+  const ops = _deriveSpreadsheetOperations(dirtyBase, dirty);
+  const { workbook, conflicts } = _applySpreadsheetOperations(base, ops);
+
+  // Projects created locally after the editor snapshot are additions, not edits.
+  const known = new Set((workbook.projects || []).map(p => p.id));
+  const origin = new Set((dirtyBase.projects || []).map(p => p.id));
+  for (const project of dirty.projects || []) {
+    if (!known.has(project.id) && !origin.has(project.id)) {
+      workbook.projects.push(_cloneJson(project));
+      known.add(project.id);
+    }
+  }
+  // Sheets created locally, and local project/sheet renames, likewise.
+  const dirtyProjects = new Map((dirty.projects || []).map(p => [p.id, p]));
+  const baseProjects = new Map((dirtyBase.projects || []).map(p => [p.id, p]));
+  for (const project of workbook.projects || []) {
+    const local = dirtyProjects.get(project.id);
+    const origin2 = baseProjects.get(project.id);
+    if (!local || !origin2) continue;
+    if (local.name !== origin2.name) project.name = local.name;
+    const originSheets = new Set((origin2.sheets || []).map(s => s.id));
+    const present = new Set((project.sheets || []).map(s => s.id));
+    for (const sheet of local.sheets || []) {
+      if (!originSheets.has(sheet.id) && !present.has(sheet.id)) {
+        project.sheets.push(_cloneJson(sheet));
+        present.add(sheet.id);
         continue;
       }
-      // H-08: sheet deleted remotely while this Mac was editing it — explicit conflict.
-      if (!targetSheet) {
-        if (changed(localSheet, originSheet)) {
-          throw new Error(
-            `Merge conflict: sheet "${localSheet.name || localSheet.id}" in project ` +
-            `"${localProject.name || localProject.id}" was deleted on another device ` +
-            `while this Mac was editing it. Use "Keep This Mac" or "Use Cloud" to resolve.`
-          );
-        }
-        continue;
+      const target = (project.sheets || []).find(s => s.id === sheet.id);
+      const originSheet = (origin2.sheets || []).find(s => s.id === sheet.id);
+      if (!target || !originSheet) continue;
+      if (sheet.name !== originSheet.name) target.name = sheet.name;
+      if (sheet.rows !== originSheet.rows) target.rows = sheet.rows;
+      if (sheet.cols !== originSheet.cols) target.cols = sheet.cols;
+      if (JSON.stringify(sheet.colWidths) !== JSON.stringify(originSheet.colWidths)) {
+        target.colWidths = _cloneJson(sheet.colWidths);
       }
-
-      if (changed(localSheet.name, originSheet.name)) targetSheet.name = localSheet.name;
-      if (changed(localSheet.rows, originSheet.rows)) targetSheet.rows = localSheet.rows;
-      if (changed(localSheet.cols, originSheet.cols)) targetSheet.cols = localSheet.cols;
-      if (changed(localSheet.colWidths, originSheet.colWidths)) {
-        targetSheet.colWidths = _cloneJson(localSheet.colWidths);
-      }
-
-      const originCells = originSheet.cells || {};
-      const localCells = localSheet.cells || {};
-      targetSheet.cells = targetSheet.cells || {};
-      // Only cells the user actually touched overwrite the reconciled base.
-      for (const cellKey of Object.keys(localCells)) {
-        if (changed(localCells[cellKey], originCells[cellKey])) {
-          targetSheet.cells[cellKey] = _cloneJson(localCells[cellKey]);
-        }
-      }
-      // Cells the user cleared locally.
-      for (const cellKey of Object.keys(originCells)) {
-        if (!(cellKey in localCells)) {
-          // H-08: if the remote device concurrently changed this cell, clearing
-          // it locally is a structural conflict — one side's intent must lose.
-          if (changed(targetSheet.cells[cellKey], originCells[cellKey])) {
-            throw new Error(
-              `Merge conflict: cell ${cellKey} in sheet "${localSheet.name || localSheet.id}" ` +
-              `was cleared on this Mac but changed on another device simultaneously. ` +
-              `Use "Keep This Mac" or "Use Cloud" to resolve.`
-            );
-          }
-          delete targetSheet.cells[cellKey];
-        }
-      }
+      if (sheet.id === local.activeId) project.activeId = sheet.id;
     }
-
-    // Sheets deleted locally.
-    for (const sheetId of originSheets.keys()) {
-      if (!(localProject.sheets || []).some(s => s.id === sheetId)) {
-        target.sheets = target.sheets.filter(s => s.id !== sheetId);
-      }
-    }
-    if (!target.sheets.some(s => s.id === target.activeId) && target.sheets.length) {
-      target.activeId = target.sheets[0].id;
+    if (!project.sheets.some(s => s.id === project.activeId) && project.sheets.length) {
+      project.activeId = project.sheets[0].id;
     }
   }
 
-  // Projects deleted locally.
-  for (const projectId of originProjects.keys()) {
-    if (!localProjects.some(p => p.id === projectId)) {
-      merged.projects = merged.projects.filter(p => p.id !== projectId);
-    }
+  if (JSON.stringify(dirty.activeProject) !== JSON.stringify(dirtyBase.activeProject)) {
+    workbook.activeProject = dirty.activeProject;
+  }
+  if (!(workbook.projects || []).some(p => p.id === workbook.activeProject) &&
+      (workbook.projects || []).length) {
+    workbook.activeProject = workbook.projects[0].id;
   }
 
-  if (changed(dirty.activeProject, dirtyBase.activeProject)) {
-    merged.activeProject = dirty.activeProject;
+  // Conflicts accumulate with any already recorded on the reconciled base, are
+  // de-duplicated by target, and are bounded so repeated divergence cannot grow
+  // the synchronized document without limit.
+  const carried = Array.isArray(base._conflicts) ? base._conflicts : [];
+  const merged = [...carried];
+  for (const entry of conflicts) {
+    const index = merged.findIndex(existing => existing.id === entry.id);
+    if (index >= 0) merged[index] = entry;
+    else merged.push(entry);
   }
-  if (!merged.projects.some(p => p.id === merged.activeProject) && merged.projects.length) {
-    merged.activeProject = merged.projects[0].id;
-  }
-  return merged;
+  if (merged.length) workbook._conflicts = merged.slice(-MAX_SPREADSHEET_CONFLICTS);
+  else delete workbook._conflicts;
+  return workbook;
 }
 
 function _releaseSpreadsheetSaveGate(gate) {

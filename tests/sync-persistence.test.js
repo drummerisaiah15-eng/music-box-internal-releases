@@ -297,6 +297,10 @@ test('spreadsheet typing in A1 preserves an unrelated remote edit in B1', async 
     ${declaration('normalizeSpreadsheetWorkbook')}
     _ssData = JSON.parse(JSON.stringify(initial));
     ${declaration('_refreshForSyncKey')}
+    ${declaration('_ssCellsOf')}
+    ${declaration('_ssConflictId')}
+    ${declaration('_deriveSpreadsheetOperations')}
+    ${declaration('_applySpreadsheetOperations')}
     ${declaration('_mergeSpreadsheetEdits')}
     ${declaration('_releaseSpreadsheetSaveGate')}
     ${declaration('_beginSpreadsheetSaveStage')}
@@ -1899,6 +1903,11 @@ test('H-08: _mergeSpreadsheetEdits throws an explicit conflict when a locally-ch
   const context = contextWith({});
   vm.runInContext(`
     ${declaration('_cloneJson')}
+    const MAX_SPREADSHEET_CONFLICTS = 200;
+    ${declaration('_ssCellsOf')}
+    ${declaration('_ssConflictId')}
+    ${declaration('_deriveSpreadsheetOperations')}
+    ${declaration('_applySpreadsheetOperations')}
     ${declaration('_mergeSpreadsheetEdits')}
     globalThis.mergeApi = { merge: _mergeSpreadsheetEdits };
   `, context);
@@ -1926,6 +1935,11 @@ test('H-08: _mergeSpreadsheetEdits throws an explicit conflict when a locally-ch
   const context = contextWith({});
   vm.runInContext(`
     ${declaration('_cloneJson')}
+    const MAX_SPREADSHEET_CONFLICTS = 200;
+    ${declaration('_ssCellsOf')}
+    ${declaration('_ssConflictId')}
+    ${declaration('_deriveSpreadsheetOperations')}
+    ${declaration('_applySpreadsheetOperations')}
     ${declaration('_mergeSpreadsheetEdits')}
     globalThis.mergeApi = { merge: _mergeSpreadsheetEdits };
   `, context);
@@ -1954,6 +1968,11 @@ test('H-08: _mergeSpreadsheetEdits throws when a locally-cleared cell was concur
   const context = contextWith({});
   vm.runInContext(`
     ${declaration('_cloneJson')}
+    const MAX_SPREADSHEET_CONFLICTS = 200;
+    ${declaration('_ssCellsOf')}
+    ${declaration('_ssConflictId')}
+    ${declaration('_deriveSpreadsheetOperations')}
+    ${declaration('_applySpreadsheetOperations')}
     ${declaration('_mergeSpreadsheetEdits')}
     globalThis.mergeApi = { merge: _mergeSpreadsheetEdits };
   `, context);
@@ -2599,4 +2618,158 @@ test('P1-6: Step Up is available to Owner AND Operations, not Operations alone',
   assert.match(renderer, /navStepup\.style\.display = canAccessStepUp\(\)/, 'nav gate');
   // Front Desk must still be denied.
   assert.doesNotMatch(body, /Front Desk/, 'Front Desk gains nothing');
+});
+
+// --- P0-1: spreadsheet operation model --------------------------------------
+//
+// The old merge diffed the local workbook against the base the editor started
+// from but never asked whether the REMOTE side had changed the same target, so
+// same-cell edits and delete-versus-edit silently discarded one side.
+
+function ssOpsApi() {
+  const context = contextWith({ _cloneJson: v => JSON.parse(JSON.stringify(v)) });
+  vm.runInContext(`
+    const MAX_SPREADSHEET_CONFLICTS = 200;
+    ${declaration('_ssCellsOf')}
+    ${declaration('_ssConflictId')}
+    ${declaration('_deriveSpreadsheetOperations')}
+    ${declaration('_applySpreadsheetOperations')}
+    ${declaration('_mergeSpreadsheetEdits')}
+    globalThis.api = {
+      merge: (b, db, d) => _mergeSpreadsheetEdits(b, db, d),
+      derive: (b, n) => _deriveSpreadsheetOperations(b, n),
+      apply: (t, o) => _applySpreadsheetOperations(t, o),
+    };
+  `, context);
+  return {
+    merge: (b, db, d) => JSON.parse(JSON.stringify(context.api.merge(b, db, d))),
+    derive: (b, n) => JSON.parse(JSON.stringify(context.api.derive(b, n))),
+    apply: (t, o) => JSON.parse(JSON.stringify(context.api.apply(t, o))),
+  };
+}
+
+const ssCell = v => ({ v, bg: '', tc: '', b: false });
+const ssBook = (cells, sheets = ['s1']) => ({
+  activeProject: 'p1',
+  projects: [{
+    id: 'p1', name: 'P', activeId: sheets[0],
+    sheets: sheets.map(id => ({
+      id, name: id.toUpperCase(), rows: 2, cols: 2, colWidths: [100, 100],
+      cells: id === sheets[0] ? cells : {},
+    })),
+  }],
+});
+const ssAt = (w, k) => w.projects[0].sheets[0].cells[k]?.v;
+const ssBase = ssBook({ '0,0': ssCell('BASE') });
+
+test('P0-1: the same cell edited on both Macs preserves both values', () => {
+  const { merge } = ssOpsApi();
+  const remote = ssBook({ '0,0': ssCell('REMOTE EDIT') });
+  const local = ssBook({ '0,0': ssCell('LOCAL EDIT') });
+  const result = merge(remote, ssBase, local);
+  assert.equal(result._conflicts?.length, 1, 'an explicit conflict is raised');
+  const c = result._conflicts[0];
+  assert.equal(c.kind, 'cell');
+  assert.equal(c.base.v, 'BASE', 'the base both sides diverged from');
+  assert.equal(c.local.v, 'LOCAL EDIT', "this Mac's value is preserved");
+  assert.equal(c.remote.v, 'REMOTE EDIT', "the other Mac's value is preserved");
+  assert.equal(c.target, '0,0', 'and the exact cell is identified');
+});
+
+test('P0-1: both Macs converge on the same current value for a cell conflict', () => {
+  const { merge } = ssOpsApi();
+  // Mirrored inputs: each Mac sees the other's value as the reconciled base.
+  const a = merge(ssBook({ '0,0': ssCell('REMOTE') }), ssBase, ssBook({ '0,0': ssCell('LOCAL') }));
+  const b = merge(ssBook({ '0,0': ssCell('LOCAL') }), ssBase, ssBook({ '0,0': ssCell('REMOTE') }));
+  assert.equal(ssAt(a, '0,0'), ssAt(b, '0,0'),
+    'a non-deterministic winner would leave the two Macs permanently disagreeing');
+});
+
+test('P0-1: local sheet deletion versus a remote edit preserves the edit', () => {
+  const { merge } = ssOpsApi();
+  const base = ssBook({}, ['s1', 's2']);
+  const remote = JSON.parse(JSON.stringify(base));
+  remote.projects[0].sheets[0].cells['0,0'] = ssCell('REMOTE EDIT');
+  const local = JSON.parse(JSON.stringify(base));
+  local.projects[0].sheets = local.projects[0].sheets.filter(s => s.id !== 's1');
+  local.projects[0].activeId = 's2';
+
+  const result = merge(remote, base, local);
+  assert.deepEqual([...result.projects[0].sheets].map(s => s.id), ['s2'], 'the deletion holds');
+  const c = (result._conflicts || []).find(x => x.kind === 'sheet');
+  assert.ok(c, 'a sheet conflict is recorded');
+  assert.ok(JSON.stringify(c.remote).includes('REMOTE EDIT'),
+    'the deleted sheet — including the concurrent edit — is recoverable');
+});
+
+test('P0-1: local project deletion versus a remote edit preserves the edit', () => {
+  const { merge } = ssOpsApi();
+  const base = ssBook({});
+  const remote = JSON.parse(JSON.stringify(base));
+  remote.projects[0].sheets[0].cells['0,0'] = ssCell('REMOTE EDIT');
+  const local = JSON.parse(JSON.stringify(base));
+  local.projects = [];
+
+  const result = merge(remote, base, local);
+  const c = (result._conflicts || []).find(x => x.kind === 'project');
+  assert.ok(c, 'a project conflict is recorded');
+  assert.ok(JSON.stringify(c.remote).includes('REMOTE EDIT'),
+    'the deleted project and its edit remain recoverable');
+});
+
+test('P0-1: different cells merge automatically with no conflict', () => {
+  const { merge } = ssOpsApi();
+  const remote = ssBook({ '0,0': ssCell('BASE'), '0,1': ssCell('B1') });
+  const local = ssBook({ '0,0': ssCell('BASE'), '1,0': ssCell('A1') });
+  const result = merge(remote, ssBase, local);
+  assert.equal(ssAt(result, '0,1'), 'B1');
+  assert.equal(ssAt(result, '1,0'), 'A1');
+  assert.ok(!result._conflicts, 'independent edits must never be reported as a conflict');
+});
+
+test('P0-1: an edit onto an untouched remote applies without a false conflict', () => {
+  const { merge } = ssOpsApi();
+  const result = merge(JSON.parse(JSON.stringify(ssBase)), ssBase, ssBook({ '0,0': ssCell('TYPED') }));
+  assert.equal(ssAt(result, '0,0'), 'TYPED');
+  assert.ok(!result._conflicts);
+});
+
+test('P0-1: operation replay is idempotent', () => {
+  const { merge, derive, apply } = ssOpsApi();
+  const strip = w => JSON.parse(JSON.stringify(w, (k, v) => (k === 'at' ? undefined : v)));
+  const remote = ssBook({ '0,0': ssCell('REMOTE') });
+  const local = ssBook({ '0,0': ssCell('LOCAL') });
+  const once = merge(remote, ssBase, local);
+  assert.deepEqual(strip(merge(once, ssBase, local)), strip(once),
+    'replaying after reconnect must not duplicate or re-conflict');
+
+  // Applying the identical operation set twice changes nothing.
+  const ops = derive(ssBase, ssBook({ '0,0': ssCell('X') }));
+  const first = apply(JSON.parse(JSON.stringify(ssBase)), ops);
+  const second = apply(first.workbook, ops);
+  assert.deepEqual(second.workbook, first.workbook);
+});
+
+test('P0-1: operations carry the base they were derived from', () => {
+  const { derive } = ssOpsApi();
+  const ops = derive(ssBase, ssBook({ '0,0': ssCell('NEXT'), '1,1': ssCell('NEW') }));
+  const set = ops.find(o => o.target === '0,0');
+  assert.equal(set.kind, 'cell.set');
+  assert.equal(set.base.v, 'BASE', 'without the base value divergence is undetectable');
+  assert.equal(set.value.v, 'NEXT');
+  const added = ops.find(o => o.target === '1,1');
+  assert.equal(added.base, null, 'a new cell has no base');
+
+  const cleared = derive(ssBase, ssBook({}));
+  assert.equal(cleared.find(o => o.target === '0,0').kind, 'cell.clear');
+});
+
+test('P0-1: workbook conflicts survive normalization and stay bounded', () => {
+  assert.ok(script.includes('MAX_SPREADSHEET_CONFLICTS'), 'a cap exists');
+  const norm = declaration('normalizeSpreadsheetWorkbook');
+  assert.match(norm, /'activeProject', 'projects', '_conflicts'/,
+    'conflicts ride with the workbook rather than being rejected by the validator');
+  assert.match(norm, /slice\(-MAX_SPREADSHEET_CONFLICTS\)/, 'and are bounded');
+  assert.match(norm, /delete source\._conflicts/,
+    'malformed conflict metadata is stripped, never allowed to make a valid workbook unloadable');
 });
