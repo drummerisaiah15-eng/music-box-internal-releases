@@ -1046,8 +1046,19 @@ function verifySourceCheckout(packageMetadata, env = process.env, execute = run)
     .split(/\r?\n/)
     .filter(Boolean)
     .sort();
-  if (changed.join('\n') !== 'package-lock.json\npackage.json') {
-    fail('release checkout contains changes beyond the controlled version files');
+  // Two shapes are legitimate here. A version bump rewrites exactly the two
+  // controlled files. A release of a version that is ALREADY committed — the
+  // provenance-correct path, where the source commit genuinely contains the
+  // version being shipped — rewrites nothing at all, so the checkout is
+  // byte-identical to the commit. Requiring the bump made that path
+  // unreleasable: it failed here after signing, notarizing and stapling had all
+  // succeeded. An empty diff is the stronger guarantee, not a weaker one.
+  const changedList = changed.join('\n');
+  if (changedList !== 'package-lock.json\npackage.json' && changedList !== '') {
+    fail(
+      'release checkout contains changes beyond the controlled version files: ' +
+      changedList.split('\n').join(', '),
+    );
   }
   if (
     execute('git', ['ls-files', '--others', '--exclude-standard'], { cwd: PROJECT_DIR }).trim()
