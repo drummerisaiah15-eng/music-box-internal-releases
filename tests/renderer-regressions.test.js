@@ -576,3 +576,53 @@ test('P1-9: an open Morning Brief refreshes when its data arrives', () => {
   assert.match(refresh, /_refreshOpenBriefing\(\)/,
     'restored logs/tasks re-render the open brief instead of leaving it stale');
 });
+
+// --- Field findings: receipt autosave and truthful sync status --------------
+
+test('receipts reach history without pressing Save', () => {
+  // Elizabeth and Carrie should not have to remember a Save button for a
+  // receipt they have already emailed or exported.
+  assert.match(script, /async function _stepUpPersistReceipt\(/, 'a shared persist step exists');
+  assert.match(namedFunctionSource('stepUpSaveReceipt'), /_stepUpPersistReceipt\(\{ silent: false \}\)/,
+    'the manual button reuses it');
+
+  // Generating a receipt implies keeping it.
+  for (const fn of ['stepUpEmailReceipt', 'stepUpDownloadPDF']) {
+    assert.match(namedFunctionSource(fn), /await _stepUpEnsureSaved\(\)/,
+      `${fn} persists the receipt before generating it`);
+  }
+  assert.match(script, /function stepUpScheduleAutoSave\(/, 'typing schedules an autosave');
+  assert.match(source, /oninput="stepUpScheduleAutoSave\(\)"/, 'and fields are wired to it');
+
+  const persist = script.slice(script.indexOf('async function _stepUpPersistReceipt('));
+  const body = persist.slice(0, persist.indexOf('\nasync function ', 1));
+  assert.match(body, /STORE\.mutate\('step_up_receipts'/,
+    'receipts merge into the reconciled list rather than replacing it');
+  assert.match(body, /_newRecordId\(\)/, 'collision-resistant id, not Date.now()');
+  assert.match(body, /if \(!receipts\.some\(r => String\(r\.id\) === String\(newId\)\)\)/,
+    'autosave running twice must not duplicate the receipt');
+  // Silence is only for success — a failed autosave must still be visible.
+  assert.match(body, /showToast\(`Receipt was not saved/, 'autosave failures surface');
+});
+
+test('sync status is always visible and never sits on Connecting forever', () => {
+  const setStatus = namedFunctionSource('setSyncStatus');
+  // 'off' was show:false, so a profile that could not reach cloud sync showed
+  // no badge at all — indistinguishable from "everything is fine".
+  assert.match(setStatus, /off:\s+\{ dot: '#aaaaaa', label: 'Local only',[^}]*show: true/,
+    'local-only is shown, not hidden');
+  assert.match(setStatus, /offline:\s+\{[^}]*show: true/, 'offline is a distinct visible state');
+  assert.match(setStatus, /Offline — saved on this Mac only/,
+    'Settings distinguishes no-network from a broken configuration');
+
+  // Firebase auth can hang indefinitely; the badge must still resolve.
+  assert.match(script, /const SYNC_CONNECT_TIMEOUT_MS = \d+/, 'the sign-in is bounded');
+  const init = namedFunctionSource('initFirebase');
+  assert.match(init, /Promise\.race\(\[/, 'sign-in races a timeout');
+  assert.match(init, /signInWithEmailAndPassword\(email, password\)/);
+  assert.match(init, /SYNC_CONNECT_TIMEOUT_MS/);
+  assert.match(init, /code: navigator\.onLine === false \? 'SYNC_OFFLINE'/,
+    'a dead network is reported as offline, not as a generic failure');
+  assert.match(init, /setSyncStatus\(offline \? 'offline' : 'error'\)/,
+    'losing the network must not read the same as a broken config');
+});

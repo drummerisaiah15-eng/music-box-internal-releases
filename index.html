@@ -1634,7 +1634,7 @@
           <!-- Student & Instructor -->
           <div class="form-group">
             <label class="form-label">Student Name</label>
-            <input type="text" id="su-student" class="form-input" placeholder="Student full name" />
+            <input type="text" id="su-student" class="form-input" placeholder="Student full name" / oninput="stepUpScheduleAutoSave()">
           </div>
           <div class="form-group">
             <label class="form-label">Instructor(s) Name</label>
@@ -1653,7 +1653,7 @@
             </div>
             <div class="form-group">
               <label class="form-label">Sale ID</label>
-              <input type="text" id="su-sale-id" class="form-input" placeholder="e.g. 12345" />
+              <input type="text" id="su-sale-id" class="form-input" placeholder="e.g. 12345" / oninput="stepUpScheduleAutoSave()">
             </div>
           </div>
           <div class="form-group">
@@ -1688,7 +1688,7 @@
           <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px">
             <div class="form-group">
               <label class="form-label">Subtotal</label>
-              <input type="text" id="su-subtotal" class="form-input" placeholder="0.00" oninput="stepUpCalcTotal()" />
+              <input type="text" id="su-subtotal" class="form-input" placeholder="0.00" oninput="stepUpCalcTotal();stepUpScheduleAutoSave()" />
             </div>
             <div class="form-group">
               <label class="form-label">Tax</label>
@@ -1732,7 +1732,7 @@
           <!-- Client email + send-from account -->
           <div class="form-group" style="margin-top:4px">
             <label class="form-label">Client Email <span style="font-weight:400;color:var(--text-muted)">(for sending receipt)</span></label>
-            <input type="email" id="su-client-email" class="form-input" placeholder="client@example.com" />
+            <input type="email" id="su-client-email" class="form-input" placeholder="client@example.com" / oninput="stepUpScheduleAutoSave()">
           </div>
           <div class="form-group" style="margin-top:4px">
             <label class="form-label">Send From <span style="font-weight:400;color:var(--text-muted)">(Microsoft 365 account)</span></label>
@@ -3448,6 +3448,8 @@ function _serializeManyKeyMutations(keys, task) {
   return run.finally(() => releaseReservations());
 }
 
+// Bounds the Firebase sign-in so the badge cannot sit on "Connecting…" forever.
+const SYNC_CONNECT_TIMEOUT_MS = 20000;
 const SYNC_PENDING_STORAGE_VERSION = 1;
 const MAX_SYNC_SUPERSEDED_OPS = 256;
 const _syncConflictNotified = new Set();
@@ -5119,9 +5121,12 @@ function setSyncStatus(state) {
   if (!chip) return;
 
   const styles = {
-    off:        { dot: '#aaaaaa', label: 'Sync off',     bg: 'var(--bg)',          show: false },
+    // Every state is visible. Hiding 'off' meant a profile that could not reach
+    // cloud sync saw no badge at all and had no way to know it was local-only.
+    off:        { dot: '#aaaaaa', label: 'Local only',   bg: 'var(--bg)',          show: true  },
     connecting: { dot: '#c4922a', label: 'Connecting…',  bg: '#fff8ec',            show: true  },
     live:       { dot: '#4a7c59', label: '☁ Synced',     bg: '#edf7f1',            show: true  },
+    offline:    { dot: '#c4922a', label: '⚠ Offline',    bg: '#fff8ec',            show: true  },
     error:      { dot: '#c0392b', label: 'Sync error',   bg: '#fdf0f0',            show: true  },
   };
   let s = styles[state] || styles.off;
@@ -5158,7 +5163,10 @@ function setSyncStatus(state) {
     const partial = state === 'live' && s.label !== '☁ Synced';
     const text = state === 'live'
       ? (partial ? 'Connected — some data not synced' : 'Connected')
-      : state === 'error' ? 'Error' : 'Not connected';
+      : state === 'offline' ? 'Offline — saved on this Mac only'
+      : state === 'error' ? 'Error'
+      : state === 'off' ? 'Local only — cloud sync not connected'
+      : 'Not connected';
     badge.className = 'api-status ' + (partial ? '' : state === 'live' ? 'connected' : state === 'error' ? 'disconnected' : '');
     badge.innerHTML = `<div class="api-status-dot"></div><span>${escHtml(text)}</span>`;
   }
@@ -5248,7 +5256,21 @@ async function initFirebase() {
 
     _firebaseAuth = firebase.auth(_firebaseApp);
     _setRemoteAuthority('authenticating');
-    const credential = await _firebaseAuth.signInWithEmailAndPassword(email, password);
+    // Firebase auth can hang indefinitely when the network is down or the
+    // project is unreachable, leaving the badge stuck on "Connecting…" forever.
+    // Bound it so the UI always reaches a truthful state.
+    const credential = await Promise.race([
+      _firebaseAuth.signInWithEmailAndPassword(email, password),
+      new Promise((_, reject) => setTimeout(
+        () => reject(Object.assign(
+          new Error(navigator.onLine === false
+            ? 'No network connection; cloud sync is unavailable'
+            : 'Firebase did not respond; check the project settings and network'),
+          { code: navigator.onLine === false ? 'SYNC_OFFLINE' : 'SYNC_TIMEOUT' }
+        )),
+        SYNC_CONNECT_TIMEOUT_MS
+      )),
+    ]);
     password = '';
     if (!credential?.user?.uid) throw new Error('Firebase authentication did not return a user');
     delete _firebaseSecretCache[FIREBASE_SECRET_KEYS.password];
@@ -5289,7 +5311,10 @@ async function initFirebase() {
     // V159-001: a failure leaves remote state unknown, never "absent".
     _remoteDocPresence.clear();
     _setRemoteAuthority('error');
-    setSyncStatus('error');
+    // Losing the network is not the same as a broken configuration; saying
+    // "Sync error" for a closed laptop lid trains people to ignore the badge.
+    const offline = e?.code === 'SYNC_OFFLINE' || navigator.onLine === false;
+    setSyncStatus(offline ? 'offline' : 'error');
     const uidEl = document.getElementById('firebase-auth-uid');
     if (uidEl) uidEl.textContent = 'Sync connection failed: ' + (e?.message || String(e));
     return false;
@@ -13837,38 +13862,86 @@ function stepUpCollectFormData() {
   };
 }
 
-async function stepUpSaveReceipt() {
+// Receipts now reach history without anyone pressing Save. This is the shared
+// persist step: `silent` is used by autosave and by the generate paths so a
+// receipt that gets emailed or exported is already in the archive.
+async function _stepUpPersistReceipt({ silent = false } = {}) {
   if (!requireStepUpAccess()) return false;
   const d = stepUpCollectFormData();
-  if (!d.student && !d.saleId) { showToast('Fill in at least Student or Sale ID before saving.', 'warning'); return; }
+  // Nothing identifying yet — autosave stays quiet rather than nagging.
+  if (!d.student && !d.saleId) {
+    if (!silent) showToast('Fill in at least Student or Sale ID before saving.', 'warning');
+    return false;
+  }
 
-  const receipts = _cloneJson(getStepUpReceipts());
-  const editingId = parseInt(document.getElementById('stepup-editing-id').value || '0');
+  const editingIdRaw = document.getElementById('stepup-editing-id')?.value || '';
+  const editingId = editingIdRaw ? (parseInt(editingIdRaw) || editingIdRaw) : null;
+  const now = new Date().toISOString();
+  // Built once, outside the mutator, so a re-run cannot create a duplicate.
+  const newId = editingId ? null : _newRecordId();
 
   try {
-    if (editingId) {
-      const idx = receipts.findIndex(r => r.id === editingId);
-      if (idx < 0) throw new Error('The receipt being edited no longer exists.');
-      receipts[idx] = { ...receipts[idx], ...d, updatedAt: new Date().toISOString() };
-      await saveStepUpReceipts(receipts);
-      showToast('Receipt updated!', 'success');
-    } else {
-      receipts.unshift({ id: Date.now(), createdAt: new Date().toISOString(), ...d });
-      await saveStepUpReceipts(receipts);
-      document.getElementById('stepup-editing-id').value = receipts[0].id;
-      document.getElementById('stepup-editing-badge').style.display = '';
-      showToast('Receipt saved to archive!', 'success');
+    await STORE.mutate('step_up_receipts', current => {
+      const receipts = Array.isArray(current) ? _cloneJson(current) : [];
+      if (editingId) {
+        const idx = receipts.findIndex(r => String(r.id) === String(editingId));
+        if (idx < 0) throw new Error('The receipt being edited no longer exists.');
+        receipts[idx] = { ...receipts[idx], ...d, updatedAt: now };
+      } else if (!receipts.some(r => String(r.id) === String(newId))) {
+        receipts.unshift({ id: newId, createdAt: now, ...d });
+      }
+      return receipts;
+    }, []);
+
+    if (!editingId) {
+      const idEl = document.getElementById('stepup-editing-id');
+      const badgeEl = document.getElementById('stepup-editing-badge');
+      if (idEl) idEl.value = newId;
+      if (badgeEl) badgeEl.style.display = '';
     }
+    if (!silent) showToast(editingId ? 'Receipt updated!' : 'Receipt saved to archive!', 'success');
     renderStepUpArchive();
     return true;
   } catch (error) {
+    // An autosave failure must still be visible — silence is only for success.
     showToast(`Receipt was not saved: ${error?.message || error}`, 'danger');
     return false;
   }
 }
 
+async function stepUpSaveReceipt() {
+  return _stepUpPersistReceipt({ silent: false });
+}
+
+// Debounced autosave so a receipt reaches history as it is filled in, without a
+// write on every keystroke.
+let _stepUpAutoSaveTimer = null;
+function stepUpScheduleAutoSave() {
+  if (!_stepUpTrustedEditable()) return;
+  clearTimeout(_stepUpAutoSaveTimer);
+  _stepUpAutoSaveTimer = setTimeout(() => {
+    _stepUpPersistReceipt({ silent: true }).catch(() => {});
+  }, 1200);
+}
+
+function _stepUpTrustedEditable() {
+  try {
+    return canAccessStepUp() &&
+      !!document.getElementById('page-stepup')?.classList.contains('active');
+  } catch (_) { return false; }
+}
+
+// Any receipt that is emailed or exported must already be in history.
+async function _stepUpEnsureSaved() {
+  clearTimeout(_stepUpAutoSaveTimer);
+  return _stepUpPersistReceipt({ silent: true });
+}
+
 async function stepUpEmailReceipt() {
   if (!requireStepUpAccess()) return false;
+  // A receipt that gets emailed is a generated receipt — it belongs in history
+  // whether or not anyone pressed Save.
+  await _stepUpEnsureSaved();
   const d = stepUpCollectFormData();
   if (!d.clientEmail) { showToast('Enter a client email address to send the receipt.', 'warning'); return; }
 
@@ -13962,6 +14035,8 @@ function stepUpPreviewEmail() {
 
 async function stepUpDownloadPDF() {
   if (!requireStepUpAccess()) return false;
+  // Same for an exported PDF.
+  await _stepUpEnsureSaved();
   const d = stepUpCollectFormData();
   const printHtml = `<!DOCTYPE html>
 <html>
