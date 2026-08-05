@@ -1491,6 +1491,11 @@
           </div>
           <!-- Sheet tabs -->
           <div id="ss-tabs-row"></div>
+          <!-- Who is here, and who last touched the selected cell -->
+          <div id="ss-activity-bar" style="display:none;align-items:center;gap:12px;flex-wrap:wrap;padding:6px 10px;border-top:1px solid var(--divider);font-size:11.5px;color:var(--text-muted)">
+            <div id="ss-presence" style="display:flex;align-items:center;gap:6px;flex-wrap:wrap"></div>
+            <div id="ss-cell-attribution"></div>
+          </div>
         </div>
       </div>
     </div>
@@ -6842,6 +6847,42 @@ function ssBoundedCellValue(value) {
   return text;
 }
 
+// Per-sheet "who last touched this cell". Deliberately stored beside the cells
+// rather than inside them: the merge model compares cells by value, so folding
+// an author stamp into the cell would make every attribution difference look
+// like a content edit and manufacture conflicts out of nothing.
+const MAX_SPREADSHEET_ATTRIBUTIONS = 200;
+const MAX_SPREADSHEET_ATTRIBUTION_NAME = 80;
+
+function _normalizeSpreadsheetAttribution(source, cells) {
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return null;
+  const entries = [];
+  for (const [cellKey, entry] of Object.entries(source)) {
+    // Never keep a stamp for a cell that no longer exists, or the map grows
+    // forever as people clear and retype cells.
+    if (!Object.prototype.hasOwnProperty.call(cells, cellKey)) continue;
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+    if (!Object.keys(entry).every(key => ['by', 'at'].includes(key))) continue;
+    if (typeof entry.by !== 'string' || !entry.by || entry.by.length > MAX_SPREADSHEET_ATTRIBUTION_NAME) continue;
+    if (typeof entry.at !== 'string' || Number.isNaN(Date.parse(entry.at))) continue;
+    entries.push([cellKey, { by: entry.by, at: entry.at }]);
+  }
+  if (!entries.length) return null;
+  // Keep the most recent when over the cap: old stamps are the ones nobody is
+  // still asking about.
+  entries.sort((a, b) => Date.parse(a[1].at) - Date.parse(b[1].at));
+  return Object.fromEntries(entries.slice(-MAX_SPREADSHEET_ATTRIBUTIONS));
+}
+
+function _ssAttributionActor() {
+  // Bookkeeping must never be able to fail a merge. An unknown author costs a
+  // line of UI; a thrown error here would cost the edit itself.
+  let name = null;
+  try { name = currentUser(); } catch (_) { return null; }
+  if (typeof name !== 'string' || !name) return null;
+  return name.slice(0, MAX_SPREADSHEET_ATTRIBUTION_NAME);
+}
+
 function normalizeSpreadsheetWorkbook(value) {
   let serialized;
   try { serialized = JSON.stringify(value); }
@@ -6936,7 +6977,7 @@ function normalizeSpreadsheetWorkbook(value) {
     const sheets = project.sheets.map(sheet => {
       if (!sheet || typeof sheet !== 'object' || Array.isArray(sheet) ||
           !Object.keys(sheet).every(key =>
-            ['id', 'name', 'rows', 'cols', 'colWidths', 'cells'].includes(key)
+            ['id', 'name', 'rows', 'cols', 'colWidths', 'cells', 'editedBy'].includes(key)
           )) {
         throw new Error('spreadsheets has an invalid sheet');
       }
@@ -7034,7 +7075,13 @@ function normalizeSpreadsheetWorkbook(value) {
         }
       }
 
-      return { id: sheetId, name: sheetName, rows, cols, colWidths, cells };
+      const normalizedSheet = { id: sheetId, name: sheetName, rows, cols, colWidths, cells };
+      // Attribution is bookkeeping, not content: a bad entry must never make a
+      // real workbook unloadable, so it is filtered and capped rather than
+      // rejected — the same treatment _conflicts gets.
+      const attribution = _normalizeSpreadsheetAttribution(sheet.editedBy, cells);
+      if (attribution) normalizedSheet.editedBy = attribution;
+      return normalizedSheet;
     });
     const activeId = checkedString(project.activeId, 'active sheet id', 160);
     if (!localSheetIds.has(activeId)) {
@@ -7288,10 +7335,36 @@ function ssActiveSheet() {
 // rather than invisible.
 const MAX_SPREADSHEET_CONFLICTS = 200;
 
-function _ssCellsOf(workbook, projectId, sheetId) {
+function _ssSheetOf(workbook, projectId, sheetId) {
   const project = (workbook?.projects || []).find(p => p.id === projectId);
-  const sheet = (project?.sheets || []).find(s => s.id === sheetId);
-  return sheet?.cells || null;
+  return (project?.sheets || []).find(s => s.id === sheetId) || null;
+}
+
+function _ssCellsOf(workbook, projectId, sheetId) {
+  return _ssSheetOf(workbook, projectId, sheetId)?.cells || null;
+}
+
+// Record (or erase) the author stamp for a cell as its operation lands. Called
+// only where the operation actually changes the reconciled workbook, so a
+// no-op replay never rewrites history with a later timestamp.
+function _ssStampAttribution(sheet, target, op) {
+  if (!sheet) return;
+  if (op.value === null || !op.by || !op.at) {
+    if (sheet.editedBy) {
+      delete sheet.editedBy[target];
+      if (!Object.keys(sheet.editedBy).length) delete sheet.editedBy;
+    }
+    return;
+  }
+  if (!sheet.editedBy) sheet.editedBy = {};
+  sheet.editedBy[target] = { by: op.by, at: op.at };
+  const keys = Object.keys(sheet.editedBy);
+  if (keys.length > MAX_SPREADSHEET_ATTRIBUTIONS) {
+    keys
+      .sort((a, b) => Date.parse(sheet.editedBy[a].at) - Date.parse(sheet.editedBy[b].at))
+      .slice(0, keys.length - MAX_SPREADSHEET_ATTRIBUTIONS)
+      .forEach(stale => delete sheet.editedBy[stale]);
+  }
 }
 
 function _ssConflictId(parts) {
@@ -7305,6 +7378,8 @@ function _ssConflictId(parts) {
 function _deriveSpreadsheetOperations(base, next) {
   const ops = [];
   if (!base || !next) return ops;
+  const actor = _ssAttributionActor();
+  const stampedAt = new Date().toISOString();
   const baseProjects = new Map((base.projects || []).map(p => [p.id, p]));
   const nextProjects = new Map((next.projects || []).map(p => [p.id, p]));
 
@@ -7328,9 +7403,12 @@ function _deriveSpreadsheetOperations(base, next) {
         const before = baseCells[key] ?? null;
         const after = nextCells[key] ?? null;
         if (JSON.stringify(before) === JSON.stringify(after)) continue;
+        // Everything derived here is by definition a change this person just
+        // made on this Mac, so the actor is known without diffing anything.
         ops.push({
           kind: after === null ? 'cell.clear' : 'cell.set',
           projectId, sheetId, target: key, base: before, value: after,
+          by: actor, at: stampedAt,
         });
       }
     }
@@ -7379,7 +7457,8 @@ function _applySpreadsheetOperations(target, ops) {
     }
 
     // Cell operations.
-    const cells = _ssCellsOf(workbook, op.projectId, op.sheetId);
+    const sheet = _ssSheetOf(workbook, op.projectId, op.sheetId);
+    const cells = sheet?.cells || null;
     if (!cells) continue; // the sheet is gone; the structural conflict covers it
     const current = cells[op.target] ?? null;
     const currentKey = JSON.stringify(current);
@@ -7397,6 +7476,7 @@ function _applySpreadsheetOperations(target, ops) {
     if (currentKey === baseKey) {                  // remote untouched — apply
       if (op.value === null) delete cells[op.target];
       else cells[op.target] = _cloneJson(op.value);
+      _ssStampAttribution(sheet, op.target, op);
       continue;
     }
     // Both sides changed this cell away from the same base: a real conflict.
@@ -7413,6 +7493,9 @@ function _applySpreadsheetOperations(target, ops) {
     if (localWins) {
       if (op.value === null) delete cells[op.target];
       else cells[op.target] = _cloneJson(op.value);
+      // Attribution follows the winning value, so both Macs agree on who the
+      // surviving edit belongs to.
+      _ssStampAttribution(sheet, op.target, op);
     }
   }
   return { workbook, conflicts };
@@ -7924,6 +8007,35 @@ function ssUpdateToolbar() {
   const unmergeBtn = document.getElementById('ss-unmerge-btn');
   if (mergeBtn) mergeBtn.style.display = '';
   if (unmergeBtn) unmergeBtn.style.display = isMerged ? '' : 'none';
+  ssRenderActivityBar();
+}
+
+function _ssRelativeTime(iso) {
+  const then = Date.parse(iso);
+  if (Number.isNaN(then)) return '';
+  const seconds = Math.round((Date.now() - then) / 1000);
+  if (seconds < 45) return 'just now';
+  if (seconds < 5400) {
+    const minutes = Math.round(seconds / 60);
+    return minutes + (minutes === 1 ? ' minute ago' : ' minutes ago');
+  }
+  const sameDay = new Date(then).toDateString() === new Date().toDateString();
+  const time = new Date(then).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  if (sameDay) return 'today at ' + time;
+  return new Date(then).toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' at ' + time;
+}
+
+function ssRenderActivityBar() {
+  const bar = document.getElementById('ss-activity-bar');
+  const attributionEl = document.getElementById('ss-cell-attribution');
+  if (!bar || !attributionEl) return;
+  const sheet = ssActiveSheet();
+  const stamp = sheet?.editedBy?.[ssKey(_ssSelR, _ssSelC)];
+  attributionEl.textContent = stamp
+    ? `${ssColLabel(_ssSelC)}${_ssSelR + 1} — last edited by ${stamp.by}, ${_ssRelativeTime(stamp.at)}`
+    : '';
+  const hasPresence = !!document.getElementById('ss-presence')?.childElementCount;
+  bar.style.display = (attributionEl.textContent || hasPresence) ? 'flex' : 'none';
 }
 
 function ssMergeCells() {

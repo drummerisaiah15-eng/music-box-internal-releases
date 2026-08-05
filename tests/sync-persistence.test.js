@@ -294,11 +294,20 @@ test('spreadsheet typing in A1 preserves an unrelated remote edit in B1', async 
     }
     ${declaration('_serializeKeyMutation')}
     ${declaration('_serializeKeyReconcile')}
+    ${declaration('_normalizeSpreadsheetAttribution')}
     ${declaration('normalizeSpreadsheetWorkbook')}
+    var MAX_SPREADSHEET_ATTRIBUTIONS = 200;
+    var MAX_SPREADSHEET_ATTRIBUTION_NAME = 80;
     _ssData = JSON.parse(JSON.stringify(initial));
     ${declaration('_refreshForSyncKey')}
+    ${declaration('_ssSheetOf')}
     ${declaration('_ssCellsOf')}
+    ${declaration('_ssStampAttribution')}
+    var MAX_SPREADSHEET_ATTRIBUTIONS = 200;
     ${declaration('_ssConflictId')}
+    var currentUser = () => 'Test Editor';
+    ${declaration('_ssAttributionActor')}
+    var MAX_SPREADSHEET_ATTRIBUTION_NAME = 80;
     ${declaration('_deriveSpreadsheetOperations')}
     ${declaration('_applySpreadsheetOperations')}
     ${declaration('_mergeSpreadsheetEdits')}
@@ -1083,7 +1092,10 @@ function remoteAuthorityContext(authority, { rawLocal = null } = {}) {
         }],
       };
     }
+    ${declaration('_normalizeSpreadsheetAttribution')}
     ${declaration('normalizeSpreadsheetWorkbook')}
+    var MAX_SPREADSHEET_ATTRIBUTIONS = 200;
+    var MAX_SPREADSHEET_ATTRIBUTION_NAME = 80;
     ${declaration('_remoteStateIsAuthoritativelyAbsent')}
     ${declaration('ssLoad')}
     globalThis.loadApi = {
@@ -1540,7 +1552,10 @@ function classifyContext({ pending, remote, pendingPlaintext = null }) {
     const MAX_SPREADSHEET_SYNC_JSON_BYTES = 600000;
     const SS_DEFAULT_TIMES = ['9:00', '10:00'];
     const _aesDecrypt = async () => _plaintext;
+    ${declaration('_normalizeSpreadsheetAttribution')}
     ${declaration('normalizeSpreadsheetWorkbook')}
+    var MAX_SPREADSHEET_ATTRIBUTIONS = 200;
+    var MAX_SPREADSHEET_ATTRIBUTION_NAME = 80;
     ${declaration('ssCreateDefaultSheets')}
     ${declaration('ssCreateDefaultData')}
     ${declaration('_syncDocumentKind')}
@@ -1659,7 +1674,10 @@ function authorityEditorContext(authority, { stored = null } = {}) {
       return gate;
     }
     function _releaseSpreadsheetSaveGate(gate) { if (gate) gate.released = true; }
+    ${declaration('_normalizeSpreadsheetAttribution')}
     ${declaration('normalizeSpreadsheetWorkbook')}
+    var MAX_SPREADSHEET_ATTRIBUTIONS = 200;
+    var MAX_SPREADSHEET_ATTRIBUTION_NAME = 80;
     ${declaration('ssCreateDefaultSheets')}
     ${declaration('ssCreateDefaultData')}
     ${declaration('_remoteStateIsAuthoritativelyAbsent')}
@@ -1904,8 +1922,14 @@ test('H-08: _mergeSpreadsheetEdits throws an explicit conflict when a locally-ch
   vm.runInContext(`
     ${declaration('_cloneJson')}
     const MAX_SPREADSHEET_CONFLICTS = 200;
+    ${declaration('_ssSheetOf')}
     ${declaration('_ssCellsOf')}
+    ${declaration('_ssStampAttribution')}
+    var MAX_SPREADSHEET_ATTRIBUTIONS = 200;
     ${declaration('_ssConflictId')}
+    var currentUser = () => 'Test Editor';
+    ${declaration('_ssAttributionActor')}
+    var MAX_SPREADSHEET_ATTRIBUTION_NAME = 80;
     ${declaration('_deriveSpreadsheetOperations')}
     ${declaration('_applySpreadsheetOperations')}
     ${declaration('_mergeSpreadsheetEdits')}
@@ -1936,8 +1960,14 @@ test('H-08: _mergeSpreadsheetEdits throws an explicit conflict when a locally-ch
   vm.runInContext(`
     ${declaration('_cloneJson')}
     const MAX_SPREADSHEET_CONFLICTS = 200;
+    ${declaration('_ssSheetOf')}
     ${declaration('_ssCellsOf')}
+    ${declaration('_ssStampAttribution')}
+    var MAX_SPREADSHEET_ATTRIBUTIONS = 200;
     ${declaration('_ssConflictId')}
+    var currentUser = () => 'Test Editor';
+    ${declaration('_ssAttributionActor')}
+    var MAX_SPREADSHEET_ATTRIBUTION_NAME = 80;
     ${declaration('_deriveSpreadsheetOperations')}
     ${declaration('_applySpreadsheetOperations')}
     ${declaration('_mergeSpreadsheetEdits')}
@@ -1969,8 +1999,14 @@ test('H-08: _mergeSpreadsheetEdits throws when a locally-cleared cell was concur
   vm.runInContext(`
     ${declaration('_cloneJson')}
     const MAX_SPREADSHEET_CONFLICTS = 200;
+    ${declaration('_ssSheetOf')}
     ${declaration('_ssCellsOf')}
+    ${declaration('_ssStampAttribution')}
+    var MAX_SPREADSHEET_ATTRIBUTIONS = 200;
     ${declaration('_ssConflictId')}
+    var currentUser = () => 'Test Editor';
+    ${declaration('_ssAttributionActor')}
+    var MAX_SPREADSHEET_ATTRIBUTION_NAME = 80;
     ${declaration('_deriveSpreadsheetOperations')}
     ${declaration('_applySpreadsheetOperations')}
     ${declaration('_mergeSpreadsheetEdits')}
@@ -2630,8 +2666,14 @@ function ssOpsApi() {
   const context = contextWith({ _cloneJson: v => JSON.parse(JSON.stringify(v)) });
   vm.runInContext(`
     const MAX_SPREADSHEET_CONFLICTS = 200;
+    ${declaration('_ssSheetOf')}
     ${declaration('_ssCellsOf')}
+    ${declaration('_ssStampAttribution')}
+    var MAX_SPREADSHEET_ATTRIBUTIONS = 200;
     ${declaration('_ssConflictId')}
+    var currentUser = () => 'Test Editor';
+    ${declaration('_ssAttributionActor')}
+    var MAX_SPREADSHEET_ATTRIBUTION_NAME = 80;
     ${declaration('_deriveSpreadsheetOperations')}
     ${declaration('_applySpreadsheetOperations')}
     ${declaration('_mergeSpreadsheetEdits')}
@@ -2772,4 +2814,111 @@ test('P0-1: workbook conflicts survive normalization and stay bounded', () => {
   assert.match(norm, /slice\(-MAX_SPREADSHEET_CONFLICTS\)/, 'and are bounded');
   assert.match(norm, /delete source\._conflicts/,
     'malformed conflict metadata is stripped, never allowed to make a valid workbook unloadable');
+});
+
+// --- P0-2: per-cell attribution ---------------------------------------------
+//
+// "Who changed this?" is the question that actually gets asked when a schedule
+// looks wrong. The stamp lives beside the cells rather than inside them: the
+// merge compares cells by value, so an author folded into the cell would make
+// every attribution difference look like a content edit.
+
+const ssStamp = (w, k) => w.projects[0].sheets[0].editedBy?.[k];
+
+test('P0-2: an edit records who made it', () => {
+  const api = ssOpsApi();
+  const base = ssBook({ '0,0': ssCell('old') });
+  const next = ssBook({ '0,0': ssCell('new') });
+  const merged = api.merge(base, base, next);
+  assert.equal(ssAt(merged, '0,0'), 'new');
+  assert.equal(ssStamp(merged, '0,0').by, 'Test Editor');
+  assert.ok(!Number.isNaN(Date.parse(ssStamp(merged, '0,0').at)), 'and when');
+});
+
+test('P0-2: attribution never turns a clean merge into a conflict', () => {
+  // The regression this design exists to prevent: two people editing different
+  // cells must still merge silently even though each carries an author stamp.
+  const api = ssOpsApi();
+  const base = ssBook({});
+  const remote = ssBook({ '0,1': ssCell('theirs') });
+  remote.projects[0].sheets[0].editedBy = { '0,1': { by: 'Carrie Gass', at: '2026-08-05T14:00:00.000Z' } };
+  const mine = ssBook({ '0,0': ssCell('mine') });
+  const merged = api.merge(remote, base, mine);
+  assert.equal(merged._conflicts, undefined, 'no conflict from bookkeeping');
+  assert.equal(ssAt(merged, '0,0'), 'mine');
+  assert.equal(ssAt(merged, '0,1'), 'theirs');
+  assert.equal(ssStamp(merged, '0,0').by, 'Test Editor', 'my edit is mine');
+  assert.equal(ssStamp(merged, '0,1').by, 'Carrie Gass', 'and theirs survives untouched');
+});
+
+test('P0-2: attribution follows the winning value in a conflict', () => {
+  // Both Macs must agree on who the surviving edit belongs to, or the two
+  // devices would disagree about history while agreeing about content.
+  const api = ssOpsApi();
+  const base = ssBook({ '0,0': ssCell('start') });
+  const remote = ssBook({ '0,0': ssCell('zzz') });
+  remote.projects[0].sheets[0].editedBy = { '0,0': { by: 'Carrie Gass', at: '2026-08-05T14:00:00.000Z' } };
+  const mine = ssBook({ '0,0': ssCell('aaa') });
+  const merged = api.merge(remote, base, mine);
+  assert.ok(merged._conflicts?.length, 'the conflict is still recorded');
+  // 'aaa' loses to 'zzz' under the deterministic content rule, so the stamp
+  // must stay with Carrie rather than being overwritten by the loser.
+  assert.equal(ssAt(merged, '0,0'), 'zzz');
+  assert.equal(ssStamp(merged, '0,0').by, 'Carrie Gass');
+});
+
+test('P0-2: replaying the same operation does not rewrite history', () => {
+  const api = ssOpsApi();
+  const base = ssBook({ '0,0': ssCell('old') });
+  const next = ssBook({ '0,0': ssCell('new') });
+  const ops = api.derive(base, next);
+  const once = api.apply(base, ops);
+  const twice = api.apply(once.workbook, ops);
+  assert.deepEqual(
+    twice.workbook.projects[0].sheets[0].editedBy,
+    once.workbook.projects[0].sheets[0].editedBy,
+    'an idempotent replay leaves the original timestamp alone'
+  );
+});
+
+test('P0-2: clearing a cell clears its stamp', () => {
+  const api = ssOpsApi();
+  const base = ssBook({ '0,0': ssCell('x') });
+  base.projects[0].sheets[0].editedBy = { '0,0': { by: 'Carrie Gass', at: '2026-08-05T14:00:00.000Z' } };
+  const next = ssBook({});
+  const merged = api.merge(base, base, next);
+  assert.equal(ssAt(merged, '0,0'), undefined);
+  assert.equal(ssStamp(merged, '0,0'), undefined, 'no orphan stamp is left behind');
+});
+
+test('P0-2: attribution is bounded and malformed entries are dropped, not fatal', () => {
+  const context = contextWith({ TextEncoder });
+  vm.runInContext(`
+    var MAX_SPREADSHEET_ATTRIBUTIONS = 200;
+    var MAX_SPREADSHEET_ATTRIBUTION_NAME = 80;
+    ${declaration('_normalizeSpreadsheetAttribution')}
+    globalThis.norm = (s, c) => _normalizeSpreadsheetAttribution(s, c);
+  `, context);
+  const norm = context.norm;
+
+  const cells = {};
+  const source = {};
+  for (let i = 0; i < 260; i++) {
+    cells['0,' + i] = { v: 'x' };
+    source['0,' + i] = { by: 'A', at: new Date(1700000000000 + i * 1000).toISOString() };
+  }
+  const capped = norm(source, cells);
+  assert.equal(Object.keys(capped).length, 200, 'capped per sheet');
+  assert.ok(capped['0,259'], 'the newest survives');
+  assert.equal(capped['0,0'], undefined, 'the oldest is pruned');
+
+  // A workbook must never become unloadable because a stamp is wrong.
+  assert.equal(norm({ '0,0': { by: '', at: 'x' } }, { '0,0': {} }), null, 'blank author dropped');
+  assert.equal(norm({ '0,0': { by: 'A', at: 'not-a-date' } }, { '0,0': {} }), null, 'bad date dropped');
+  assert.equal(norm({ '0,0': { by: 'A', at: new Date().toISOString(), evil: 1 } }, { '0,0': {} }), null,
+    'unexpected keys dropped');
+  assert.equal(norm({ '9,9': { by: 'A', at: new Date().toISOString() } }, {}), null,
+    'a stamp for a cell that no longer exists is not kept');
+  assert.equal(norm('nonsense', {}), null);
+  assert.equal(norm(null, {}), null);
 });
