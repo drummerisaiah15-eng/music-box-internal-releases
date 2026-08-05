@@ -9100,6 +9100,9 @@ function ssDeleteSheet() {
   ssSave(); ssRender();
 }
 
+let _ssLastCellMouseDown = { r: -1, c: -1, at: 0 };
+const SS_DOUBLE_CLICK_MS = 450;
+
 function ssGridMouseDown(e) {
   const td = e.target.closest('td[data-r]');
   if (!td) return;
@@ -9108,6 +9111,23 @@ function ssGridMouseDown(e) {
   if (_ssEditCell && _ssEditCell.r===r && _ssEditCell.c===c) return;
   // Leaving a different cell — commit it first
   if (_ssEditCell) ssCommitEdit();
+
+  // Detect the double-click here rather than relying on the browser's dblclick
+  // event. Selecting a cell rebuilds the whole table, so the two clicks of a
+  // double-click land on different DOM nodes and dblclick is never dispatched
+  // to the cell at all. That is why editing existing text was impossible:
+  // edit mode was never entered, and select-then-retype was the only way to
+  // change a cell that already had something in it.
+  const now = Date.now();
+  const secondClick = _ssLastCellMouseDown.r === r && _ssLastCellMouseDown.c === c &&
+    (now - _ssLastCellMouseDown.at) <= SS_DOUBLE_CLICK_MS;
+  _ssLastCellMouseDown = { r, c, at: now };
+  if (secondClick) {
+    _ssLastCellMouseDown.at = 0; // a third click must not re-trigger
+    ssStartEdit(r, c, null, { x: e.clientX, y: e.clientY });
+    return;
+  }
+
   _ssSelR=r;_ssSelC=c;_ssSelR2=r;_ssSelC2=c;
   _ssIsSelecting=false;
   _ssDragOrigin={x:e.clientX,y:e.clientY};
@@ -9135,11 +9155,16 @@ function ssGridMouseOver(e) {
   _ssSelR2=+td.dataset.r; _ssSelC2=+td.dataset.c; ssRenderGrid();
 }
 
+// Kept as a fallback for the case where the grid did not need rebuilding and
+// the browser does dispatch dblclick. It must not restart an edit the mousedown
+// handler already began, or the caret it just placed is thrown away.
 function ssGridDblClick(e) {
   const td = e.target.closest('td[data-r]');
   if (!td) return;
+  const r = +td.dataset.r, c = +td.dataset.c;
+  if (_ssEditCell && _ssEditCell.r === r && _ssEditCell.c === c) return;
   // Capture click coordinates so we can position cursor at the click point
-  ssStartEdit(+td.dataset.r, +td.dataset.c, null, { x: e.clientX, y: e.clientY });
+  ssStartEdit(r, c, null, { x: e.clientX, y: e.clientY });
 }
 
 function ssStartEdit(r, c, initChar, clickPos) {

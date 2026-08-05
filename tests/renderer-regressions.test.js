@@ -1037,3 +1037,35 @@ test('derived passcode material is never compared with ===', () => {
   }
   assert.doesNotMatch(script, /await _hashPin\([^)]*\) === /, 'no derived material compared with ===');
 });
+
+test('double-clicking a cell enters edit mode even though selecting rebuilds the grid', () => {
+  // Reproduced directly on the machine: double-click never opened the editor.
+  // Pressing Left afterwards moved the cell SELECTION, which only happens when
+  // no editor is open. Cause: ssGridMouseDown rebuilds the entire table on
+  // every mousedown, so the two clicks of a double-click land on different DOM
+  // nodes and the browser never dispatches dblclick to the cell. Editing text
+  // that was already in a cell was impossible.
+  const down = namedFunctionSource('ssGridMouseDown');
+  assert.match(down, /const secondClick = _ssLastCellMouseDown\.r === r && _ssLastCellMouseDown\.c === c/,
+    'the second click is recognised without the browser event');
+  assert.match(down, /\(now - _ssLastCellMouseDown\.at\) <= SS_DOUBLE_CLICK_MS/);
+  assert.match(down, /if \(secondClick\) \{[\s\S]*?ssStartEdit\(r, c, null, \{ x: e\.clientX, y: e\.clientY \}\)/,
+    'and it opens the editor at the click point');
+  assert.match(down, /_ssLastCellMouseDown\.at = 0;.*third click/,
+    'a third click does not immediately re-trigger');
+
+  // Order matters: the detection must happen before the selection rebuild,
+  // which is the very thing that destroys the browser's dblclick pairing.
+  const detectAt = down.indexOf('const secondClick');
+  const selectAt = down.indexOf('_ssSelR=r;_ssSelC=c;');
+  assert.ok(detectAt > -1 && selectAt > -1 && detectAt < selectAt);
+
+  // The fallback path must not restart an edit already begun, or it throws away
+  // the caret that was just positioned.
+  const dbl = namedFunctionSource('ssGridDblClick');
+  assert.match(dbl, /if \(_ssEditCell && _ssEditCell\.r === r && _ssEditCell\.c === c\) return;/);
+
+  // Clicking inside the open editor still falls through to the browser so the
+  // caret lands where it was clicked.
+  assert.match(down, /if \(_ssEditCell && _ssEditCell\.r===r && _ssEditCell\.c===c\) return;/);
+});
