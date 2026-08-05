@@ -788,3 +788,25 @@ test('clicking a contributor highlights exactly their cells, and toggles off', (
   assert.match(paint, /_ssPresenceColor\(entry\.name\)/);
   assert.match(namedFunctionSource('ssRenderActivityBar'), /_ssPresenceColor\(entry\.name\)/);
 });
+
+test('the activity panel collapses, and remembers that it was collapsed', () => {
+  assert.match(source, /<button id="ss-activity-toggle" type="button" onclick="ssToggleActivityPanel\(\)"><\/button>/);
+  assert.match(source, /#ss-activity-bar\.ss-collapsed \{ width:30px/);
+  assert.match(source, /#ss-activity-bar\.ss-collapsed #ss-activity-content \{ display:none/);
+
+  const toggle = namedFunctionSource('ssToggleActivityPanel');
+  assert.match(toggle, /localStorage\.setItem\(SS_ACTIVITY_COLLAPSED_KEY/,
+    'the preference survives a restart rather than resetting every session');
+  assert.match(namedFunctionSource('_ssActivityCollapsed'), /catch \(_\) \{ return false; \}/,
+    'and unreadable storage falls back to visible instead of throwing');
+
+  const apply = namedFunctionSource('_ssApplyActivityPanelState');
+  // Hiding the panel must not hide the one thing you would not want hidden.
+  assert.match(apply, /const peers = collapsed \? _ssLivePresencePeers\(\) : \[\]/);
+  assert.match(apply, /dot\.style\.background = _ssPresenceColor\(peers\[0\]\.name\)/,
+    'a collapsed panel still shows that someone else is editing');
+  assert.match(apply, /\} else if \(dot\) \{\s*\n\s*dot\.remove\(\);/,
+    'and the indicator goes away when they do');
+  assert.match(namedFunctionSource('ssRenderActivityBar'), /_ssApplyActivityPanelState\(\)/,
+    'the collapsed state is reapplied after every render');
+});
