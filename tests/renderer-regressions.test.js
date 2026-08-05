@@ -626,3 +626,31 @@ test('sync status is always visible and never sits on Connecting forever', () =>
   assert.match(init, /setSyncStatus\(offline \? 'offline' : 'error'\)/,
     'losing the network must not read the same as a broken config');
 });
+
+test('a failed sync says why, on screen, where there is no console', () => {
+  // Packaged builds disable devTools, so console.warn is invisible to whoever
+  // is actually on shift. A red badge alone is indistinguishable from a red
+  // badge for any other reason.
+  const init = namedFunctionSource('initFirebase');
+  assert.match(init, /catch \(pendingError\)/);
+  assert.match(init, /uidEl\.textContent =\s*\n?\s*'Signed in as '/,
+    'the upload failure names itself in the settings panel');
+  assert.match(init, /pendingError\?\.message \|\| String\(pendingError\)/,
+    'and carries the real reason, not a generic string');
+  assert.match(init, /pendingError\?\.code \? ' \(' \+ pendingError\.code \+ '\)' : ''/,
+    'plus the Firebase error code, which is what makes it searchable');
+
+  // The connect path must clear the stale "must be in memberUids" hint once
+  // that is no longer the situation.
+  assert.match(init, /if \(uidEl && !_portablePinStale\) \{[\s\S]*?'Connected as '/,
+    'success replaces the setup hint rather than leaving it on screen');
+
+  // Same treatment for the outer failure.
+  assert.match(init, /'Sync connection failed: ' \+ \(e\?\.message \|\| String\(e\)\) \+\s*\n?\s*\(e\?\.code \? ' \(' \+ e\.code \+ '\)' : ''\)/,
+    'connection failures carry their code too');
+
+  // The underlying flush must keep producing per-key detail for that line to
+  // be worth showing at all.
+  const flush = namedFunctionSource('_flushSyncDeliveries');
+  assert.match(flush, /throw new Error\(problems\.join\('; '\)\)/);
+});

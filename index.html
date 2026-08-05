@@ -5295,9 +5295,24 @@ async function initFirebase() {
     try {
       await _drainPendingSyncWrites();
       setSyncStatus(_portablePinStale ? 'error' : 'live');
+      // The passcode branch already explains itself through a toast; the
+      // connected branch should not leave a stale failure line on screen.
+      if (uidEl && !_portablePinStale) {
+        uidEl.textContent = 'Connected as ' + credential.user.uid + '.';
+      }
     } catch (pendingError) {
+      // A red badge with no reason is the same as no badge: whoever is on
+      // shift can see that sync broke but not what to do about it, and
+      // packaged builds have no console to fall back on.
       console.warn('Pending cloud writes remain after bootstrap:', pendingError?.message || pendingError);
       setSyncStatus('error');
+      if (uidEl) {
+        uidEl.textContent =
+          'Signed in as ' + credential.user.uid +
+          ', but uploading this Mac’s data failed: ' +
+          (pendingError?.message || String(pendingError)) +
+          (pendingError?.code ? ' (' + pendingError.code + ')' : '');
+      }
     }
     updateSyncTimestamp();
     return true;
@@ -5316,7 +5331,10 @@ async function initFirebase() {
     const offline = e?.code === 'SYNC_OFFLINE' || navigator.onLine === false;
     setSyncStatus(offline ? 'offline' : 'error');
     const uidEl = document.getElementById('firebase-auth-uid');
-    if (uidEl) uidEl.textContent = 'Sync connection failed: ' + (e?.message || String(e));
+    if (uidEl) {
+      uidEl.textContent = 'Sync connection failed: ' + (e?.message || String(e)) +
+        (e?.code ? ' (' + e.code + ')' : '');
+    }
     return false;
   }
 }
