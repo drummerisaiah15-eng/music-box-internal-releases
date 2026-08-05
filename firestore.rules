@@ -179,6 +179,29 @@ service cloud.firestore {
         request.resource.data.updated == request.time;
     }
 
+    // Live collaborator presence: who has a sheet open and where their cursor
+    // is. Deliberately NOT under data/ — presence is disposable, rewritten every
+    // few seconds, and must never touch the revision counters that protect real
+    // data. The payload is encrypted with the same shared key as everything
+    // else, so staff names never sit in Firestore as plaintext; the rules can
+    // only bound its size, which is all they need to do.
+    function validPresenceWrite() {
+      return request.resource.data.keys().hasOnly(
+          ['format', 'keyId', 'ciphertext', 'updated']) &&
+        request.resource.data.keys().hasAll(
+          ['format', 'keyId', 'ciphertext', 'updated']) &&
+        request.resource.data.format == 'tmb-sync-aes-gcm-v2' &&
+        request.resource.data.keyId is string &&
+        request.resource.data.keyId.size() >= 16 &&
+        request.resource.data.keyId.size() <= 160 &&
+        request.resource.data.ciphertext is string &&
+        request.resource.data.ciphertext.size() >= 42 &&
+        request.resource.data.ciphertext.size() <= 4000 &&
+        // Server time only: a client cannot claim to be more recently active
+        // than it is, so a stale cursor always ages out.
+        request.resource.data.updated == request.time;
+    }
+
     match /musicbox/{studioCode} {
       allow read: if isStudioMember(studioCode);
       // Membership is provisioned only through the Firebase console/Admin SDK.
@@ -202,6 +225,14 @@ service cloud.firestore {
         );
 
         allow delete: if false;
+      }
+
+      match /presence/{deviceId} {
+        allow read: if isStudioMember(studioCode);
+        allow create, update: if isStudioMember(studioCode) && validPresenceWrite();
+        // Unlike data, presence is meant to be removed: a Mac clears its own
+        // entry when it closes the sheet rather than leaving a ghost cursor.
+        allow delete: if isStudioMember(studioCode);
       }
     }
 

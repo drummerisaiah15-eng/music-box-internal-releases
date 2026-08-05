@@ -6898,7 +6898,8 @@ function navigate(page) {
     renderLogs();
   }
   // Staff Hub removed
-  if (page === 'spreadsheets') initSpreadsheet();
+  if (page === 'spreadsheets') { initSpreadsheet(); ssPresenceStart(); }
+  else ssPresenceStop();
   if (page === 'stepup') renderStepUp();
   if (page === 'policies') loadPoliciesPage();
   if (page === 'settings') { loadSettings(); loadRingCentralSettings(); }
@@ -8107,7 +8108,226 @@ function ssUpdateToolbar() {
   if (mergeBtn) mergeBtn.style.display = '';
   if (unmergeBtn) unmergeBtn.style.display = isMerged ? '' : 'none';
   ssRenderActivityBar();
+  // Publishes only when the cursor actually moved; the signature check inside
+  // makes this safe to call on every toolbar refresh.
+  try { _ssPresencePublish(); } catch (_) {}
+  try { _ssPaintPresenceCursors(); } catch (_) {}
 }
+
+// ─────────────────────────────────────────────────────────────
+// Live collaborator presence
+//
+// Who has a sheet open and where their cursor is. Kept entirely off the data
+// path: presence lives in its own subcollection with no revision counter, so a
+// heartbeat can never collide with, delay, or corrupt a real edit.
+//
+// Write budget matters. This studio is on Firestore's free tier, so a naive
+// timer would burn the daily quota on cursors. A write happens only when the
+// selection actually moves, or once every 15s to prove the Mac is still there,
+// and only while the Spreadsheets page is visible.
+// ─────────────────────────────────────────────────────────────
+const SS_PRESENCE_HEARTBEAT_MS = 15000;
+// Generous relative to the heartbeat: a Mac that misses one write to a slow
+// network should not flicker out of the roster.
+const SS_PRESENCE_TTL_MS = 45000;
+const SS_PRESENCE_MAX_PEERS = 12;
+const SS_PRESENCE_COLORS = [
+  '#c0392b', '#2e86c1', '#1e8449', '#8e44ad',
+  '#d68910', '#16a085', '#c2185b', '#5d6d7e',
+];
+
+let _ssPresenceUnsub = null;
+let _ssPresenceTimer = null;
+let _ssPresencePeers = [];
+let _ssPresenceLastSignature = '';
+let _ssPresenceLastWriteAt = 0;
+let _ssPresenceWriting = false;
+
+function _ssPresenceDeviceId() {
+  let id = localStorage.getItem('tmb__presence_device_id');
+  if (!id || !/^[A-Za-z0-9_-]{8,80}$/.test(id)) {
+    id = 'dev_' + _newRecordId();
+    try { localStorage.setItem('tmb__presence_device_id', id); } catch (_) {}
+  }
+  return id;
+}
+
+function _ssPresenceColor(seed) {
+  let hash = 5381;
+  for (let i = 0; i < seed.length; i++) hash = ((hash * 33) ^ seed.charCodeAt(i)) >>> 0;
+  return SS_PRESENCE_COLORS[hash % SS_PRESENCE_COLORS.length];
+}
+
+function _ssPresenceRef() {
+  return studioRef().collection('presence').doc(_ssPresenceDeviceId());
+}
+
+function _ssPresenceCanPublish() {
+  return !!(_syncReady && _syncBootstrapComplete && _firestoreDb && _syncEncKey &&
+    document.getElementById('page-spreadsheets')?.classList.contains('active'));
+}
+
+async function _ssPresencePublish({ force = false } = {}) {
+  if (!_ssPresenceCanPublish() || _ssPresenceWriting) return false;
+  const project = ssActiveProject();
+  const sheet = ssActiveSheet();
+  if (!project || !sheet) return false;
+  const signature = [project.id, sheet.id, _ssSelR, _ssSelC].join('|');
+  const elapsed = Date.now() - _ssPresenceLastWriteAt;
+  if (!force && signature === _ssPresenceLastSignature && elapsed < SS_PRESENCE_HEARTBEAT_MS) {
+    return false;
+  }
+  _ssPresenceWriting = true;
+  try {
+    const ciphertext = await _aesEncryptWithKey(JSON.stringify({
+      name: _ssAttributionActor() || 'Someone',
+      projectId: project.id,
+      sheetId: sheet.id,
+      cell: ssKey(_ssSelR, _ssSelC),
+    }), _syncEncKey);
+    if (typeof ciphertext !== 'string') return false;
+    await _ssPresenceRef().set({
+      format: SYNC_ENVELOPE_FORMAT,
+      keyId: localStorage.getItem('tmb__sync_key_id'),
+      ciphertext,
+      updated: firebase.firestore.FieldValue.serverTimestamp(),
+    });
+    _ssPresenceLastSignature = signature;
+    _ssPresenceLastWriteAt = Date.now();
+    return true;
+  } catch (error) {
+    // Presence is a convenience. It must never surface as a sync failure or
+    // interrupt the person's editing.
+    console.warn('Presence write skipped:', error?.message || error);
+    return false;
+  } finally {
+    _ssPresenceWriting = false;
+  }
+}
+
+async function _ssPresenceDecode(doc) {
+  const data = doc.data();
+  if (!data || data.format !== SYNC_ENVELOPE_FORMAT) return null;
+  if (!_syncEncKey || data.keyId !== localStorage.getItem('tmb__sync_key_id')) return null;
+  const updatedMs = data.updated?.toMillis?.();
+  if (!Number.isFinite(updatedMs)) return null;
+  const plaintext = await _aesDecryptWithKey(data.ciphertext, _syncEncKey);
+  if (plaintext === null) return null;
+  let parsed;
+  try { parsed = JSON.parse(plaintext); } catch (_) { return null; }
+  if (!parsed || typeof parsed !== 'object') return null;
+  const name = typeof parsed.name === 'string' ? parsed.name.slice(0, 80) : '';
+  if (!name) return null;
+  return {
+    deviceId: doc.id,
+    name,
+    projectId: typeof parsed.projectId === 'string' ? parsed.projectId : '',
+    sheetId: typeof parsed.sheetId === 'string' ? parsed.sheetId : '',
+    cell: /^\d{1,6},\d{1,6}$/.test(parsed.cell) ? parsed.cell : '',
+    updatedMs,
+  };
+}
+
+function _ssPresenceSubscribe() {
+  if (_ssPresenceUnsub || !_syncReady || !_firestoreDb) return;
+  const selfId = _ssPresenceDeviceId();
+  try {
+    _ssPresenceUnsub = studioRef().collection('presence').onSnapshot(
+      async snapshot => {
+        const decoded = await Promise.all(snapshot.docs
+          .filter(doc => doc.id !== selfId)
+          .slice(0, SS_PRESENCE_MAX_PEERS)
+          .map(doc => _ssPresenceDecode(doc).catch(() => null)));
+        _ssPresencePeers = decoded.filter(Boolean);
+        _ssPresenceRenderRoster();
+        ssRenderActivityBar();
+        try { _ssPaintPresenceCursors(); } catch (_) {}
+      },
+      error => console.warn('Presence listener stopped:', error?.message || error)
+    );
+  } catch (error) {
+    console.warn('Presence listener unavailable:', error?.message || error);
+  }
+}
+
+// Entries are dropped by age at render time rather than deleted remotely: a Mac
+// that loses power never gets to clean up after itself, so the roster cannot
+// depend on a goodbye that may never arrive.
+function _ssLivePresencePeers() {
+  const cutoff = Date.now() - SS_PRESENCE_TTL_MS;
+  const project = ssActiveProject();
+  const sheet = ssActiveSheet();
+  return _ssPresencePeers.filter(peer =>
+    peer.updatedMs >= cutoff &&
+    (!project || peer.projectId === project.id) &&
+    (!sheet || peer.sheetId === sheet.id));
+}
+
+function _ssPresenceRenderRoster() {
+  const host = document.getElementById('ss-presence');
+  if (!host) return;
+  host.innerHTML = '';
+  for (const peer of _ssLivePresencePeers()) {
+    const color = _ssPresenceColor(peer.name);
+    const chip = document.createElement('span');
+    chip.style.cssText =
+      `display:inline-flex;align-items:center;gap:5px;padding:2px 8px;border-radius:999px;` +
+      `border:1px solid ${color};color:${color};font-weight:600`;
+    const dot = document.createElement('span');
+    dot.style.cssText = `width:7px;height:7px;border-radius:50%;background:${color}`;
+    chip.appendChild(dot);
+    chip.appendChild(document.createTextNode(peer.name));
+    host.appendChild(chip);
+  }
+}
+
+function _ssPaintPresenceCursors() {
+  const grid = document.getElementById('ss-grid');
+  if (!grid) return;
+  grid.querySelectorAll('[data-presence-cursor]').forEach(cell => {
+    cell.style.outline = '';
+    cell.style.outlineOffset = '';
+    cell.removeAttribute('title');
+    cell.removeAttribute('data-presence-cursor');
+  });
+  for (const peer of _ssLivePresencePeers()) {
+    if (!peer.cell) continue;
+    const [row, col] = peer.cell.split(',');
+    const target = grid.querySelector(`td[data-r="${row}"][data-c="${col}"]`);
+    if (!target) continue;
+    const color = _ssPresenceColor(peer.name);
+    target.style.outline = `2px solid ${color}`;
+    target.style.outlineOffset = '-2px';
+    target.title = `${peer.name} is here`;
+    target.setAttribute('data-presence-cursor', peer.name);
+  }
+}
+
+function ssPresenceStart() {
+  if (!_syncReady) return;
+  _ssPresenceSubscribe();
+  _ssPresencePublish({ force: true });
+  clearInterval(_ssPresenceTimer);
+  _ssPresenceTimer = setInterval(() => { _ssPresencePublish(); }, SS_PRESENCE_HEARTBEAT_MS);
+}
+
+async function ssPresenceStop() {
+  clearInterval(_ssPresenceTimer);
+  _ssPresenceTimer = null;
+  if (_ssPresenceUnsub) {
+    try { _ssPresenceUnsub(); } catch (_) {}
+    _ssPresenceUnsub = null;
+  }
+  _ssPresencePeers = [];
+  _ssPresenceLastSignature = '';
+  _ssPresenceRenderRoster();
+  try { _ssPaintPresenceCursors(); } catch (_) {}
+  if (!_syncReady || !_firestoreDb) return;
+  // Leave no ghost cursor behind for the other Mac.
+  try { await _ssPresenceRef().delete(); } catch (_) {}
+}
+
+window.addEventListener('beforeunload', () => { try { ssPresenceStop(); } catch (_) {} });
 
 function _ssRelativeTime(iso) {
   const then = Date.parse(iso);

@@ -654,3 +654,86 @@ test('a failed sync says why, on screen, where there is no console', () => {
   const flush = namedFunctionSource('_flushSyncDeliveries');
   assert.match(flush, /throw new Error\(problems\.join\('; '\)\)/);
 });
+
+// --- Live collaborator presence ---------------------------------------------
+
+test('presence never rides on the data path that protects real edits', () => {
+  const publish = namedFunctionSource('_ssPresencePublish');
+  const ref = namedFunctionSource('_ssPresenceRef');
+  assert.match(ref, /collection\('presence'\)/, 'its own subcollection');
+  // A cursor heartbeat must never touch a revision counter, a pending record,
+  // or the store — those are what make real edits recoverable.
+  for (const forbidden of [/STORE\./, /revision/i, /_writePendingSyncRecord/, /_queueEncryptedWrite/]) {
+    assert.doesNotMatch(publish, forbidden, `presence stays off the data path: ${forbidden}`);
+  }
+  assert.doesNotMatch(namedFunctionSource('_ssPresenceDecode'), /STORE\./);
+});
+
+test('presence is encrypted, so staff names never sit in Firestore as plaintext', () => {
+  const publish = namedFunctionSource('_ssPresencePublish');
+  assert.match(publish, /_aesEncryptWithKey\(JSON\.stringify\(\{/, 'the payload is encrypted');
+  assert.match(publish, /_syncEncKey/, 'with the shared cloud key, so peers can read it');
+  assert.match(publish, /format: SYNC_ENVELOPE_FORMAT/);
+  // The name must be inside the ciphertext, not a sibling field.
+  const setCall = publish.slice(publish.indexOf('.set({'));
+  assert.doesNotMatch(setCall.slice(0, 240), /name/, 'no plaintext name on the document');
+
+  const decode = namedFunctionSource('_ssPresenceDecode');
+  assert.match(decode, /keyId !== localStorage\.getItem\('tmb__sync_key_id'\)/,
+    'a payload from a different key is ignored rather than guessed at');
+  assert.match(decode, /_aesDecryptWithKey/);
+});
+
+test('presence writes are rationed, because this studio is on the free tier', () => {
+  const publish = namedFunctionSource('_ssPresencePublish');
+  // A plain interval would burn the daily Firestore quota on cursors.
+  assert.match(publish, /signature === _ssPresenceLastSignature && elapsed < SS_PRESENCE_HEARTBEAT_MS/,
+    'an unmoved cursor does not write');
+  assert.match(publish, /if \(!_ssPresenceCanPublish\(\) \|\| _ssPresenceWriting\) return false/,
+    'and overlapping writes are not queued up');
+  const canPublish = namedFunctionSource('_ssPresenceCanPublish');
+  assert.match(canPublish, /page-spreadsheets'\)\?\.classList\.contains\('active'\)/,
+    'nothing is published while the page is closed');
+  assert.match(source, /if \(page === 'spreadsheets'\) \{ initSpreadsheet\(\); ssPresenceStart\(\); \}\s*\n\s*else ssPresenceStop\(\);/,
+    'leaving the page stops the heartbeat');
+});
+
+test('a cursor disappears on its own when a Mac stops reporting', () => {
+  // A Mac that loses power never gets to say goodbye, so the roster cannot
+  // depend on the delete call arriving.
+  const live = namedFunctionSource('_ssLivePresencePeers');
+  assert.match(live, /peer\.updatedMs >= cutoff/, 'stale entries age out at render time');
+  assert.match(source, /const SS_PRESENCE_TTL_MS = \d+/);
+  const decode = namedFunctionSource('_ssPresenceDecode');
+  assert.match(decode, /if \(!Number\.isFinite\(updatedMs\)\) return null/,
+    'an entry with no server timestamp cannot masquerade as live');
+  // Still make the common case clean.
+  assert.match(namedFunctionSource('ssPresenceStop'), /_ssPresenceRef\(\)\.delete\(\)/);
+  assert.match(source, /addEventListener\('beforeunload', \(\) => \{ try \{ ssPresenceStop\(\)/);
+});
+
+test('a broken presence feature never breaks editing', () => {
+  const publish = namedFunctionSource('_ssPresencePublish');
+  assert.match(publish, /console\.warn\('Presence write skipped:'/,
+    'a failed heartbeat is logged, not surfaced as a sync failure');
+  assert.doesNotMatch(publish, /showToast/, 'and never interrupts the person typing');
+  assert.match(namedFunctionSource('_ssPresenceSubscribe'), /console\.warn\('Presence listener/);
+  // Every call site from the editor is guarded.
+  const toolbar = namedFunctionSource('ssUpdateToolbar');
+  assert.match(toolbar, /try \{ _ssPresencePublish\(\); \} catch \(_\) \{\}/);
+  assert.match(toolbar, /try \{ _ssPaintPresenceCursors\(\); \} catch \(_\) \{\}/);
+});
+
+test('the presence rules keep it disposable without loosening the data rules', () => {
+  const rules = fs.readFileSync(path.join(__dirname, '..', 'firestore.rules'), 'utf8');
+  assert.match(rules, /match \/presence\/\{deviceId\}/);
+  assert.match(rules, /allow create, update: if isStudioMember\(studioCode\) && validPresenceWrite\(\)/);
+  // Presence is the one thing that SHOULD be deletable; data must not become so.
+  const presenceBlock = rules.slice(rules.indexOf('match /presence/{deviceId}'));
+  assert.match(presenceBlock, /allow delete: if isStudioMember\(studioCode\)/);
+  const dataBlock = rules.slice(rules.indexOf('match /data/{keyId}'), rules.indexOf('match /presence/'));
+  assert.match(dataBlock, /allow delete: if false/, 'data documents stay undeletable');
+  // Server time only, or a stale cursor could claim to be live forever.
+  assert.match(rules, /request\.resource\.data\.updated == request\.time/);
+  assert.match(rules, /request\.resource\.data\.ciphertext\.size\(\) <= 4000/, 'and bounded');
+});
