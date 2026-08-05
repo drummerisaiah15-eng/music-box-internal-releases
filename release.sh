@@ -52,9 +52,20 @@ verify_isolated_source() {
     exit 1
   fi
   changed_files="$("$GIT_BIN" -C "$RELEASE_SOURCE_DIR" diff --name-only | sort)"
-  if [[ "$changed_files" != $'package-lock.json\npackage.json' ]]; then
+  # V159-010 added the path where the version being shipped is ALREADY committed,
+  # which is the provenance-correct one: the source commit genuinely contains
+  # that version, so an auditor can rebuild the artifact from public source. On
+  # that path no in-place bump happens, so the working tree is identical to the
+  # commit and this diff is empty. Requiring the two version files to differ made
+  # that path impossible to release — it failed here every time, reporting an
+  # empty file list.
+  local expected_changes=$'package-lock.json\npackage.json'
+  if (( VERSION_ALREADY_COMMITTED == 1 )); then
+    expected_changes=""
+  fi
+  if [[ "$changed_files" != "$expected_changes" ]]; then
     echo "ERROR: Isolated release source differs beyond the controlled version files." >&2
-    printf 'Changed files:\n%s\n' "$changed_files" >&2
+    printf 'Expected:\n%s\nChanged files:\n%s\n' "${expected_changes:-<none>}" "${changed_files:-<none>}" >&2
     exit 1
   fi
   if [[ -n "$("$GIT_BIN" -C "$RELEASE_SOURCE_DIR" \
