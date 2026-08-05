@@ -737,3 +737,43 @@ test('the presence rules keep it disposable without loosening the data rules', (
   assert.match(rules, /request\.resource\.data\.updated == request\.time/);
   assert.match(rules, /request\.resource\.data\.ciphertext\.size\(\) <= 4000/, 'and bounded');
 });
+
+// --- Contributor summary and highlight ---------------------------------------
+
+test('the sheet says who changed it, without waiting to be asked', () => {
+  // The first version only showed a stamp for the selected cell, so a sheet
+  // full of tracked edits looked identical to one with none.
+  const summary = namedFunctionSource('_ssContributorSummary');
+  assert.match(summary, /sheet\?\.editedBy \|\| \{\}/, 'derived from the stamps');
+  assert.doesNotMatch(source, /editCount|_ssChangeCounts/,
+    'no second running total that could disagree with the stamps');
+  assert.match(summary, /Date\.parse\(b\.lastAt\) - Date\.parse\(a\.lastAt\)/, 'most recent first');
+
+  const render = namedFunctionSource('ssRenderActivityBar');
+  assert.match(render, /made \$\{count\} change\$\{count === 1 \? '' : 's'\}/, 'names the person and the count');
+  assert.match(render, /No tracked edits on this sheet yet/,
+    'an empty sheet says so rather than showing nothing and looking broken');
+  assert.match(render, /bar\.style\.display = 'flex'/, 'the bar is always present once a sheet is open');
+});
+
+test('clicking a contributor highlights exactly their cells, and toggles off', () => {
+  const toggle = namedFunctionSource('ssToggleContributorHighlight');
+  assert.match(toggle, /_ssHighlightedContributor === name \? null : name/, 'a second click clears it');
+
+  const paint = namedFunctionSource('_ssPaintContributorHighlight');
+  assert.match(paint, /\[data-contributor-highlight\]/, 'a repaint clears the previous one first');
+  assert.match(paint, /entry\.cells/, 'and paints only that person’s cells');
+  // Must not fight the live collaborator cursor, which owns `outline`.
+  assert.match(paint, /style\.boxShadow = `inset 0 0 0 2px \$\{color\}`/,
+    'uses box-shadow so a cell can show both a cursor and a highlight');
+  assert.doesNotMatch(paint, /style\.outline\b/, 'outline belongs to presence');
+
+  // Rebuilding the table drops inline styles, so both repaints must follow it.
+  const toolbar = namedFunctionSource('ssUpdateToolbar');
+  assert.match(toolbar, /try \{ _ssPaintContributorHighlight\(\); \} catch \(_\) \{\}/);
+  assert.match(toolbar, /try \{ _ssPaintPresenceCursors\(\); \} catch \(_\) \{\}/);
+
+  // One person, one colour, everywhere they appear.
+  assert.match(paint, /_ssPresenceColor\(entry\.name\)/);
+  assert.match(namedFunctionSource('ssRenderActivityBar'), /_ssPresenceColor\(entry\.name\)/);
+});

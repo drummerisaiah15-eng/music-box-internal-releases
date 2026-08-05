@@ -1494,7 +1494,8 @@
           <!-- Who is here, and who last touched the selected cell -->
           <div id="ss-activity-bar" style="display:none;align-items:center;gap:12px;flex-wrap:wrap;padding:6px 10px;border-top:1px solid var(--divider);font-size:11.5px;color:var(--text-muted)">
             <div id="ss-presence" style="display:flex;align-items:center;gap:6px;flex-wrap:wrap"></div>
-            <div id="ss-cell-attribution"></div>
+            <div id="ss-contributors" style="display:flex;align-items:center;gap:6px;flex-wrap:wrap"></div>
+            <div id="ss-cell-attribution" style="margin-left:auto"></div>
           </div>
         </div>
       </div>
@@ -8111,6 +8112,9 @@ function ssUpdateToolbar() {
   // Publishes only when the cursor actually moved; the signature check inside
   // makes this safe to call on every toolbar refresh.
   try { _ssPresencePublish(); } catch (_) {}
+  // Both repaints run after every grid render, because rebuilding the table
+  // discards the inline styles they apply.
+  try { _ssPaintContributorHighlight(); } catch (_) {}
   try { _ssPaintPresenceCursors(); } catch (_) {}
 }
 
@@ -8136,6 +8140,7 @@ const SS_PRESENCE_COLORS = [
   '#d68910', '#16a085', '#c2185b', '#5d6d7e',
 ];
 
+let _ssHighlightedContributor = null;
 let _ssPresenceUnsub = null;
 let _ssPresenceTimer = null;
 let _ssPresencePeers = [];
@@ -8344,17 +8349,90 @@ function _ssRelativeTime(iso) {
   return new Date(then).toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' at ' + time;
 }
 
+// Who has edited this sheet, most recent first. Derived from the stamps rather
+// than kept as a second running total, so it can never disagree with them.
+function _ssContributorSummary() {
+  const sheet = ssActiveSheet();
+  const stamps = sheet?.editedBy || {};
+  const byName = new Map();
+  for (const [cellKey, stamp] of Object.entries(stamps)) {
+    const entry = byName.get(stamp.by) || { name: stamp.by, cells: [], lastAt: '' };
+    entry.cells.push(cellKey);
+    if (!entry.lastAt || Date.parse(stamp.at) > Date.parse(entry.lastAt)) entry.lastAt = stamp.at;
+    byName.set(stamp.by, entry);
+  }
+  return [...byName.values()].sort((a, b) => Date.parse(b.lastAt) - Date.parse(a.lastAt));
+}
+
+function ssToggleContributorHighlight(name) {
+  _ssHighlightedContributor = _ssHighlightedContributor === name ? null : name;
+  ssRenderActivityBar();
+  try { _ssPaintContributorHighlight(); } catch (_) {}
+}
+
+// Uses inset box-shadow so it can sit on a cell that also has a live
+// collaborator's cursor outline without the two overwriting each other.
+function _ssPaintContributorHighlight() {
+  const grid = document.getElementById('ss-grid');
+  if (!grid) return;
+  grid.querySelectorAll('[data-contributor-highlight]').forEach(cell => {
+    cell.style.boxShadow = '';
+    cell.removeAttribute('data-contributor-highlight');
+  });
+  if (!_ssHighlightedContributor) return;
+  const entry = _ssContributorSummary().find(c => c.name === _ssHighlightedContributor);
+  if (!entry) return;
+  const color = _ssPresenceColor(entry.name);
+  for (const cellKey of entry.cells) {
+    const [row, col] = cellKey.split(',');
+    const target = grid.querySelector(`td[data-r="${row}"][data-c="${col}"]`);
+    if (!target) continue;
+    target.style.boxShadow = `inset 0 0 0 2px ${color}`;
+    target.setAttribute('data-contributor-highlight', entry.name);
+  }
+}
+
 function ssRenderActivityBar() {
   const bar = document.getElementById('ss-activity-bar');
   const attributionEl = document.getElementById('ss-cell-attribution');
-  if (!bar || !attributionEl) return;
+  const contributorsEl = document.getElementById('ss-contributors');
+  if (!bar || !attributionEl || !contributorsEl) return;
+
   const sheet = ssActiveSheet();
   const stamp = sheet?.editedBy?.[ssKey(_ssSelR, _ssSelC)];
   attributionEl.textContent = stamp
-    ? `${ssColLabel(_ssSelC)}${_ssSelR + 1} — last edited by ${stamp.by}, ${_ssRelativeTime(stamp.at)}`
+    ? `${ssColLabel(_ssSelC)}${_ssSelR + 1} — ${stamp.by}, ${_ssRelativeTime(stamp.at)}`
     : '';
-  const hasPresence = !!document.getElementById('ss-presence')?.childElementCount;
-  bar.style.display = (attributionEl.textContent || hasPresence) ? 'flex' : 'none';
+
+  const contributors = _ssContributorSummary();
+  contributorsEl.innerHTML = '';
+  if (!contributors.length) {
+    // Say so explicitly. A feature that shows nothing looks broken rather than
+    // empty, and existing cells predate any tracking.
+    const empty = document.createElement('span');
+    empty.textContent = 'No tracked edits on this sheet yet — changes from now on are recorded.';
+    contributorsEl.appendChild(empty);
+  }
+  for (const entry of contributors) {
+    const color = _ssPresenceColor(entry.name);
+    const active = _ssHighlightedContributor === entry.name;
+    const chip = document.createElement('button');
+    chip.type = 'button';
+    chip.onclick = () => ssToggleContributorHighlight(entry.name);
+    chip.title = active
+      ? 'Click to stop highlighting'
+      : `Highlight every cell ${entry.name} changed`;
+    chip.style.cssText =
+      `display:inline-flex;align-items:center;gap:6px;padding:2px 9px;border-radius:999px;cursor:pointer;` +
+      `font-size:11.5px;font-weight:600;border:1px solid ${color};` +
+      (active ? `background:${color};color:#fff` : `background:transparent;color:${color}`);
+    const count = entry.cells.length;
+    chip.textContent =
+      `${entry.name} made ${count} change${count === 1 ? '' : 's'}`;
+    contributorsEl.appendChild(chip);
+  }
+
+  bar.style.display = 'flex';
 }
 
 function ssMergeCells() {
