@@ -5371,7 +5371,18 @@ async function initFirebase() {
         storageBucket: projectId + '.appspot.com',
     };
     const existing = (firebase.apps || []).find(app => app.name === appName);
-    if (existing && existing.options?.projectId !== projectId) {
+    // The credentials are baked into the app instance at initializeApp time and
+    // cannot be changed afterwards. Comparing only projectId meant that fixing
+    // a mistyped API key had no effect until the app was quit and reopened:
+    // the corrected key was stored and displayed, while every sign-in kept
+    // using the stale one and reporting auth/api-key-not-valid.
+    const staleConfig = !!existing && [
+      ['projectId', projectId],
+      ['apiKey', apiKey],
+      ['appId', appId || undefined],
+      ['authDomain', config.authDomain],
+    ].some(([field, value]) => (existing.options?.[field] || undefined) !== (value || undefined));
+    if (staleConfig) {
       await existing.delete();
       _firebaseApp = null;
     } else if (existing) {

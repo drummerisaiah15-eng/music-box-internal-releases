@@ -877,3 +877,36 @@ test('a mistyped Firebase API key is diagnosed here, not by a round trip', () =>
   assert.match(source, /id="firebase-api-key" class="form-input" placeholder="AIzaSy\.\.\."\s*\n?\s*spellcheck="false"/,
     'and autocorrect cannot quietly rewrite it');
 });
+
+test('correcting Firebase credentials takes effect without restarting the app', () => {
+  // Reported from real use: the API key was fixed in Settings, stored, and
+  // displayed correctly, yet every attempt still failed with
+  // auth/api-key-not-valid. Credentials are baked into the Firebase app
+  // instance at initializeApp time, and the instance was only rebuilt when the
+  // projectId changed — so a corrected key was never actually used.
+  const init = namedFunctionSource('initFirebase');
+  assert.match(init, /const staleConfig = !!existing && \[/);
+  for (const field of ['projectId', 'apiKey', 'appId', 'authDomain']) {
+    assert.match(init, new RegExp(`\\['${field}',`), `${field} change forces a rebuild`);
+  }
+  assert.match(init, /if \(staleConfig\) \{\s*\n\s*await existing\.delete\(\);/,
+    'the stale instance is torn down, not reused');
+  assert.doesNotMatch(init, /existing\.options\?\.projectId !== projectId/,
+    'the projectId-only comparison is gone');
+
+  // Exercise the comparison itself.
+  const compare = (existingOptions, next) => {
+    const fields = [
+      ['projectId', next.projectId], ['apiKey', next.apiKey],
+      ['appId', next.appId || undefined], ['authDomain', next.authDomain],
+    ];
+    return fields.some(([f, v]) => (existingOptions?.[f] || undefined) !== (v || undefined));
+  };
+  const live = { projectId: 'p', apiKey: 'AIzaGOOD', appId: '1:2:web:3', authDomain: 'p.firebaseapp.com' };
+  assert.equal(compare(live, live), false, 'an unchanged config reuses the instance');
+  assert.equal(compare(live, { ...live, apiKey: 'AIzaFIXED' }), true, 'a corrected key rebuilds it');
+  assert.equal(compare(live, { ...live, appId: '9:9:web:9' }), true);
+  assert.equal(compare(live, { ...live, projectId: 'other' }), true);
+  // Absent and empty must not read as a difference, or every connect rebuilds.
+  assert.equal(compare({ ...live, appId: undefined }, { ...live, appId: '' }), false);
+});
