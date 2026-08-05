@@ -966,3 +966,34 @@ test('the sync badge can never come to rest on Connecting', () => {
   const bailAt = setStatus.indexOf('if (!chip) return;');
   assert.ok(assignAt > -1 && bailAt > -1 && assignAt < bailAt);
 });
+
+test('selecting text inside a cell does not destroy the cell being edited', () => {
+  // Reported from real use: the caret could not be placed inside a word, so the
+  // only way to change a cell was to clear it and retype. Dragging inside the
+  // open cell was being read as a cell range-selection, which re-rendered the
+  // grid and threw away the contenteditable mid-gesture.
+  const over = namedFunctionSource('ssGridMouseOver');
+  assert.match(over, /if \(_ssEditCell\) return;/, 'an open editor owns the drag');
+  const guardAt = over.indexOf('if (_ssEditCell) return;');
+  const renderAt = over.indexOf('ssRenderGrid()');
+  assert.ok(guardAt > -1 && renderAt > -1 && guardAt < renderAt,
+    'and the guard comes before anything that rebuilds the grid');
+
+  // A double-click leaves a drag origin behind; the next mouse move would
+  // otherwise start a range selection over the cell being typed in.
+  const start = namedFunctionSource('ssStartEdit');
+  assert.match(start, /_ssIsSelecting = false;\s*\n\s*_ssDragOrigin = null;/);
+
+  // Clicking inside the open cell must still fall through to the browser so the
+  // caret lands where it was clicked.
+  assert.match(namedFunctionSource('ssGridMouseDown'),
+    /if \(_ssEditCell && _ssEditCell\.r===r && _ssEditCell\.c===c\) return;/);
+  // And arrow keys must reach the cell rather than moving the selection. The
+  // grid key handler is an inline listener, so check it where it lives.
+  const arrowHandler = script.slice(
+    script.lastIndexOf('if (_ssEditCell) return;', script.indexOf("e.key==='ArrowLeft'")),
+    script.indexOf("e.key==='ArrowLeft'")
+  );
+  assert.match(arrowHandler, /if \(_ssEditCell\) return;/,
+    'cell navigation stands down while a cell is open');
+});

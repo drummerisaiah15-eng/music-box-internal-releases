@@ -8988,6 +8988,12 @@ function ssGridMouseDown(e) {
 }
 
 function ssGridMouseOver(e) {
+  // While a cell is open for editing, a held button inside it means the person
+  // is selecting text — placing the caret in the middle of a word, or dragging
+  // over a few letters to replace them. Range-selecting cells here re-rendered
+  // the grid, which destroyed the contenteditable mid-gesture and threw the
+  // caret away, leaving "clear it and retype" as the only way to change a cell.
+  if (_ssEditCell) return;
   // If no mouse button is held (catches trackpad finger-lift that didn't fire mouseup)
   if (e.buttons === 0) { _ssIsSelecting = false; _ssDragOrigin = null; return; }
   if (!_ssDragOrigin) return;
@@ -9016,6 +9022,11 @@ function ssStartEdit(r, c, initChar, clickPos) {
   _ssEditClickPos = clickPos || null;
   _ssEditUndoCaptured = false;
   _ssSelR=r;_ssSelC=c;_ssSelR2=r;_ssSelC2=c;
+  // Drop any in-flight cell drag. Entering edit mode from a double-click leaves
+  // an origin behind, and the next mouse move would have been read as the start
+  // of a range selection over the cell being typed in.
+  _ssIsSelecting = false;
+  _ssDragOrigin = null;
   ssRenderGrid();
 }
 
