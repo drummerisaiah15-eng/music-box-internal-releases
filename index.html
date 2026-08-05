@@ -3601,7 +3601,23 @@ function _resetLocalSyncRevisionsForNewCloud(keys = null) {
   return affected;
 }
 
+// Rebasing an edit needs the value it was derived FROM, not just the revision
+// number that value had. Only kept for keys whose merge strategy actually reads
+// it — it is another full encrypted copy, and carrying one for every key would
+// double this Mac's pending storage for no benefit.
+function _needsMergeBase(key) {
+  return SYNC_MERGE_STRATEGIES[key] === 'spreadsheet-operations';
+}
+
 function _validatePendingSyncRecord(key, record) {
+  // Optional and absent on records written by older builds: a pending write
+  // must never become unreadable because a field was added later.
+  if (record && record.baseCiphertext !== undefined && record.baseCiphertext !== null &&
+      (typeof record.baseCiphertext !== 'string' ||
+        !record.baseCiphertext.startsWith('E:') ||
+        record.baseCiphertext.length > 2_000_000)) {
+    throw new Error(`Pending sync state for ${key} is invalid; the encrypted local value was preserved`);
+  }
   if (!record || record.version !== SYNC_PENDING_STORAGE_VERSION ||
       typeof record.opId !== 'string' || record.opId.length < 8 || record.opId.length > 512 ||
       !Number.isSafeInteger(record.baseRevision) || record.baseRevision < 0 ||
@@ -3646,7 +3662,7 @@ function _readPendingSyncRecord(key) {
   return migrated;
 }
 
-function _writePendingSyncRecord(key, opId, localCiphertext) {
+function _writePendingSyncRecord(key, opId, localCiphertext, baseCiphertext = null) {
   const previous = _readPendingSyncRecord(key);
   const allPredecessors = previous
     ? [...previous.supersededOpIds, previous.opId]
@@ -3661,6 +3677,15 @@ function _writePendingSyncRecord(key, opId, localCiphertext) {
     opId,
     baseRevision: previous ? previous.baseRevision : _localSyncRevision(key),
     localCiphertext,
+    // The base belongs to the whole undelivered run, not to the latest
+    // keystroke. Typing ten more characters while a write is in flight does not
+    // change what this Mac started from, and taking the newest value as the base
+    // would derive an empty set of operations and rebase to a no-op.
+    ...(previous?.baseCiphertext
+      ? { baseCiphertext: previous.baseCiphertext }
+      : (_needsMergeBase(key) && typeof baseCiphertext === 'string' && baseCiphertext.startsWith('E:')
+        ? { baseCiphertext }
+        : {})),
     supersededOpIds: predecessors,
     createdAt: new Date().toISOString(),
   });
@@ -3725,11 +3750,55 @@ const SYNC_MERGE_STRATEGIES = Object.freeze({
   // V159-005: directory entries carry stable ids, versions and tombstones, so
   // two Macs editing different profiles merge instead of clobbering.
   staff_directory: 'tombstoned-record-list',
+  // P0-1's operation model exists precisely for this: replay the operations this
+  // Mac performed onto whichever workbook won the race, rather than choosing a
+  // whole workbook and discarding the other person's afternoon. Sound without
+  // tombstones because deletions are derived as explicit operations and the
+  // ones that cannot be reconciled throw instead of guessing.
+  spreadsheets: 'spreadsheet-operations',
 });
 const MAX_SYNC_MERGE_ATTEMPTS = 3;
 
 function _canAutoMergeSyncKey(key) {
-  return SYNC_MERGE_STRATEGIES[key] === 'tombstoned-record-list';
+  return !!SYNC_MERGE_STRATEGIES[key];
+}
+
+// Thrown when a rebase cannot be decided without the person. Distinct from a
+// failure: the data is intact, but which version survives is not ours to pick.
+class SyncRebaseUndecidable extends Error {
+  constructor(key, reason) {
+    super(reason);
+    this.name = 'SyncRebaseUndecidable';
+    this.code = 'SYNC_REBASE_UNDECIDABLE';
+    this.key = key;
+  }
+}
+
+function _mergeSyncValuesForKey(key, { localValue, remoteValue, baseValue }) {
+  const strategy = SYNC_MERGE_STRATEGIES[key];
+  if (strategy === 'tombstoned-record-list') {
+    return _mergeTombstonedRecordLists(localValue, remoteValue);
+  }
+  if (strategy === 'spreadsheet-operations') {
+    if (!baseValue) {
+      // Without the starting point there is no way to tell this Mac's edits from
+      // the other Mac's. Refusing is the only honest option — guessing here
+      // would silently revert whoever lost the race.
+      throw new SyncRebaseUndecidable(key,
+        'This Mac has an unsent spreadsheet edit from before it recorded what it started from, so it cannot be merged automatically.');
+    }
+    try {
+      // remoteValue is the base to apply onto: it is what the cloud actually
+      // holds now, including the other Mac's edit.
+      return _mergeSpreadsheetEdits(remoteValue, baseValue, localValue);
+    } catch (error) {
+      // H-08: a cell cleared here but changed there, or a sheet deleted on one
+      // side and edited on the other. Preserved as a real conflict rather than
+      // resolved by fiat.
+      throw new SyncRebaseUndecidable(key, error?.message || String(error));
+    }
+  }
+  throw new Error(`No merge strategy is defined for ${key}`);
 }
 
 function _recordSortTime(record) {
@@ -3933,18 +4002,34 @@ async function _rebasePendingOnRemote(key) {
     const plaintext = await _aesDecrypt(pending.localCiphertext);
     if (plaintext === null) return false;
     const localValue = _normalizeSyncValue(key, JSON.parse(plaintext));
-    const merged = _normalizeSyncValue(key, _mergeTombstonedRecordLists(localValue, remoteValue));
+    let baseValue = null;
+    if (pending.baseCiphertext) {
+      const basePlaintext = await _aesDecrypt(pending.baseCiphertext);
+      if (basePlaintext !== null) {
+        try { baseValue = _normalizeSyncValue(key, JSON.parse(basePlaintext)); }
+        catch (_) { baseValue = null; }
+      }
+    }
+    const merged = _normalizeSyncValue(key,
+      _mergeSyncValuesForKey(key, { localValue, remoteValue, baseValue }));
     const serialized = JSON.stringify(merged);
 
     // Drop the stale pending record FIRST so _writePendingSyncRecord derives a
     // fresh baseRevision from the remote revision we just observed, instead of
     // inheriting the superseded one.
     localStorage.removeItem(_pendingSyncStorageKey(key));
+    // The rebased value was derived from the remote we just merged onto, so
+    // that is what a second rebase must diff against — not the pre-merge local
+    // value, which would replay this Mac's edits a second time.
+    const rebasedBase = _needsMergeBase(key)
+      ? await _aesEncrypt(JSON.stringify(remoteValue))
+      : null;
     await _commitEncryptedSnapshot(key, serialized, merged, {
       sync: true,
       preserveTimestamp: true,
       operationId: _newOperationId(),
       remoteRevision,
+      mergeBaseCiphertext: rebasedBase,
     });
     _decCache[key] = merged;
     _refreshForSyncKey(key, merged);
@@ -3986,7 +4071,19 @@ async function _drainSyncKey(key) {
       if (err?.code === 'SYNC_CONFLICT' && _canAutoMergeSyncKey(key) &&
           mergeAttempts < MAX_SYNC_MERGE_ATTEMPTS) {
         mergeAttempts += 1;
-        if (await _rebasePendingOnRemote(key)) continue;
+        let rebased = false;
+        try {
+          rebased = await _rebasePendingOnRemote(key);
+        } catch (rebaseError) {
+          if (rebaseError?.code !== 'SYNC_REBASE_UNDECIDABLE') throw rebaseError;
+          // Both copies are intact; which one survives is the person's call.
+          // Report it as the conflict it is, naming the actual collision rather
+          // than the CAS revision numbers, which explain nothing to anyone.
+          const conflict = new SyncConflictError(key, pending.baseRevision, pending.baseRevision);
+          conflict.message = `${key}: ${rebaseError.message}`;
+          throw conflict;
+        }
+        if (rebased) continue;
       }
       throw err;
     }
@@ -4150,6 +4247,9 @@ async function _commitEncryptedSnapshot(k, serialized, snapshot, options = {}) {
     preserveTimestamp = false,
     operationId = sync && isSyncKey(k) ? _newOperationId() : null,
     remoteRevision = null,
+    // A rebase supplies its own base: the remote value it merged onto, which is
+    // not the same as the local value being overwritten here.
+    mergeBaseCiphertext = null,
   } = options;
   const enc = await _aesEncrypt(serialized);
   if (!enc) throw new Error('encryption key unavailable');
@@ -4177,7 +4277,9 @@ async function _commitEncryptedSnapshot(k, serialized, snapshot, options = {}) {
       localStorage.setItem(prefix + '_local_ts', new Date().toISOString());
     }
     if (sync && isSyncKey(k)) {
-      _writePendingSyncRecord(k, operationId, enc);
+      // prior.ciphertext is the durable value this edit was derived from, read
+      // before the overwrite above. That is the base a rebase needs.
+      _writePendingSyncRecord(k, operationId, enc, mergeBaseCiphertext || prior.ciphertext);
     }
     _lockedStorageKeys.delete(k);
     _storeWriteErrors.delete(k);

@@ -76,6 +76,8 @@ test('rapid same-key writes retain immutable operation ancestry until each ackno
     ${declaration('_localSyncRevision')}
     ${declaration('_validatePendingSyncRecord')}
     ${declaration('_readPendingSyncRecord')}
+    var SYNC_MERGE_STRATEGIES = { logs: 'tombstoned-record-list', staff_directory: 'tombstoned-record-list', spreadsheets: 'spreadsheet-operations' };
+    ${declaration('_needsMergeBase')}
     ${declaration('_writePendingSyncRecord')}
     ${declaration('_acknowledgePendingSyncRecord')}
     globalThis.pendingApi = {
@@ -524,6 +526,8 @@ test('an iCloud apply rolls back if its durable Firebase pending record cannot b
     ${declaration('_localSyncRevision')}
     ${declaration('_validatePendingSyncRecord')}
     ${declaration('_readPendingSyncRecord')}
+    var SYNC_MERGE_STRATEGIES = { logs: 'tombstoned-record-list', staff_directory: 'tombstoned-record-list', spreadsheets: 'spreadsheet-operations' };
+    ${declaration('_needsMergeBase')}
     ${declaration('_writePendingSyncRecord')}
     ${declaration('_serializeKeyMutation')}
     ${declaration('_setOrRemoveStorage')}
@@ -826,6 +830,8 @@ test('restore path reapplies encrypted data, preserves CAS revision, and snapsho
     ${declaration('_localSyncRevision')}
     ${declaration('_validatePendingSyncRecord')}
     ${declaration('_readPendingSyncRecord')}
+    var SYNC_MERGE_STRATEGIES = { logs: 'tombstoned-record-list', staff_directory: 'tombstoned-record-list', spreadsheets: 'spreadsheet-operations' };
+    ${declaration('_needsMergeBase')}
     ${declaration('_writePendingSyncRecord')}
     ${declaration('_serializeKeyMutation')}
     ${declaration('_serializeManyKeyMutations')}
@@ -3124,4 +3130,119 @@ test('the client window matches the one the rules enforce', () => {
   const future = renderer.match(/const CHECKOUT_WRITE_WINDOW_FUTURE_DAYS = (\d+)/)[1];
   assert.match(rules, new RegExp(`duration\\.value\\(${past}, 'd'\\)`), 'retention window agrees');
   assert.match(rules, new RegExp(`duration\\.value\\(${future}, 'd'\\)`), 'skew allowance agrees');
+});
+
+// --- Two Macs editing the same sheet at the same moment ----------------------
+//
+// Reported from real use: simultaneous edits produced a sync conflict and the
+// losing Mac stopped delivering entirely. spreadsheets had no merge strategy,
+// so a CAS collision froze the key until someone chose Use Cloud or Keep This
+// Mac — a whole-workbook choice that necessarily discards one person's work.
+
+function ssRebaseApi() {
+  const context = contextWith({ _cloneJson: v => JSON.parse(JSON.stringify(v)) });
+  vm.runInContext(`
+    const MAX_SPREADSHEET_CONFLICTS = 200;
+    var MAX_SPREADSHEET_ATTRIBUTIONS = 200;
+    var MAX_SPREADSHEET_ATTRIBUTION_NAME = 80;
+    var currentUser = () => 'Test Editor';
+    ${declaration('_ssCellIsBlank')}
+    ${declaration('_ssSheetOf')}
+    ${declaration('_ssCellsOf')}
+    ${declaration('_ssStampAttribution')}
+    ${declaration('_ssConflictId')}
+    ${declaration('_ssAttributionActor')}
+    ${declaration('_deriveSpreadsheetOperations')}
+    ${declaration('_applySpreadsheetOperations')}
+    ${declaration('_mergeSpreadsheetEdits')}
+    ${declaration('_mergeTombstonedRecordLists')}
+    ${script.slice(script.indexOf('class SyncRebaseUndecidable'), script.indexOf('function _mergeSyncValuesForKey'))}
+    var SYNC_MERGE_STRATEGIES = { logs: 'tombstoned-record-list', spreadsheets: 'spreadsheet-operations' };
+    ${declaration('_canAutoMergeSyncKey')}
+    ${declaration('_mergeSyncValuesForKey')}
+    globalThis.api = {
+      merge: (key, parts) => _mergeSyncValuesForKey(key, parts),
+      canMerge: key => _canAutoMergeSyncKey(key),
+    };
+  `, context);
+  return context.api;
+}
+
+test('two Macs editing different cells at once merge without asking anyone', () => {
+  const api = ssRebaseApi();
+  assert.equal(api.canMerge('spreadsheets'), true, 'spreadsheets is mergeable at all');
+
+  const base = ssBook({ '0,0': ssCell('start') });
+  // The other Mac won the race and its edit is what the cloud now holds.
+  const remote = ssBook({ '0,0': ssCell('start'), '0,1': ssCell('theirs') });
+  // This Mac edited a different cell from the same starting point.
+  const local = ssBook({ '0,0': ssCell('start'), '1,0': ssCell('mine') });
+
+  const merged = JSON.parse(JSON.stringify(
+    api.merge('spreadsheets', { localValue: local, remoteValue: remote, baseValue: base })));
+  assert.equal(ssAt(merged, '0,1'), 'theirs', 'the winner keeps their edit');
+  assert.equal(ssAt(merged, '1,0'), 'mine', 'and the loser is not discarded');
+  assert.equal(merged._conflicts, undefined, 'nobody is asked to choose');
+});
+
+test('the same cell edited on both Macs keeps both versions on record', () => {
+  const api = ssRebaseApi();
+  const base = ssBook({ '0,0': ssCell('start') });
+  const remote = ssBook({ '0,0': ssCell('zzz theirs') });
+  const local = ssBook({ '0,0': ssCell('aaa mine') });
+  const merged = JSON.parse(JSON.stringify(
+    api.merge('spreadsheets', { localValue: local, remoteValue: remote, baseValue: base })));
+  assert.ok(merged._conflicts?.length, 'a real collision is recorded, not silently resolved');
+  const conflict = merged._conflicts[0];
+  assert.equal(conflict.local.v, 'aaa mine', 'the losing text is preserved');
+  assert.equal(conflict.remote.v, 'zzz theirs', 'and so is the winning one');
+  assert.equal(ssAt(merged, '0,0'), 'zzz theirs',
+    'both Macs settle on the same survivor, so they converge');
+});
+
+test('a delete-versus-edit collision stops and asks instead of merging', () => {
+  const api = ssRebaseApi();
+  // H-08: cleared here, changed there. A clear has no value to keep, so
+  // resolving it either way destroys something.
+  const base = ssBook({ '0,0': ssCell('start') });
+  const remote = ssBook({ '0,0': ssCell('their change') });
+  const local = ssBook({});
+  assert.throws(
+    () => api.merge('spreadsheets', { localValue: local, remoteValue: remote, baseValue: base }),
+    error => error.code === 'SYNC_REBASE_UNDECIDABLE' && /cleared on this Mac/.test(error.message),
+    'it escalates as undecidable rather than throwing a generic failure'
+  );
+});
+
+test('a pending edit with no recorded base refuses rather than guessing', () => {
+  // Written by an older build, or after storage was trimmed. Without the
+  // starting point there is no way to tell this Mac's edits from the other
+  // Mac's, and guessing would silently revert whoever lost the race.
+  const api = ssRebaseApi();
+  assert.throws(
+    () => api.merge('spreadsheets', {
+      localValue: ssBook({ '0,0': ssCell('mine') }),
+      remoteValue: ssBook({ '0,0': ssCell('theirs') }),
+      baseValue: null,
+    }),
+    error => error.code === 'SYNC_REBASE_UNDECIDABLE' && /what it started from/.test(error.message)
+  );
+});
+
+test('the merge base travels with the pending write and survives more typing', () => {
+  const renderer = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  // The base belongs to the whole undelivered run. Taking the newest local
+  // value would derive an empty operation set and rebase to a no-op.
+  assert.match(renderer, /\.\.\.\(previous\?\.baseCiphertext\s*\n?\s*\? \{ baseCiphertext: previous\.baseCiphertext \}/);
+  // The value being overwritten is the base — read before the overwrite.
+  assert.match(renderer, /_writePendingSyncRecord\(k, operationId, enc, mergeBaseCiphertext \|\| prior\.ciphertext\)/);
+  // A second rebase must diff against what it merged onto, not the pre-merge
+  // local value, or this Mac's edits get replayed twice.
+  assert.match(renderer, /const rebasedBase = _needsMergeBase\(key\)\s*\n\s*\? await _aesEncrypt\(JSON\.stringify\(remoteValue\)\)/);
+  // Only carried where a strategy reads it; it is a second full encrypted copy.
+  assert.match(renderer, /function _needsMergeBase\(key\) \{\s*\n\s*return SYNC_MERGE_STRATEGIES\[key\] === 'spreadsheet-operations';/);
+  // Older records lack the field entirely and must stay readable.
+  assert.match(renderer, /record\.baseCiphertext !== undefined && record\.baseCiphertext !== null &&/);
+  // And the retry stays bounded.
+  assert.match(renderer, /mergeAttempts < MAX_SYNC_MERGE_ATTEMPTS/);
 });
