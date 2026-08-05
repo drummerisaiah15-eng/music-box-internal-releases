@@ -8135,9 +8135,12 @@ const SS_PRESENCE_HEARTBEAT_MS = 15000;
 // network should not flicker out of the roster.
 const SS_PRESENCE_TTL_MS = 45000;
 const SS_PRESENCE_MAX_PEERS = 12;
+// High-chroma on purpose. These have to stay legible on top of the schedule's
+// own fill colours, which are already saturated — a muted palette disappeared
+// into them.
 const SS_PRESENCE_COLORS = [
-  '#c0392b', '#2e86c1', '#1e8449', '#8e44ad',
-  '#d68910', '#16a085', '#c2185b', '#5d6d7e',
+  '#e11d48', '#0ea5e9', '#16a34a', '#9333ea',
+  '#f59e0b', '#06b6d4', '#ec4899', '#f97316',
 ];
 
 let _ssHighlightedContributor = null;
@@ -8375,20 +8378,29 @@ function ssToggleContributorHighlight(name) {
 function _ssPaintContributorHighlight() {
   const grid = document.getElementById('ss-grid');
   if (!grid) return;
-  grid.querySelectorAll('[data-contributor-highlight]').forEach(cell => {
+  grid.querySelectorAll('[data-contributor-highlight], [data-contributor-dim]').forEach(cell => {
     cell.style.boxShadow = '';
+    cell.style.opacity = '';
     cell.removeAttribute('data-contributor-highlight');
+    cell.removeAttribute('data-contributor-dim');
   });
   if (!_ssHighlightedContributor) return;
   const entry = _ssContributorSummary().find(c => c.name === _ssHighlightedContributor);
   if (!entry) return;
   const color = _ssPresenceColor(entry.name);
-  for (const cellKey of entry.cells) {
-    const [row, col] = cellKey.split(',');
-    const target = grid.querySelector(`td[data-r="${row}"][data-c="${col}"]`);
-    if (!target) continue;
-    target.style.boxShadow = `inset 0 0 0 2px ${color}`;
-    target.setAttribute('data-contributor-highlight', entry.name);
+  const wanted = new Set(entry.cells);
+
+  // Ringing the matches is not enough on a sheet that is already a wall of
+  // colour. Fading everything else is what actually makes them jump out.
+  for (const cell of grid.querySelectorAll('td[data-r]')) {
+    const cellKey = `${cell.getAttribute('data-r')},${cell.getAttribute('data-c')}`;
+    if (wanted.has(cellKey)) {
+      cell.style.boxShadow = `inset 0 0 0 3px ${color}, 0 0 8px ${color}`;
+      cell.setAttribute('data-contributor-highlight', entry.name);
+    } else {
+      cell.style.opacity = '0.28';
+      cell.setAttribute('data-contributor-dim', '1');
+    }
   }
 }
 

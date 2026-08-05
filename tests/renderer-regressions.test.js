@@ -764,8 +764,12 @@ test('clicking a contributor highlights exactly their cells, and toggles off', (
   assert.match(paint, /\[data-contributor-highlight\]/, 'a repaint clears the previous one first');
   assert.match(paint, /entry\.cells/, 'and paints only that person’s cells');
   // Must not fight the live collaborator cursor, which owns `outline`.
-  assert.match(paint, /style\.boxShadow = `inset 0 0 0 2px \$\{color\}`/,
+  assert.match(paint, /style\.boxShadow = `inset 0 0 0 3px \$\{color\}, 0 0 8px \$\{color\}`/,
     'uses box-shadow so a cell can show both a cursor and a highlight');
+  // A ring alone vanished into the schedule's own fill colours.
+  assert.match(paint, /cell\.style\.opacity = '0\.28'/, 'everything else fades back');
+  assert.match(paint, /\[data-contributor-highlight\], \[data-contributor-dim\]/,
+    'and both effects are cleared together, so nothing stays faded');
   assert.doesNotMatch(paint, /style\.outline\b/, 'outline belongs to presence');
 
   // Rebuilding the table drops inline styles, so both repaints must follow it.
