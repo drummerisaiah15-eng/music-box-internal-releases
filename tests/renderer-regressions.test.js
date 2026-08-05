@@ -845,3 +845,35 @@ test('no two people on a sheet share a colour', () => {
   assert.equal(new Set(assigned).size, assigned.length,
     `every person got their own colour, got ${JSON.stringify(assigned)}`);
 });
+
+test('a mistyped Firebase API key is diagnosed here, not by a round trip', () => {
+  // "auth/api-key-not-valid" tells you the key is wrong and nothing about why,
+  // and the field was masked so nobody could proof-read their own typing.
+  const context = {};
+  vm.runInNewContext(
+    `${source.match(/const FIREBASE_API_KEY_PATTERN = .*/)[0]}\n` +
+    `${namedFunctionSource('describeFirebaseApiKeyProblem')}\n` +
+    `globalThis.check = k => describeFirebaseApiKeyProblem(k);`,
+    context
+  );
+  const check = context.check;
+  const valid = 'AIza' + 'B'.repeat(35);
+  assert.equal(check(valid), null, 'a well-formed key passes');
+  assert.equal(check(valid.slice(0, 30)), 'A Firebase API Key is 39 characters; this one is 30. It looks truncated — re-copy the whole value.');
+  assert.match(check('1:284007458:web:c153cd92'), /starts with “AIza”/, 'pasting the App ID is named as such');
+  assert.match(check('AIza B'.padEnd(39, 'B')), /contains a space/);
+  assert.match(check(''), /empty/);
+
+  // The check has to run before the network call, or it adds nothing.
+  const save = namedFunctionSource("saveFirebaseSettings");
+  const problemAt = save.indexOf('describeFirebaseApiKeyProblem(apiKey)');
+  const configureAt = save.indexOf('window.electronFirebase.configure');
+  assert.ok(problemAt > -1 && configureAt > -1 && problemAt < configureAt);
+
+  // And the field can be read back, since this value is not a secret.
+  assert.match(source, /onclick="toggleFirebaseKeyVisibility\(\)"/);
+  const toggle = namedFunctionSource('toggleFirebaseKeyVisibility');
+  assert.match(toggle, /field\.type = showing \? 'password' : 'text'/);
+  assert.match(source, /id="firebase-api-key" class="form-input" placeholder="AIzaSy\.\.\."\s*\n?\s*spellcheck="false"/,
+    'and autocorrect cannot quietly rewrite it');
+});

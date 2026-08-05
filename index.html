@@ -398,6 +398,13 @@
     /* ── FORM ELEMENTS ── */
     .form-group { margin-bottom: 16px; }
     .form-label { font-size: 12px; font-weight: 600; color: var(--text-secondary); margin-bottom: 6px; display: block; text-transform: uppercase; letter-spacing: .07em; }
+    .btn-reveal {
+      margin-left: 8px; padding: 1px 7px; cursor: pointer; vertical-align: baseline;
+      font-size: 10px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase;
+      border: 1px solid var(--divider); border-radius: 5px;
+      background: var(--bg); color: var(--text-muted);
+    }
+    .btn-reveal:hover { background: var(--surface-2); color: var(--text); }
     .form-input, .form-textarea, .form-select {
       width: 100%;
       background: var(--bg);
@@ -1946,8 +1953,17 @@
         </div>
         <div class="grid-2">
           <div class="form-group">
-            <label class="form-label">Firebase API Key</label>
-            <input type="password" id="firebase-api-key" class="form-input" placeholder="AIzaSy..." />
+            <label class="form-label">
+              Firebase API Key
+              <button type="button" class="btn-reveal" id="firebase-api-key-reveal"
+                onclick="toggleFirebaseKeyVisibility()">Show</button>
+            </label>
+            <!-- Not a secret: Google ships this key inside every web client, and
+                 access is governed by firestore.rules and memberUids. Masking it
+                 only stopped people proof-reading their own typing, which is the
+                 single most common reason a new Mac fails to connect. -->
+            <input type="password" id="firebase-api-key" class="form-input" placeholder="AIzaSy..."
+              spellcheck="false" autocapitalize="off" autocorrect="off" />
           </div>
           <div class="form-group">
             <label class="form-label">Firebase Project ID</label>
@@ -6821,6 +6837,13 @@ async function saveFirebaseSettings() {
     showToast('Studio Code must be 8–80 letters, numbers, underscores, or hyphens.', 'warning');
     return;
   }
+  const apiKeyProblem = describeFirebaseApiKeyProblem(apiKey);
+  if (apiKeyProblem) {
+    showToast(apiKeyProblem, 'warning');
+    const uidEl = document.getElementById('firebase-auth-uid');
+    if (uidEl) uidEl.textContent = apiKeyProblem + ' Use Show to check what you typed.';
+    return;
+  }
 
   try {
     if (!window.electronFirebase?.configure) {
@@ -9235,6 +9258,32 @@ function getShortName() {
 // ─────────────────────────────────────────────────────────────
 // USER PREFS
 // ─────────────────────────────────────────────────────────────
+// A Firebase web API key is 'AIza' followed by 35 URL-safe characters. Checking
+// the shape locally turns "auth/api-key-not-valid" — which says nothing about
+// what is wrong with it — into a specific answer before a round trip.
+const FIREBASE_API_KEY_PATTERN = /^AIza[A-Za-z0-9_-]{35}$/;
+
+function describeFirebaseApiKeyProblem(key) {
+  if (!key) return 'The Firebase API Key is empty.';
+  if (FIREBASE_API_KEY_PATTERN.test(key)) return null;
+  if (/\s/.test(key)) return 'The Firebase API Key contains a space — it should be one unbroken string.';
+  if (!key.startsWith('AIza')) return 'A Firebase API Key starts with “AIza”. This looks like a different value from the config — check you did not paste the App ID or Project ID.';
+  if (key.length !== 39) {
+    return `A Firebase API Key is 39 characters; this one is ${key.length}. ` +
+      (key.length < 39 ? 'It looks truncated — re-copy the whole value.' : 'Something extra came along with it.');
+  }
+  return 'The Firebase API Key contains a character that cannot appear in one.';
+}
+
+function toggleFirebaseKeyVisibility() {
+  const field = document.getElementById('firebase-api-key');
+  const button = document.getElementById('firebase-api-key-reveal');
+  if (!field || !button) return;
+  const showing = field.type === 'text';
+  field.type = showing ? 'password' : 'text';
+  button.textContent = showing ? 'Show' : 'Hide';
+}
+
 async function loadSettings() {
   await loadAnthropicKeyStatus(true);
   const name = currentUser() || 'Elizabeth Chaves';
