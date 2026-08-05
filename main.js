@@ -1873,10 +1873,26 @@ _secureHandle('firebase-config-status', async () => {
   };
 });
 
+// Any signed-in profile on a provisioned Mac may start cloud sync.
+//
+// This is deliberately weaker than Owner-only, and worth being precise about
+// what it does and does not change. A staff renderer that inherited a live
+// session already held full Firestore read/write through the SDK — the same
+// capability this credential grants. What Owner-only actually bought was that
+// staff had it only when the owner happened to sign in first that morning, and
+// otherwise silently worked offline while believing they were synced. That is
+// not a security boundary, it is a coin flip.
+//
+// What it does concede: a passwordless Front Desk profile can now obtain a
+// credential that works outside the app, where the UI's role gates do not
+// apply. Provisioning still requires the owner — the vault is written only by
+// firebase-configure, which stays Owner-only — so this releases an existing
+// secret to an existing session rather than letting anyone create one.
 _secureHandle('firebase-runtime-config', async () => {
-  _requireAppRole(new Set(['Owner']));
+  // A session is still required: this must not be reachable before login.
+  _requireAppRole(new Set(['Owner', 'Operations & Events', 'Front Desk']));
   if (firebaseRuntimeSecretIssued) {
-    throw new Error('Firebase runtime credentials were already delivered for this owner session.');
+    throw new Error('Firebase runtime credentials were already delivered for this app session.');
   }
   const config = _firebaseConfigFromVault(_loadSecretVault());
   if (_validFirebaseConfig(config)) firebaseRuntimeSecretIssued = true;

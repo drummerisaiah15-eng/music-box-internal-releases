@@ -1148,3 +1148,32 @@ test('an update failure is reported in language that names the real problem', ()
   assert.match(main, /console\.warn\('\[updater\] Error:', raw\)/,
     'the original text stays in the log so a real fault is still diagnosable');
 });
+
+test('any signed-in profile can start cloud sync, but only on a provisioned Mac', () => {
+  // Staff previously had cloud sync only when the owner happened to sign in
+  // first that session; otherwise they worked offline while the badge implied
+  // otherwise. That was not a security boundary, it was a coin flip — a staff
+  // renderer inheriting a live session already had full Firestore access.
+  const handler = main.slice(main.indexOf("_secureHandle('firebase-runtime-config'"));
+  const body = handler.slice(0, handler.indexOf('});') + 3);
+  assert.match(body, /_requireAppRole\(new Set\(\['Owner', 'Operations & Events', 'Front Desk'\]\)\)/);
+  // A session is still mandatory: this must not be reachable before login.
+  assert.match(body, /_requireAppRole\(/);
+  assert.match(body, /firebaseRuntimeSecretIssued/, 'and it is still issue-once per session');
+
+  // Provisioning stays owner-only, so this releases an existing secret rather
+  // than letting anyone create one.
+  const configure = main.slice(main.indexOf("_secureHandle('firebase-configure'"));
+  assert.match(configure.slice(0, 400), /_requireAppRole\(new Set\(\['Owner'\]\)\)/,
+    'writing the credential is still the owner alone');
+  const clear = main.slice(main.indexOf("_secureHandle('firebase-clear'"));
+  assert.match(clear.slice(0, 400), /_requireAppRole\(new Set\(\['Owner'\]\)\)/,
+    'and so is removing it');
+
+  // Switching profiles must re-arm the one-shot, or the second profile in a
+  // session would be refused its own credential.
+  for (const fn of ['_resetAppSession', '_setAppSession']) {
+    assert.match(extractFunction(main, fn), /firebaseRuntimeSecretIssued = false/,
+      `${fn} re-arms the credential release`);
+  }
+});

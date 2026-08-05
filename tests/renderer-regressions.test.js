@@ -178,12 +178,16 @@ test('Microsoft OAuth and Graph authority stay behind the main-process proxy', (
   );
 });
 
-test('Firebase password retrieval is owner-only and cleared after authentication', () => {
+test('Firebase password retrieval needs a session, is issue-once, and is cleared after use', () => {
+  // Retrieval opened up to every signed-in profile so staff are not silently
+  // offline until the owner happens to log in. Writing and clearing the
+  // credential are still owner-only, which is the boundary that matters:
+  // this releases an existing secret rather than letting anyone create one.
   assert.match(
     mainSource,
-    /_secureHandle\('firebase-runtime-config'[\s\S]*?_requireAppRole\(new Set\(\['Owner'\]\)\)/
+    /_secureHandle\('firebase-runtime-config'[\s\S]*?_requireAppRole\(new Set\(\['Owner', 'Operations & Events', 'Front Desk'\]\)\)/
   );
-  assert.match(mainSource, /if \(firebaseRuntimeSecretIssued\)[\s\S]*already delivered for this owner session/);
+  assert.match(mainSource, /if \(firebaseRuntimeSecretIssued\)[\s\S]*already delivered for this app session/);
   assert.match(mainSource, /if \(_validFirebaseConfig\(config\)\) firebaseRuntimeSecretIssued = true/);
   assert.match(script, /_loadFirebaseSecrets\(\{ includePassword: true \}\)/);
   assert.match(
