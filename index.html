@@ -4061,8 +4061,41 @@ function _unsyncedSyncKeys() {
   return getSyncKeys().filter(key => _syncKeyStatus(key) !== 'current');
 }
 
+// A checkout day that has aged out of the retention window can never be
+// accepted by the rules, no matter how many times it is retried. Retire the
+// delivery rather than failing forever: the encrypted local copy is untouched
+// and still readable here, only the promise to upload it is abandoned — and it
+// is reported, because "kept on this Mac only" is a fact the studio needs.
+function _retireUndeliverableCheckouts(wanted) {
+  const retired = [];
+  for (const key of getSyncKeys()) {
+    if (wanted && !wanted.has(key)) continue;
+    if (!_isCheckoutKey(key) || _checkoutKeyIsWritable(key)) continue;
+    let pending = null;
+    try { pending = _readPendingSyncRecord(key); } catch (_) { pending = true; }
+    if (!pending && !_syncDeliveryErrors.has(key)) continue;
+    try { localStorage.removeItem(_pendingSyncStorageKey(key)); } catch (_) {}
+    try { localStorage.removeItem('tmb_' + key + '_pending_op'); } catch (_) {}
+    try { localStorage.removeItem('tmb_' + key + '_pending_base_revision'); } catch (_) {}
+    _syncDeliveryErrors.delete(key);
+    retired.push(key);
+  }
+  if (retired.length) {
+    console.warn(`Retired ${retired.length} checkout day(s) past the cloud retention window: ${retired.join(', ')}`);
+    showToast(
+      `${retired.length} old checkout day${retired.length === 1 ? '' : 's'} ` +
+      `(${retired.map(k => k.slice(9)).join(', ')}) ${retired.length === 1 ? 'is' : 'are'} ` +
+      `older than the ${CHECKOUT_WRITE_WINDOW_PAST_DAYS}-day cloud window. ` +
+      `They are kept on this Mac but will not upload.`,
+      'warning'
+    );
+  }
+  return retired;
+}
+
 async function _flushSyncDeliveries(keys = null) {
   const wanted = keys ? new Set(keys) : null;
+  _retireUndeliverableCheckouts(wanted);
   // V160-008: a quarantined key must be reported even when it has NO pending
   // record. Building targets from pending records alone let a quarantined key
   // with nothing queued pass the flush as a success.
@@ -4564,6 +4597,23 @@ function _isCheckoutKey(key) {
   const value = key.slice(9);
   const parsed = new Date(value + 'T12:00:00');
   return Number.isFinite(parsed.getTime()) && _todayLocal(parsed) === value;
+}
+
+// firestore.rules bounds writable checkout documents to a retention window so a
+// stolen credential cannot pre-create millions of date-shaped documents. The
+// window is deliberately not negotiable from the client — but it means a Mac
+// holding an older checkout day can never deliver it, and retrying forever left
+// sync permanently red with no way out. Keep these numbers in step with
+// writableDataKey() in firestore.rules.
+const CHECKOUT_WRITE_WINDOW_PAST_DAYS = 45;
+const CHECKOUT_WRITE_WINDOW_FUTURE_DAYS = 1;
+
+function _checkoutKeyIsWritable(key, now = new Date()) {
+  if (!_isCheckoutKey(key)) return true; // not a checkout key; not our business
+  const day = key.slice(9);
+  const oldest = new Date(now.getTime() - CHECKOUT_WRITE_WINDOW_PAST_DAYS * 86400000);
+  const newest = new Date(now.getTime() + CHECKOUT_WRITE_WINDOW_FUTURE_DAYS * 86400000);
+  return day >= _todayLocal(oldest) && day <= _todayLocal(newest);
 }
 
 function getSyncKeys() {

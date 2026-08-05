@@ -123,6 +123,9 @@ test('writes held during Firebase bootstrap are drained only after bootstrap com
   });
   vm.runInContext(`
     ${declaration('_scheduleSyncDrain')}
+    ${declaration('_isCheckoutKey')}
+    ${declaration('_checkoutKeyIsWritable')}
+    ${declaration('_retireUndeliverableCheckouts')}
     ${declaration('_flushSyncDeliveries')}
     ${declaration('_drainPendingSyncWrites')}
     globalThis.bootstrapApi = {
@@ -446,6 +449,9 @@ test('iCloud-applied values create durable Firebase work offline and drain after
     ${declaration('_commitEncryptedSnapshot')}
     ${declaration('_persistRemoteValue')}
     ${declaration('_scheduleSyncDrain')}
+    ${declaration('_isCheckoutKey')}
+    ${declaration('_checkoutKeyIsWritable')}
+    ${declaration('_retireUndeliverableCheckouts')}
     ${declaration('_flushSyncDeliveries')}
     ${declaration('_drainPendingSyncWrites')}
     globalThis.icloudApi = {
@@ -1189,6 +1195,9 @@ test('MB-009: a quarantined key with a pending record fails the flush', async ()
   });
   vm.runInContext(`
     ${declaration('_scheduleSyncDrain')}
+    ${declaration('_isCheckoutKey')}
+    ${declaration('_checkoutKeyIsWritable')}
+    ${declaration('_retireUndeliverableCheckouts')}
     ${declaration('_flushSyncDeliveries')}
     globalThis.quarantineApi = { flush: keys => _flushSyncDeliveries(keys) };
   `, context);
@@ -1222,6 +1231,9 @@ test('MB-009: healthy keys still drain while another key is quarantined', async 
       return true;
     };
     ${declaration('_scheduleSyncDrain')}
+    ${declaration('_isCheckoutKey')}
+    ${declaration('_checkoutKeyIsWritable')}
+    ${declaration('_retireUndeliverableCheckouts')}
     ${declaration('_flushSyncDeliveries')}
     globalThis.quarantineApi = {
       flush: keys => _flushSyncDeliveries(keys),
@@ -1521,6 +1533,9 @@ test('V160-003: a held key can never be scheduled for delivery', async () => {
   });
   vm.runInContext(`
     ${declaration('_scheduleSyncDrain')}
+    ${declaration('_isCheckoutKey')}
+    ${declaration('_checkoutKeyIsWritable')}
+    ${declaration('_retireUndeliverableCheckouts')}
     ${declaration('_flushSyncDeliveries')}
     globalThis.holdApi = {
       schedule: k => _scheduleSyncDrain(k),
@@ -3042,4 +3057,68 @@ test('P0-2: visiting a cell is not an edit', () => {
     [...api.derive(base, ssBook({ '0,3': { v: '', bg: '', tc: '', b: true } }))].length, 1,
     'so is bold'
   );
+});
+
+// --- Checkout days that age out of the cloud retention window ----------------
+
+test('a checkout day older than the cloud window stops being retried', () => {
+  // firestore.rules deliberately refuses checkout documents outside a retention
+  // window, so a Mac holding an older day could never deliver it and sync sat
+  // permanently red on "Missing or insufficient permissions" with no way out.
+  const store = new Map([
+    ['tmb_checkout_2026-06-18_pending_sync', JSON.stringify({ version: 3, opId: 'op-1234567890', baseRevision: 0, localCiphertext: 'E:old', supersededOpIds: [] })],
+    ['tmb_checkout_2026-06-18', 'E:old'],
+    ['tmb_checkout_2026-08-05_pending_sync', JSON.stringify({ version: 3, opId: 'op-0987654321', baseRevision: 0, localCiphertext: 'E:today', supersededOpIds: [] })],
+  ]);
+  const errors = new Map([['checkout_2026-06-18', new Error('Missing or insufficient permissions.')]]);
+  const toasts = [];
+  const context = contextWith({
+    localStorage: {
+      getItem: k => (store.has(k) ? store.get(k) : null),
+      setItem: (k, v) => store.set(k, String(v)),
+      removeItem: k => store.delete(k),
+    },
+    getSyncKeys: () => ['checkout_2026-06-18', 'checkout_2026-08-05', 'logs'],
+    _pendingSyncStorageKey: key => 'tmb_' + key + '_pending_sync',
+    _readPendingSyncRecord: key => store.get('tmb_' + key + '_pending_sync') || null,
+    _syncDeliveryErrors: errors,
+    showToast: (msg) => toasts.push(msg),
+    _todayLocal: (d = new Date('2026-08-05T12:00:00')) => new Date(d).toISOString().slice(0, 10),
+  });
+  vm.runInContext(`
+    ${declaration('_isCheckoutKey')}
+    ${declaration('_checkoutKeyIsWritable')}
+    ${declaration('_retireUndeliverableCheckouts')}
+    globalThis.retire = () => _retireUndeliverableCheckouts(null);
+    globalThis.writable = (k, now) => _checkoutKeyIsWritable(k, now);
+  `, context);
+
+  const now = new Date('2026-08-05T12:00:00');
+  assert.equal(context.writable('checkout_2026-06-18', now), false, '48 days back is outside the window');
+  assert.equal(context.writable('checkout_2026-08-05', now), true, 'today is inside it');
+  assert.equal(context.writable('checkout_2026-08-06', now), true, 'tomorrow covers timezone skew');
+  assert.equal(context.writable('logs', now), true, 'non-checkout keys are not this function’s business');
+
+  assert.deepEqual([...context.retire()], ['checkout_2026-06-18']);
+  // The promise to upload is abandoned; the data itself is not.
+  assert.equal(store.get('tmb_checkout_2026-06-18_pending_sync'), undefined, 'no more doomed retries');
+  assert.equal(store.get('tmb_checkout_2026-06-18'), 'E:old', 'the encrypted local copy stays');
+  assert.equal(errors.has('checkout_2026-06-18'), false, 'and it stops reporting as an error');
+  // A day still inside the window must be left completely alone.
+  assert.ok(store.get('tmb_checkout_2026-08-05_pending_sync'), 'a deliverable day is untouched');
+
+  assert.equal(toasts.length, 1, 'silently dropping an upload would be worse than the error');
+  assert.match(toasts[0], /kept on this Mac but will not upload/);
+  assert.match(toasts[0], /2026-06-18/, 'and says which day');
+});
+
+test('the client window matches the one the rules enforce', () => {
+  // If these drift, the client either retries something the rules will always
+  // refuse, or abandons something they would have accepted.
+  const renderer = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const rules = fs.readFileSync(path.join(__dirname, '..', 'firestore.rules'), 'utf8');
+  const past = renderer.match(/const CHECKOUT_WRITE_WINDOW_PAST_DAYS = (\d+)/)[1];
+  const future = renderer.match(/const CHECKOUT_WRITE_WINDOW_FUTURE_DAYS = (\d+)/)[1];
+  assert.match(rules, new RegExp(`duration\\.value\\(${past}, 'd'\\)`), 'retention window agrees');
+  assert.match(rules, new RegExp(`duration\\.value\\(${future}, 'd'\\)`), 'skew allowance agrees');
 });
