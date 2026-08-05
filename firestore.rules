@@ -185,6 +185,11 @@ service cloud.firestore {
     // data. The payload is encrypted with the same shared key as everything
     // else, so staff names never sit in Firestore as plaintext; the rules can
     // only bound its size, which is all they need to do.
+    // Matches the ids the client actually mints: 'dev_' plus a record id.
+    function validPresenceDeviceId(deviceId) {
+      return deviceId.matches('dev_[A-Za-z0-9_-]{8,72}');
+    }
+
     function validPresenceWrite() {
       return request.resource.data.keys().hasOnly(
           ['format', 'keyId', 'ciphertext', 'updated']) &&
@@ -229,9 +234,19 @@ service cloud.firestore {
 
       match /presence/{deviceId} {
         allow read: if isStudioMember(studioCode);
-        allow create, update: if isStudioMember(studioCode) && validPresenceWrite();
+        // Every other collection is bounded by an explicit key allowlist. This
+        // one takes an id from the client, so constrain its shape: a member
+        // credential should not be able to spray documents under arbitrary
+        // names. This bounds the namespace, not the count — Firestore rules
+        // cannot count documents — so the real limit is that a Mac writes to
+        // exactly one id, and stale entries are already ignored by age.
+        allow create, update: if isStudioMember(studioCode) &&
+          validPresenceDeviceId(deviceId) && validPresenceWrite();
         // Unlike data, presence is meant to be removed: a Mac clears its own
         // entry when it closes the sheet rather than leaving a ghost cursor.
+        // Any member may delete any entry — all Macs share one Firebase
+        // identity, so the rules cannot tell them apart. The worst case is a
+        // cursor disappearing, which the TTL would have done anyway.
         allow delete: if isStudioMember(studioCode);
       }
     }

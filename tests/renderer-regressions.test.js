@@ -727,7 +727,13 @@ test('a broken presence feature never breaks editing', () => {
 test('the presence rules keep it disposable without loosening the data rules', () => {
   const rules = fs.readFileSync(path.join(__dirname, '..', 'firestore.rules'), 'utf8');
   assert.match(rules, /match \/presence\/\{deviceId\}/);
-  assert.match(rules, /allow create, update: if isStudioMember\(studioCode\) && validPresenceWrite\(\)/);
+  assert.match(rules, /allow create, update: if isStudioMember\(studioCode\) &&\s*\n\s*validPresenceDeviceId\(deviceId\) && validPresenceWrite\(\)/);
+  // Every other collection is bounded by a key allowlist; this one takes an id
+  // from the client, so its shape has to be constrained too.
+  assert.match(rules, /function validPresenceDeviceId\(deviceId\) \{\s*\n\s*return deviceId\.matches\('dev_\[A-Za-z0-9_-\]\{8,72\}'\);/);
+  // Client and rules must agree, or writes are rejected server-side and
+  // presence silently stops working.
+  assert.match(source, /!\/\^dev_\[A-Za-z0-9_-\]\{8,72\}\$\/\.test\(id\)/);
   // Presence is the one thing that SHOULD be deletable; data must not become so.
   const presenceBlock = rules.slice(rules.indexOf('match /presence/{deviceId}'));
   assert.match(presenceBlock, /allow delete: if isStudioMember\(studioCode\)/);
@@ -996,4 +1002,34 @@ test('selecting text inside a cell does not destroy the cell being edited', () =
   );
   assert.match(arrowHandler, /if \(_ssEditCell\) return;/,
     'cell navigation stands down while a cell is open');
+});
+
+test('derived passcode material is never compared with ===', () => {
+  // Comparing a PBKDF2 output with === leaks how many leading characters
+  // matched. The main process already used timingSafeEqual for the
+  // authoritative check; the renderer path was the one place that did not.
+  const compare = namedFunctionSource('_constantTimeEquals');
+  assert.match(compare, /const length = Math\.max\(left\.length, right\.length\)/,
+    'the loop count does not depend on where the first difference is');
+  assert.match(compare, /let difference = left\.length \^ right\.length/,
+    'and a length mismatch is folded in rather than returning early');
+  assert.doesNotMatch(compare, /return (true|false);/, 'no early exit at all');
+
+  const context = {};
+  vm.runInNewContext(`${compare}\nglobalThis.eq = _constantTimeEquals;`, context);
+  assert.equal(context.eq('abc', 'abc'), true);
+  assert.equal(context.eq('abc', 'abd'), false);
+  assert.equal(context.eq('abc', 'abcd'), false, 'a prefix is not a match');
+  assert.equal(context.eq('', ''), true);
+  assert.equal(context.eq(null, ''), true, 'null and empty both normalise');
+
+  // Every passcode comparison must go through it.
+  for (const call of [
+    /_constantTimeEquals\(await _hashPin\(pin, salt, state\.iterations\), state\.hash\)/,
+    /_constantTimeEquals\(\s*\n\s*await _hashPin\(_pinBuffer, _b64ToBytes\(psB64\), iterations\), stored\)/,
+    /_constantTimeEquals\(_pinBuffer, stored\)/,
+  ]) {
+    assert.match(script, call, `passcode comparison uses the constant-time helper: ${call}`);
+  }
+  assert.doesNotMatch(script, /await _hashPin\([^)]*\) === /, 'no derived material compared with ===');
 });

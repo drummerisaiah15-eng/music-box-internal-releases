@@ -2627,6 +2627,24 @@ function _clearPinFailures() {
   localStorage.removeItem('tmb__pin_lock_until');
 }
 
+// Comparing derived key material with === leaks how many leading characters
+// matched through timing. The main process already uses timingSafeEqual for the
+// authoritative check; this is the legacy renderer path, and it should not be
+// the one place the pattern is not followed.
+function _constantTimeEquals(a, b) {
+  const left = String(a ?? '');
+  const right = String(b ?? '');
+  // Compare a fixed number of characters regardless of length, so the loop
+  // count reveals nothing. A length difference is folded into the result
+  // instead of returning early.
+  const length = Math.max(left.length, right.length);
+  let difference = left.length ^ right.length;
+  for (let i = 0; i < length; i++) {
+    difference |= (left.charCodeAt(i) || 0) ^ (right.charCodeAt(i) || 0);
+  }
+  return difference === 0;
+}
+
 async function _hashPin(pin, salt, iterations) {
   const km = await crypto.subtle.importKey('raw', new TextEncoder().encode(pin), 'PBKDF2', false, ['deriveBits']);
   const bits = await crypto.subtle.deriveBits(
@@ -2676,7 +2694,7 @@ async function _pinMatchesHashState(pin, state) {
   let salt;
   try { salt = _b64ToBytes(state.salt); } catch { return false; }
   if (salt.byteLength !== 16) return false;
-  return await _hashPin(pin, salt, state.iterations) === state.hash;
+  return _constantTimeEquals(await _hashPin(pin, salt, state.iterations), state.hash);
 }
 
 function selectLoginUser(name, role) {
@@ -2815,14 +2833,18 @@ async function checkPin() {
       }
     } else if (/^\d{4}$/.test(stored)) {
       // Backward-compatible one-time migration for legacy v1.0.52 installs.
-      pinCorrect = _pinBuffer === stored;
+      // Legacy v1.0.52 stored the passcode in the clear. Nothing can undo that
+      // for the moment before migration, but the comparison should not leak on
+      // top of it — and _storePinHash below replaces it with a derived hash.
+      pinCorrect = _constantTimeEquals(_pinBuffer, stored);
       isLegacyPin = pinCorrect;
       if (pinCorrect) await _storePinHash(_pinBuffer);
     } else if (stored.startsWith('H:')) {
       const psB64 = localStorage.getItem('tmb__ps');
       if (psB64) {
         const iterations = Number(localStorage.getItem('tmb__pin_kdf_iterations')) || LEGACY_PIN_KDF_ITERATIONS;
-        pinCorrect = await _hashPin(_pinBuffer, _b64ToBytes(psB64), iterations) === stored;
+        pinCorrect = _constantTimeEquals(
+          await _hashPin(_pinBuffer, _b64ToBytes(psB64), iterations), stored);
         isLegacyPin = pinCorrect && _storedPinLength() === 4;
       }
     }
@@ -8446,7 +8468,10 @@ let _ssPresenceWriting = false;
 
 function _ssPresenceDeviceId() {
   let id = localStorage.getItem('tmb__presence_device_id');
-  if (!id || !/^[A-Za-z0-9_-]{8,80}$/.test(id)) {
+  // Must match validPresenceDeviceId() in firestore.rules exactly. If the two
+  // disagree the write is rejected server-side and presence silently stops
+  // working, which is the hardest kind of failure to notice.
+  if (!id || !/^dev_[A-Za-z0-9_-]{8,72}$/.test(id)) {
     id = 'dev_' + _newRecordId();
     try { localStorage.setItem('tmb__presence_device_id', id); } catch (_) {}
   }
