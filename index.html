@@ -3375,6 +3375,9 @@ async function loadEncKeyFromSession() {
 // ─────────────────────────────────────────────────────────────
 const SHARED_KEYS = new Set([
   'firebase_studio_code', 'firebase_app_check_key',
+  // Which cloud the local revision bookkeeping describes. Revision numbers are
+  // that cloud's numbering, so they are meaningless against a different one.
+  'sync_cloud_binding',
   'ms_tenant', 'ms_client_id', 'ms_accounts', 'ms_email',
 ]);
 
@@ -3477,6 +3480,68 @@ function _pendingSyncStorageKey(key) {
 function _localSyncRevision(key) {
   const revision = Number(localStorage.getItem('tmb_' + key + '_revision') || 0);
   return Number.isSafeInteger(revision) && revision >= 0 ? revision : 0;
+}
+
+// Which Firestore project + studio document the local revision numbers belong
+// to. Revisions are the cloud's numbering, not ours.
+function _syncCloudBinding() {
+  const projectId = _firebaseSecret('firebase_project_id') || '';
+  const code = SHARED.get('firebase_studio_code', '') || '';
+  return projectId && code ? `${projectId}::${code}` : '';
+}
+
+// Pointed at a different project or studio document, every stored revision
+// describes a document that does not exist there. CAS then fails closed on
+// every key forever — "expected revision 1, but cloud is revision 0" — and no
+// amount of retrying can clear it, because the expectation itself is what is
+// wrong. Reset the expectations; the encrypted local data is left completely
+// untouched and simply becomes a first write against the new cloud. If that
+// cloud already holds data, this turns a permanent wedge into an ordinary
+// Use Cloud / Keep This Mac decision.
+// The evidence that local revisions belong to a different cloud: this Mac
+// expects a revision above zero for a document the cloud authoritatively does
+// not have. firestore.rules forbids deleting a data document, so a document
+// that once existed cannot have gone away -- the only way to expect revision N
+// from a cloud that has no such document is that N was counted somewhere else.
+// Authoritative absence specifically, never a failed read: a transient error
+// must not license a reset.
+function _staleRevisionKeysAgainstAbsentRemote() {
+  return getSyncKeys().filter(key => {
+    try {
+      return _localSyncRevision(key) > 0 && _remoteStateIsAuthoritativelyAbsent(key);
+    } catch (_) { return false; }
+  });
+}
+
+function _resetLocalSyncRevisionsForNewCloud(keys = null) {
+  const affected = [];
+  for (const key of (keys || getSyncKeys())) {
+    let touched = false;
+    if (localStorage.getItem('tmb_' + key + '_revision') !== null) {
+      localStorage.removeItem('tmb_' + key + '_revision');
+      touched = true;
+    }
+    if (localStorage.getItem('tmb_' + key + '_pending_base_revision') !== null) {
+      localStorage.removeItem('tmb_' + key + '_pending_base_revision');
+      touched = true;
+    }
+    const storageKey = _pendingSyncStorageKey(key);
+    const raw = localStorage.getItem(storageKey);
+    if (raw) {
+      // A record we cannot parse is left exactly where it is: the existing
+      // validation reports it, and guessing at it risks the local ciphertext.
+      try {
+        const record = JSON.parse(raw);
+        if (record && typeof record === 'object' && record.baseRevision !== 0) {
+          record.baseRevision = 0;
+          localStorage.setItem(storageKey, JSON.stringify(record));
+          touched = true;
+        }
+      } catch (_) {}
+    }
+    if (touched) affected.push(key);
+  }
+  return affected;
 }
 
 function _validatePendingSyncRecord(key, record) {
@@ -5216,6 +5281,14 @@ async function initFirebase() {
   // Credentials confirmed — mark sync as configured so ssLoad() knows not to push
   // an empty default workbook while the connection is in progress.
   _syncConfigured = true;
+
+  // Repointing this Mac at a different Firestore project or studio document
+  // invalidates every local revision expectation. Detect it before bootstrap,
+  // or the first sync fails closed on all keys with no way back.
+  const cloudBinding = _syncCloudBinding();
+  const previousCloudBinding = SHARED.get('sync_cloud_binding', '');
+  const cloudChanged = !!cloudBinding && !!previousCloudBinding && previousCloudBinding !== cloudBinding;
+
   _setRemoteAuthority('connecting');
   setSyncStatus('connecting');
 
@@ -5294,6 +5367,32 @@ async function initFirebase() {
     );
     subscribeToSync();
     _syncBootstrapComplete = true;
+
+    // Repointed at a different cloud, every stored revision describes a
+    // document that is not there, and CAS fails closed on every key forever.
+    // Remote presence is authoritative only now that bootstrap has finished,
+    // so this is the first point the evidence can be trusted.
+    const staleRevisionKeys = _staleRevisionKeysAgainstAbsentRemote();
+    if (staleRevisionKeys.length) {
+      const reset = _resetLocalSyncRevisionsForNewCloud(staleRevisionKeys);
+      console.warn(
+        `Cloud binding changed (${previousCloudBinding || 'unrecorded'} -> ${cloudBinding || 'unknown'}); ` +
+        `cleared unsatisfiable revision expectations for ${reset.length} key(s).`
+      );
+      if (reset.length) {
+        showToast(
+          `This Mac is pointed at a different studio cloud than the one it last synced with. ` +
+          `Nothing local was deleted — ${reset.length} item${reset.length === 1 ? '' : 's'} will upload fresh.`,
+          'info'
+        );
+      }
+    } else if (cloudChanged) {
+      console.warn(`Cloud binding changed (${previousCloudBinding} -> ${cloudBinding}) but every revision was satisfiable.`);
+    }
+    if (cloudBinding) {
+      try { SHARED.set('sync_cloud_binding', cloudBinding); } catch (_) {}
+    }
+
     // V160-002: remote authority is now known one way or the other; release the
     // spreadsheet read-only hold in whichever direction is authoritative.
     try { _reevaluateSpreadsheetAuthority(); } catch (_) {}

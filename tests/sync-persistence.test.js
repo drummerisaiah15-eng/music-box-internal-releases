@@ -2922,3 +2922,94 @@ test('P0-2: attribution is bounded and malformed entries are dropped, not fatal'
   assert.equal(norm('nonsense', {}), null);
   assert.equal(norm(null, {}), null);
 });
+
+// --- Repointing at a different Firestore project -----------------------------
+//
+// Revision numbers are the cloud's numbering. Aimed at a different project or
+// studio document, every stored expectation describes a document that is not
+// there, CAS fails closed on every key, and no retry can ever clear it —
+// "expected revision 1, but cloud is revision 0" forever.
+
+test('a cloud that authoritatively lacks a document clears the impossible revision', () => {
+  const store = new Map([
+    ['tmb_logs_revision', '4'],
+    ['tmb_logs_pending_sync', JSON.stringify({ version: 3, opId: 'op-1234567890', baseRevision: 4, localCiphertext: 'E:x', supersededOpIds: [] })],
+    ['tmb_staff_revision', '2'],
+    ['tmb_policies_revision', '7'],
+  ]);
+  const context = contextWith({
+    localStorage: {
+      getItem: k => (store.has(k) ? store.get(k) : null),
+      setItem: (k, v) => store.set(k, String(v)),
+      removeItem: k => store.delete(k),
+    },
+    getSyncKeys: () => ['logs', 'staff', 'policies'],
+    _pendingSyncStorageKey: key => 'tmb_' + key + '_pending_sync',
+    // logs and policies are missing from this cloud; staff is present.
+    _remoteStateIsAuthoritativelyAbsent: key => key !== 'staff',
+  });
+  vm.runInContext(`
+    ${declaration('_localSyncRevision')}
+    ${declaration('_staleRevisionKeysAgainstAbsentRemote')}
+    ${declaration('_resetLocalSyncRevisionsForNewCloud')}
+    globalThis.api = {
+      stale: () => _staleRevisionKeysAgainstAbsentRemote(),
+      reset: keys => _resetLocalSyncRevisionsForNewCloud(keys),
+    };
+  `, context);
+
+  // Arrays cross the vm realm boundary, so compare plain copies.
+  assert.deepEqual([...context.api.stale()], ['logs', 'policies'],
+    'only documents the cloud authoritatively lacks are stale');
+  assert.deepEqual([...context.api.reset(context.api.stale())].sort(), ['logs', 'policies']);
+
+  assert.equal(store.get('tmb_logs_revision'), undefined, 'the impossible expectation is gone');
+  assert.equal(store.get('tmb_policies_revision'), undefined);
+  assert.equal(store.get('tmb_staff_revision'), '2', 'a satisfiable expectation is untouched');
+
+  // The local data itself is never the thing that gets reset.
+  const pending = JSON.parse(store.get('tmb_logs_pending_sync'));
+  assert.equal(pending.baseRevision, 0, 'the pending write becomes a create');
+  assert.equal(pending.localCiphertext, 'E:x', 'the encrypted local value is preserved');
+  assert.equal(pending.opId, 'op-1234567890', 'and its identity');
+});
+
+test('a failed read is never mistaken for a different cloud', () => {
+  // The dangerous inverse: if a transient error could pass for absence, this
+  // would reset revisions and then upload stale local data over live remote
+  // data. Only authoritative absence counts.
+  const store = new Map([['tmb_logs_revision', '4']]);
+  const context = contextWith({
+    localStorage: {
+      getItem: k => (store.has(k) ? store.get(k) : null),
+      setItem: (k, v) => store.set(k, String(v)),
+      removeItem: k => store.delete(k),
+    },
+    getSyncKeys: () => ['logs'],
+    _pendingSyncStorageKey: key => 'tmb_' + key + '_pending_sync',
+    _remoteStateIsAuthoritativelyAbsent: () => { throw new Error('read failed'); },
+  });
+  vm.runInContext(`
+    ${declaration('_localSyncRevision')}
+    ${declaration('_staleRevisionKeysAgainstAbsentRemote')}
+    globalThis.stale = () => _staleRevisionKeysAgainstAbsentRemote();
+  `, context);
+  assert.deepEqual([...context.stale()], [], 'an unreadable remote resets nothing');
+  assert.equal(store.get('tmb_logs_revision'), '4');
+});
+
+test('the reset runs only after bootstrap has made remote presence authoritative', () => {
+  const renderer = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const fn = renderer.slice(renderer.indexOf('async function initFirebase('));
+  const body = fn.slice(0, fn.indexOf('\nfunction studioRef('));
+  const bootstrapAt = body.indexOf('await _bootstrapSync()');
+  const authorityAt = body.indexOf("_setRemoteAuthority(\n");
+  const staleAt = body.indexOf('_staleRevisionKeysAgainstAbsentRemote()');
+  const drainAt = body.indexOf('await _drainPendingSyncWrites()');
+  assert.ok(bootstrapAt > -1 && staleAt > -1 && drainAt > -1);
+  assert.ok(staleAt > bootstrapAt, 'presence is not authoritative until bootstrap completes');
+  assert.ok(authorityAt === -1 || staleAt > authorityAt, 'authority is resolved first');
+  assert.ok(staleAt < drainAt, 'and the reset happens before the writes it unblocks');
+  assert.match(body, /SHARED\.set\('sync_cloud_binding', cloudBinding\)/,
+    'the cloud this Mac synced with is recorded for the next connect');
+});
