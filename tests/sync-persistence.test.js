@@ -300,6 +300,7 @@ test('spreadsheet typing in A1 preserves an unrelated remote edit in B1', async 
     var MAX_SPREADSHEET_ATTRIBUTION_NAME = 80;
     _ssData = JSON.parse(JSON.stringify(initial));
     ${declaration('_refreshForSyncKey')}
+    ${declaration('_ssCellIsBlank')}
     ${declaration('_ssSheetOf')}
     ${declaration('_ssCellsOf')}
     ${declaration('_ssStampAttribution')}
@@ -1922,6 +1923,7 @@ test('H-08: _mergeSpreadsheetEdits throws an explicit conflict when a locally-ch
   vm.runInContext(`
     ${declaration('_cloneJson')}
     const MAX_SPREADSHEET_CONFLICTS = 200;
+    ${declaration('_ssCellIsBlank')}
     ${declaration('_ssSheetOf')}
     ${declaration('_ssCellsOf')}
     ${declaration('_ssStampAttribution')}
@@ -1960,6 +1962,7 @@ test('H-08: _mergeSpreadsheetEdits throws an explicit conflict when a locally-ch
   vm.runInContext(`
     ${declaration('_cloneJson')}
     const MAX_SPREADSHEET_CONFLICTS = 200;
+    ${declaration('_ssCellIsBlank')}
     ${declaration('_ssSheetOf')}
     ${declaration('_ssCellsOf')}
     ${declaration('_ssStampAttribution')}
@@ -1999,6 +2002,7 @@ test('H-08: _mergeSpreadsheetEdits throws when a locally-cleared cell was concur
   vm.runInContext(`
     ${declaration('_cloneJson')}
     const MAX_SPREADSHEET_CONFLICTS = 200;
+    ${declaration('_ssCellIsBlank')}
     ${declaration('_ssSheetOf')}
     ${declaration('_ssCellsOf')}
     ${declaration('_ssStampAttribution')}
@@ -2666,6 +2670,7 @@ function ssOpsApi() {
   const context = contextWith({ _cloneJson: v => JSON.parse(JSON.stringify(v)) });
   vm.runInContext(`
     const MAX_SPREADSHEET_CONFLICTS = 200;
+    ${declaration('_ssCellIsBlank')}
     ${declaration('_ssSheetOf')}
     ${declaration('_ssCellsOf')}
     ${declaration('_ssStampAttribution')}
@@ -3012,4 +3017,29 @@ test('the reset runs only after bootstrap has made remote presence authoritative
   assert.ok(staleAt < drainAt, 'and the reset happens before the writes it unblocks');
   assert.match(body, /SHARED\.set\('sync_cloud_binding', cloudBinding\)/,
     'the cloud this Mac synced with is recorded for the next connect');
+});
+
+test('P0-2: visiting a cell is not an edit', () => {
+  // Reported from real use: Carrie was credited with changing a cell she had
+  // only clicked on. Selecting can materialise an empty record where there was
+  // nothing, and that was being derived as an operation and stamped.
+  const api = ssOpsApi();
+  const base = ssBook({});
+  const touched = ssBook({ '0,3': { v: '', bg: '', tc: '', b: false } });
+  assert.deepEqual([...api.derive(base, touched)], [], 'absent -> empty record is no change');
+  assert.deepEqual([...api.derive(touched, base)], [], 'and neither is the reverse');
+
+  const merged = api.merge(base, base, touched);
+  assert.equal(merged.projects[0].sheets[0].editedBy, undefined, 'nobody is credited');
+
+  // Real edits must still register, including formatting-only ones.
+  assert.equal([...api.derive(base, ssBook({ '0,3': ssCell('x') }))].length, 1, 'text counts');
+  assert.equal(
+    [...api.derive(base, ssBook({ '0,3': { v: '', bg: '#7ed957', tc: '', b: false } }))].length, 1,
+    'a fill with no text is still a real change'
+  );
+  assert.equal(
+    [...api.derive(base, ssBook({ '0,3': { v: '', bg: '', tc: '', b: true } }))].length, 1,
+    'so is bold'
+  );
 });

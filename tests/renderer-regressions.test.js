@@ -753,7 +753,14 @@ test('the sheet says who changed it, without waiting to be asked', () => {
   assert.match(render, /made \$\{count\} change\$\{count === 1 \? '' : 's'\}/, 'names the person and the count');
   assert.match(render, /No tracked edits on this sheet yet/,
     'an empty sheet says so rather than showing nothing and looking broken');
-  assert.match(render, /bar\.style\.display = 'flex'/, 'the bar is always present once a sheet is open');
+  assert.match(render, /bar\.style\.display = 'flex'/, 'the panel is always present once a sheet is open');
+  // It lives beside the grid, not under it: a long contributor list must not
+  // push the sheet down and force scrolling to reach the tabs.
+  assert.match(source, /<aside id="ss-activity-bar">/);
+  assert.match(source, /#ss-activity-bar \{[^}]*flex:0 0 212px/);
+  assert.match(source, /#ss-editor-main \{ display:flex;flex:1;min-height:0/);
+  assert.match(namedFunctionSource('_ssPresenceRenderRoster'), /Just you on this sheet/,
+    'an empty roster explains itself rather than sitting blank');
 });
 
 test('clicking a contributor highlights exactly their cells, and toggles off', () => {
