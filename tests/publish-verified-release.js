@@ -26,6 +26,23 @@ const DOWNLOAD_REDIRECT_HOSTS = new Set([
 const PUBLICATION_STATE_FILE = '.publication-state';
 const MAX_PUBLIC_FEED_BYTES = 1024 * 1024;
 
+
+// Node reports every transport-level failure as the bare string "fetch failed"
+// and hides what actually went wrong in error.cause. Printing only the message
+// turns a diagnosable fault into a dead end.
+function describeFailure(error) {
+  const parts = [error?.message || String(error)];
+  let cause = error?.cause;
+  const seen = new Set();
+  while (cause && !seen.has(cause)) {
+    seen.add(cause);
+    const detail = [cause.code, cause.message].filter(Boolean).join(': ');
+    if (detail) parts.push(`caused by: ${detail}`);
+    cause = cause.cause;
+  }
+  return parts.join('\n');
+}
+
 function fail(message) {
   throw new Error(`Verified release publication failed: ${message}`);
 }
@@ -985,7 +1002,7 @@ if (require.main === module) {
         );
       })
       .catch(error => {
-        console.error(error.message);
+        console.error(describeFailure(error));
         process.exitCode = 1;
       });
   } else {
@@ -993,7 +1010,7 @@ if (require.main === module) {
     const token = process.env.GH_TOKEN;
     delete process.env.GH_TOKEN;
     verifyAndPublish(outDir, globalThis.fetch, token).catch(error => {
-      console.error(error.message);
+      console.error(describeFailure(error));
       process.exitCode = 1;
     });
   }
