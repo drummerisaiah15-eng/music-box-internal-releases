@@ -1117,3 +1117,34 @@ test('V159-008: the device id is stable and filename-safe', () => {
   assert.equal(id, api.deviceId(), 'stable across calls');
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+test('an update failure is reported in language that names the real problem', () => {
+  // electron-updater pastes the whole HTTP exchange into its message, including
+  // a stock "check that your authentication token is correct" line that is
+  // simply wrong for a public repository — it sent us hunting for a credential
+  // problem that did not exist.
+  const context = {};
+  vm.runInNewContext(
+    `${extractFunction(main, '_describeUpdaterError')}\nglobalThis.describe = _describeUpdaterError;`,
+    context
+  );
+  const describe = context.describe;
+
+  const realWorld = 'Cannot find latest-mac.yml in the latest release artifacts ' +
+    '(https://github.com/x/y/releases/download/v1.1.60/latest-mac.yml): HttpError: 404 ' +
+    '"method: GET url: ...\\nPlease double check that your authentication token is correct."';
+  const explained = describe(realWorld);
+  assert.match(explained, /no downloadable build attached/);
+  assert.match(explained, /not with this Mac/, 'and says where the fault is not');
+  assert.doesNotMatch(explained, /authentication token/, 'the misleading line is gone');
+
+  assert.match(describe('Error: getaddrinfo ENOTFOUND github.com'), /Could not reach GitHub/);
+  assert.match(describe('HttpError: 403 API rate limit exceeded'), /rate-limiting/);
+  assert.match(describe('code signature check failed'), /signature check/);
+  // Anything unrecognised must pass through rather than being flattened into a
+  // useless generic message.
+  assert.equal(describe('some novel failure'), null);
+
+  assert.match(main, /console\.warn\('\[updater\] Error:', raw\)/,
+    'the original text stays in the log so a real fault is still diagnosable');
+});

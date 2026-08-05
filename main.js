@@ -61,9 +61,36 @@ autoUpdater.autoDownload = false;
 // chose to defer, and Restart to Install first waits for pending saves.
 autoUpdater.autoInstallOnAppQuit = false;
 
+// electron-updater reports transport failures by pasting the whole HTTP
+// exchange into the message, including a stock "check that your authentication
+// token is correct" line that is wrong for a public repository and sends people
+// hunting for a credential problem that does not exist. Translate the cases we
+// can recognise into something that names the real situation.
+function _describeUpdaterError(raw) {
+  const text = String(raw || '');
+  if (/latest-mac\.yml/.test(text) && /404/.test(text)) {
+    return 'The latest release on GitHub has no downloadable build attached, so there is nothing to update to. ' +
+      'This is a problem with the published release, not with this Mac.';
+  }
+  if (/\b(ENOTFOUND|EAI_AGAIN|ENETUNREACH|ECONNREFUSED|ETIMEDOUT)\b/.test(text)) {
+    return 'Could not reach GitHub to check for updates. This is usually the network.';
+  }
+  if (/\b403\b/.test(text) && /rate limit/i.test(text)) {
+    return 'GitHub is rate-limiting update checks right now. Try again shortly.';
+  }
+  if (/code signature|not signed|rejected/i.test(text)) {
+    return 'The downloaded update failed its signature check and was not installed.';
+  }
+  return null;
+}
+
 function _reportUpdaterError(err) {
-  const message = String(err?.message || 'Unknown update error').slice(0, 500);
-  console.warn('[updater] Error:', message);
+  const raw = String(err?.message || 'Unknown update error');
+  const friendly = _describeUpdaterError(raw);
+  // Keep the raw text in the log: the readable version is for whoever is on
+  // shift, the original is what makes a real fault diagnosable.
+  console.warn('[updater] Error:', raw);
+  const message = (friendly || raw).slice(0, 500);
   _safeRendererSend('update-error', message);
   return message;
 }
