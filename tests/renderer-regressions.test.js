@@ -810,3 +810,38 @@ test('the activity panel collapses, and remembers that it was collapsed', () => 
   assert.match(namedFunctionSource('ssRenderActivityBar'), /_ssApplyActivityPanelState\(\)/,
     'the collapsed state is reapplied after every render');
 });
+
+test('no two people on a sheet share a colour', () => {
+  // Hashing names collided: with five staff and eight colours, three of them
+  // came out orange and the colour identified nobody.
+  const color = namedFunctionSource('_ssPresenceColor');
+  assert.match(color, /const roster = _ssIdentityRoster\(\)/);
+  assert.match(color, /const index = roster\.indexOf\(seed\)/, 'assigned by position, not by hash');
+
+  const roster = namedFunctionSource('_ssIdentityRoster');
+  assert.match(roster, /\.sort\(\(a, b\) => a\.localeCompare\(b\)\)/,
+    'ordered the same on every Mac, so a person is the same colour on both');
+  assert.match(roster, /for \(const peer of _ssPresencePeers\) names\.add\(peer\.name\)/,
+    'presence and past edits draw from one roster, so a person has one colour');
+
+  // Exercise it: distinct people must come out distinct.
+  const palette = [...source.matchAll(/'(#[0-9a-f]{6})'/g)].map(m => m[1]);
+  assert.ok(palette.length >= 12, 'enough colours for a studio');
+  const context = {
+    _ssContributorSummary: () => [
+      { name: 'Emma Minnetto' }, { name: 'Carrie Gass' }, { name: 'Kylie' },
+      { name: 'Elizabeth Chaves' }, { name: 'Ana Chaves' },
+    ],
+    _ssPresencePeers: [],
+    _ssAttributionActor: () => null,
+  };
+  vm.runInNewContext(
+    `${source.match(/const SS_PRESENCE_COLORS = \[[\s\S]*?\];/)[0]}\n` +
+    `${namedFunctionSource('_ssIdentityRoster')}\n${namedFunctionSource('_ssPresenceColor')}\n` +
+    `globalThis.out = _ssContributorSummary().map(c => _ssPresenceColor(c.name));`,
+    context
+  );
+  const assigned = [...context.out];
+  assert.equal(new Set(assigned).size, assigned.length,
+    `every person got their own colour, got ${JSON.stringify(assigned)}`);
+});

@@ -8196,6 +8196,7 @@ const SS_PRESENCE_MAX_PEERS = 12;
 const SS_PRESENCE_COLORS = [
   '#e11d48', '#0ea5e9', '#16a34a', '#9333ea',
   '#f59e0b', '#06b6d4', '#ec4899', '#f97316',
+  '#4f46e5', '#84cc16', '#be123c', '#0d9488',
 ];
 
 let _ssHighlightedContributor = null;
@@ -8215,7 +8216,27 @@ function _ssPresenceDeviceId() {
   return id;
 }
 
+// Everyone visible on this sheet, in an order every Mac agrees on. Sorting by
+// name rather than by when they appeared means two devices assign the same
+// person the same colour without having to coordinate.
+function _ssIdentityRoster() {
+  const names = new Set();
+  try { for (const entry of _ssContributorSummary()) names.add(entry.name); } catch (_) {}
+  for (const peer of _ssPresencePeers) names.add(peer.name);
+  const self = _ssAttributionActor();
+  if (self) names.add(self);
+  return [...names].sort((a, b) => a.localeCompare(b));
+}
+
+// Hashing the name collided: with five staff and eight colours, three of them
+// came out orange and the colour stopped identifying anyone. Assigning by
+// position guarantees distinct colours for everyone actually on the sheet.
 function _ssPresenceColor(seed) {
+  const roster = _ssIdentityRoster();
+  const index = roster.indexOf(seed);
+  if (index !== -1) return SS_PRESENCE_COLORS[index % SS_PRESENCE_COLORS.length];
+  // Not on this sheet (a stale stamp, say): fall back to something stable
+  // rather than shifting every render.
   let hash = 5381;
   for (let i = 0; i < seed.length; i++) hash = ((hash * 33) ^ seed.charCodeAt(i)) >>> 0;
   return SS_PRESENCE_COLORS[hash % SS_PRESENCE_COLORS.length];
