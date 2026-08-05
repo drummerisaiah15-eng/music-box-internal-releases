@@ -940,3 +940,29 @@ test('a remote edit does not throw you out of the project you have open', () => 
   // Mid-edit is still left alone.
   assert.match(block, /if \(pageActive && !_ssEditCell\)/);
 });
+
+test('the sync badge can never come to rest on Connecting', () => {
+  // Reported from real use: opening the app on a staff profile left
+  // "Connecting…" on screen indefinitely. "Connecting" is a promise that
+  // something happens next; if a path returns without resolving it, the person
+  // has no idea whether their work is reaching the cloud.
+  const wrapper = namedFunctionSource('initFirebase');
+  assert.match(wrapper, /return await _initFirebaseInner\(\);/);
+  assert.match(wrapper, /\} finally \{/, 'the guarantee holds even when a path throws');
+  assert.match(wrapper, /if \(_syncStatusState === 'connecting'\)/);
+  assert.match(wrapper, /setSyncStatus\(_syncReady && _firestoreDb && _firebaseAuth\?\.currentUser \? 'live' : 'error'\)/,
+    'and it resolves to what is actually true, not to a guess');
+
+  // Reusing an owner session is a success and has to say so — this path used to
+  // return true without touching the badge at all.
+  const inner = namedFunctionSource('_initFirebaseInner');
+  assert.match(inner, /if \(!isElizabeth\(\) && _syncReady && _firestoreDb && _firebaseAuth\?\.currentUser\) \{/);
+  assert.match(inner, /setSyncStatus\(_portablePinStale \? 'error' : 'live'\);\s*\n\s*return true;/);
+
+  // The tracker has to be updated before setSyncStatus can bail on a missing
+  // chip, or a renderer without one looks permanently stuck.
+  const setStatus = namedFunctionSource('setSyncStatus');
+  const assignAt = setStatus.indexOf('_syncStatusState = state;');
+  const bailAt = setStatus.indexOf('if (!chip) return;');
+  assert.ok(assignAt > -1 && bailAt > -1 && assignAt < bailAt);
+});

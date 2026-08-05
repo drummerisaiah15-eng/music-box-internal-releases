@@ -5289,8 +5289,14 @@ function _syncDocumentKind(remote) {
   throw new Error('Cloud sync document has an unsupported schema');
 }
 
+// Tracked so a caller can tell whether the badge was ever resolved. Set before
+// the early DOM return, or a renderer without the chip would look permanently
+// stuck to anything that inspects it.
+let _syncStatusState = 'off';
+
 function setSyncStatus(state) {
-  // state: 'off' | 'connecting' | 'live' | 'error'
+  // state: 'off' | 'connecting' | 'offline' | 'live' | 'error'
+  _syncStatusState = state;
   const chip = document.getElementById('sync-status-chip');
   const dot = document.getElementById('sync-dot');
   const label = document.getElementById('sync-label');
@@ -5354,10 +5360,30 @@ function setSyncStatus(state) {
   if (discBtn) discBtn.style.display = state === 'live' ? '' : 'none';
 }
 
+// "Connecting…" is a promise that something will happen next. Every path out of
+// initFirebase has to end somewhere else, or a profile sits watching a spinner
+// that will never resolve and has no idea whether its work is being saved.
 async function initFirebase() {
+  try {
+    return await _initFirebaseInner();
+  } finally {
+    if (_syncStatusState === 'connecting') {
+      console.warn('Firebase init returned while still marked connecting; resolving the badge.');
+      setSyncStatus(_syncReady && _firestoreDb && _firebaseAuth?.currentUser ? 'live' : 'error');
+    }
+  }
+}
+
+async function _initFirebaseInner() {
   // Staff can reuse the already-authenticated Firebase session established
   // during the required owner unlock, but cannot retrieve the saved password.
-  if (!isElizabeth() && _syncReady && _firestoreDb && _firebaseAuth?.currentUser) return true;
+  if (!isElizabeth() && _syncReady && _firestoreDb && _firebaseAuth?.currentUser) {
+    // Reusing a live session is a success, and has to say so: this path used to
+    // return without touching the badge, so whatever it happened to show last
+    // stayed on screen.
+    setSyncStatus(_portablePinStale ? 'error' : 'live');
+    return true;
+  }
   _setRemoteAuthority('checking');
   await _loadFirebaseSecrets({ includePassword: true });
   const apiKey     = _firebaseSecret('firebase_api_key');
