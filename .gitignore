@@ -1,8 +1,18 @@
 .DS_Store
 node_modules/
 dist/
+dist-test/
 vendor/
 *.log
+
+# Working notes and audit handoffs kept alongside the code but not part of it.
+# release.sh requires a completely clean worktree including untracked files, so
+# these have to be ignored rather than left loose — deleting them is not an
+# option, they are the record of what was fixed and why.
+TWO_MAC_TEST_SCRIPT.md
+CLAUDE_*.md
+CODEX_*.md
+PENTEST_*.md
 
 # Generated package artifacts
 *.asar
