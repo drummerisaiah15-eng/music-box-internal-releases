@@ -5731,15 +5731,40 @@ function _refreshForSyncKey(key, value) {
   }
   if (key === 'spreadsheets') {
     try {
+      const pageActive = document.getElementById('page-spreadsheets')?.classList.contains('active');
+      const editorOpen = document.getElementById('ss-editor-view')?.style.display !== 'none';
+      const openProjectId = _ssData?.activeProject || null;
+      const openSheetId = (_ssData?.projects || [])
+        .find(project => project.id === openProjectId)?.activeId || null;
+
       // A remote reconciliation may already be in flight when the user begins
       // typing. The per-key write queue still persists that remote value first,
       // but it must not replace the dirty workbook currently shown in the UI.
-      if (!_ssDirtyWorkbook) _ssData = normalizeSpreadsheetWorkbook(value);
+      if (!_ssDirtyWorkbook) {
+        _ssData = normalizeSpreadsheetWorkbook(value);
+        // Which project and sheet you are looking at travels inside the shared
+        // workbook, but it is a per-Mac view preference. Without this, whoever
+        // saves last drags everyone else to whatever they had open.
+        const stillPresent = (_ssData.projects || []).find(project => project.id === openProjectId);
+        if (stillPresent) {
+          _ssData.activeProject = openProjectId;
+          if (openSheetId && (stillPresent.sheets || []).some(sheet => sheet.id === openSheetId)) {
+            stillPresent.activeId = openSheetId;
+          }
+        }
+      }
       // V160-002: a real workbook has arrived, so the read-only hold is over.
-      // H-01: use ssGoHome() so the "Checking the cloud" card is replaced on
-      // arrival; ssRender() only refreshes the inner grid, not the home card.
       _ssAwaitingAuthority = false;
-      if (document.getElementById('page-spreadsheets')?.classList.contains('active') && !_ssEditCell) ssGoHome();
+      if (pageActive && !_ssEditCell) {
+        // H-01 needs ssGoHome() so the "Checking the cloud" card is replaced
+        // when a workbook finally arrives. But calling it unconditionally threw
+        // anyone with a project open back to the project list every time the
+        // other Mac saved — which, with live collaboration, is constantly.
+        const openProjectSurvived = editorOpen &&
+          (_ssData?.projects || []).some(project => project.id === _ssData.activeProject);
+        if (openProjectSurvived) ssRender();
+        else ssGoHome();
+      }
     } catch {}
   }
   if (key === 'staff_directory') {

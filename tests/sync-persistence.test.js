@@ -1766,9 +1766,12 @@ test('V160-002: the read-only hold is released in both directions', () => {
     'bootstrap completion calls it');
   assert.ok(script.includes('function ssWorkLocallyAnyway('),
     'the explicit user escape exists');
-  // A delivered remote workbook clears the hold directly in _refreshForSyncKey.
-  assert.ok(/_ssAwaitingAuthority = false;\s*\n\s*if \(document\.getElementById\('page-spreadsheets'\)/
+  // A delivered remote workbook clears the hold directly in _refreshForSyncKey,
+  // and still swaps the "Checking the cloud" card for the real home view.
+  assert.ok(/_ssAwaitingAuthority = false;\s*\n\s*if \(pageActive && !_ssEditCell\) \{/
     .test(script), 'an arriving remote workbook clears the hold');
+  assert.ok(/if \(openProjectSurvived\) ssRender\(\);\s*\n\s*else ssGoHome\(\);/.test(script),
+    'and the home card is still refreshed when no project is open');
 });
 
 test('V160-002: every editing entry point is refused while the editor is held', () => {

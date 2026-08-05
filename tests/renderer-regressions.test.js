@@ -910,3 +910,33 @@ test('correcting Firebase credentials takes effect without restarting the app', 
   // Absent and empty must not read as a difference, or every connect rebuilds.
   assert.equal(compare({ ...live, appId: undefined }, { ...live, appId: '' }), false);
 });
+
+test('a remote edit does not throw you out of the project you have open', () => {
+  // Reported from real use: two Macs in the same sheet, and the moment one
+  // saved, the other was dumped back to the project list. Every arriving
+  // workbook called ssGoHome() — written so the "Checking the cloud" card gets
+  // replaced on first arrival, but with live collaboration that fires
+  // constantly.
+  const refresh = namedFunctionSource('_refreshForSyncKey');
+  const block = refresh.slice(refresh.indexOf("if (key === 'spreadsheets')"));
+  assert.match(block, /const openProjectSurvived = editorOpen &&/);
+  assert.match(block, /if \(openProjectSurvived\) ssRender\(\);/, 'an open project re-renders in place');
+  assert.match(block, /else ssGoHome\(\);/, 'the home card is still refreshed when none is open');
+  assert.doesNotMatch(
+    block,
+    /classList\.contains\('active'\) && !_ssEditCell\) ssGoHome\(\);/,
+    'the unconditional bounce is gone'
+  );
+
+  // Which project and sheet you are looking at rides inside the shared
+  // workbook, so without this the last person to save drags everyone else to
+  // whatever they had open.
+  assert.match(block, /const stillPresent = \(_ssData\.projects \|\| \[\]\)\.find/);
+  assert.match(block, /_ssData\.activeProject = openProjectId;/, 'your project stays yours');
+  assert.match(block, /stillPresent\.activeId = openSheetId;/, 'and so does your sheet');
+  // A project deleted on the other Mac has to send you home; there is nothing
+  // left to render.
+  assert.match(block, /\.some\(project => project\.id === _ssData\.activeProject\)/);
+  // Mid-edit is still left alone.
+  assert.match(block, /if \(pageActive && !_ssEditCell\)/);
+});
