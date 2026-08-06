@@ -1270,3 +1270,157 @@ test('MB161-005: adding a user that could not be published says so', () => {
   assert.match(body, /not yet[\s\S]*shared with the other Macs/,
     'and a local-only add is described as local-only');
 });
+
+// ── MB161-014: Google Sheets, read-only ─────────────────────────────────────
+//
+// Phase 1 of the sync plan is Google -> app only. The guarantee is not "we did
+// not write the code" — it is that the OAuth scope requested is
+// spreadsheets.readonly, so Google refuses a write even if something here were
+// wrong. These tests hold that line.
+
+function googleHelpers() {
+  const context = vm.createContext({ String, Number, Math, RegExp });
+  const slice = name => {
+    const start = main.indexOf(`function ${name}(`);
+    assert.notEqual(start, -1, `${name} exists`);
+    const next = main.indexOf('\nfunction ', start + 1);
+    return main.slice(start, next === -1 ? main.length : next);
+  };
+  vm.runInContext(`
+    ${slice('_validGoogleClientId')}
+    ${slice('_validGoogleClientSecret')}
+    ${slice('_googleSpreadsheetId')}
+    ${slice('_columnLetters')}
+    globalThis.api = {
+      clientId: v => _validGoogleClientId(v),
+      secret: v => _validGoogleClientSecret(v),
+      sheetId: v => _googleSpreadsheetId(v),
+      columns: n => _columnLetters(n),
+    };
+  `, context);
+  return context.api;
+}
+
+test('MB161-014: the requested Google scope is read-only', () => {
+  assert.match(main, /const GOOGLE_SCOPE = 'https:\/\/www\.googleapis\.com\/auth\/spreadsheets\.readonly'/,
+    'the narrow scope is what makes a write impossible at the API, not just absent from the code');
+  // The broad scope would permit writing every spreadsheet the account can see.
+  assert.doesNotMatch(main, /auth\/spreadsheets'/, 'the read-write scope is never requested');
+  assert.doesNotMatch(main, /auth\/drive'/, 'and neither is Drive');
+});
+
+test('MB161-014: there is no Google write path anywhere', () => {
+  for (const forbidden of [
+    'values:batchUpdate', 'values/batchUpdate', ':batchUpdate',
+    'batchClear', 'valueInputOption', 'USER_ENTERED',
+  ]) {
+    assert.equal(main.includes(forbidden), false,
+      `main.js must not contain ${forbidden} while the integration is read-only`);
+  }
+  assert.doesNotMatch(main, /method: '(POST|PUT|PATCH)'[\s\S]{0,200}sheets\.googleapis\.com/,
+    'the only Sheets calls are GETs');
+});
+
+test('MB161-014: the preload bridge exposes no write method', () => {
+  const start = preload.indexOf("exposeInMainWorld('electronGoogleSheets'");
+  assert.notEqual(start, -1, 'the bridge exists');
+  const bridge = preload.slice(start, preload.indexOf('});', start));
+  for (const method of ['write', 'update', 'push', 'set', 'append', 'clear']) {
+    assert.doesNotMatch(bridge, new RegExp(`\\b${method}\\s*:`),
+      `the bridge must not offer ${method}`);
+  }
+  assert.match(bridge, /read:\s*\(request\)/, 'reading is all it does');
+  // Tokens must never cross into the renderer, same rule as Microsoft.
+  assert.doesNotMatch(bridge, /token|refresh|secret/i);
+});
+
+test('MB161-014: connecting and configuring are Owner-only', () => {
+  for (const channel of ['google-set-credentials', 'google-oauth-begin',
+                         'google-oauth-complete', 'google-disconnect']) {
+    const start = main.indexOf(`_secureHandle('${channel}'`);
+    assert.notEqual(start, -1, `${channel} is handled`);
+    const body = main.slice(start, start + 400);
+    assert.match(body, /_requireAppRole\(new Set\(\['Owner'\]\)\)/,
+      `${channel} must be Owner-only — linking a Google account is a privileged act`);
+  }
+  // Reading is not: staff who can see spreadsheets can see the linked values.
+  const read = main.slice(main.indexOf("_secureHandle('google-sheet-read'"));
+  assert.match(read.slice(0, 300), /_requireAppRole\(COMMUNICATION_ROLES\)/);
+});
+
+test('MB161-014: a client id must really be a Google client id', () => {
+  const api = googleHelpers();
+  assert.equal(api.clientId('123456789012-abc123def456.apps.googleusercontent.com'), true);
+  for (const bad of [
+    '', 'not-an-id', '123.apps.googleusercontent.com',
+    '123456789012-abc.apps.googleusercontent.com.evil.com',
+    'https://123456789012-abc123def456.apps.googleusercontent.com',
+    '123456789012-abc123def456.apps.googleuser.com', null, undefined, 42,
+  ]) {
+    assert.equal(api.clientId(bad), false, `${String(bad)} must be refused`);
+  }
+});
+
+test('MB161-014: a spreadsheet link is parsed, never guessed at', () => {
+  const api = googleHelpers();
+  const id = '1zZ4M7ewY7cFBePc2nV-kX2j-YHr0riIPQ6bFvB7WYrg';
+  assert.equal(api.sheetId(`https://docs.google.com/spreadsheets/d/${id}/edit?usp=sharing`), id);
+  assert.equal(api.sheetId(`https://docs.google.com/spreadsheets/d/${id}`), id);
+  assert.equal(api.sheetId(id), id, 'a bare id is accepted too');
+
+  for (const bad of [
+    '', 'https://evil.com/spreadsheets/d/' + id,
+    'https://docs.google.com.evil.com/spreadsheets/d/' + id,
+    'http://docs.google.com/spreadsheets/d/' + id,   // plain http
+    'https://docs.google.com/document/d/' + id,      // a Doc, not a Sheet
+    'javascript:alert(1)', null, undefined,
+  ]) {
+    assert.equal(api.sheetId(bad), null,
+      `${String(bad)} must not resolve to a spreadsheet — reading the wrong sheet silently is worse than refusing`);
+  }
+});
+
+test('MB161-014: the A1 range is bounded and correct', () => {
+  const api = googleHelpers();
+  assert.equal(api.columns(1), 'A');
+  assert.equal(api.columns(26), 'Z');
+  assert.equal(api.columns(27), 'AA');
+  assert.equal(api.columns(30), 'AD');
+  assert.equal(api.columns(100), 'CV');
+  // The read handler clamps before building the range.
+  const read = main.slice(main.indexOf("_secureHandle('google-sheet-read'"));
+  assert.match(read, /Math\.min\(Math\.max\(Number\(request\.rows\) \|\| 200, 1\), 500\)/);
+  assert.match(read, /Math\.min\(Math\.max\(Number\(request\.columns\) \|\| 30, 1\), 100\)/);
+  assert.match(read, /A1:\$\{_columnLetters\(columns\)\}\$\{rows\}/,
+    'never the whole tab — Google tabs carry thousands of empty default rows');
+});
+
+test('MB161-014: the OAuth flow keeps the code in main and demands a refresh token', () => {
+  const begin = main.slice(main.indexOf('async function _beginGoogleOAuth'));
+  assert.match(begin, /access_type: 'offline'/,
+    'without this Google issues no refresh token and the link dies within the hour');
+  assert.match(begin, /prompt: 'consent'/);
+  assert.match(begin, /code_challenge_method: 'S256'/, 'PKCE, same as the Microsoft flow');
+  assert.match(begin, /http:\/\/127\.0\.0\.1:\$\{address\.port\}/,
+    'Google matches loopback on the IP literal, not on localhost');
+  assert.match(begin, /_safeRendererSend\('google-auth-code', \{ state: pendingGoogleOAuth\.state \}\)/,
+    'the renderer receives the state only; the authorization code stays in main');
+
+  const complete = main.slice(main.indexOf("_secureHandle('google-oauth-complete'"));
+  assert.match(complete, /verifierChallenge !== attempt\.codeChallenge/, 'the PKCE verifier is checked');
+  assert.match(complete, /tokens\.refresh_token !== 'string'/,
+    'a grant with no refresh token is refused rather than silently expiring later');
+  assert.match(complete, /granted\.split\(\/\\s\+\/\)\.includes\(GOOGLE_SCOPE\)/,
+    'the scope Google actually granted is verified, not the one we asked for');
+});
+
+test('MB161-014: access tokens are memory-only and errors say what to do', () => {
+  assert.match(main, /Access tokens live in memory only/);
+  assert.doesNotMatch(main, /accessToken:\s*tokens\.access_token[\s\S]{0,80}_saveGoogleVault/,
+    'an access token is never written to the vault');
+  const failure = main.slice(main.indexOf('function _googleReadFailure'));
+  for (const [code, hint] of [[401, /Disconnect and reconnect/], [403, /Sheets API is not enabled/],
+                              [404, /shared with the connected account/], [429, /rate limiting/]]) {
+    assert.match(failure, hint, `HTTP ${code} explains itself`);
+  }
+});

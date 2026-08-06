@@ -1201,6 +1201,323 @@ _secureHandle('keychain-decrypt', async (_, b64) => {
   } catch { return null; }
 });
 
+// ─────────────────────────────────────────────────────────────
+// MB161-014: Google Sheets, read-only.
+//
+// Phase 1 of GOOGLE_SHEETS_SYNC_PLAN.md. Google -> app only. There is no
+// write path here, and there deliberately cannot be one: the scope requested
+// is `spreadsheets.readonly`, so even a bug in this file cannot modify
+// anybody's sheet. Google itself refuses the write. That is a stronger
+// guarantee than "we did not write the code", and it is why read-only could be
+// built before the write-safety contract in the plan is decided.
+//
+// Same loopback-plus-PKCE shape as the Microsoft flow above, with the three
+// differences Google requires: `access_type=offline` and `prompt=consent` to
+// receive a refresh token at all, and a client id that is not a UUID.
+// ─────────────────────────────────────────────────────────────
+
+const GOOGLE_VAULT_KEY = 'app_google_sheets_v1';
+const GOOGLE_SCOPE = 'https://www.googleapis.com/auth/spreadsheets.readonly';
+const GOOGLE_AUTH_ENDPOINT = 'https://accounts.google.com/o/oauth2/v2/auth';
+const GOOGLE_TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
+let pendingGoogleOAuth = null;
+let googleOAuthServer = null;
+
+const GOOGLE_SUCCESS_HTML = `<!doctype html><html><head><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'">
+<title>Music Box — Connected</title><style>body{font-family:system-ui,sans-serif;text-align:center;padding:80px;background:#f5f2ec;color:#1a1a1a}</style>
+</head><body><h2>Google Sheets connected</h2><p>Read-only access. You can close this tab and return to Music Box.</p></body></html>`;
+const GOOGLE_ERROR_HTML = `<!doctype html><html><head><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'">
+<title>Music Box — Sign-in failed</title><style>body{font-family:system-ui,sans-serif;text-align:center;padding:80px;background:#f5f2ec;color:#1a1a1a}</style>
+</head><body><h2>Google sign-in failed</h2><p>Close this tab and try connecting again from Music Box.</p></body></html>`;
+
+// `123456789012-abc123def456.apps.googleusercontent.com`
+function _validGoogleClientId(value) {
+  return typeof value === 'string' &&
+    /^[0-9]{6,32}-[A-Za-z0-9_]{8,64}\.apps\.googleusercontent\.com$/.test(value);
+}
+
+// A desktop client secret is NOT confidential — Google's own native-app guidance
+// says so — but it is still a credential the studio would rather not leave in a
+// plain file, so it lives in the same safeStorage vault as everything else.
+function _validGoogleClientSecret(value) {
+  return typeof value === 'string' && /^[A-Za-z0-9_-]{8,120}$/.test(value);
+}
+
+function _closeGoogleOAuthServer() {
+  if (googleOAuthServer) {
+    try { googleOAuthServer.close(); } catch (_) {}
+    googleOAuthServer = null;
+  }
+}
+
+function _googleVault() {
+  try {
+    const vault = _loadSecretVault();
+    const entry = vault[GOOGLE_VAULT_KEY];
+    return _isPlainObject(entry) ? entry : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function _saveGoogleVault(next) {
+  const vault = _loadSecretVault();
+  if (next === null) delete vault[GOOGLE_VAULT_KEY];
+  else vault[GOOGLE_VAULT_KEY] = next;
+  _saveSecretVault(vault);
+}
+
+async function _beginGoogleOAuth({ clientId, codeChallenge }) {
+  if (!_validGoogleClientId(clientId) || !_validPkceChallenge(codeChallenge)) {
+    throw new Error('Invalid Google OAuth configuration.');
+  }
+
+  _closeGoogleOAuthServer();
+  pendingGoogleOAuth = null;
+
+  const state = crypto.randomBytes(32).toString('base64url');
+  const server = http.createServer((req, res) => {
+    if (req.method !== 'GET') {
+      _oauthResponse(res, 405, GOOGLE_ERROR_HTML);
+      return;
+    }
+    let callback;
+    try {
+      callback = new URL(req.url, pendingGoogleOAuth?.redirectUri || 'http://127.0.0.1/');
+    } catch (_) {
+      _oauthResponse(res, 400, GOOGLE_ERROR_HTML);
+      return;
+    }
+    if (!pendingGoogleOAuth || pendingGoogleOAuth.callbackReceived ||
+        String(req.headers.host || '').toLowerCase() !== pendingGoogleOAuth.expectedHost ||
+        callback.origin !== pendingGoogleOAuth.redirectUri ||
+        callback.pathname !== '/' ||
+        callback.searchParams.get('state') !== pendingGoogleOAuth.state ||
+        Date.now() > pendingGoogleOAuth.expiresAt) {
+      _oauthResponse(res, 400, GOOGLE_ERROR_HTML);
+      return;
+    }
+
+    const error = callback.searchParams.get('error');
+    const code = callback.searchParams.get('code');
+    if (error) {
+      _safeRendererSend('google-auth-error', {
+        error: String(error).slice(0, 100),
+        errorDesc: String(callback.searchParams.get('error_description') ||
+          'Google sign-in was not completed.').slice(0, 500),
+      });
+      pendingGoogleOAuth = null;
+      _oauthResponse(res, 400, GOOGLE_ERROR_HTML);
+      setImmediate(_closeGoogleOAuthServer);
+      return;
+    }
+    if (!code || code.length > 8192) {
+      _safeRendererSend('google-auth-error', {
+        error: 'no_code',
+        errorDesc: 'The Google redirect did not include a valid authorization code.',
+      });
+      pendingGoogleOAuth = null;
+      _oauthResponse(res, 400, GOOGLE_ERROR_HTML);
+      setImmediate(_closeGoogleOAuthServer);
+      return;
+    }
+
+    // The authorization code never leaves the main process. The renderer is
+    // told only the one-time state, exactly as the Microsoft flow does.
+    pendingGoogleOAuth.code = code;
+    pendingGoogleOAuth.callbackReceived = true;
+    _safeRendererSend('google-auth-code', { state: pendingGoogleOAuth.state });
+    _oauthResponse(res, 200, GOOGLE_SUCCESS_HTML);
+    setImmediate(_closeGoogleOAuthServer);
+  });
+  server.requestTimeout = 5000;
+  server.headersTimeout = 5000;
+  server.maxRequestsPerSocket = 1;
+
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      server.removeListener('error', reject);
+      resolve();
+    });
+  });
+  server.unref();
+  googleOAuthServer = server;
+
+  const address = server.address();
+  if (!address || typeof address === 'string') {
+    _closeGoogleOAuthServer();
+    throw new Error('Could not start the Google sign-in callback.');
+  }
+  // Google's native-app guidance permits a loopback redirect on an arbitrary
+  // port, and matches on the IP literal rather than the hostname — so unlike
+  // Microsoft this must be 127.0.0.1, not localhost.
+  const redirectUri = `http://127.0.0.1:${address.port}`;
+  pendingGoogleOAuth = {
+    state,
+    redirectUri,
+    expectedHost: `127.0.0.1:${address.port}`,
+    clientId,
+    codeChallenge,
+    expiresAt: Date.now() + OAUTH_TIMEOUT_MS,
+    callbackReceived: false,
+    code: null,
+  };
+
+  const authorizeUrl = new URL(GOOGLE_AUTH_ENDPOINT);
+  authorizeUrl.search = new URLSearchParams({
+    client_id: clientId,
+    response_type: 'code',
+    redirect_uri: redirectUri,
+    scope: GOOGLE_SCOPE,
+    // Without both of these Google returns an access token and no refresh
+    // token, and the connection silently dies an hour later.
+    access_type: 'offline',
+    prompt: 'consent',
+    include_granted_scopes: 'false',
+    code_challenge: codeChallenge,
+    code_challenge_method: 'S256',
+    state,
+  }).toString();
+
+  try {
+    await shell.openExternal(authorizeUrl.toString());
+  } catch (error) {
+    pendingGoogleOAuth = null;
+    _closeGoogleOAuthServer();
+    throw error;
+  }
+
+  setTimeout(() => {
+    if (pendingGoogleOAuth?.state === state && Date.now() >= pendingGoogleOAuth.expiresAt) {
+      pendingGoogleOAuth = null;
+      _closeGoogleOAuthServer();
+    }
+  }, OAUTH_TIMEOUT_MS + 1000).unref();
+
+  return { ok: true };
+}
+
+function _googleTokenRequest(body) {
+  return new Promise((resolve, reject) => {
+    const payload = new URLSearchParams(body).toString();
+    const request = https.request({
+      method: 'POST',
+      hostname: 'oauth2.googleapis.com',
+      path: '/token',
+      timeout: 20000,
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(payload),
+        Accept: 'application/json',
+      },
+    }, response => {
+      let raw = '';
+      let size = 0;
+      response.on('data', chunk => {
+        size += chunk.length;
+        if (size > 256 * 1024) { request.destroy(new Error('Google token response was too large.')); return; }
+        raw += chunk;
+      });
+      response.on('end', () => {
+        let parsed = null;
+        try { parsed = JSON.parse(raw); } catch (_) { parsed = null; }
+        if (!parsed || typeof parsed !== 'object') {
+          reject(new Error('Google returned a response this app could not read.'));
+          return;
+        }
+        if (response.statusCode !== 200) {
+          // Google names the actual problem here; passing it through saves an
+          // hour of guessing which of the six setup steps was missed.
+          const detail = parsed.error_description || parsed.error || `HTTP ${response.statusCode}`;
+          reject(new Error(`Google refused the sign-in: ${String(detail).slice(0, 300)}`));
+          return;
+        }
+        resolve(parsed);
+      });
+    });
+    request.on('timeout', () => request.destroy(new Error('Google did not respond in time.')));
+    request.on('error', reject);
+    request.end(payload);
+  });
+}
+
+// Access tokens live in memory only. They expire in an hour, they are not worth
+// persisting, and a token on disk is one more thing to leak.
+let _googleAccessToken = null;
+
+async function _googleAccessTokenFor() {
+  if (_googleAccessToken && Date.now() < _googleAccessToken.expiresAt - 60000) {
+    return _googleAccessToken.value;
+  }
+  const vault = _googleVault();
+  if (!vault.refreshToken) throw new Error('Google Sheets is not connected.');
+  const tokens = await _googleTokenRequest({
+    client_id: vault.clientId,
+    client_secret: vault.clientSecret || '',
+    refresh_token: vault.refreshToken,
+    grant_type: 'refresh_token',
+  });
+  if (typeof tokens.access_token !== 'string' || !tokens.access_token) {
+    throw new Error('Google did not return a usable access token.');
+  }
+  const lifetime = Number.isFinite(tokens.expires_in) ? tokens.expires_in * 1000 : 3600000;
+  _googleAccessToken = { value: tokens.access_token, expiresAt: Date.now() + lifetime };
+  return _googleAccessToken.value;
+}
+
+function _googleApiGet(host, requestPath, accessToken) {
+  return new Promise((resolve, reject) => {
+    const request = https.request({
+      method: 'GET',
+      hostname: host,
+      path: requestPath,
+      timeout: 30000,
+      headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' },
+    }, response => {
+      let raw = '';
+      let size = 0;
+      response.on('data', chunk => {
+        size += chunk.length;
+        // A bounded range cannot legitimately produce this much JSON.
+        if (size > 8 * 1024 * 1024) { request.destroy(new Error('The Google response was too large to read safely.')); return; }
+        raw += chunk;
+      });
+      response.on('end', () => {
+        let parsed = null;
+        try { parsed = JSON.parse(raw); } catch (_) { parsed = null; }
+        if (response.statusCode === 200 && parsed && typeof parsed === 'object') {
+          resolve(parsed);
+          return;
+        }
+        const detail = parsed?.error?.message || `HTTP ${response.statusCode}`;
+        const error = new Error(String(detail).slice(0, 300));
+        error.statusCode = response.statusCode;
+        reject(error);
+      });
+    });
+    request.on('timeout', () => request.destroy(new Error('Google did not respond in time.')));
+    request.on('error', reject);
+    request.end();
+  });
+}
+
+async function _googleAccountEmail(accessToken) {
+  const info = await _googleApiGet('www.googleapis.com', '/oauth2/v2/userinfo', accessToken);
+  return typeof info?.email === 'string' ? info.email.slice(0, 200) : null;
+}
+
+// A Google Sheets URL, or a bare spreadsheet id. Rejected rather than coerced:
+// silently reading the wrong sheet is worse than saying "that is not a link".
+function _googleSpreadsheetId(input) {
+  const text = String(input || '').trim();
+  if (/^[A-Za-z0-9_-]{20,80}$/.test(text)) return text;
+  const match = /^https:\/\/docs\.google\.com\/spreadsheets\/d\/([A-Za-z0-9_-]{20,80})(?:\/|\?|$)/.exec(text);
+  return match ? match[1] : null;
+}
+
 // ── Main-process credential vault and authenticated app session ──────────────
 function _secretVaultPath() {
   return path.join(app.getPath('userData'), 'renderer-secrets-v1.bin');
@@ -1788,6 +2105,244 @@ _secureHandle('app-session-import-directory', async (_, directory) => {
   const profiles = _applyStaffDirectory(directory);
   return { ok: true, profiles };
 });
+
+// ── MB161-014: Google Sheets, read-only ─────────────────────────────────────
+//
+// Owner-only to configure and connect, because linking a Google account is the
+// same class of act as configuring Firebase. Reading a linked sheet is open to
+// the roles that can already see spreadsheets — the data is the studio's either
+// way, and gating the read would just mean staff see stale cells.
+
+_secureHandle('google-set-credentials', async (_, request) => {
+  _requireAppRole(new Set(['Owner']));
+  if (!_isPlainObject(request)) throw new Error('Invalid Google credentials.');
+  const clientId = String(request.clientId || '').trim();
+  const clientSecret = String(request.clientSecret || '').trim();
+  if (!_validGoogleClientId(clientId)) {
+    throw new Error('That does not look like a Google OAuth client ID. It should end in .apps.googleusercontent.com');
+  }
+  if (!_validGoogleClientSecret(clientSecret)) {
+    throw new Error('That does not look like a Google OAuth client secret.');
+  }
+  const existing = _googleVault();
+  // Changing the client identity invalidates any token issued under the old
+  // one, so drop them rather than leaving credentials that cannot work.
+  const sameClient = existing.clientId === clientId;
+  _saveGoogleVault({
+    clientId,
+    clientSecret,
+    refreshToken: sameClient ? existing.refreshToken : undefined,
+    account: sameClient ? existing.account : undefined,
+    connectedAt: sameClient ? existing.connectedAt : undefined,
+  });
+  return { ok: true, reconnectRequired: !sameClient };
+});
+
+_secureHandle('google-status', async () => {
+  _requireAppRole(COMMUNICATION_ROLES);
+  const vault = _googleVault();
+  return {
+    ok: true,
+    configured: _validGoogleClientId(vault.clientId || ''),
+    connected: typeof vault.refreshToken === 'string' && vault.refreshToken.length > 0,
+    account: typeof vault.account === 'string' ? vault.account : null,
+    connectedAt: typeof vault.connectedAt === 'string' ? vault.connectedAt : null,
+    // Stated in the UI so nobody has to take it on trust.
+    scope: GOOGLE_SCOPE,
+    readOnly: true,
+  };
+});
+
+_secureHandle('google-oauth-begin', async (_, request) => {
+  _requireAppRole(new Set(['Owner']));
+  if (!_isPlainObject(request)) throw new Error('Invalid Google sign-in request.');
+  const vault = _googleVault();
+  if (!_validGoogleClientId(vault.clientId || '')) {
+    throw new Error('Add the Google OAuth client ID in Settings before connecting.');
+  }
+  return _beginGoogleOAuth({
+    clientId: vault.clientId,
+    codeChallenge: request.codeChallenge,
+  });
+});
+
+_secureHandle('google-oauth-complete', async (_, request) => {
+  _requireAppRole(new Set(['Owner']));
+  if (!_isPlainObject(request)) throw new Error('Invalid Google sign-in completion.');
+  const attempt = pendingGoogleOAuth;
+  const { state, codeVerifier } = request;
+  if (!attempt || !attempt.callbackReceived || !attempt.code ||
+      typeof state !== 'string' || state !== attempt.state ||
+      !_validPkceChallenge(codeVerifier) ||
+      Date.now() > attempt.expiresAt) {
+    pendingGoogleOAuth = null;
+    _closeGoogleOAuthServer();
+    throw new Error('That Google sign-in is no longer valid. Try connecting again.');
+  }
+  const verifierChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64url');
+  if (verifierChallenge !== attempt.codeChallenge) {
+    pendingGoogleOAuth = null;
+    _closeGoogleOAuthServer();
+    throw new Error('The Google sign-in could not be verified.');
+  }
+
+  const vault = _googleVault();
+  let tokens;
+  try {
+    tokens = await _googleTokenRequest({
+      client_id: attempt.clientId,
+      client_secret: vault.clientSecret || '',
+      code: attempt.code,
+      code_verifier: codeVerifier,
+      grant_type: 'authorization_code',
+      redirect_uri: attempt.redirectUri,
+    });
+  } finally {
+    // One use, win or lose.
+    pendingGoogleOAuth = null;
+    _closeGoogleOAuthServer();
+  }
+
+  if (typeof tokens.refresh_token !== 'string' || !tokens.refresh_token) {
+    throw new Error(
+      'Google did not return a refresh token, so the connection would stop working within the hour. ' +
+      'Remove Music Box from your Google account permissions and connect again.');
+  }
+  // Confirm the scope Google actually granted rather than the one we asked for.
+  const granted = String(tokens.scope || '');
+  if (granted && !granted.split(/\s+/).includes(GOOGLE_SCOPE)) {
+    throw new Error(`Google granted "${granted.slice(0, 200)}" rather than read-only spreadsheet access.`);
+  }
+
+  let account = null;
+  try {
+    account = await _googleAccountEmail(tokens.access_token);
+  } catch (_) {
+    account = null;
+  }
+
+  _saveGoogleVault({
+    ...vault,
+    refreshToken: tokens.refresh_token,
+    account,
+    connectedAt: new Date().toISOString(),
+  });
+  return { ok: true, account, scope: GOOGLE_SCOPE };
+});
+
+_secureHandle('google-disconnect', async () => {
+  _requireAppRole(new Set(['Owner']));
+  const vault = _googleVault();
+  // Keep the client configuration; drop only the account grant.
+  _saveGoogleVault({
+    clientId: vault.clientId,
+    clientSecret: vault.clientSecret,
+  });
+  _googleAccessToken = null;
+  return { ok: true };
+});
+
+// What tabs does this spreadsheet have, and how big are they? Cheap enough to
+// call before committing to reading anything.
+_secureHandle('google-sheet-describe', async (_, request) => {
+  _requireAppRole(COMMUNICATION_ROLES);
+  if (!_isPlainObject(request)) throw new Error('Invalid spreadsheet request.');
+  const spreadsheetId = _googleSpreadsheetId(request.url);
+  if (!spreadsheetId) {
+    throw new Error('Paste a Google Sheets link, e.g. https://docs.google.com/spreadsheets/d/…');
+  }
+  const token = await _googleAccessTokenFor();
+  // A field mask, so Google does not send the entire workbook just to list tabs.
+  const mask = encodeURIComponent('properties.title,sheets.properties');
+  let payload;
+  try {
+    payload = await _googleApiGet('sheets.googleapis.com',
+      `/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}?fields=${mask}`, token);
+  } catch (error) {
+    throw new Error(_googleReadFailure(error));
+  }
+  const tabs = (Array.isArray(payload.sheets) ? payload.sheets : []).map(entry => {
+    const props = entry?.properties || {};
+    const grid = props.gridProperties || {};
+    return {
+      sheetId: Number.isSafeInteger(props.sheetId) ? props.sheetId : null,
+      title: String(props.title || '').slice(0, 200),
+      rows: Number.isSafeInteger(grid.rowCount) ? grid.rowCount : 0,
+      columns: Number.isSafeInteger(grid.columnCount) ? grid.columnCount : 0,
+    };
+  }).filter(tab => tab.sheetId !== null);
+  return {
+    ok: true,
+    spreadsheetId,
+    title: String(payload.properties?.title || 'Untitled').slice(0, 200),
+    tabs,
+  };
+});
+
+// Read one tab as text. FORMATTED_VALUE is deliberate: the app's cell model is
+// text, so what a person SEES in Google is the honest thing to mirror. A date
+// shows as the date, a formula shows its result. The formula itself is not
+// imported, and the plan says so rather than pretending otherwise.
+_secureHandle('google-sheet-read', async (_, request) => {
+  _requireAppRole(COMMUNICATION_ROLES);
+  if (!_isPlainObject(request)) throw new Error('Invalid spreadsheet read request.');
+  const spreadsheetId = _googleSpreadsheetId(request.spreadsheetId || request.url);
+  const title = String(request.title || '').trim();
+  if (!spreadsheetId) throw new Error('That spreadsheet link is not valid.');
+  if (!title || title.length > 200) throw new Error('Choose which tab to read.');
+  const rows = Math.min(Math.max(Number(request.rows) || 200, 1), 500);
+  const columns = Math.min(Math.max(Number(request.columns) || 30, 1), 100);
+
+  // A bounded A1 range. Never the whole tab: Google tabs carry thousands of
+  // empty default rows, and asking for them wastes quota and memory alike.
+  const range = `${title}!A1:${_columnLetters(columns)}${rows}`;
+  const token = await _googleAccessTokenFor();
+  let payload;
+  try {
+    payload = await _googleApiGet('sheets.googleapis.com',
+      `/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}/values/${encodeURIComponent(range)}` +
+      `?valueRenderOption=FORMATTED_VALUE&dateTimeRenderOption=FORMATTED_STRING`, token);
+  } catch (error) {
+    throw new Error(_googleReadFailure(error));
+  }
+  const values = Array.isArray(payload.values) ? payload.values : [];
+  let cells = 0;
+  const grid = values.slice(0, rows).map(row => {
+    const line = (Array.isArray(row) ? row : []).slice(0, columns)
+      .map(value => String(value ?? '').slice(0, 50000));
+    cells += line.filter(value => value !== '').length;
+    return line;
+  });
+  return { ok: true, spreadsheetId, title, range, rows: grid, filledCells: cells };
+});
+
+function _columnLetters(count) {
+  let n = count - 1;
+  let letters = '';
+  while (n >= 0) {
+    letters = String.fromCharCode(65 + (n % 26)) + letters;
+    n = Math.floor(n / 26) - 1;
+  }
+  return letters;
+}
+
+// Google's own message, plus what to do about it. "HTTP 403" on its own has
+// cost more debugging hours than any other string in this project.
+function _googleReadFailure(error) {
+  const detail = String(error?.message || error).slice(0, 300);
+  switch (error?.statusCode) {
+    case 401:
+      return `Google rejected the saved sign-in. Disconnect and reconnect the Google account. (${detail})`;
+    case 403:
+      return `That Google account cannot open this spreadsheet, or the Sheets API is not enabled on the Cloud project. (${detail})`;
+    case 404:
+      return `No spreadsheet was found at that link. Check it is shared with the connected account. (${detail})`;
+    case 429:
+      return `Google is rate limiting this app. Wait a minute and try again. (${detail})`;
+    default:
+      return `Google could not be read: ${detail}`;
+  }
+}
 
 // Owner-only role assignment. Any profile, built-in included, can be moved
 // between the assignable roles — so Operations & Events is not limited to one

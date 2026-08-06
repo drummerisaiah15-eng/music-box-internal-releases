@@ -78,6 +78,22 @@ contextBridge.exposeInMainWorld('electronSpreadsheet', {
   importFile:     () => ipcRenderer.invoke('import-spreadsheet'),
 });
 
+// MB161-014: Google Sheets, READ ONLY. There is no write method on this bridge
+// and there is no write handler behind it. The OAuth scope requested is
+// spreadsheets.readonly, so Google itself refuses a write even if something
+// here were wrong. Tokens never cross the bridge; the renderer gets values.
+contextBridge.exposeInMainWorld('electronGoogleSheets', {
+  status:         () => ipcRenderer.invoke('google-status'),
+  setCredentials: (request) => ipcRenderer.invoke('google-set-credentials', request),
+  beginAuth:      (request) => ipcRenderer.invoke('google-oauth-begin', request),
+  completeAuth:   (request) => ipcRenderer.invoke('google-oauth-complete', request),
+  disconnect:     () => ipcRenderer.invoke('google-disconnect'),
+  describe:       (request) => ipcRenderer.invoke('google-sheet-describe', request),
+  read:           (request) => ipcRenderer.invoke('google-sheet-read', request),
+  onCode:         (cb) => subscribe('google-auth-code', cb),
+  onError:        (cb) => subscribe('google-auth-error', cb),
+});
+
 // Shell bridge — opens URLs in the system default browser
 contextBridge.exposeInMainWorld('electronShell', {
   openExternal: (url) => ipcRenderer.invoke('open-external', url),
