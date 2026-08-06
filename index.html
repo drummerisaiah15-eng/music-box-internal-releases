@@ -7351,7 +7351,10 @@ function normalizeSpreadsheetWorkbook(value) {
   // Validated and bounded below; stripped if malformed rather than rejected, so
   // bad conflict metadata can never make a valid workbook unloadable.
   if (source._conflicts !== undefined) {
-    if (!Array.isArray(source._conflicts) || source._conflicts.length > MAX_SPREADSHEET_CONFLICTS) {
+    // Over the cap means trim to the newest, not discard everything. Dropping
+    // the whole list because it grew too long destroys exactly the preserved
+    // values the cap exists to keep affordable.
+    if (!Array.isArray(source._conflicts)) {
       delete source._conflicts;
     } else {
       const kept = source._conflicts.filter(entry =>
@@ -7558,6 +7561,14 @@ function normalizeSpreadsheetWorkbook(value) {
     throw new Error('spreadsheets active project does not exist');
   }
   const normalized = { activeProject: source.activeProject, projects };
+  // The conflicts were validated and bounded above and then never carried into
+  // the returned object, so every save silently destroyed them: the whole point
+  // of preserving a losing value is that it survives to be resolved. The size
+  // check has to happen after they are attached, or the limit is measured
+  // against something smaller than what actually gets stored.
+  if (Array.isArray(source._conflicts) && source._conflicts.length) {
+    normalized._conflicts = source._conflicts;
+  }
   if (new TextEncoder().encode(JSON.stringify(normalized)).byteLength >
       MAX_SPREADSHEET_SYNC_JSON_BYTES) {
     throw new Error('spreadsheets exceeds the 600 KB sync limit');

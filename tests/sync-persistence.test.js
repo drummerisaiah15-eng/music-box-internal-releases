@@ -2846,13 +2846,54 @@ test('P0-1: operations carry the base they were derived from', () => {
 });
 
 test('P0-1: workbook conflicts survive normalization and stay bounded', () => {
-  assert.ok(script.includes('MAX_SPREADSHEET_CONFLICTS'), 'a cap exists');
-  const norm = declaration('normalizeSpreadsheetWorkbook');
-  assert.match(norm, /'activeProject', 'projects', '_conflicts'/,
-    'conflicts ride with the workbook rather than being rejected by the validator');
-  assert.match(norm, /slice\(-MAX_SPREADSHEET_CONFLICTS\)/, 'and are bounded');
-  assert.match(norm, /delete source\._conflicts/,
-    'malformed conflict metadata is stripped, never allowed to make a valid workbook unloadable');
+  // This used to assert on the source text and passed while the runtime threw
+  // every conflict away: the normalizer validated them and then returned an
+  // object built from activeProject and projects alone. Preserving a losing
+  // value is pointless if the next save destroys it, so this now runs the real
+  // normalizer and looks at what comes out.
+  const context = contextWith({ TextEncoder });
+  vm.runInContext(`
+    var MAX_SPREADSHEET_CELL_CHARS=50000, MAX_SPREADSHEET_SHEETS=25,
+        MAX_SPREADSHEET_ROWS=500, MAX_SPREADSHEET_COLS=100,
+        MAX_SPREADSHEET_GRID_CELLS=10000, MAX_SPREADSHEET_TOTAL_CELLS=10000,
+        MAX_SPREADSHEET_TOTAL_CHARS=400000, MAX_SPREADSHEET_SYNC_JSON_BYTES=600000,
+        MAX_SPREADSHEET_CONFLICTS=200, MAX_SPREADSHEET_ATTRIBUTIONS=200,
+        MAX_SPREADSHEET_ATTRIBUTION_NAME=80;
+    ${declaration('_normalizeSpreadsheetAttribution')}
+    ${declaration('normalizeSpreadsheetWorkbook')}
+    globalThis.norm = value => normalizeSpreadsheetWorkbook(value);
+  `, context);
+
+  const workbook = (conflicts) => ({
+    activeProject: 'p1',
+    projects: [{ id: 'p1', name: 'P', activeId: 's1', sheets: [
+      { id: 's1', name: 'S', rows: 3, cols: 3, colWidths: [],
+        cells: { '0,0': { v: 'x', bg: '', tc: '', b: false } } },
+    ] }],
+    ...(conflicts ? { _conflicts: conflicts } : {}),
+  });
+  const conflict = suffix => ({
+    id: 'sc_' + suffix, kind: 'cell', projectId: 'p1', sheetId: 's1', target: '0,0',
+    base: null, local: { v: 'mine' + suffix }, remote: { v: 'theirs' + suffix },
+    at: new Date().toISOString(),
+  });
+
+  const kept = context.norm(workbook([conflict('a')]));
+  assert.equal(kept._conflicts?.length, 1, 'a valid conflict survives the round trip');
+  assert.equal(kept._conflicts[0].local.v, 'minea', 'with the losing value intact');
+
+  // Normalizing its own output must be stable, because that is what repeated
+  // saves actually do.
+  assert.equal(context.norm(kept)._conflicts?.length, 1, 'and survives a second save');
+
+  const bounded = context.norm(workbook(
+    Array.from({ length: 260 }, (_, i) => conflict(String(i)))));
+  assert.equal(bounded._conflicts.length, 200, 'still bounded');
+
+  // Malformed metadata must never make a real workbook unloadable.
+  assert.doesNotThrow(() => context.norm(workbook([{ nonsense: true }])));
+  assert.equal(context.norm(workbook([{ nonsense: true }]))._conflicts, undefined);
+  assert.equal(context.norm(workbook(null))._conflicts, undefined);
 });
 
 // --- P0-2: per-cell attribution ---------------------------------------------
