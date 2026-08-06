@@ -3977,6 +3977,38 @@ function _mergeDivergentRecords(a, b) {
   return applyMarkers(winner);
 }
 
+// MB161-008: a synchronized record list has to have ONE order, derived from the
+// records themselves.
+//
+// Reported from real use: a new log appeared on both dashboards, was replaced
+// by an older entry, then came back. The merge below used to return records in
+// the order it happened to encounter them — remote first, then whatever was
+// local-only — so the same two record sets produced different arrays depending
+// on which Mac merged and when. Every renderer reads array order, so the
+// dashboard's "most recent log" moved around while sync settled.
+//
+// `date` is a calendar day and cannot break ties on its own, and record ids are
+// deliberately not minted from the clock (MB161-007), so `created` is the only
+// field that actually orders two entries made on the same day. Newest first.
+function _syncRecordOrderKey(record) {
+  return [
+    String(record?.date ?? ''),
+    String(record?.created ?? record?.updatedAt ?? ''),
+    String(record?.id ?? ''),
+  ];
+}
+
+function _compareSyncRecords(a, b) {
+  const left = _syncRecordOrderKey(a);
+  const right = _syncRecordOrderKey(b);
+  for (let i = 0; i < left.length; i += 1) {
+    // Descending: the newer value sorts first.
+    const cmp = right[i].localeCompare(left[i]);
+    if (cmp !== 0) return cmp;
+  }
+  return 0;
+}
+
 // Deterministic and symmetric: merge(a, b) always equals merge(b, a).
 function _mergeTombstonedRecordLists(localList, remoteList) {
   const local = Array.isArray(localList) ? localList : [];
@@ -4028,6 +4060,10 @@ function _mergeTombstonedRecordLists(localList, remoteList) {
       return _mergeDivergentRecords(a, b);
     })));
   }
+  // MB161-008: order by content, never by arrival. Without this the array is a
+  // function of sync timing and the two Macs disagree about which record is
+  // first even when they hold identical data.
+  merged.sort(_compareSyncRecords);
   return merged;
 }
 
@@ -10515,8 +10551,11 @@ function refreshDashboard() {
 
 function renderYesterdayLog() {
   const logs = getVisibleLogs();
-  // Always show the most recently dated log entry
-  const entry = logs.slice().sort((a, b) => (b.date || '').localeCompare(a.date || ''))[0];
+  // MB161-008: this used to sort on `date` alone. Two entries on the same day
+  // tie, JavaScript's sort is stable, so the winner was whichever the array
+  // happened to hold first — and the merge decided that by arrival order. Use
+  // the same total order everything else does.
+  const entry = logs.slice().sort(_compareSyncRecords)[0];
 
   if (!entry) {
     document.getElementById('yesterday-log-content').innerHTML = `<div style="font-size:13px;color:var(--text-muted);padding:8px 0">No log entries yet. <button class="btn btn-ghost btn-sm" onclick="navigate('log')">Add one now</button></div>`;
@@ -12051,10 +12090,9 @@ async function saveLogEntry() {
       } else if (!logs.some(l => String(l.id) === String(newEntry.id))) {
         logs.unshift(newEntry);
       }
-      logs.sort((a, b) =>
-        String(b.date).localeCompare(String(a.date)) ||
-        String(b.id).localeCompare(String(a.id))
-      );
+      // MB161-008: the same order the merge produces, so a local save and a
+      // merged result never disagree about which entry is first.
+      logs.sort(_compareSyncRecords);
       return logs;
     }, []);
     bodyElement.value = '';
@@ -12129,7 +12167,10 @@ function getRecoverableDeletedLogs() {
 }
 
 function renderLogs() {
-  const logs = getVisibleLogs();
+  // MB161-008: the log page renders array order. Sort here too rather than
+  // trusting whatever order storage happens to be in — an older record list
+  // written before this build has no guaranteed order at all.
+  const logs = getVisibleLogs().sort(_compareSyncRecords);
   const rawSearch = boundedText((document.getElementById('log-search')?.value || '').trim(), 256);
   const authorFilter = (document.getElementById('log-author-filter')?.value || '');
   const terms = rawSearch

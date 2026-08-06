@@ -2156,6 +2156,8 @@ function mergeApi() {
     ${declaration('_mergeResolvedConflictIds')}
     ${declaration('_mergeConflictVariants')}
     ${declaration('_mergeDivergentRecords')}
+    ${declaration('_syncRecordOrderKey')}
+    ${declaration('_compareSyncRecords')}
     ${declaration('_mergeTombstonedRecordLists')}
     globalThis.m = {
       merge: (a, b) => _mergeTombstonedRecordLists(a, b),
@@ -2407,6 +2409,8 @@ function logMergeApi() {
     ${declaration('_mergeResolvedConflictIds')}
     ${declaration('_mergeConflictVariants')}
     ${declaration('_mergeDivergentRecords')}
+    ${declaration('_syncRecordOrderKey')}
+    ${declaration('_compareSyncRecords')}
     ${declaration('_mergeTombstonedRecordLists')}
     globalThis.m = (a, b) => _mergeTombstonedRecordLists(a, b);
   `, context);
@@ -2605,6 +2609,8 @@ function conflictMergeApi() {
     ${declaration('_mergeResolvedConflictIds')}
     ${declaration('_mergeConflictVariants')}
     ${declaration('_mergeDivergentRecords')}
+    ${declaration('_syncRecordOrderKey')}
+    ${declaration('_compareSyncRecords')}
     ${declaration('_mergeTombstonedRecordLists')}
     globalThis.api = {
       merge: (a, b) => _mergeTombstonedRecordLists(a, b),
@@ -3125,6 +3131,62 @@ test('P0-2: visiting a cell is not an edit', () => {
   );
 });
 
+// --- MB161-008: the dashboard's "most recent log" moved around ---------------
+//
+// Reported from real use: a new log appeared on both dashboards, was replaced
+// by an older entry, then came back. Two causes compounded — the merge returned
+// records in arrival order, and the dashboard's sort could not break a tie
+// between two entries made on the same day.
+
+test('MB161-008: merged record order is a function of the records, not arrival', () => {
+  const merge = logMergeApi();
+  const older = { id: 'a', date: '2026-08-05', body: 'morning', created: '2026-08-05T14:00:00.000Z', version: 1 };
+  const newer = { id: 'b', date: '2026-08-05', body: 'afternoon', created: '2026-08-05T21:30:00.000Z', version: 1 };
+  const third = { id: 'c', date: '2026-08-04', body: 'yesterday', created: '2026-08-04T20:00:00.000Z', version: 1 };
+
+  const ids = list => list.map(r => r.id);
+  // The Mac that just wrote `newer` holds it locally; the Mac that has not seen
+  // it yet holds only the other two. Whichever way round the merge runs, and
+  // whatever order either side stores its own copy in, one array must come out.
+  const expected = ['b', 'a', 'c'];
+  assert.deepEqual(ids(merge([newer, older, third], [older, third])), expected);
+  assert.deepEqual(ids(merge([older, third], [newer, older, third])), expected);
+  assert.deepEqual(ids(merge([third, older], [third, newer])), expected);
+  assert.deepEqual(ids(merge([newer], [third, older])), expected);
+});
+
+test('MB161-008: a same-day tie is broken by creation time, not array position', () => {
+  const context = contextWith({});
+  vm.runInContext(`
+    ${declaration('_syncRecordOrderKey')}
+    ${declaration('_compareSyncRecords')}
+    globalThis.newest = list => list.slice().sort(_compareSyncRecords)[0];
+  `, context);
+
+  const morning = { id: 'zzz', date: '2026-08-05', created: '2026-08-05T14:00:00.000Z' };
+  const evening = { id: 'aaa', date: '2026-08-05', created: '2026-08-05T21:30:00.000Z' };
+
+  // Same date, so `date` alone ties and a stable sort returns whichever came
+  // first — which is exactly what the dashboard was doing.
+  assert.equal(context.newest([morning, evening]).id, 'aaa');
+  assert.equal(context.newest([evening, morning]).id, 'aaa');
+  // And the id must not be trusted as a clock: record ids are random by design.
+  assert.equal(context.newest([evening, morning]).created, '2026-08-05T21:30:00.000Z',
+    'the later entry wins even though its id sorts lower');
+
+  // A dated record always outranks one with no date at all.
+  assert.equal(context.newest([{ id: 'x' }, morning]).id, 'zzz');
+});
+
+test('MB161-008: the renderers and the local save share one comparator', () => {
+  assert.match(declaration('saveLogEntry'), /logs\.sort\(_compareSyncRecords\)/,
+    'a local save must store the same order the merge produces');
+  assert.match(declaration('renderYesterdayLog'), /sort\(_compareSyncRecords\)/,
+    'the dashboard must not depend on array position');
+  assert.match(declaration('renderLogs'), /sort\(_compareSyncRecords\)/,
+    'nor the log page');
+});
+
 // --- Lesson check-out, retired with MindBody ---------------------------------
 
 test('queued check-out deliveries are retired instead of retried forever', () => {
@@ -3230,6 +3292,8 @@ function ssRebaseApi() {
     ${declaration('_deriveSpreadsheetOperations')}
     ${declaration('_applySpreadsheetOperations')}
     ${declaration('_mergeSpreadsheetEdits')}
+    ${declaration('_syncRecordOrderKey')}
+    ${declaration('_compareSyncRecords')}
     ${declaration('_mergeTombstonedRecordLists')}
     ${script.slice(script.indexOf('class SyncRebaseUndecidable'), script.indexOf('function _mergeSyncValuesForKey'))}
     var SYNC_MERGE_STRATEGIES = { logs: 'tombstoned-record-list', spreadsheets: 'spreadsheet-operations' };
