@@ -851,9 +851,17 @@
       border:1px solid var(--divider);border-radius:6px;padding:4px 6px;
       background:var(--bg);color:var(--text-primary);
     }
+    #ss-formula-row {
+      display:flex;align-items:center;gap:8px;padding:6px 12px;flex-shrink:0;
+      background:var(--surface);border:1px solid var(--divider);border-top:none;
+    }
+    #ss-formula-label {
+      font-size:10px;font-weight:700;letter-spacing:.08em;color:var(--text-muted);
+      flex-shrink:0;
+    }
     #ss-formula-bar {
       flex:1;font-size:13px;border:1px solid var(--divider);border-radius:6px;
-      padding:4px 10px;background:var(--bg);color:var(--text-primary);min-width:0;
+      padding:5px 10px;background:var(--bg);color:var(--text-primary);min-width:0;
     }
     .ss-sep { width:1px;height:22px;background:var(--divider);margin:0 2px;flex-shrink:0; }
     .ss-color-swatch {
@@ -913,12 +921,15 @@
     #ss-grid td.ss-selected {
       outline:2px solid #1a73e8;outline-offset:-2px;z-index:2;
     }
-    /* The cell being typed in has to show what is being typed, so it escapes
-       the clipping the rest of the grid uses and floats above its neighbours. */
-    #ss-grid td.ss-editing { overflow:visible;z-index:6; }
+    /* The editor stays exactly one row tall as well. Letting it grow was the
+       remaining source of expansion: typing a long note pushed the row open and
+       shoved the schedule out of alignment while you typed. It scrolls
+       horizontally instead, and the formula row above shows the whole value. */
+    #ss-grid td.ss-editing { z-index:6; }
     #ss-grid td.ss-editing .ss-cell-input {
-      min-height:100%;height:auto;background:#fff;
-      box-shadow:0 2px 10px rgba(0,0,0,.18);outline:2px solid #1a73e8;
+      white-space:pre;overflow-x:auto;overflow-y:hidden;
+      height:100%;min-height:0;line-height:24px;background:#fff;
+      outline:2px solid #1a73e8;
     }
     #ss-grid td.ss-in-range { background-color:rgba(26,115,232,.08) !important; }
     #ss-grid td.ss-editing {
@@ -935,8 +946,8 @@
       padding:3px 6px;font-size:13px;font-family:inherit;
       background:inherit;color:inherit;caret-color:#1a73e8;
       z-index:4;width:100%;box-sizing:border-box;
-      resize:none;overflow:hidden;white-space:pre-wrap;
-      word-wrap:break-word;min-height:100%;line-height:1.35;
+      resize:none;overflow:hidden;white-space:pre;
+      min-height:100%;line-height:1.35;
     }
     #ss-tabs-row {
       display:flex;align-items:stretch;background:#f0f0f0;
@@ -1520,13 +1531,6 @@
             <button class="ss-toolbar-btn" id="ss-undo-btn" onclick="ssUndo()" title="Undo (⌘Z)" disabled style="opacity:.4">↩ Undo</button>
             <div class="ss-sep"></div>
             <input id="ss-cell-ref" readonly placeholder="A1" title="Cell reference" />
-            <!-- Cells clip rather than grow, so this is where the whole value is
-                 readable. It was styled and wired but never actually placed in
-                 the document, which is why it never appeared. -->
-            <input id="ss-formula-bar" placeholder="Select a cell to see its full text"
-              spellcheck="false" autocapitalize="off" autocorrect="off"
-              onkeydown="ssFormulaBarKey(event)" onblur="ssUpdateToolbar()"
-              title="Full contents of the selected cell — edit here and press Return" />
             <div class="ss-sep"></div>
             <span style="font-size:11px;color:var(--text-muted);font-weight:600;white-space:nowrap;flex-shrink:0">FILL:</span>
             <div class="ss-color-clear" onclick="ssClearColor()" title="No fill">✕</div>
@@ -1546,6 +1550,17 @@
             <button class="ss-toolbar-btn" id="ss-unmerge-btn" onclick="ssUnmergeCells()" style="display:none;color:#c44">Unmerge</button>
             <div class="ss-sep"></div>
             <button class="ss-toolbar-btn" id="ss-key-btn" onclick="ssToggleColorKey()">+ Color Key</button>
+          </div>
+          <!-- Cells clip rather than grow, so the whole value of the selected
+               cell is read here. Full width and on its own row, directly under
+               the palette, because a long note squeezed beside the cell
+               reference is no more readable than the clipped cell was. -->
+          <div id="ss-formula-row">
+            <span id="ss-formula-label">CELL</span>
+            <input id="ss-formula-bar" placeholder="Select a cell to see its full text"
+              spellcheck="false" autocapitalize="off" autocorrect="off"
+              onkeydown="ssFormulaBarKey(event)" onblur="ssUpdateToolbar()"
+              title="Full contents of the selected cell — edit here and press Return" />
           </div>
           <!-- Color Key -->
           <div id="ss-color-key" style="display:none"></div>

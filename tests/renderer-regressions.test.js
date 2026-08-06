@@ -1084,7 +1084,10 @@ test('cells clip and the formula bar carries the full value', () => {
 
   // The formula bar was styled and wired but never placed in the document,
   // which is why selecting a cell never showed anything.
-  assert.match(source, /<input id="ss-formula-bar"[\s\S]*?onkeydown="ssFormulaBarKey\(event\)"/);
+  // Full width on its own row under the palette: a long note squeezed beside
+  // the cell reference is no more readable than the clipped cell was.
+  assert.match(source, /<div id="ss-formula-row">[\s\S]*?<input id="ss-formula-bar"[\s\S]*?onkeydown="ssFormulaBarKey\(event\)"/);
+  assert.match(source, /#ss-formula-row \{[^}]*display:flex/);
   const toolbar = namedFunctionSource('ssUpdateToolbar');
   assert.match(toolbar, /const fb = document\.getElementById\('ss-formula-bar'\)/);
   assert.match(toolbar, /if \(fb && document\.activeElement !== fb\) fb\.value = cell\.v \|\| ''/,
@@ -1093,5 +1096,10 @@ test('cells clip and the formula bar carries the full value', () => {
     'and editing through it is bounded like any other cell write');
 
   // The cell being typed in must still show what is being typed.
-  assert.match(source, /#ss-grid td\.ss-editing \{ overflow:visible;z-index:6; \}/);
+  // The editor stays one row tall too — letting it grow was the remaining
+  // source of expansion while typing.
+  assert.match(source, /#ss-grid td\.ss-editing \.ss-cell-input \{\s*\n\s*white-space:pre;overflow-x:auto;overflow-y:hidden;/);
+  assert.match(source, /height:100%;min-height:0;/);
+  assert.doesNotMatch(source, /white-space:pre-wrap;\s*\n?\s*word-wrap:break-word/,
+    'the wrapping editor rule is gone');
 });
