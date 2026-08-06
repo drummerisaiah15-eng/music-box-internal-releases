@@ -801,6 +801,43 @@
       background:transparent;white-space:nowrap;
     }
     .ss-key-add:hover { border-color:var(--sidebar-accent);color:var(--sidebar-accent); }
+
+    /* Unresolved conflicts */
+    #ss-conflict-banner {
+      display:flex;align-items:center;gap:12px;margin-bottom:14px;
+      padding:11px 15px;border-radius:9px;
+      background:rgba(196,146,42,.10);border:1px solid rgba(196,146,42,.42);
+      font-size:13px;color:var(--text-primary);
+    }
+    #ss-conflict-banner .ss-conflict-count { font-weight:700; }
+    .ss-conflict-card {
+      border:1px solid var(--divider);border-radius:9px;
+      padding:13px 15px;margin-bottom:11px;background:var(--surface);
+    }
+    .ss-conflict-where {
+      font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;
+      color:var(--text-muted);margin-bottom:9px;
+    }
+    .ss-conflict-sides { display:flex;gap:10px;flex-wrap:wrap; }
+    .ss-conflict-side {
+      flex:1 1 220px;border:1.5px solid var(--divider);border-radius:8px;padding:10px 12px;
+    }
+    .ss-conflict-side-label {
+      font-size:11px;font-weight:700;color:var(--text-secondary);margin-bottom:5px;
+    }
+    .ss-conflict-value {
+      font-size:13px;white-space:pre-wrap;word-break:break-word;
+      max-height:110px;overflow:auto;margin-bottom:9px;
+    }
+    .ss-conflict-value.ss-conflict-empty { color:var(--text-muted);font-style:italic; }
+    .ss-conflict-swatch {
+      display:inline-block;width:11px;height:11px;border-radius:3px;
+      border:1px solid var(--divider);vertical-align:-1px;margin-right:5px;
+    }
+    .ss-conflict-base {
+      font-size:11.5px;color:var(--text-muted);margin-top:9px;
+    }
+
     #ss-toolbar {
       display:flex;align-items:center;gap:6px;padding:8px 12px;
       background:var(--surface);border:1px solid var(--divider);
@@ -1459,9 +1496,34 @@
         </div>
       </div>
 
+      <!-- MB161-009: unresolved conflicts used to be preserved and invisible.
+           Every divergence kept a losing value that nobody could see or act on,
+           and the list was silently trimmed once it passed 200. -->
+      <div id="ss-conflict-banner" style="display:none"></div>
+
       <!-- HOME: project card grid -->
       <div id="ss-home-view">
         <div id="ss-project-grid"></div>
+      </div>
+
+      <!-- Conflict resolution -->
+      <div class="modal-overlay hidden" id="ss-conflict-modal">
+        <div class="modal" style="max-width:720px">
+          <div class="modal-header">
+            <div class="modal-title">Unresolved spreadsheet conflicts</div>
+            <button class="modal-close" onclick="ssCloseConflicts()">✕</button>
+          </div>
+          <div class="modal-body" style="max-height:60vh;overflow:auto">
+            <div style="font-size:12.5px;color:var(--text-secondary);margin-bottom:14px">
+              Two Macs changed the same thing at the same time. Both versions were
+              kept — choose which one to keep and the other is discarded.
+            </div>
+            <div id="ss-conflict-list"></div>
+          </div>
+          <div style="padding:0 28px 20px;display:flex;justify-content:flex-end">
+            <button class="btn btn-ghost" onclick="ssCloseConflicts()">Close</button>
+          </div>
+        </div>
       </div>
 
       <!-- Project Name Modal (inside spreadsheets page so it's visible when active) -->
@@ -7357,9 +7419,13 @@ function normalizeSpreadsheetWorkbook(value) {
   // Validated and bounded below; stripped if malformed rather than rejected, so
   // bad conflict metadata can never make a valid workbook unloadable.
   if (source._conflicts !== undefined) {
-    // Over the cap means trim to the newest, not discard everything. Dropping
-    // the whole list because it grew too long destroys exactly the preserved
-    // values the cap exists to keep affordable.
+    // MB161-009: malformed entries are still stripped — bad metadata must never
+    // make a valid workbook unloadable — but a well-formed UNRESOLVED conflict
+    // is never dropped for being one of many. It used to be `.slice(-200)`,
+    // which silently discarded the OLDEST entries: the ones that had been
+    // waiting longest, and therefore the ones nobody had rescued yet. A
+    // conflict record is the only surviving copy of a losing value. Deleting it
+    // to save space defeats the entire reason for keeping it.
     if (!Array.isArray(source._conflicts)) {
       delete source._conflicts;
     } else {
@@ -7368,12 +7434,26 @@ function normalizeSpreadsheetWorkbook(value) {
         typeof entry.id === 'string' && entry.id.length > 0 && entry.id.length <= 128 &&
         ['cell', 'sheet', 'project', 'project-name', 'sheet-name'].includes(entry.kind) &&
         typeof entry.projectId === 'string' && entry.projectId.length <= 128
-      ).slice(-MAX_SPREADSHEET_CONFLICTS);
+      );
       if (kept.length) source._conflicts = kept;
       else delete source._conflicts;
     }
   }
-  if (!Object.keys(source).every(key => ['activeProject', 'projects', '_conflicts'].includes(key)) ||
+  // MB161-009: ids of conflicts somebody has already settled. Bounded, unlike
+  // the conflicts themselves, because losing a resolution marker costs a second
+  // trip through the same decision rather than a value.
+  if (source._resolvedConflicts !== undefined) {
+    if (!Array.isArray(source._resolvedConflicts)) {
+      delete source._resolvedConflicts;
+    } else {
+      const settled = source._resolvedConflicts
+        .filter(id => typeof id === 'string' && id.length > 0 && id.length <= 128)
+        .slice(-MAX_RESOLVED_CONFLICT_IDS);
+      if (settled.length) source._resolvedConflicts = settled;
+      else delete source._resolvedConflicts;
+    }
+  }
+  if (!Object.keys(source).every(key => ['activeProject', 'projects', '_conflicts', '_resolvedConflicts'].includes(key)) ||
       typeof source.activeProject !== 'string' ||
       !Array.isArray(source.projects) ||
       source.projects.length < 1 ||
@@ -7577,6 +7657,9 @@ function normalizeSpreadsheetWorkbook(value) {
   // against something smaller than what actually gets stored.
   if (Array.isArray(source._conflicts) && source._conflicts.length) {
     normalized._conflicts = source._conflicts;
+  }
+  if (Array.isArray(source._resolvedConflicts) && source._resolvedConflicts.length) {
+    normalized._resolvedConflicts = source._resolvedConflicts;
   }
   if (new TextEncoder().encode(JSON.stringify(normalized)).byteLength >
       MAX_SPREADSHEET_SYNC_JSON_BYTES) {
@@ -7839,11 +7922,49 @@ function _ssStampAttribution(sheet, target, op) {
   }
 }
 
+// MB161-009: both of the hashes below used to be 32-bit djb2, and both decide
+// something irreversible.
+//
+// A conflict id collision means one preserved losing value silently replaces
+// another — the surviving copy of somebody's edit, gone. A structure digest
+// collision is worse: _ssStructureWasEditedRemotely() would read an edited
+// sheet as untouched, so a deletion would swallow the other Mac's work without
+// recording a conflict at all. At 32 bits those are roughly one in five million
+// and one in four billion respectively. Small, but the cost of being wrong is
+// data nobody can get back, and widening the hash is nearly free.
+//
+// 64-bit FNV-1a. SHA-256 would be the textbook answer, but WebCrypto's digest
+// is async and every caller here is inside a synchronous merge. FNV-1a is not a
+// cryptographic hash and is not being used as one: nothing here is adversarial,
+// the only question is accidental collision, and at 64 bits that is about one
+// in 10^15 across a full conflict list. Both Macs must derive the same id from
+// the same divergence, so BigInt is used for exact, platform-independent
+// arithmetic rather than the usual 32-bit shift tricks.
+function _ssDigest(text) {
+  const OFFSET = 0xcbf29ce484222325n;
+  const PRIME = 0x100000001b3n;
+  const MASK = 0xffffffffffffffffn;
+  const input = String(text);
+  let hash = OFFSET;
+  for (let i = 0; i < input.length; i += 1) {
+    hash = (hash ^ BigInt(input.charCodeAt(i))) & MASK;
+    hash = (hash * PRIME) & MASK;
+  }
+  // Fixed width so two digests are always comparable as strings and an id can
+  // never be a prefix of another.
+  return hash.toString(36).padStart(13, '0');
+}
+
 function _ssConflictId(parts) {
-  const key = parts.join('|');
-  let hash = 5381;
-  for (let i = 0; i < key.length; i++) hash = ((hash * 33) ^ key.charCodeAt(i)) >>> 0;
-  return 'sc_' + hash.toString(36);
+  // Length-prefixed, not just joined. A bare join is not injective: ['a|b'] and
+  // ['a', 'b'] produce the same string and therefore the same id, and the parts
+  // here are cell JSON, which contains separators of every kind. Prefixing each
+  // part with its length makes the encoding reversible, so two different
+  // divergences cannot describe themselves identically.
+  const encoded = parts
+    .map(part => { const text = String(part ?? ''); return text.length + ':' + text; })
+    .join('|');
+  return 'sc_' + _ssDigest(encoded);
 }
 
 // Content of a project or sheet, ignoring the bookkeeping that changes without
@@ -7859,10 +7980,7 @@ function _ssStructureDigest(structure) {
     });
   }
   delete bare.editedBy;
-  const key = JSON.stringify(bare);
-  let hash = 5381;
-  for (let i = 0; i < key.length; i++) hash = ((hash * 33) ^ key.charCodeAt(i)) >>> 0;
-  return hash.toString(36);
+  return _ssDigest(JSON.stringify(bare));
 }
 
 // True when the copy being deleted is not the copy the deleter last saw — i.e.
@@ -8150,18 +8268,46 @@ function _mergeSpreadsheetEdits(base, dirtyBase, dirty) {
     workbook.activeProject = workbook.projects[0].id;
   }
 
-  // Conflicts accumulate with any already recorded on the reconciled base, are
-  // de-duplicated by target, and are bounded so repeated divergence cannot grow
-  // the synchronized document without limit.
+  // MB161-009: resolution markers come from BOTH sides. The base carries what
+  // the other Mac settled; the dirty workbook carries what this person just
+  // settled, and the operation replay above knows nothing about either.
+  const settledIds = _mergeResolvedConflictIds(
+    base._resolvedConflicts,
+    dirtyBase?._resolvedConflicts,
+    dirty?._resolvedConflicts,
+  );
+  const settled = new Set(settledIds);
+
+  // Conflicts accumulate with any already recorded on the reconciled base and
+  // are de-duplicated by id. They are NOT trimmed to a cap: each one is the
+  // only surviving copy of a value somebody lost, so the list shrinks by being
+  // resolved and by nothing else.
   const carried = Array.isArray(base._conflicts) ? base._conflicts : [];
-  const merged = [...carried];
-  for (const entry of conflicts) {
+  const merged = [];
+  for (const entry of [...carried, ...conflicts]) {
+    // A settled conflict must never come back, including from a stale Mac that
+    // has been offline since before it was resolved.
+    if (settled.has(entry.id)) continue;
     const index = merged.findIndex(existing => existing.id === entry.id);
     if (index >= 0) merged[index] = entry;
     else merged.push(entry);
   }
-  if (merged.length) workbook._conflicts = merged.slice(-MAX_SPREADSHEET_CONFLICTS);
+  if (merged.length) workbook._conflicts = merged;
   else delete workbook._conflicts;
+  if (settledIds.length) workbook._resolvedConflicts = settledIds;
+  else delete workbook._resolvedConflicts;
+  // Nothing is dropped, so the only defence against a workbook growing past the
+  // sync limit is telling somebody. This is not a failure — the values are all
+  // safe — but it does need attention before the 600 KB ceiling arrives.
+  if (merged.length >= MAX_SPREADSHEET_CONFLICTS && merged.length > carried.length) {
+    try {
+      showToast(
+        `${merged.length} unresolved spreadsheet conflicts are being kept. ` +
+        `Open Spreadsheets and resolve them — nothing is lost, but they take up sync space.`,
+        'warning'
+      );
+    } catch (_) {}
+  }
   return workbook;
 }
 
@@ -8324,6 +8470,226 @@ function ssGoHome() {
        <button class="btn btn-primary" onclick="ssNewProject()">+ New Project</button>`;
   }
   ssRenderHomeView();
+  ssRenderConflictBanner();
+}
+
+// ─────────────────────────────────────────────────────────────
+// MB161-009: UNRESOLVED CONFLICTS
+//
+// The merge preserves the losing side of every simultaneous edit, which is only
+// half a feature while nothing can display or clear them. They were invisible,
+// unresolvable, and silently trimmed once the list passed 200 — so the oldest
+// preserved values, the ones nobody had rescued, were the first to go.
+//
+// Resolving writes the chosen value through the ordinary edit path, so it
+// merges and syncs like any other change, and records the conflict's id in
+// `_resolvedConflicts` so a Mac that has been offline since before the decision
+// cannot bring it back.
+// ─────────────────────────────────────────────────────────────
+
+function _ssUnresolvedConflicts() {
+  const list = _ssData?._conflicts;
+  return Array.isArray(list) ? list : [];
+}
+
+function _ssConflictLocation(entry) {
+  const project = (_ssData?.projects || []).find(p => p.id === entry.projectId);
+  const sheet = entry.sheetId
+    ? (project?.sheets || []).find(s => s.id === entry.sheetId)
+    : null;
+  const where = [project?.name || 'a deleted project'];
+  if (entry.sheetId) where.push(sheet?.name || 'a deleted sheet');
+  if (entry.kind === 'cell' && typeof entry.target === 'string') {
+    const [row, col] = entry.target.split(',').map(Number);
+    where.push(Number.isFinite(row) && Number.isFinite(col)
+      ? ssColLabel(col) + (row + 1)
+      : entry.target);
+  }
+  return where.join(' · ');
+}
+
+// A cell is {v, bg, tc, b, rs, cs}; a name conflict is a plain string; a
+// structure conflict carries a whole project or sheet.
+function _ssConflictValueHtml(entry, value) {
+  if (entry.kind === 'project' || entry.kind === 'sheet') {
+    const sheets = Array.isArray(value?.sheets) ? value.sheets.length : null;
+    return `<span>${escHtml(value?.name || 'Untitled')}</span>` +
+      (sheets === null ? '' : ` <span style="color:var(--text-muted)">· ${sheets} sheet${sheets === 1 ? '' : 's'}</span>`);
+  }
+  if (entry.kind === 'project-name' || entry.kind === 'sheet-name') {
+    const name = typeof value === 'string' ? value : '';
+    return name
+      ? escHtml(name)
+      : '<span class="ss-conflict-empty">(no name)</span>';
+  }
+  if (value === null || value === undefined) {
+    return '<span class="ss-conflict-empty">(empty)</span>';
+  }
+  const text = String(value.v ?? '');
+  const swatch = value.bg
+    ? `<span class="ss-conflict-swatch" style="background:${safeCssColor(value.bg)}"></span>`
+    : '';
+  const body = text
+    ? `<span${value.b ? ' style="font-weight:700"' : ''}>${escHtml(text)}</span>`
+    : '<span class="ss-conflict-empty">(no text)</span>';
+  return swatch + body;
+}
+
+function _ssConflictSideLabels(entry) {
+  if (entry.kind === 'project' || entry.kind === 'sheet') {
+    return { local: 'Delete it (this Mac)', remote: 'Restore it (other Mac)' };
+  }
+  return { local: 'This Mac', remote: 'The other Mac' };
+}
+
+function ssRenderConflictBanner() {
+  const banner = document.getElementById('ss-conflict-banner');
+  if (!banner) return;
+  const count = _ssUnresolvedConflicts().length;
+  if (!count) {
+    banner.style.display = 'none';
+    banner.innerHTML = '';
+    return;
+  }
+  banner.style.display = '';
+  banner.innerHTML =
+    `<span class="ss-conflict-count">${count} unresolved conflict${count === 1 ? '' : 's'}</span>` +
+    `<span style="flex:1;color:var(--text-secondary)">Both versions were kept. Nothing has been lost.</span>` +
+    `<button class="btn btn-ghost btn-sm" onclick="ssOpenConflicts()" style="border:1.5px solid rgba(196,146,42,.6);border-radius:8px;padding:5px 13px">Review</button>`;
+}
+
+function ssOpenConflicts() {
+  ssRenderConflictList();
+  document.getElementById('ss-conflict-modal')?.classList.remove('hidden');
+}
+
+function ssCloseConflicts() {
+  document.getElementById('ss-conflict-modal')?.classList.add('hidden');
+}
+
+function ssRenderConflictList() {
+  const el = document.getElementById('ss-conflict-list');
+  if (!el) return;
+  const conflicts = _ssUnresolvedConflicts();
+  if (!conflicts.length) {
+    el.innerHTML = '<div style="padding:20px 0;text-align:center;color:var(--text-muted);font-size:13px">Everything is resolved.</div>';
+    return;
+  }
+  el.innerHTML = conflicts.map(entry => {
+    const labels = _ssConflictSideLabels(entry);
+    const isStructure = entry.kind === 'project' || entry.kind === 'sheet';
+    // A contested deletion has no "local value" — the local act WAS the
+    // deletion — so describe the choice rather than pretending to show one.
+    const localHtml = isStructure
+      ? '<span class="ss-conflict-empty">Deleted on this Mac</span>'
+      : _ssConflictValueHtml(entry, entry.local);
+    const remoteHtml = _ssConflictValueHtml(entry, entry.remote);
+    const when = entry.at ? new Date(entry.at).toLocaleString('en-US', {
+      month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
+    }) : '';
+    return `
+      <div class="ss-conflict-card">
+        <div class="ss-conflict-where">${escHtml(_ssConflictLocation(entry))}${when ? ' · ' + escHtml(when) : ''}</div>
+        <div class="ss-conflict-sides">
+          <div class="ss-conflict-side">
+            <div class="ss-conflict-side-label">${escHtml(labels.local)}</div>
+            <div class="ss-conflict-value">${localHtml}</div>
+            <button class="btn btn-ghost btn-sm" style="width:100%;border:1.5px solid var(--divider);border-radius:7px;padding:5px"
+              onclick="ssResolveConflict(${jsArg(entry.id)},'local')">Keep this</button>
+          </div>
+          <div class="ss-conflict-side">
+            <div class="ss-conflict-side-label">${escHtml(labels.remote)}</div>
+            <div class="ss-conflict-value">${remoteHtml}</div>
+            <button class="btn btn-ghost btn-sm" style="width:100%;border:1.5px solid var(--divider);border-radius:7px;padding:5px"
+              onclick="ssResolveConflict(${jsArg(entry.id)},'remote')">Keep this</button>
+          </div>
+        </div>
+        ${(!isStructure && entry.base !== undefined) ? `<div class="ss-conflict-base">Both were changed from: ${_ssConflictValueHtml(entry, entry.base)}</div>` : ''}
+      </div>`;
+  }).join('');
+}
+
+// Apply the chosen side to the workbook. Returns false without changing
+// anything if the target no longer exists, so a stale click cannot recreate a
+// sheet somebody has since deleted.
+function _ssApplyConflictChoice(entry, choice) {
+  if (entry.kind === 'cell') {
+    const sheet = _ssSheetOf(_ssData, entry.projectId, entry.sheetId);
+    if (!sheet) return false;
+    if (!sheet.cells) sheet.cells = {};
+    const value = choice === 'local' ? entry.local : entry.remote;
+    if (value === null || value === undefined) delete sheet.cells[entry.target];
+    else sheet.cells[entry.target] = _cloneJson(value);
+    return true;
+  }
+  if (entry.kind === 'project-name' || entry.kind === 'sheet-name') {
+    const target = entry.kind === 'project-name'
+      ? (_ssData.projects || []).find(p => p.id === entry.projectId)
+      : _ssSheetOf(_ssData, entry.projectId, entry.sheetId);
+    if (!target) return false;
+    const name = choice === 'local' ? entry.local : entry.remote;
+    if (typeof name !== 'string' || !name) return false;
+    target.name = name;
+    return true;
+  }
+  if (entry.kind === 'project') {
+    // 'local' confirms the deletion, which has already been applied — there is
+    // nothing to write, only the marker to record.
+    if (choice === 'local') return true;
+    if ((_ssData.projects || []).some(p => p.id === entry.projectId)) return true;
+    if (!entry.remote) return false;
+    _ssData.projects.push(_cloneJson(entry.remote));
+    return true;
+  }
+  if (entry.kind === 'sheet') {
+    if (choice === 'local') return true;
+    const project = (_ssData.projects || []).find(p => p.id === entry.projectId);
+    if (!project) return false;
+    if (!Array.isArray(project.sheets)) project.sheets = [];
+    if (project.sheets.some(s => s.id === entry.sheetId)) return true;
+    if (!entry.remote) return false;
+    project.sheets.push(_cloneJson(entry.remote));
+    return true;
+  }
+  return false;
+}
+
+async function ssResolveConflict(id, choice) {
+  if (!_ssData || _ssBlockedWorkbook || _ssAwaitingAuthority) return false;
+  const entry = _ssUnresolvedConflicts().find(item => item.id === id);
+  if (!entry) { ssRenderConflictList(); return false; }
+  // Snapshot enough to put the workbook back if the save is refused. Losing a
+  // conflict record to a failed write would be the original bug wearing a hat.
+  const priorConflicts = _cloneJson(_ssData._conflicts);
+  const priorResolved = _cloneJson(_ssData._resolvedConflicts);
+  const priorProjects = _cloneJson(_ssData.projects);
+  try {
+    if (!_ssApplyConflictChoice(entry, choice)) {
+      showToast('That conflict refers to something that no longer exists; it has been cleared.', 'info');
+    }
+    _ssData._conflicts = _ssUnresolvedConflicts().filter(item => item.id !== id);
+    if (!_ssData._conflicts.length) delete _ssData._conflicts;
+    _ssData._resolvedConflicts = _mergeResolvedConflictIds(_ssData._resolvedConflicts, [id]);
+    await ssSave();
+    await _ssSavePending;
+  } catch (error) {
+    _ssData.projects = priorProjects;
+    if (priorConflicts) _ssData._conflicts = priorConflicts; else delete _ssData._conflicts;
+    if (priorResolved) _ssData._resolvedConflicts = priorResolved; else delete _ssData._resolvedConflicts;
+    ssRenderConflictList();
+    ssRenderConflictBanner();
+    // _stageDirtySpreadsheetSave already surfaced the reason.
+    return false;
+  }
+  ssRenderConflictList();
+  ssRenderConflictBanner();
+  if (document.getElementById('ss-editor-view')?.style.display !== 'none') ssRender();
+  else ssRenderHomeView();
+  if (!_ssUnresolvedConflicts().length) {
+    ssCloseConflicts();
+    showToast('All spreadsheet conflicts resolved.', 'success');
+  }
+  return true;
 }
 
 async function ssExportBlockedWorkbook() {
@@ -8362,7 +8728,7 @@ function ssOpenProject(id) {
   ssRender();
 }
 
-function ssRender() { ssRenderTabs(); ssRenderColorKey(); ssRenderGrid(); ssUpdateToolbar(); }
+function ssRender() { ssRenderTabs(); ssRenderColorKey(); ssRenderGrid(); ssUpdateToolbar(); ssRenderConflictBanner(); }
 
 function ssRenderHomeView() {
   const grid = document.getElementById('ss-project-grid');

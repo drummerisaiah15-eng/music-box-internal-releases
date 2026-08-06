@@ -54,6 +54,12 @@ function contextWith(values = {}) {
   return vm.createContext({
     console: { warn() {}, error() {}, log() {} },
     crypto: globalThis.crypto,
+    BigInt,
+    showToast() {},
+    // Some harnesses pick this up incidentally via declaration('_ssCellIsBlank');
+    // others do not extract it at all. A context global covers both without
+    // colliding with a lexical declaration.
+    MAX_SPREADSHEET_CONFLICTS: 200,
     TextEncoder,
     TextDecoder,
     Uint8Array,
@@ -312,6 +318,7 @@ test('spreadsheet typing in A1 preserves an unrelated remote edit in B1', async 
     _ssData = JSON.parse(JSON.stringify(initial));
     ${declaration('_refreshForSyncKey')}
     ${declaration('_ssCellIsBlank')}
+    ${declaration('_ssDigest')}
     ${declaration('_ssStructureDigest')}
     ${declaration('_ssStructureWasEditedRemotely')}
     ${declaration('_ssSheetOf')}
@@ -324,6 +331,8 @@ test('spreadsheet typing in A1 preserves an unrelated remote edit in B1', async 
     var MAX_SPREADSHEET_ATTRIBUTION_NAME = 80;
     ${declaration('_deriveSpreadsheetOperations')}
     ${declaration('_applySpreadsheetOperations')}
+    var MAX_RESOLVED_CONFLICT_IDS = 200;
+    ${declaration('_mergeResolvedConflictIds')}
     ${declaration('_mergeSpreadsheetEdits')}
     ${declaration('_releaseSpreadsheetSaveGate')}
     ${declaration('_beginSpreadsheetSaveStage')}
@@ -1956,6 +1965,7 @@ test('H-08: _mergeSpreadsheetEdits throws an explicit conflict when a locally-ch
     ${declaration('_cloneJson')}
     const MAX_SPREADSHEET_CONFLICTS = 200;
     ${declaration('_ssCellIsBlank')}
+    ${declaration('_ssDigest')}
     ${declaration('_ssStructureDigest')}
     ${declaration('_ssStructureWasEditedRemotely')}
     ${declaration('_ssSheetOf')}
@@ -1968,6 +1978,8 @@ test('H-08: _mergeSpreadsheetEdits throws an explicit conflict when a locally-ch
     var MAX_SPREADSHEET_ATTRIBUTION_NAME = 80;
     ${declaration('_deriveSpreadsheetOperations')}
     ${declaration('_applySpreadsheetOperations')}
+    var MAX_RESOLVED_CONFLICT_IDS = 200;
+    ${declaration('_mergeResolvedConflictIds')}
     ${declaration('_mergeSpreadsheetEdits')}
     globalThis.mergeApi = { merge: _mergeSpreadsheetEdits };
   `, context);
@@ -1997,6 +2009,7 @@ test('H-08: _mergeSpreadsheetEdits throws an explicit conflict when a locally-ch
     ${declaration('_cloneJson')}
     const MAX_SPREADSHEET_CONFLICTS = 200;
     ${declaration('_ssCellIsBlank')}
+    ${declaration('_ssDigest')}
     ${declaration('_ssStructureDigest')}
     ${declaration('_ssStructureWasEditedRemotely')}
     ${declaration('_ssSheetOf')}
@@ -2009,6 +2022,8 @@ test('H-08: _mergeSpreadsheetEdits throws an explicit conflict when a locally-ch
     var MAX_SPREADSHEET_ATTRIBUTION_NAME = 80;
     ${declaration('_deriveSpreadsheetOperations')}
     ${declaration('_applySpreadsheetOperations')}
+    var MAX_RESOLVED_CONFLICT_IDS = 200;
+    ${declaration('_mergeResolvedConflictIds')}
     ${declaration('_mergeSpreadsheetEdits')}
     globalThis.mergeApi = { merge: _mergeSpreadsheetEdits };
   `, context);
@@ -2039,6 +2054,7 @@ test('H-08: _mergeSpreadsheetEdits throws when a locally-cleared cell was concur
     ${declaration('_cloneJson')}
     const MAX_SPREADSHEET_CONFLICTS = 200;
     ${declaration('_ssCellIsBlank')}
+    ${declaration('_ssDigest')}
     ${declaration('_ssStructureDigest')}
     ${declaration('_ssStructureWasEditedRemotely')}
     ${declaration('_ssSheetOf')}
@@ -2051,6 +2067,8 @@ test('H-08: _mergeSpreadsheetEdits throws when a locally-cleared cell was concur
     var MAX_SPREADSHEET_ATTRIBUTION_NAME = 80;
     ${declaration('_deriveSpreadsheetOperations')}
     ${declaration('_applySpreadsheetOperations')}
+    var MAX_RESOLVED_CONFLICT_IDS = 200;
+    ${declaration('_mergeResolvedConflictIds')}
     ${declaration('_mergeSpreadsheetEdits')}
     globalThis.mergeApi = { merge: _mergeSpreadsheetEdits };
   `, context);
@@ -2715,6 +2733,7 @@ function ssOpsApi() {
   vm.runInContext(`
     const MAX_SPREADSHEET_CONFLICTS = 200;
     ${declaration('_ssCellIsBlank')}
+    ${declaration('_ssDigest')}
     ${declaration('_ssStructureDigest')}
     ${declaration('_ssStructureWasEditedRemotely')}
     ${declaration('_ssSheetOf')}
@@ -2727,6 +2746,8 @@ function ssOpsApi() {
     var MAX_SPREADSHEET_ATTRIBUTION_NAME = 80;
     ${declaration('_deriveSpreadsheetOperations')}
     ${declaration('_applySpreadsheetOperations')}
+    var MAX_RESOLVED_CONFLICT_IDS = 200;
+    ${declaration('_mergeResolvedConflictIds')}
     ${declaration('_mergeSpreadsheetEdits')}
     globalThis.api = {
       merge: (b, db, d) => _mergeSpreadsheetEdits(b, db, d),
@@ -2857,7 +2878,7 @@ test('P0-1: operations carry the base they were derived from', () => {
   assert.equal(cleared.find(o => o.target === '0,0').kind, 'cell.clear');
 });
 
-test('P0-1: workbook conflicts survive normalization and stay bounded', () => {
+test('P0-1: workbook conflicts survive normalization and are never evicted', () => {
   // This used to assert on the source text and passed while the runtime threw
   // every conflict away: the normalizer validated them and then returned an
   // object built from activeProject and projects alone. Preserving a losing
@@ -2869,7 +2890,7 @@ test('P0-1: workbook conflicts survive normalization and stay bounded', () => {
         MAX_SPREADSHEET_ROWS=500, MAX_SPREADSHEET_COLS=100,
         MAX_SPREADSHEET_GRID_CELLS=10000, MAX_SPREADSHEET_TOTAL_CELLS=10000,
         MAX_SPREADSHEET_TOTAL_CHARS=400000, MAX_SPREADSHEET_SYNC_JSON_BYTES=600000,
-        MAX_SPREADSHEET_CONFLICTS=200, MAX_SPREADSHEET_ATTRIBUTIONS=200,
+        MAX_RESOLVED_CONFLICT_IDS=200, MAX_SPREADSHEET_ATTRIBUTIONS=200,
         MAX_SPREADSHEET_ATTRIBUTION_NAME=80;
     ${declaration('_normalizeSpreadsheetAttribution')}
     ${declaration('normalizeSpreadsheetWorkbook')}
@@ -2898,14 +2919,32 @@ test('P0-1: workbook conflicts survive normalization and stay bounded', () => {
   // saves actually do.
   assert.equal(context.norm(kept)._conflicts?.length, 1, 'and survives a second save');
 
-  const bounded = context.norm(workbook(
+  // MB161-009: this used to assert the list was trimmed to 200 — .slice(-200),
+  // which drops the OLDEST entries. Those are the conflicts that have been
+  // waiting longest, so the ones nobody has rescued were the first destroyed,
+  // and a conflict record is the only surviving copy of the losing value.
+  const many = context.norm(workbook(
     Array.from({ length: 260 }, (_, i) => conflict(String(i)))));
-  assert.equal(bounded._conflicts.length, 200, 'still bounded');
+  assert.equal(many._conflicts.length, 260, 'no unresolved conflict is evicted for being one of many');
+  assert.equal(many._conflicts[0].id, 'sc_0', 'and the oldest is still the first');
+
+  // Resolution markers ARE bounded: losing one costs a second pass through the
+  // same decision, not a value.
+  const settled = context.norm({
+    ...workbook([conflict('a')]),
+    _resolvedConflicts: Array.from({ length: 260 }, (_, i) => 'sc_r' + i),
+  });
+  assert.equal(settled._resolvedConflicts.length, 200, 'resolution markers stay bounded');
+  assert.equal(settled._conflicts.length, 1, 'without touching the conflicts');
 
   // Malformed metadata must never make a real workbook unloadable.
   assert.doesNotThrow(() => context.norm(workbook([{ nonsense: true }])));
   assert.equal(context.norm(workbook([{ nonsense: true }]))._conflicts, undefined);
   assert.equal(context.norm(workbook(null))._conflicts, undefined);
+  assert.equal(
+    context.norm({ ...workbook([conflict('a')]), _resolvedConflicts: 'nope' })._resolvedConflicts,
+    undefined,
+    'a malformed marker list is stripped, not thrown on');
 });
 
 // --- P0-2: per-cell attribution ---------------------------------------------
@@ -3131,6 +3170,132 @@ test('P0-2: visiting a cell is not an edit', () => {
   );
 });
 
+// --- MB161-009: preserved conflicts were invisible, unresolvable, and evicted -
+
+test('MB161-009: a resolved conflict does not come back, even from a stale Mac', () => {
+  const { merge } = ssOpsApi();
+  const remote = ssBook({ '0,0': ssCell('REMOTE EDIT') });
+  const local = ssBook({ '0,0': ssCell('LOCAL EDIT') });
+  const clash = merge(remote, ssBase, local);
+  assert.equal(clash._conflicts.length, 1);
+  const id = clash._conflicts[0].id;
+
+  // The operator picks a side: the value is written like any other edit, and
+  // the id is recorded as settled.
+  const resolved = JSON.parse(JSON.stringify(clash));
+  resolved.projects[0].sheets[0].cells['0,0'] = ssCell('LOCAL EDIT');
+  delete resolved._conflicts;
+  resolved._resolvedConflicts = [id];
+  const saved = merge(clash, clash, resolved);
+  assert.equal(saved._conflicts, undefined, 'the conflict is gone');
+  assert.deepEqual(saved._resolvedConflicts, [id], 'and the decision is recorded');
+
+  // A Mac that has been offline since before the decision still carries the
+  // conflict on its base. It must not be able to reattach it.
+  const staleBase = JSON.parse(JSON.stringify(clash));
+  staleBase._resolvedConflicts = [id];
+  const afterStale = merge(staleBase, staleBase, JSON.parse(JSON.stringify(staleBase)));
+  assert.equal(afterStale._conflicts, undefined, 'a settled conflict is never reattached');
+});
+
+test('MB161-009: unresolved conflicts accumulate rather than evicting each other', () => {
+  const { merge } = ssOpsApi();
+  // Two hundred and one distinct divergences on distinct cells. Under the old
+  // .slice(-200) the first one — the oldest, longest unrescued — vanished.
+  let base = ssBook({});
+  const cells = {};
+  for (let i = 0; i < 201; i += 1) cells[`0,${i}`] = ssCell('BASE' + i);
+  base = { ...base };
+  base.projects[0].sheets[0].cols = 210;
+  base.projects[0].sheets[0].cells = cells;
+
+  const remote = JSON.parse(JSON.stringify(base));
+  const local = JSON.parse(JSON.stringify(base));
+  for (let i = 0; i < 201; i += 1) {
+    remote.projects[0].sheets[0].cells[`0,${i}`] = ssCell('THEIRS' + i);
+    local.projects[0].sheets[0].cells[`0,${i}`] = ssCell('MINE' + i);
+  }
+  const result = merge(remote, base, local);
+  assert.equal(result._conflicts.length, 201, 'every divergence is kept');
+  const ids = new Set(result._conflicts.map(c => c.id));
+  assert.equal(ids.size, 201, 'and each has its own id');
+  // The specific record the old cap destroyed.
+  assert.ok(result._conflicts.some(c => c.target === '0,0' && c.local.v === 'MINE0'),
+    'including the oldest, which .slice(-200) used to drop');
+});
+
+test('MB161-009: conflict and structure digests are wide enough to trust', () => {
+  const context = contextWith({ _cloneJson: v => JSON.parse(JSON.stringify(v)) });
+  vm.runInContext(`
+    ${declaration('_ssDigest')}
+    ${declaration('_ssConflictId')}
+    ${declaration('_ssStructureDigest')}
+    globalThis.api = {
+      digest: t => _ssDigest(t),
+      id: parts => _ssConflictId(parts),
+      structure: s => _ssStructureDigest(s),
+    };
+  `, context);
+
+  // 64 bits, not 32: an id collision silently replaces one preserved value with
+  // another, and a structure-digest collision lets a deletion swallow a remote
+  // edit without recording anything at all.
+  assert.equal(context.api.digest('anything').length, 13, 'fixed width');
+  assert.equal(context.api.digest('a'), context.api.digest('a'), 'deterministic');
+  assert.notEqual(context.api.digest('a'), context.api.digest('b'));
+
+  // A bare join is not injective, and the parts are cell JSON full of
+  // separators. These are different divergences and must get different ids.
+  assert.notEqual(context.api.id(['a|b']), context.api.id(['a', 'b']));
+  assert.notEqual(context.api.id(['ab', 'c']), context.api.id(['a', 'bc']));
+  assert.equal(context.api.id(['a', 'b']), context.api.id(['a', 'b']));
+  assert.match(context.api.id(['x']), /^sc_[0-9a-z]{13}$/);
+
+  // Null and undefined parts must not collapse into each other's neighbours.
+  assert.notEqual(context.api.id(['a', null, 'b']), context.api.id(['a', 'b', null]));
+
+  // No collisions across a realistic population. The old 32-bit djb2 fails a
+  // birthday test at this size often enough to matter.
+  const seen = new Set();
+  for (let i = 0; i < 20000; i += 1) {
+    seen.add(context.api.id(['cell', 'p1', 's1', `0,${i}`, 'null', `{"v":"m${i}"}`, `{"v":"t${i}"}`]));
+  }
+  assert.equal(seen.size, 20000, 'twenty thousand distinct divergences, twenty thousand ids');
+
+  // Attribution churn must still not read as a structural edit.
+  const sheet = { id: 's1', name: 'S', cells: { '0,0': { v: 'x' } } };
+  assert.equal(
+    context.api.structure({ ...sheet, editedBy: { '0,0': { by: 'A' } } }),
+    context.api.structure({ ...sheet, editedBy: { '0,0': { by: 'B' } } }),
+    'who touched it is not what it is');
+  assert.notEqual(
+    context.api.structure(sheet),
+    context.api.structure({ ...sheet, cells: { '0,0': { v: 'y' } } }));
+});
+
+test('MB161-009: the conflict surface exists and resolves through the edit path', () => {
+  for (const name of [
+    '_ssUnresolvedConflicts', 'ssRenderConflictBanner', 'ssOpenConflicts',
+    'ssRenderConflictList', '_ssApplyConflictChoice', 'ssResolveConflict',
+  ]) {
+    assert.ok(script.includes(`function ${name}(`) || script.includes(`async function ${name}(`),
+      `${name} is missing`);
+  }
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  assert.ok(html.includes('id="ss-conflict-banner"'), 'the banner has somewhere to render');
+  assert.ok(html.includes('id="ss-conflict-list"'), 'and the list does too');
+  assert.match(declaration('ssRender'), /ssRenderConflictBanner\(\)/,
+    'opening a project shows outstanding conflicts');
+
+  const resolve = declaration('ssResolveConflict');
+  assert.match(resolve, /_mergeResolvedConflictIds\(_ssData\._resolvedConflicts, \[id\]\)/,
+    'resolving records a durable marker, not just a local deletion');
+  assert.match(resolve, /await ssSave\(\)/,
+    'and goes out through the ordinary save path so it merges and syncs');
+  assert.match(resolve, /_ssData\.projects = priorProjects/,
+    'a refused save must not leave the conflict deleted and the value gone');
+});
+
 // --- MB161-008: the dashboard's "most recent log" moved around ---------------
 //
 // Reported from real use: a new log appeared on both dashboards, was replaced
@@ -3282,6 +3447,7 @@ function ssRebaseApi() {
     var MAX_SPREADSHEET_ATTRIBUTION_NAME = 80;
     var currentUser = () => 'Test Editor';
     ${declaration('_ssCellIsBlank')}
+    ${declaration('_ssDigest')}
     ${declaration('_ssStructureDigest')}
     ${declaration('_ssStructureWasEditedRemotely')}
     ${declaration('_ssSheetOf')}
@@ -3291,6 +3457,8 @@ function ssRebaseApi() {
     ${declaration('_ssAttributionActor')}
     ${declaration('_deriveSpreadsheetOperations')}
     ${declaration('_applySpreadsheetOperations')}
+    var MAX_RESOLVED_CONFLICT_IDS = 200;
+    ${declaration('_mergeResolvedConflictIds')}
     ${declaration('_mergeSpreadsheetEdits')}
     ${declaration('_syncRecordOrderKey')}
     ${declaration('_compareSyncRecords')}
