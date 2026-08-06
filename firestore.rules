@@ -63,23 +63,30 @@ service cloud.firestore {
       ];
     }
 
-    // Lesson check-out went away with MindBody, and with it the only
-    // date-shaped document key the app ever wrote. Every synchronized document
-    // is now a fixed name from the list above, which means a compromised
-    // member credential can no longer create documents this rule set has never
-    // heard of.
+    // MB161-012: one document per spreadsheet project.
     //
-    // Deploy ordering matters: a Mac still running 1.1.61 or earlier writes
-    // `checkout_<today>` once a day. Deploy these rules only after every Mac
-    // is on 1.1.62+, otherwise the old build reports a permission error.
-    // Existing `checkout_<date>` documents in Firestore are unaffected —
-    // readable, no longer writable, and safe to delete by hand at any time.
+    // Firestore caps a DOCUMENT at 1 MiB on every plan and offers no way to
+    // raise it, but places no limit on documents per collection. Holding every
+    // project in one `spreadsheets` document therefore capped the whole studio
+    // at roughly 9,000 filled cells; holding one project per document applies
+    // that budget to each project instead.
+    //
+    // This is the only dynamic key the rule set admits, and the pattern is
+    // deliberately narrow: project ids are `proj_` + a generated record id, so
+    // [A-Za-z0-9_-] bounded to 100 characters. It must stay in step with
+    // SPREADSHEET_PROJECT_ID_PATTERN in the client. Bounding the shape stops a
+    // compromised member credential spraying documents under arbitrary names;
+    // it does not bound the count, which the client's 25-project limit does.
+    function spreadsheetProjectKey(keyId) {
+      return keyId.matches('spreadsheet_[A-Za-z0-9_-]{1,100}');
+    }
+
     function knownDataKey(keyId) {
-      return baseDataKey(keyId);
+      return baseDataKey(keyId) || spreadsheetProjectKey(keyId);
     }
 
     function writableDataKey(keyId) {
-      return baseDataKey(keyId);
+      return baseDataKey(keyId) || spreadsheetProjectKey(keyId);
     }
 
     function validEncryptedValue(value) {

@@ -4877,12 +4877,31 @@ function _isLegacyCheckoutKey(key) {
   return Number.isFinite(parsed.getTime()) && _todayLocal(parsed) === value;
 }
 
+// MB161-012: `spreadsheets` is now an index naming one document per project, so
+// the set of synchronized keys is no longer fixed. Every project the index
+// knows about — including tombstoned ones, whose documents must keep syncing
+// so a deletion is not mistaken for absence — plus anything already decrypted
+// locally, so a project this Mac holds is never silently dropped from sync
+// because the index has not arrived yet.
+function _ssKnownProjectSyncKeys() {
+  const keys = new Set();
+  const index = _decCache?.spreadsheets;
+  for (const entry of (Array.isArray(index?.projects) ? index.projects : [])) {
+    const id = String(entry?.id ?? '');
+    if (SPREADSHEET_PROJECT_ID_PATTERN.test(id)) keys.add(_ssProjectSyncKey(id));
+  }
+  for (const key of Object.keys(_decCache || {})) {
+    if (_ssIsProjectSyncKey(key)) keys.add(key);
+  }
+  return keys;
+}
+
 function getSyncKeys() {
-  return [...SYNC_BASE_KEYS];
+  return [...SYNC_BASE_KEYS, ..._ssKnownProjectSyncKeys()];
 }
 
 function isSyncKey(key) {
-  return SYNC_BASE_KEYS.includes(key);
+  return SYNC_BASE_KEYS.includes(key) || _ssIsProjectSyncKey(key);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -7412,6 +7431,238 @@ function _ssAttributionActor() {
   try { name = currentUser(); } catch (_) { return null; }
   if (typeof name !== 'string' || !name) return null;
   return name.slice(0, MAX_SPREADSHEET_ATTRIBUTION_NAME);
+}
+
+// ─────────────────────────────────────────────────────────────
+// MB161-012: one synchronized document per project
+//
+// Everything used to live in a single `spreadsheets` document, so the 600 KB
+// budget was shared by every project the studio had — about 9,000 filled cells
+// for the whole app. Firestore caps a DOCUMENT at 1 MiB on every plan, with no
+// way to raise it, but places no limit on how many documents a collection may
+// hold. So the ceiling moves by changing what a document contains, not by
+// paying anyone.
+//
+// Two shapes:
+//
+//   spreadsheets              the index. Which projects exist, and which one is
+//                             open. A tombstoned record list, so a project
+//                             created on one Mac and deleted on the other
+//                             merges by the same rules logs already use, and
+//                             absence never means deletion.
+//
+//   spreadsheet_<projectId>   one project's content: name, sheets, cells,
+//                             attribution, conflicts. This is where the 600 KB
+//                             now applies, per project.
+//
+// A project document is deliberately stored as, and merged as, a one-project
+// workbook. That is not a convenience — it means _deriveSpreadsheetOperations,
+// _applySpreadsheetOperations, _mergeSpreadsheetEdits, the conflict model and
+// normalizeSpreadsheetWorkbook are reused UNCHANGED, rather than a second merge
+// implementation being written for the same data.
+// ─────────────────────────────────────────────────────────────
+
+const SPREADSHEET_INDEX_SCHEMA = 2;
+const MAX_SPREADSHEET_PROJECTS = 25;
+const SPREADSHEET_PROJECT_KEY_PREFIX = 'spreadsheet_';
+// Project ids are `proj_` + _newRecordId(), which is [A-Za-z0-9_]. The pattern
+// is kept deliberately narrow and MUST stay in step with firestore.rules.
+const SPREADSHEET_PROJECT_ID_PATTERN = /^[A-Za-z0-9_-]{1,100}$/;
+
+function _ssProjectSyncKey(projectId) {
+  return SPREADSHEET_PROJECT_KEY_PREFIX + projectId;
+}
+
+function _ssIsProjectSyncKey(key) {
+  if (typeof key !== 'string' || !key.startsWith(SPREADSHEET_PROJECT_KEY_PREFIX)) return false;
+  return SPREADSHEET_PROJECT_ID_PATTERN.test(key.slice(SPREADSHEET_PROJECT_KEY_PREFIX.length));
+}
+
+function _ssProjectIdFromSyncKey(key) {
+  return _ssIsProjectSyncKey(key) ? key.slice(SPREADSHEET_PROJECT_KEY_PREFIX.length) : null;
+}
+
+// The old single-document shape: projects carrying their own sheets. Recognised
+// so it can be migrated, and so a Mac still running an older build cannot have
+// its workbook mistaken for an index.
+function _ssIsLegacyWorkbook(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  if (value.schema === SPREADSHEET_INDEX_SCHEMA) return false;
+  return Array.isArray(value.projects) &&
+    value.projects.some(project => Array.isArray(project?.sheets));
+}
+
+// A project document expressed as the one-project workbook the existing merge
+// and validation already understand.
+function _ssProjectDocToWorkbook(doc) {
+  const project = {
+    id: doc?.id,
+    name: doc?.name,
+    activeId: doc?.activeId,
+    sheets: doc?.sheets,
+  };
+  if (doc && doc.colorKey !== undefined) project.colorKey = doc.colorKey;
+  const workbook = { activeProject: doc?.id, projects: [project] };
+  if (Array.isArray(doc?._conflicts) && doc._conflicts.length) {
+    workbook._conflicts = doc._conflicts;
+  }
+  if (Array.isArray(doc?._resolvedConflicts) && doc._resolvedConflicts.length) {
+    workbook._resolvedConflicts = doc._resolvedConflicts;
+  }
+  return workbook;
+}
+
+function _ssWorkbookToProjectDoc(workbook) {
+  const project = (workbook?.projects || [])[0];
+  if (!project) throw new Error('a spreadsheet project document has no project');
+  const doc = {
+    id: project.id,
+    name: project.name,
+    activeId: project.activeId,
+    sheets: project.sheets,
+  };
+  if (project.colorKey !== undefined) doc.colorKey = project.colorKey;
+  if (Array.isArray(workbook._conflicts) && workbook._conflicts.length) {
+    doc._conflicts = workbook._conflicts;
+  }
+  if (Array.isArray(workbook._resolvedConflicts) && workbook._resolvedConflicts.length) {
+    doc._resolvedConflicts = workbook._resolvedConflicts;
+  }
+  return doc;
+}
+
+// Validation for a project document is EXACTLY the workbook validation, applied
+// to one project. Writing a second validator would guarantee the two drifted.
+function normalizeSpreadsheetProject(doc) {
+  return _ssWorkbookToProjectDoc(
+    normalizeSpreadsheetWorkbook(_ssProjectDocToWorkbook(doc)));
+}
+
+function normalizeSpreadsheetIndex(value) {
+  let source;
+  try { source = JSON.parse(JSON.stringify(value)); }
+  catch { throw new Error('spreadsheets index is not JSON serializable'); }
+  if (!source || typeof source !== 'object' || Array.isArray(source)) {
+    throw new Error('spreadsheets index expected object data');
+  }
+  if (source.schema !== SPREADSHEET_INDEX_SCHEMA) {
+    throw new Error('spreadsheets index has an unrecognised schema');
+  }
+  if (!Array.isArray(source.projects)) {
+    throw new Error('spreadsheets index has no project list');
+  }
+  if (!Object.keys(source).every(key =>
+      ['schema', 'activeProject', 'projects'].includes(key))) {
+    throw new Error('spreadsheets index has unexpected fields');
+  }
+  const seen = new Set();
+  const projects = source.projects.map(entry => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      throw new Error('spreadsheets index has an invalid project entry');
+    }
+    const id = String(entry.id ?? '');
+    if (!SPREADSHEET_PROJECT_ID_PATTERN.test(id)) {
+      throw new Error('spreadsheets index has an invalid project id');
+    }
+    if (seen.has(id)) throw new Error('spreadsheets index has a duplicate project');
+    seen.add(id);
+    const record = { id };
+    // `created` orders the home view without needing the content documents;
+    // `version` and the tombstone are what make the merge a record list.
+    const stamp = input => String(input ?? '').slice(0, 40);
+    if (entry.created !== undefined) record.created = stamp(entry.created);
+    record.version = Number.isSafeInteger(entry.version) && entry.version >= 0
+      ? entry.version : 1;
+    if (entry._deleted === true) {
+      record._deleted = true;
+      record._deletedAt = stamp(entry._deletedAt);
+    }
+    return record;
+  });
+  // Only live projects count against the limit. A tombstone is a few bytes and
+  // deleting one would let a stale Mac resurrect the project.
+  if (projects.filter(entry => !entry._deleted).length > MAX_SPREADSHEET_PROJECTS) {
+    throw new Error(`spreadsheets exceeds the ${MAX_SPREADSHEET_PROJECTS}-project limit`);
+  }
+  const activeProject = String(source.activeProject ?? '');
+  const normalized = { schema: SPREADSHEET_INDEX_SCHEMA, projects };
+  if (projects.some(entry => entry.id === activeProject && !entry._deleted)) {
+    normalized.activeProject = activeProject;
+  } else {
+    const first = projects.find(entry => !entry._deleted);
+    if (first) normalized.activeProject = first.id;
+  }
+  return normalized;
+}
+
+// Split a legacy single-document workbook into the index plus one document per
+// project. Pure: it decides what to write, it does not write anything.
+function _ssSplitWorkbook(workbook) {
+  const projects = Array.isArray(workbook?.projects) ? workbook.projects : [];
+  const documents = new Map();
+  const index = {
+    schema: SPREADSHEET_INDEX_SCHEMA,
+    activeProject: workbook?.activeProject,
+    projects: projects.map(project => ({
+      id: project?.id,
+      created: project?.created,
+      version: 1,
+    })),
+  };
+  for (const project of projects) {
+    const doc = {
+      id: project?.id,
+      name: project?.name,
+      activeId: project?.activeId,
+      sheets: project?.sheets,
+    };
+    if (project?.colorKey !== undefined) doc.colorKey = project.colorKey;
+    documents.set(_ssProjectSyncKey(String(project?.id ?? '')), doc);
+  }
+  // Conflicts belonged to the workbook as a whole and each names the project it
+  // happened in, so they follow their project rather than being dropped or
+  // copied to all of them.
+  for (const entry of (Array.isArray(workbook?._conflicts) ? workbook._conflicts : [])) {
+    const doc = documents.get(_ssProjectSyncKey(String(entry?.projectId ?? '')));
+    if (!doc) continue;
+    (doc._conflicts = doc._conflicts || []).push(entry);
+  }
+  const settled = Array.isArray(workbook?._resolvedConflicts) ? workbook._resolvedConflicts : [];
+  if (settled.length) {
+    // A resolution marker names an id, not a project, so it cannot be routed.
+    // Every project keeps the full set: the cost is bytes, and the cost of
+    // guessing wrong is a resolved conflict coming back.
+    for (const doc of documents.values()) doc._resolvedConflicts = [...settled];
+  }
+  return { index: normalizeSpreadsheetIndex(index), documents };
+}
+
+// Rebuild the whole-workbook shape the editor works with. A project named in
+// the index whose document has not arrived yet is simply absent — that is a
+// still-loading state, never a deletion.
+function _ssAssembleWorkbook(index, documents) {
+  const live = (index?.projects || []).filter(entry => !entry?._deleted);
+  const projects = [];
+  const conflicts = [];
+  const settled = [];
+  for (const entry of live) {
+    const doc = documents instanceof Map
+      ? documents.get(_ssProjectSyncKey(entry.id))
+      : documents?.[_ssProjectSyncKey(entry.id)];
+    if (!doc) continue;
+    const project = { id: doc.id, name: doc.name, activeId: doc.activeId, sheets: doc.sheets };
+    if (doc.colorKey !== undefined) project.colorKey = doc.colorKey;
+    projects.push(project);
+    for (const conflict of (doc._conflicts || [])) conflicts.push(conflict);
+    for (const id of (doc._resolvedConflicts || [])) settled.push(id);
+  }
+  const workbook = { activeProject: index?.activeProject, projects };
+  if (!projects.some(project => project.id === workbook.activeProject) && projects.length) {
+    workbook.activeProject = projects[0].id;
+  }
+  if (conflicts.length) workbook._conflicts = conflicts;
+  if (settled.length) workbook._resolvedConflicts = _mergeResolvedConflictIds(settled);
+  return workbook;
 }
 
 // MB161-011: how full the workbook is, and how much room a change would need.
