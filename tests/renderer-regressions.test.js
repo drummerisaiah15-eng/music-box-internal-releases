@@ -1042,7 +1042,11 @@ test('a remote edit does not throw you out of the project you have open', () => 
   // replaced on first arrival, but with live collaboration that fires
   // constantly.
   const refresh = namedFunctionSource('_refreshForSyncKey');
-  const block = refresh.slice(refresh.indexOf("if (key === 'spreadsheets')"));
+  // MB161-012: the branch now also fires for a single project document
+  // arriving on its own key.
+  const start = refresh.indexOf("if (key === 'spreadsheets' || _ssIsProjectSyncKey(key))");
+  assert.notEqual(start, -1, 'the spreadsheet refresh branch is still there');
+  const block = refresh.slice(start);
   assert.match(block, /const openProjectSurvived = editorOpen &&/);
   assert.match(block, /if \(openProjectSurvived\) ssRender\(\);/, 'an open project re-renders in place');
   assert.match(block, /else ssGoHome\(\);/, 'the home card is still refreshed when none is open');

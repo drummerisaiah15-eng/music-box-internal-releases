@@ -62,6 +62,8 @@ function contextWith(values = {}) {
     // works either way: a lexical declaration in the script simply shadows it.
     SPREADSHEET_PROJECT_KEY_PREFIX: 'spreadsheet_',
     SPREADSHEET_PROJECT_ID_PATTERN: /^[A-Za-z0-9_-]{1,100}$/,
+    SPREADSHEET_INDEX_SCHEMA: 2,
+    MAX_SPREADSHEET_PROJECTS: 25,
     // Some harnesses pick this up incidentally via declaration('_ssCellIsBlank');
     // others do not extract it at all. A context global covers both without
     // colliding with a lexical declaration.
@@ -325,6 +327,21 @@ test('spreadsheet typing in A1 preserves an unrelated remote edit in B1', async 
     var MAX_SPREADSHEET_ATTRIBUTIONS = 200;
     var MAX_SPREADSHEET_ATTRIBUTION_NAME = 80;
     _ssData = JSON.parse(JSON.stringify(initial));
+    // MB161-012: storage is now an index plus one document per project. These
+    // harnesses drive a legacy workbook, so the mode stays 'legacy' and the
+    // behaviour under test is unchanged — but the functions have to exist.
+    // _ssPendingProjectIds arrives with the _ssStorageMode slice below.
+    ${declaration('_ssProjectSyncKey')}
+    ${declaration('_ssIsProjectSyncKey')}
+    ${declaration('_ssIsLegacyWorkbook')}
+    ${declaration('normalizeSpreadsheetIndex')}
+    ${declaration('_ssProjectDocToWorkbook')}
+    ${declaration('_ssWorkbookToProjectDoc')}
+    ${declaration('normalizeSpreadsheetProject')}
+    ${declaration('_ssAssembleWorkbook')}
+    ${declaration('_ssStorageMode')}
+    ${declaration('_ssReadStoredWorkbook')}
+    async function _ssMigrateToSplitStorage() { return false; }
     ${declaration('_refreshForSyncKey')}
     ${declaration('_ssCellIsBlank')}
     ${declaration('_ssDigest')}
@@ -1142,6 +1159,21 @@ function remoteAuthorityContext(authority, { rawLocal = null } = {}) {
     var MAX_SPREADSHEET_ATTRIBUTIONS = 200;
     var MAX_SPREADSHEET_ATTRIBUTION_NAME = 80;
     ${declaration('_remoteStateIsAuthoritativelyAbsent')}
+    // MB161-012: storage is now an index plus one document per project. These
+    // harnesses drive a legacy workbook, so the mode stays 'legacy' and the
+    // behaviour under test is unchanged — but the functions have to exist.
+    // _ssPendingProjectIds arrives with the _ssStorageMode slice below.
+    ${declaration('_ssProjectSyncKey')}
+    ${declaration('_ssIsProjectSyncKey')}
+    ${declaration('_ssIsLegacyWorkbook')}
+    ${declaration('normalizeSpreadsheetIndex')}
+    ${declaration('_ssProjectDocToWorkbook')}
+    ${declaration('_ssWorkbookToProjectDoc')}
+    ${declaration('normalizeSpreadsheetProject')}
+    ${declaration('_ssAssembleWorkbook')}
+    ${declaration('_ssStorageMode')}
+    ${declaration('_ssReadStoredWorkbook')}
+    async function _ssMigrateToSplitStorage() { return false; }
     ${declaration('ssLoad')}
     globalThis.loadApi = {
       load: () => { ssLoad(); return _countSaves(); },
@@ -1735,6 +1767,21 @@ function authorityEditorContext(authority, { stored = null } = {}) {
     ${declaration('ssCreateDefaultSheets')}
     ${declaration('ssCreateDefaultData')}
     ${declaration('_remoteStateIsAuthoritativelyAbsent')}
+    // MB161-012: storage is now an index plus one document per project. These
+    // harnesses drive a legacy workbook, so the mode stays 'legacy' and the
+    // behaviour under test is unchanged — but the functions have to exist.
+    // _ssPendingProjectIds arrives with the _ssStorageMode slice below.
+    ${declaration('_ssProjectSyncKey')}
+    ${declaration('_ssIsProjectSyncKey')}
+    ${declaration('_ssIsLegacyWorkbook')}
+    ${declaration('normalizeSpreadsheetIndex')}
+    ${declaration('_ssProjectDocToWorkbook')}
+    ${declaration('_ssWorkbookToProjectDoc')}
+    ${declaration('normalizeSpreadsheetProject')}
+    ${declaration('_ssAssembleWorkbook')}
+    ${declaration('_ssStorageMode')}
+    ${declaration('_ssReadStoredWorkbook')}
+    async function _ssMigrateToSplitStorage() { return false; }
     ${declaration('ssLoad')}
     ${declaration('_stageDirtySpreadsheetSave')}
     globalThis.editorApi = {

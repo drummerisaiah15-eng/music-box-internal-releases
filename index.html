@@ -6061,7 +6061,11 @@ function _refreshForSyncKey(key, value) {
   if (key === 'sent_emails' || key === 'ms_sent_emails' || key === 'flagged_emails') {
     try { renderEmailList(); } catch {}
   }
-  if (key === 'spreadsheets') {
+  // MB161-012: a project document now arrives on its own key. Either the index
+  // or any project document is a reason to rebuild what is on screen, and both
+  // are rebuilt the same way — from storage, not from the value that arrived,
+  // because one project is only ever part of the picture.
+  if (key === 'spreadsheets' || _ssIsProjectSyncKey(key)) {
     try {
       const pageActive = document.getElementById('page-spreadsheets')?.classList.contains('active');
       const editorOpen = document.getElementById('ss-editor-view')?.style.display !== 'none';
@@ -6073,7 +6077,9 @@ function _refreshForSyncKey(key, value) {
       // typing. The per-key write queue still persists that remote value first,
       // but it must not replace the dirty workbook currently shown in the UI.
       if (!_ssDirtyWorkbook) {
-        _ssData = normalizeSpreadsheetWorkbook(value);
+        _ssData = _ssStorageMode() === 'legacy' && key === 'spreadsheets'
+          ? normalizeSpreadsheetWorkbook(value)
+          : _ssReadStoredWorkbook();
         // Which project and sheet you are looking at travels inside the shared
         // workbook, but it is a per-Mac view preference. Without this, whoever
         // saves last drags everyone else to whatever they had open.
@@ -7778,6 +7784,185 @@ function _ssAssembleWorkbook(index, documents) {
   return workbook;
 }
 
+// Which shape the stored data is actually in. Everything below branches on
+// this rather than assuming, because a Mac can be mid-migration, and a Mac that
+// has not migrated yet must keep working exactly as it did.
+function _ssStorageMode(stored = STORE.get('spreadsheets', null)) {
+  if (stored === null || stored === undefined) return 'empty';
+  if (_ssIsLegacyWorkbook(stored)) return 'legacy';
+  if (stored?.schema === SPREADSHEET_INDEX_SCHEMA) return 'split';
+  return 'unknown';
+}
+
+// Projects the index names but whose documents are not readable here yet.
+// Tracked so the UI can say "still loading" rather than showing a short list
+// that looks like data went missing.
+let _ssPendingProjectIds = [];
+
+function _ssReadStoredWorkbook() {
+  const stored = STORE.get('spreadsheets', null);
+  const mode = _ssStorageMode(stored);
+  _ssPendingProjectIds = [];
+  if (mode === 'empty') return null;
+  if (mode === 'legacy') return normalizeSpreadsheetWorkbook(stored);
+  if (mode === 'unknown') {
+    throw new Error('The saved spreadsheet index is in a format this version does not recognise.');
+  }
+  const index = normalizeSpreadsheetIndex(stored);
+  const documents = new Map();
+  for (const entry of index.projects) {
+    if (entry._deleted) continue;
+    const key = _ssProjectSyncKey(entry.id);
+    const doc = STORE.get(key, null);
+    if (doc === null || doc === undefined) {
+      // Not arrived yet. NOT a deletion — _ssIndexAfterEdit is written so this
+      // cannot turn into a tombstone.
+      _ssPendingProjectIds.push(entry.id);
+      continue;
+    }
+    try {
+      documents.set(key, normalizeSpreadsheetProject(doc));
+    } catch (error) {
+      // One unreadable project must not make the other twenty unreadable. Its
+      // document is left exactly as it is, and it stays in the index.
+      console.warn(`Spreadsheet project ${entry.id} could not be read:`, error?.message || error);
+      _ssPendingProjectIds.push(entry.id);
+    }
+  }
+  return _ssAssembleWorkbook(index, documents);
+}
+
+// Write the projects an edit session touched, then the index. Each project is
+// its own document with its own compare-and-set, so two Macs editing different
+// projects no longer contend at all.
+async function _ssCommitSplitWorkbook(dirtyBase, dirty) {
+  const at = new Date().toISOString();
+  const written = [];
+  for (const project of (dirty?.projects || [])) {
+    const id = String(project?.id ?? '');
+    if (!SPREADSHEET_PROJECT_ID_PATTERN.test(id)) continue;
+    const key = _ssProjectSyncKey(id);
+    const nextDoc = _ssProjectAsDoc(dirty, id);
+    const baseDoc = _ssProjectAsDoc(dirtyBase, id);
+    const durable = _durableStoreSnapshots.has(key)
+      ? _cloneJson(_durableStoreSnapshots.get(key))
+      : null;
+
+    // Same three-way merge the whole workbook used, applied to one project.
+    // A project created in this session has no durable copy and no base, and
+    // _mergeSpreadsheetEdits returns `dirty` unchanged for that case.
+    const mergedDoc = _ssWorkbookToProjectDoc(normalizeSpreadsheetWorkbook(
+      _mergeSpreadsheetEdits(
+        durable ? _ssProjectDocToWorkbook(durable) : null,
+        baseDoc ? _ssProjectDocToWorkbook(baseDoc) : null,
+        _ssProjectDocToWorkbook(nextDoc),
+      )));
+
+    // Only write what changed. Without this every keystroke rewrites every
+    // project document, which is both wasteful and a good way to manufacture
+    // compare-and-set collisions on projects nobody touched.
+    if (JSON.stringify(mergedDoc) === JSON.stringify(durable)) continue;
+    await _serializeKeyMutation(key, async () => {
+      await _commitEncryptedSnapshot(key, JSON.stringify(mergedDoc), mergedDoc, {
+        sync: true,
+        operationId: _newOperationId(),
+      });
+    });
+    written.push(key);
+  }
+
+  const storedIndex = _durableStoreSnapshots.has('spreadsheets')
+    ? _cloneJson(_durableStoreSnapshots.get('spreadsheets'))
+    : null;
+  // Compare NORMALIZED against NORMALIZED. The stored index and the one the
+  // normalizer produces hold the same facts in a different key order, so
+  // comparing raw JSON reported a change on every save — rewriting a document
+  // both Macs write, for nothing, and manufacturing compare-and-set collisions
+  // out of pure bookkeeping.
+  const currentIndex = _ssStorageMode(storedIndex) === 'split'
+    ? normalizeSpreadsheetIndex(storedIndex)
+    : null;
+  const nextIndex = _ssIndexAfterEdit(currentIndex, dirtyBase, dirty, at);
+  if (JSON.stringify(nextIndex) !== JSON.stringify(currentIndex)) {
+    await _serializeKeyMutation('spreadsheets', async () => {
+      await _commitEncryptedSnapshot('spreadsheets', JSON.stringify(nextIndex), nextIndex, {
+        sync: true,
+        operationId: _newOperationId(),
+      });
+    });
+    written.push('spreadsheets');
+  }
+
+  if (_syncReady && _syncBootstrapComplete) {
+    for (const key of written) _scheduleSyncDrain(key).catch(() => {});
+  }
+  return _ssReadStoredWorkbook();
+}
+
+// MB161-012: the one-way trip from a single workbook document to the split.
+//
+// Order matters. Every project document is written FIRST and the index LAST, so
+// a Mac that sees the new index always finds the content behind it. The reverse
+// order would briefly present an index naming projects whose documents do not
+// exist — survivable, because a missing document reads as "still loading"
+// rather than "deleted", but there is no reason to rely on that.
+//
+// Safe to attempt on both Macs at once: every key carries its own
+// compare-and-set, the documents written are byte-identical because they are
+// derived from the same workbook, and the index merge is a record list.
+let _ssMigrationRan = false;
+async function _ssMigrateToSplitStorage() {
+  if (_ssMigrationRan) return false;
+  const stored = STORE.get('spreadsheets', null);
+  if (_ssStorageMode(stored) !== 'legacy') return false;
+  // Never migrate a workbook this Mac invented. The same rule that stops a
+  // fabricated default being published: if remote state is unknown, wait.
+  if (_ssAwaitingAuthority || _ssBlockedWorkbook) return false;
+
+  const workbook = normalizeSpreadsheetWorkbook(stored);
+  const { index, documents } = _ssSplitWorkbook(workbook);
+  _ssMigrationRan = true;
+  try {
+    for (const [key, doc] of documents) {
+      const normalized = normalizeSpreadsheetProject(doc);
+      await _serializeKeyMutation(key, async () => {
+        await _commitEncryptedSnapshot(key, JSON.stringify(normalized), normalized, {
+          sync: true,
+          operationId: _newOperationId(),
+        });
+      });
+    }
+    await _serializeKeyMutation('spreadsheets', async () => {
+      await _commitEncryptedSnapshot('spreadsheets', JSON.stringify(index), index, {
+        sync: true,
+        operationId: _newOperationId(),
+      });
+    });
+  } catch (error) {
+    // The old document is still intact and still authoritative — the index is
+    // written last precisely so a failure here leaves it that way.
+    _ssMigrationRan = false;
+    console.warn('Spreadsheet split migration did not complete:', error?.message || error);
+    showToast(
+      `Spreadsheets could not be upgraded to per-project storage: ${error?.message || error}. ` +
+      `Your data is unchanged.`,
+      'warning');
+    return false;
+  }
+  if (_syncReady && _syncBootstrapComplete) {
+    for (const key of [...documents.keys(), 'spreadsheets']) {
+      _scheduleSyncDrain(key).catch(() => {});
+    }
+  }
+  const count = documents.size;
+  console.info(`Spreadsheets migrated to per-project storage: ${count} project document(s).`);
+  showToast(
+    `Spreadsheets now store each project separately, so each one gets its own space ` +
+    `instead of sharing. ${count} project${count === 1 ? '' : 's'} moved; nothing changed on screen.`,
+    'success');
+  return true;
+}
+
 // MB161-011: how full the workbook is, and how much room a change would need.
 //
 // The whole workbook — every project, every sheet — is one encrypted Firestore
@@ -8235,11 +8420,18 @@ function ssLoad() {
   const stored = STORE.get('spreadsheets', null);
   if (stored !== null && stored !== undefined) {
     try {
-      const normalized = normalizeSpreadsheetWorkbook(stored);
+      // MB161-012: assembles from the index plus one document per project, or
+      // reads the old single document if this Mac has not migrated yet.
+      const normalized = _ssReadStoredWorkbook();
       _ssData = normalized;
-      // Persist a valid legacy workbook only after the complete canonical
-      // validator has accepted it. Invalid data is never overwritten here.
-      if (JSON.stringify(normalized) !== JSON.stringify(stored)) ssSave();
+      if (_ssStorageMode(stored) === 'legacy') {
+        // Persist a valid legacy workbook only after the complete canonical
+        // validator has accepted it. Invalid data is never overwritten here.
+        if (JSON.stringify(normalized) !== JSON.stringify(stored)) ssSave();
+        // And upgrade it. Deliberately not awaited: the workbook on screen is
+        // already correct, and the migration must not delay the page.
+        _ssMigrateToSplitStorage().catch(() => {});
+      }
       return;
     } catch (error) {
       _ssData = null;
@@ -8812,16 +9004,25 @@ function _beginSpreadsheetSaveStage() {
     const reconciledBase = _durableStoreSnapshots.has('spreadsheets')
       ? _cloneJson(_durableStoreSnapshots.get('spreadsheets'))
       : null;
-    const merged = _mergeSpreadsheetEdits(reconciledBase, _ssDirtyBase, dirtySource);
-    const normalized = normalizeSpreadsheetWorkbook(merged);
-    const serialized = JSON.stringify(normalized);
-    const operationId = _newOperationId();
-    await _commitEncryptedSnapshot('spreadsheets', serialized, normalized, {
-      sync: true,
-      operationId,
-    });
-    if (_syncReady && _syncBootstrapComplete) {
-      _scheduleSyncDrain('spreadsheets').catch(() => {});
+
+    // MB161-012: once storage is split, each project is committed to its own
+    // document with its own compare-and-set, so two Macs editing different
+    // projects cannot collide at all. The index is written only when the set of
+    // projects actually changed.
+    let normalized;
+    if (_ssStorageMode(reconciledBase) === 'split' ||
+        (reconciledBase === null && _ssStorageMode() === 'split')) {
+      normalized = await _ssCommitSplitWorkbook(_ssDirtyBase, dirtySource);
+    } else {
+      const merged = _mergeSpreadsheetEdits(reconciledBase, _ssDirtyBase, dirtySource);
+      normalized = normalizeSpreadsheetWorkbook(merged);
+      await _commitEncryptedSnapshot('spreadsheets', JSON.stringify(normalized), normalized, {
+        sync: true,
+        operationId: _newOperationId(),
+      });
+      if (_syncReady && _syncBootstrapComplete) {
+        _scheduleSyncDrain('spreadsheets').catch(() => {});
+      }
     }
     if (_ssDirtyGeneration === generation) {
       _ssDirtyWorkbook = null;

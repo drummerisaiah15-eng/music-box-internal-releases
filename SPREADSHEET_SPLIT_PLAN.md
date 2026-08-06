@@ -1,7 +1,7 @@
 # One document per spreadsheet project (MB161-012)
 
-Status: **stage 1 of 3 complete.** The storage model, the index, and the rules
-are in and tested. Nothing calls them yet, so the running app is unchanged.
+Status: **all three stages written and unit-tested. Never run on a real Mac.**
+The next step is behavioural: install on two machines and watch it migrate.
 
 ---
 
@@ -57,34 +57,65 @@ adapter on each end.
 
 25 tests in `tests/spreadsheet-split.test.js`.
 
-## Stage 2 — wiring *(next)*
+## Stage 2 — wiring *(done)*
 
-- `ssLoad` assembles `_ssData` from the index plus loaded project documents
-- the save path splits `_ssData` and writes only the projects that changed
-- `SYNC_MERGE_STRATEGIES` gains `spreadsheet-index`; project keys reuse
-  `spreadsheet-operations`
-- `_refreshForSyncKey` handles a project key arriving on its own
-- capacity (MB161-011) becomes per project
-- presence and attribution follow the project document
+- `_syncMergeStrategy(key)` replaces the frozen lookup, since project keys are
+  dynamic. `spreadsheets` keeps the **operation** merge while it still holds a
+  legacy workbook, so a Mac mid-migration is never stranded with an unmergeable
+  key
+- `_ssIndexAfterEdit` decides when absence means deletion — see below
+- `ssLoad` assembles from the index plus project documents
+- the save path commits each changed project to its own document, then the
+  index only if the set of projects actually changed
+- `_refreshForSyncKey` fires for a project document arriving on its own key and
+  rebuilds from storage rather than from the one value that arrived
 
-## Stage 3 — migration
+## Stage 3 — migration *(done)*
 
-- on load, if `spreadsheets` is a legacy workbook, split it and write the
-  documents before the index, so a Mac that sees the new index always finds the
-  content behind it
-- idempotent, and safe when both Macs attempt it — each key is CAS'd
-  independently and the merge converges
-- **both Macs must be on the new build before the rules are deployed.** An older
-  build reading the new index fails normalization, which quarantines the key and
-  preserves local data rather than overwriting — safe, but it stops syncing
-  until it is updated.
+`_ssMigrateToSplitStorage()` runs once, from `ssLoad`, when the stored shape is
+a legacy workbook. Every project document is written **first** and the index
+**last**, so a failure part-way leaves the old single document authoritative —
+`_ssStorageMode` still reports `legacy` until the index lands. A failure
+re-arms the migration and says the data is unchanged.
+
+It refuses to run while `_ssAwaitingAuthority` or `_ssBlockedWorkbook` is set:
+migrating a workbook this Mac invented would publish it as real, per project.
+
+---
+
+## The rule that matters most
+
+`_ssIndexAfterEdit` derives the index from what **changed** between the
+workbook the session started from and the one it ends with:
+
+| | |
+|---|---|
+| in the result, not in the index | new project — added |
+| in the base, not in the result | somebody deleted it — tombstoned |
+| in the index but in **neither** | untouched, whatever its state |
+
+That last row is the whole design. A project whose document has not finished
+downloading is absent from `_ssData`; building the index from `_ssData` would
+tombstone it, and the tombstone would sync and delete the project off the other
+Mac. Deletion has to be an act somebody performed, never an inference from
+absence.
 
 ---
 
 ## Not yet true
 
-- Nothing calls any of stage 1. The app still reads and writes one document.
-- No migration has been written or run.
-- The per-project ceiling is enforced by `normalizeSpreadsheetProject`, which
-  nothing calls yet; the live limit is still workbook-wide.
-- None of this has been exercised on two Macs.
+- **None of this has run on a real Mac.** Every test is a unit test against a
+  stubbed store; no migration has touched real localStorage or Firestore.
+- The two-Mac behavioural matrix has not been run — and it now has more to
+  cover: migration on one Mac while the other is on the old build, migration on
+  both at once, a project document arriving before the index, and a project
+  deleted on one Mac while open on the other.
+- **Both Macs must be on this build before the rules are deployed.** An older
+  build reading the new index fails normalization, which quarantines the key
+  and preserves local data rather than overwriting — safe, but it stops syncing
+  until it is updated.
+- Capacity (MB161-011) still measures the assembled whole workbook, so it warns
+  against the old shared budget rather than the new per-project one. It is now
+  pessimistic rather than wrong, but it should be made per-project.
+- Presence and attribution have not been revisited; they ride inside the
+  project document and should be fine, but that is reasoning, not evidence.
