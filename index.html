@@ -7499,6 +7499,13 @@ function _ssAttributionActor() {
 
 const SPREADSHEET_INDEX_SCHEMA = 2;
 const MAX_SPREADSHEET_PROJECTS = 25;
+// MB161-013: the index decides how many other documents this Mac subscribes to,
+// so it needs bounds of its own. 175 tombstones is far more deletion history
+// than a studio with a 25-project ceiling will ever accumulate; 400 records and
+// 64 KB are the hard refusals, which nothing legitimate can reach.
+const MAX_SPREADSHEET_TOMBSTONES = 175;
+const MAX_SPREADSHEET_INDEX_RECORDS = 400;
+const MAX_SPREADSHEET_INDEX_BYTES = 64000;
 const SPREADSHEET_PROJECT_KEY_PREFIX = 'spreadsheet_';
 // Project ids are `proj_` + _newRecordId(), which is [A-Za-z0-9_]. The pattern
 // is kept deliberately narrow and MUST stay in step with firestore.rules.
@@ -7574,11 +7581,25 @@ function normalizeSpreadsheetProject(doc) {
 }
 
 function normalizeSpreadsheetIndex(value) {
-  let source;
-  try { source = JSON.parse(JSON.stringify(value)); }
+  let serialized;
+  try { serialized = JSON.stringify(value); }
   catch { throw new Error('spreadsheets index is not JSON serializable'); }
+  // MB161-013: bound the raw payload BEFORE parsing it. The index is the one
+  // document that decides how many other documents this Mac subscribes to, so
+  // it is the one place where accepting something oversized costs more than
+  // memory. Checked first, and cheaply, so a hostile payload is refused without
+  // being walked.
+  if (serialized === undefined ||
+      new TextEncoder().encode(serialized).byteLength > MAX_SPREADSHEET_INDEX_BYTES) {
+    throw new Error('spreadsheets index is too large to be genuine');
+  }
+  const source = JSON.parse(serialized);
   if (!source || typeof source !== 'object' || Array.isArray(source)) {
     throw new Error('spreadsheets index expected object data');
+  }
+  if (Array.isArray(source.projects) &&
+      source.projects.length > MAX_SPREADSHEET_INDEX_RECORDS) {
+    throw new Error('spreadsheets index lists more projects than it could ever have held');
   }
   if (source.schema !== SPREADSHEET_INDEX_SCHEMA) {
     throw new Error('spreadsheets index has an unrecognised schema');
@@ -7614,17 +7635,38 @@ function normalizeSpreadsheetIndex(value) {
     }
     return record;
   });
-  // Only live projects count against the limit. A tombstone is a few bytes and
-  // deleting one would let a stale Mac resurrect the project.
-  if (projects.filter(entry => !entry._deleted).length > MAX_SPREADSHEET_PROJECTS) {
+  // Only live projects count against the project limit — a tombstone is a few
+  // bytes, and refusing one would mean a studio could not delete its way back
+  // under the limit.
+  const live = projects.filter(entry => !entry._deleted);
+  if (live.length > MAX_SPREADSHEET_PROJECTS) {
     throw new Error(`spreadsheets exceeds the ${MAX_SPREADSHEET_PROJECTS}-project limit`);
   }
+
+  // MB161-013: but tombstones cannot be unbounded either.
+  //
+  // _ssKnownProjectSyncKeys deliberately includes tombstoned projects, because
+  // their documents must keep syncing or the other Mac never learns of the
+  // deletion. That makes the index the one document that decides how many
+  // Firestore listeners this Mac opens — and tombstones did not count against
+  // any limit, so an index carrying 50,000 of them (4 MB, one live project,
+  // passing every check) would have opened 50,000 listeners.
+  //
+  // Compacted rather than refused: refusing would eventually brick a studio
+  // that legitimately deleted enough projects. The oldest tombstones go first,
+  // since resurrecting one requires a Mac that has been offline since before
+  // that deletion AND still holds the project.
+  const graves = projects.filter(entry => entry._deleted)
+    .sort((a, b) => String(a._deletedAt || '').localeCompare(String(b._deletedAt || '')))
+    .slice(-MAX_SPREADSHEET_TOMBSTONES);
+  const kept = new Set([...live, ...graves]);
+  const compacted = projects.filter(entry => kept.has(entry));
   const activeProject = String(source.activeProject ?? '');
-  const normalized = { schema: SPREADSHEET_INDEX_SCHEMA, projects };
-  if (projects.some(entry => entry.id === activeProject && !entry._deleted)) {
+  const normalized = { schema: SPREADSHEET_INDEX_SCHEMA, projects: compacted };
+  if (compacted.some(entry => entry.id === activeProject && !entry._deleted)) {
     normalized.activeProject = activeProject;
   } else {
-    const first = projects.find(entry => !entry._deleted);
+    const first = compacted.find(entry => !entry._deleted);
     if (first) normalized.activeProject = first.id;
   }
   return normalized;
@@ -7975,10 +8017,21 @@ async function _ssMigrateToSplitStorage() {
 // staff typed all afternoon, then got "Spreadsheet changes were not saved" and
 // were dropped back to the project list. Measuring up front lets the app say no
 // to the change that would not fit, while everything already typed stays safe.
-function _ssCapacity(workbook) {
+// MB161-012: measured PER PROJECT once storage is split, because that is where
+// the budget now applies. Measuring the assembled workbook would warn at 75% of
+// a ceiling that no longer exists — three half-full projects would look full
+// while each had two thirds of its own document free.
+//
+// `projectId` defaults to whichever project is open, since that is the one an
+// edit is about to land in.
+function _ssCapacity(workbook, projectId = workbook?.activeProject) {
+  const split = _ssStorageMode() === 'split';
+  const scope = split
+    ? (workbook?.projects || []).filter(project => project?.id === projectId)
+    : (workbook?.projects || []);
   let cells = 0;
   let characters = 0;
-  for (const project of workbook?.projects || []) {
+  for (const project of scope) {
     for (const sheet of project?.sheets || []) {
       const entries = Object.entries(sheet?.cells || {});
       cells += entries.length;
@@ -7986,8 +8039,10 @@ function _ssCapacity(workbook) {
     }
   }
   let bytes = 0;
-  try { bytes = new TextEncoder().encode(JSON.stringify(workbook ?? {})).byteLength; }
-  catch (_) { bytes = 0; }
+  try {
+    bytes = new TextEncoder().encode(JSON.stringify(
+      split ? (_ssProjectAsDoc(workbook, projectId) ?? {}) : (workbook ?? {}))).byteLength;
+  } catch (_) { bytes = 0; }
   const share = value => (value.limit > 0 ? value.used / value.limit : 0);
   const measures = {
     cells: { used: cells, limit: MAX_SPREADSHEET_TOTAL_CELLS, label: 'cells' },

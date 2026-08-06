@@ -49,6 +49,9 @@ function splitApi() {
     var MAX_SPREADSHEET_PROJECTS = 25;
     var SPREADSHEET_PROJECT_KEY_PREFIX = 'spreadsheet_';
     var SPREADSHEET_PROJECT_ID_PATTERN = /^[A-Za-z0-9_-]{1,100}$/;
+    var MAX_SPREADSHEET_TOMBSTONES = 175;
+    var MAX_SPREADSHEET_INDEX_RECORDS = 400;
+    var MAX_SPREADSHEET_INDEX_BYTES = 64000;
     var MAX_RESOLVED_CONFLICT_IDS = 200;
     var MAX_SPREADSHEET_CONFLICTS = 200;
     var MAX_SPREADSHEET_CELL_CHARS = 50000, MAX_SPREADSHEET_SHEETS = 25,
@@ -540,6 +543,9 @@ function routingApi(decCache = {}) {
     var SPREADSHEET_PROJECT_KEY_PREFIX = 'spreadsheet_';
     var SPREADSHEET_PROJECT_ID_PATTERN = /^[A-Za-z0-9_-]{1,100}$/;
     var MAX_SYNC_PLAINTEXT_BYTES = 620000;
+    var MAX_SPREADSHEET_TOMBSTONES = 175;
+    var MAX_SPREADSHEET_INDEX_RECORDS = 400;
+    var MAX_SPREADSHEET_INDEX_BYTES = 64000;
     var MAX_RESOLVED_CONFLICT_IDS = 200;
     var MAX_SPREADSHEET_CONFLICTS = 200;
     var MAX_SPREADSHEET_CELL_CHARS = 50000, MAX_SPREADSHEET_SHEETS = 25,
@@ -653,12 +659,15 @@ test('MB161-012: a project document that is not a project is refused', () => {
 function indexMergeApi() {
   const context = vm.createContext({
     console: { warn() {}, error() {}, log() {} },
-    Date, Object, Map, Set, Array, JSON, Number, String, Boolean,
+    Date, Object, Map, Set, Array, JSON, Number, String, Boolean, TextEncoder,
     _cloneJson: value => JSON.parse(JSON.stringify(value)),
   });
   vm.runInContext(`
     var SPREADSHEET_INDEX_SCHEMA = 2;
     var MAX_SPREADSHEET_PROJECTS = 25;
+    var MAX_SPREADSHEET_TOMBSTONES = 175;
+    var MAX_SPREADSHEET_INDEX_RECORDS = 400;
+    var MAX_SPREADSHEET_INDEX_BYTES = 64000;
     var SPREADSHEET_PROJECT_ID_PATTERN = /^[A-Za-z0-9_-]{1,100}$/;
     ${declaration('_recordSortTime')}
     ${declaration('_recordContentKey')}
@@ -928,7 +937,7 @@ function wiringApi({ store = {}, durable = {}, awaiting = false } = {}) {
     _storeBacking: store,
   });
   vm.runInContext(`
-    // The MB161-012 constants arrive with the _ssStorageMode slice below;
+    // The MB161-012/013 constants arrive with the _ssStorageMode slice below;
     // declaring them here as well is a redeclaration.
     var MAX_RESOLVED_CONFLICT_IDS = 200;
     var MAX_SPREADSHEET_CONFLICTS = 200;
@@ -1231,4 +1240,119 @@ test('MB161-012: a failed migration leaves the old document authoritative', asyn
   assert.match(migrate, /Your data is unchanged/, 'and says so plainly');
   assert.match(migrate, /if \(_ssAwaitingAuthority \|\| _ssBlockedWorkbook\) return false;/,
     'and it never runs while remote state is unknown');
+});
+
+// ── MB161-013: the index is the one document that opens other documents ─────
+//
+// _ssKnownProjectSyncKeys deliberately includes tombstoned projects, because
+// their documents must keep syncing or the other Mac never learns of the
+// deletion. That makes the index the thing that decides how many Firestore
+// listeners this Mac opens, and tombstones counted against nothing.
+
+test('MB161-013: an index stuffed with tombstones is refused, not subscribed to', () => {
+  const api = splitApi();
+  const graves = Array.from({ length: 50000 }, (_, i) => ({
+    id: 'p' + i, version: 2, _deleted: true, _deletedAt: '2026-01-01T00:00:00.000Z',
+  }));
+  // One live project, so the 25-project limit passes cleanly. This is what the
+  // old code accepted, and getSyncKeys would then have returned 50,000 keys.
+  assert.throws(
+    () => api.normIndex({ schema: 2, activeProject: 'live', projects: [{ id: 'live', version: 1 }, ...graves] }),
+    /too large to be genuine|more projects than it could ever have held/);
+});
+
+test('MB161-013: the size check happens before the payload is walked', () => {
+  const api = splitApi();
+  // Few records, each enormous. A record-count check alone would let this in.
+  const fat = Array.from({ length: 20 }, (_, i) => ({
+    id: 'p' + i, version: 1, created: 'x'.repeat(9000),
+  }));
+  assert.throws(() => api.normIndex({ schema: 2, activeProject: 'p0', projects: fat }),
+    /too large to be genuine/);
+});
+
+test('MB161-013: ordinary deletion history is compacted, never refused', () => {
+  const api = splitApi();
+  // A studio that has deleted 300 projects over the years must not find its
+  // app bricked — refusing here would be worse than the problem.
+  const graves = Array.from({ length: 300 }, (_, i) => ({
+    id: 'g' + i, version: 2, _deleted: true,
+    _deletedAt: new Date(Date.UTC(2026, 0, 1) + i * 86400000).toISOString(),
+  }));
+  const normalized = api.normIndex({
+    schema: 2, activeProject: 'live',
+    projects: [{ id: 'live', version: 1 }, ...graves],
+  });
+  const kept = normalized.projects.filter(p => p._deleted);
+  assert.equal(kept.length, 175, 'compacted to the tombstone cap');
+  assert.ok(normalized.projects.some(p => p.id === 'live' && !p._deleted),
+    'and every live project is kept regardless');
+
+  // The OLDEST go first: resurrecting one needs a Mac offline since before that
+  // deletion that still holds the project.
+  assert.equal(kept.some(p => p.id === 'g0'), false, 'the oldest tombstone is dropped');
+  assert.equal(kept.some(p => p.id === 'g299'), true, 'the newest is kept');
+});
+
+test('MB161-013: compaction never drops a live project to make room', () => {
+  const api = splitApi();
+  const live = Array.from({ length: 25 }, (_, i) => ({ id: 'p' + i, version: 1 }));
+  const graves = Array.from({ length: 300 }, (_, i) => ({
+    id: 'g' + i, version: 2, _deleted: true,
+    _deletedAt: new Date(Date.UTC(2026, 0, 1) + i * 86400000).toISOString(),
+  }));
+  const normalized = api.normIndex({ schema: 2, activeProject: 'p0', projects: [...live, ...graves] });
+  assert.equal(normalized.projects.filter(p => !p._deleted).length, 25,
+    'all 25 live projects survive');
+  assert.equal(normalized.projects.filter(p => p._deleted).length, 175);
+});
+
+test('MB161-013: a normal index is not disturbed by any of this', () => {
+  const api = splitApi();
+  const plain = {
+    schema: 2, activeProject: 'p1',
+    projects: [{ id: 'p1', version: 1 }, { id: 'p2', version: 3, _deleted: true, _deletedAt: '2026-08-01T00:00:00.000Z' }],
+  };
+  const once = api.normIndex(plain);
+  assert.equal(once.projects.length, 2);
+  assert.deepEqual(api.normIndex(once), once, 'and normalizing is still idempotent');
+});
+
+test('MB161-012: capacity is measured per project once storage is split', () => {
+  const context = vm.createContext({
+    console: { warn() {}, error() {}, log() {} },
+    Object, Array, JSON, Number, String, Boolean, Math, TextEncoder,
+    _mode: 'split',
+  });
+  vm.runInContext(`
+    var MAX_SPREADSHEET_TOTAL_CELLS = 10000;
+    var MAX_SPREADSHEET_TOTAL_CHARS = 400000;
+    var MAX_SPREADSHEET_SYNC_JSON_BYTES = 600000;
+    function _ssStorageMode() { return _mode; }
+    ${declaration('_ssProjectAsDoc')}
+    ${declaration('_ssCapacity')}
+    globalThis.api = { level: (wb, id) => _ssCapacity(wb, id), setMode: m => { _mode = m; } };
+  `, context);
+
+  const filled = n => {
+    const cells = {};
+    for (let i = 0; i < n; i += 1) cells[`${Math.floor(i / 100)},${i % 100}`] = cell('x'.repeat(10));
+    return cells;
+  };
+  const workbook = legacyWorkbook([
+    project('p1', [{ ...sheet('s1'), cells: filled(4000) }]),
+    project('p2', [{ ...sheet('s2'), cells: filled(4000) }]),
+    project('p3', [{ ...sheet('s3'), cells: filled(4000) }]),
+  ]);
+
+  // Split: each project is measured against its own document budget.
+  assert.equal(context.api.level(workbook, 'p1').cells.used, 4000);
+  assert.ok(context.api.level(workbook, 'p1').fraction < 0.5,
+    'a project using 4,000 of its own 10,000 cells is not nearly full');
+
+  // Legacy: the same data shares one budget and IS over.
+  context.api.setMode('legacy');
+  const shared = context.api.level(workbook, 'p1');
+  assert.equal(shared.cells.used, 12000, 'the old shape counts every project together');
+  assert.equal(shared.fraction, 1);
 });

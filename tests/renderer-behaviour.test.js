@@ -965,6 +965,11 @@ function capacityApi(workbook) {
     var MAX_SPREADSHEET_TOTAL_CHARS = 400000;
     var MAX_SPREADSHEET_SYNC_JSON_BYTES = 600000;
     var _ssData = ${JSON.stringify(workbook)};
+    // MB161-012: capacity is per project once storage is split. These fixtures
+    // exercise the legacy (workbook-wide) path, which is what an un-migrated
+    // Mac still sees.
+    function _ssStorageMode() { return 'legacy'; }
+    function _ssProjectAsDoc() { return null; }
     ${declaration('_ssCapacity')}
     ${declaration('_ssCapacityRefusal')}
     ${declaration('ssRefuseIfFull')}
