@@ -1074,13 +1074,18 @@ test('cells clip and the formula bar carries the full value', () => {
   // A schedule is read by scanning rows and columns. One long note growing its
   // cell pushed every neighbouring row out of alignment, so cells now hold a
   // fixed height and the whole value lives in the formula bar.
-  assert.match(source, /#ss-grid td \{\s*\n\s*white-space:nowrap;overflow:hidden;text-overflow:ellipsis;/);
-  assert.doesNotMatch(source, /#ss-grid td \{ white-space:normal;word-break:break-word/,
-    'the growing-cell rule is gone');
+  // The text lives in .ss-cell-inner, not directly in the td — setting
+  // white-space on the td never applied to it, which is why two earlier
+  // attempts at this changed nothing.
+  assert.match(source, /\.ss-cell-inner \{[^}]*white-space:nowrap;overflow:hidden;text-overflow:ellipsis;/);
+  // Anchored to the base rule: the merged-cell override below it legitimately
+  // does wrap and must not make this pass or fail by accident.
+  assert.doesNotMatch(source, /\n    \.ss-cell-inner \{[^}]*white-space:pre-wrap/,
+    'the wrapping rule that actually governed cell text is gone');
+  assert.match(source, /#ss-grid td\[rowspan\]:not\(\[rowspan="1"\]\) \.ss-cell-inner,/,
+    'merged cells still wrap, since that is the point of merging');
 
   // A merged cell was deliberately given the room, so it may use it.
-  assert.match(source, /#ss-grid td\[rowspan\]:not\(\[rowspan="1"\]\),/);
-  assert.match(source, /white-space:normal;word-break:break-word;overflow-wrap:break-word;/);
 
   // The formula bar was styled and wired but never placed in the document,
   // which is why selecting a cell never showed anything.

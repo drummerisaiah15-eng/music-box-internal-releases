@@ -925,21 +925,31 @@
        remaining source of expansion: typing a long note pushed the row open and
        shoved the schedule out of alignment while you typed. It scrolls
        horizontally instead, and the formula row above shows the whole value. */
-    #ss-grid td.ss-editing { z-index:6; }
+    #ss-grid td.ss-editing {
+      z-index:6;outline:2.5px solid #1a73e8;outline-offset:-2px;
+      box-shadow:0 0 0 3px rgba(26,115,232,0.18);
+    }
     #ss-grid td.ss-editing .ss-cell-input {
       white-space:pre;overflow-x:auto;overflow-y:hidden;
       height:100%;min-height:0;line-height:24px;background:#fff;
       outline:2px solid #1a73e8;
     }
     #ss-grid td.ss-in-range { background-color:rgba(26,115,232,.08) !important; }
-    #ss-grid td.ss-editing {
-      outline:2.5px solid #1a73e8;outline-offset:-2px;z-index:3;
-      box-shadow:0 0 0 3px rgba(26,115,232,0.18);
-    }
+    /* This is where a cell's text actually lives, so this is the rule that
+       decides whether cells grow. Two earlier attempts set white-space on the
+       td, which never applied because the text is not a direct child of it.
+       Wrapping here also broke click-to-edit: the displayed text laid out over
+       several lines, so the point you clicked mapped to a position that did not
+       exist once the single-line editor opened. */
     .ss-cell-inner {
-      padding:3px 6px;min-height:26px;user-select:none;
+      padding:3px 6px;height:26px;line-height:20px;user-select:none;
+      white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+    }
+    /* A merged cell was deliberately given the room, so it may wrap. */
+    #ss-grid td[rowspan]:not([rowspan="1"]) .ss-cell-inner,
+    #ss-grid td[colspan]:not([colspan="1"]) .ss-cell-inner {
       white-space:pre-wrap;word-break:break-word;overflow-wrap:break-word;
-      line-height:1.35;
+      height:auto;min-height:26px;line-height:1.35;
     }
     .ss-cell-input {
       position:absolute;inset:0;border:none;outline:none;
