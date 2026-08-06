@@ -63,29 +63,23 @@ service cloud.firestore {
       ];
     }
 
+    // Lesson check-out went away with MindBody, and with it the only
+    // date-shaped document key the app ever wrote. Every synchronized document
+    // is now a fixed name from the list above, which means a compromised
+    // member credential can no longer create documents this rule set has never
+    // heard of.
+    //
+    // Deploy ordering matters: a Mac still running 1.1.61 or earlier writes
+    // `checkout_<today>` once a day. Deploy these rules only after every Mac
+    // is on 1.1.62+, otherwise the old build reports a permission error.
+    // Existing `checkout_<date>` documents in Firestore are unaffected —
+    // readable, no longer writable, and safe to delete by hand at any time.
     function knownDataKey(keyId) {
-      return baseDataKey(keyId) ||
-        keyId.matches('checkout_[0-9]{4}-[0-9]{2}-[0-9]{2}');
-    }
-
-    function twoDigit(value) {
-      return value < 10 ? '0' + string(value) : string(value);
-    }
-
-    function checkoutKeyForDate(at) {
-      return 'checkout_' + string(at.year()) + '-' +
-        twoDigit(at.month()) + '-' + twoDigit(at.day());
+      return baseDataKey(keyId);
     }
 
     function writableDataKey(keyId) {
-      // Bound daily checkout documents to the app's operational retention
-      // window (plus tomorrow for timezone skew). This still lets an offline
-      // Mac deliver recent pending work, but a compromised member credential
-      // cannot pre-create millions of permanent date-shaped documents.
-      return baseDataKey(keyId) ||
-        (keyId.matches('checkout_[0-9]{4}-[0-9]{2}-[0-9]{2}') &&
-          keyId >= checkoutKeyForDate(request.time - duration.value(45, 'd')) &&
-          keyId <= checkoutKeyForDate(request.time + duration.value(1, 'd')));
+      return baseDataKey(keyId);
     }
 
     function validEncryptedValue(value) {

@@ -4,6 +4,13 @@ const path = require('node:path');
 const test = require('node:test');
 const vm = require('node:vm');
 
+// The rules file explains why check-out is gone, so the explanation itself
+// mentions the retired key. Assertions about what the rules *do* must look at
+// the expressions, not the prose.
+function stripRulesComments(rules) {
+  return rules.split('\n').filter(line => !line.trim().startsWith('//')).join('\n');
+}
+
 const renderer = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
 const scripts = [...renderer.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/gi)];
 const script = scripts.find(match => match[0].startsWith('<script>'))?.[1];
@@ -125,9 +132,9 @@ test('writes held during Firebase bootstrap are drained only after bootstrap com
   });
   vm.runInContext(`
     ${declaration('_scheduleSyncDrain')}
-    ${declaration('_isCheckoutKey')}
-    ${declaration('_checkoutKeyIsWritable')}
-    ${declaration('_retireUndeliverableCheckouts')}
+    var _legacyCheckoutSweepDone = false;
+    ${declaration('_isLegacyCheckoutKey')}
+    ${declaration('_retireLegacyCheckoutDeliveries')}
     ${declaration('_flushSyncDeliveries')}
     ${declaration('_drainPendingSyncWrites')}
     globalThis.bootstrapApi = {
@@ -269,7 +276,6 @@ test('spreadsheet typing in A1 preserves an unrelated remote edit in B1', async 
     ssGoHome: () => events.push('home'),
     ssRender: () => {},
     refreshDashboard: () => {},
-    _isCheckoutKey: () => false,
   });
   vm.runInContext(`
     const MAX_SPREADSHEET_CELL_CHARS = 50000;
@@ -453,9 +459,9 @@ test('iCloud-applied values create durable Firebase work offline and drain after
     ${declaration('_commitEncryptedSnapshot')}
     ${declaration('_persistRemoteValue')}
     ${declaration('_scheduleSyncDrain')}
-    ${declaration('_isCheckoutKey')}
-    ${declaration('_checkoutKeyIsWritable')}
-    ${declaration('_retireUndeliverableCheckouts')}
+    var _legacyCheckoutSweepDone = false;
+    ${declaration('_isLegacyCheckoutKey')}
+    ${declaration('_retireLegacyCheckoutDeliveries')}
     ${declaration('_flushSyncDeliveries')}
     ${declaration('_drainPendingSyncWrites')}
     globalThis.icloudApi = {
@@ -1047,8 +1053,8 @@ test('Firestore rules admit rotation metadata and no longer retain removed iMess
   assert.match(rules, /request\.resource\.data\.pinEpoch is int/);
   assert.match(rules, /request\.resource\.data\.rotationId == null/);
   assert.match(rules, /function writableDataKey\(keyId\)/);
-  assert.match(rules, /checkoutKeyForDate\(request\.time - duration\.value\(45, 'd'\)\)/);
-  assert.match(rules, /checkoutKeyForDate\(request\.time \+ duration\.value\(1, 'd'\)\)/);
+  assert.doesNotMatch(stripRulesComments(rules), /checkout_/,
+    'lesson check-out is retired; no date-shaped document key may remain writable');
   assert.match(rules, /writableDataKey\(keyId\) && validDataWrite\(\)/);
   assert.match(rules, /function validLegacyData\(data\)/);
   assert.match(rules, /data\.keys\(\)\.hasOnly\(\['value', 'updated'\]\)/);
@@ -1203,9 +1209,9 @@ test('MB-009: a quarantined key with a pending record fails the flush', async ()
   });
   vm.runInContext(`
     ${declaration('_scheduleSyncDrain')}
-    ${declaration('_isCheckoutKey')}
-    ${declaration('_checkoutKeyIsWritable')}
-    ${declaration('_retireUndeliverableCheckouts')}
+    var _legacyCheckoutSweepDone = false;
+    ${declaration('_isLegacyCheckoutKey')}
+    ${declaration('_retireLegacyCheckoutDeliveries')}
     ${declaration('_flushSyncDeliveries')}
     globalThis.quarantineApi = { flush: keys => _flushSyncDeliveries(keys) };
   `, context);
@@ -1239,9 +1245,9 @@ test('MB-009: healthy keys still drain while another key is quarantined', async 
       return true;
     };
     ${declaration('_scheduleSyncDrain')}
-    ${declaration('_isCheckoutKey')}
-    ${declaration('_checkoutKeyIsWritable')}
-    ${declaration('_retireUndeliverableCheckouts')}
+    var _legacyCheckoutSweepDone = false;
+    ${declaration('_isLegacyCheckoutKey')}
+    ${declaration('_retireLegacyCheckoutDeliveries')}
     ${declaration('_flushSyncDeliveries')}
     globalThis.quarantineApi = {
       flush: keys => _flushSyncDeliveries(keys),
@@ -1541,9 +1547,9 @@ test('V160-003: a held key can never be scheduled for delivery', async () => {
   });
   vm.runInContext(`
     ${declaration('_scheduleSyncDrain')}
-    ${declaration('_isCheckoutKey')}
-    ${declaration('_checkoutKeyIsWritable')}
-    ${declaration('_retireUndeliverableCheckouts')}
+    var _legacyCheckoutSweepDone = false;
+    ${declaration('_isLegacyCheckoutKey')}
+    ${declaration('_retireLegacyCheckoutDeliveries')}
     ${declaration('_flushSyncDeliveries')}
     globalThis.holdApi = {
       schedule: k => _scheduleSyncDrain(k),
@@ -3119,68 +3125,84 @@ test('P0-2: visiting a cell is not an edit', () => {
   );
 });
 
-// --- Checkout days that age out of the cloud retention window ----------------
+// --- Lesson check-out, retired with MindBody ---------------------------------
 
-test('a checkout day older than the cloud window stops being retried', () => {
-  // firestore.rules deliberately refuses checkout documents outside a retention
-  // window, so a Mac holding an older day could never deliver it and sync sat
-  // permanently red on "Missing or insufficient permissions" with no way out.
+test('queued check-out deliveries are retired instead of retried forever', () => {
+  // Nothing writes checkout_<date> any more, so nothing will ever drain what a
+  // Mac had queued when it upgraded. Left alone those records sit behind the
+  // sync status permanently. The encrypted day records are a different matter:
+  // they are the studio's data and removing a feature is not licence to delete
+  // them.
   const store = new Map([
     ['tmb_checkout_2026-06-18_pending_sync', JSON.stringify({ version: 3, opId: 'op-1234567890', baseRevision: 0, localCiphertext: 'E:old', supersededOpIds: [] })],
+    ['tmb_checkout_2026-06-18_pending_op', 'op-1234567890'],
+    ['tmb_checkout_2026-06-18_revision', '4'],
     ['tmb_checkout_2026-06-18', 'E:old'],
     ['tmb_checkout_2026-08-05_pending_sync', JSON.stringify({ version: 3, opId: 'op-0987654321', baseRevision: 0, localCiphertext: 'E:today', supersededOpIds: [] })],
+    ['tmb_checkout_2026-08-05', 'E:today'],
+    ['tmb_logs_pending_sync', JSON.stringify({ version: 3, opId: 'op-1111111111', baseRevision: 0, localCiphertext: 'E:logs', supersededOpIds: [] })],
+    ['tmb_checkout_2026-02-30_pending_sync', 'E:not-a-real-date'],
   ]);
-  const errors = new Map([['checkout_2026-06-18', new Error('Missing or insufficient permissions.')]]);
-  const toasts = [];
+  const errors = new Map([
+    ['checkout_2026-06-18', new Error('Missing or insufficient permissions.')],
+    ['checkout_2026-07-04', new Error('Missing or insufficient permissions.')],
+    ['logs', new Error('unrelated')],
+  ]);
   const context = contextWith({
-    localStorage: {
-      getItem: k => (store.has(k) ? store.get(k) : null),
-      setItem: (k, v) => store.set(k, String(v)),
-      removeItem: k => store.delete(k),
-    },
-    getSyncKeys: () => ['checkout_2026-06-18', 'checkout_2026-08-05', 'logs'],
-    _pendingSyncStorageKey: key => 'tmb_' + key + '_pending_sync',
-    _readPendingSyncRecord: key => store.get('tmb_' + key + '_pending_sync') || null,
+    localStorage: Object.create(null, {
+      removeItem: { value: k => store.delete(k), enumerable: false },
+      getItem: { value: k => (store.has(k) ? store.get(k) : null), enumerable: false },
+    }),
     _syncDeliveryErrors: errors,
-    showToast: (msg) => toasts.push(msg),
-    _todayLocal: (d = new Date('2026-08-05T12:00:00')) => new Date(d).toISOString().slice(0, 10),
+    _todayLocal: (d = new Date('2026-08-05T12:00:00')) =>
+      new Date(d).toISOString().slice(0, 10),
   });
+  // Object.keys(localStorage) is how the sweep enumerates real browser storage;
+  // the fake above mirrors that by exposing the stored names as own keys.
+  for (const name of store.keys()) context.localStorage[name] = store.get(name);
+
   vm.runInContext(`
-    ${declaration('_isCheckoutKey')}
-    ${declaration('_checkoutKeyIsWritable')}
-    ${declaration('_retireUndeliverableCheckouts')}
-    globalThis.retire = () => _retireUndeliverableCheckouts(null);
-    globalThis.writable = (k, now) => _checkoutKeyIsWritable(k, now);
+    var _legacyCheckoutSweepDone = false;
+    ${declaration('_isLegacyCheckoutKey')}
+    ${declaration('_retireLegacyCheckoutDeliveries')}
+    globalThis.api = { sweep: () => _retireLegacyCheckoutDeliveries() };
   `, context);
 
-  const now = new Date('2026-08-05T12:00:00');
-  assert.equal(context.writable('checkout_2026-06-18', now), false, '48 days back is outside the window');
-  assert.equal(context.writable('checkout_2026-08-05', now), true, 'today is inside it');
-  assert.equal(context.writable('checkout_2026-08-06', now), true, 'tomorrow covers timezone skew');
-  assert.equal(context.writable('logs', now), true, 'non-checkout keys are not this function’s business');
+  const retired = context.api.sweep();
+  assert.deepEqual([...retired],
+    ['checkout_2026-06-18', 'checkout_2026-07-04', 'checkout_2026-08-05'],
+    'every queued day is retired, including one known only from its error');
 
-  assert.deepEqual([...context.retire()], ['checkout_2026-06-18']);
-  // The promise to upload is abandoned; the data itself is not.
-  assert.equal(store.get('tmb_checkout_2026-06-18_pending_sync'), undefined, 'no more doomed retries');
-  assert.equal(store.get('tmb_checkout_2026-06-18'), 'E:old', 'the encrypted local copy stays');
-  assert.equal(errors.has('checkout_2026-06-18'), false, 'and it stops reporting as an error');
-  // A day still inside the window must be left completely alone.
-  assert.ok(store.get('tmb_checkout_2026-08-05_pending_sync'), 'a deliverable day is untouched');
+  for (const suffix of ['_pending_sync', '_pending_op', '_revision']) {
+    assert.equal(store.get('tmb_checkout_2026-06-18' + suffix), undefined,
+      `no more doomed retries for ${suffix}`);
+  }
+  assert.equal(store.get('tmb_checkout_2026-08-05_pending_sync'), undefined,
+    'today is no more deliverable than any other day now');
 
-  assert.equal(toasts.length, 1, 'silently dropping an upload would be worse than the error');
-  assert.match(toasts[0], /kept on this Mac but will not upload/);
-  assert.match(toasts[0], /2026-06-18/, 'and says which day');
+  assert.equal(store.get('tmb_checkout_2026-06-18'), 'E:old',
+    'the encrypted day record is the studio\'s data and stays');
+  assert.equal(store.get('tmb_checkout_2026-08-05'), 'E:today');
+
+  assert.equal(store.get('tmb_checkout_2026-02-30_pending_sync'), 'E:not-a-real-date',
+    'a date-shaped name that is not a real date is not ours to delete');
+  assert.equal(store.get('tmb_logs_pending_sync') !== undefined, true,
+    'and an unrelated key is untouched');
+
+  assert.equal(errors.has('checkout_2026-06-18'), false, 'it stops reporting as an error');
+  assert.equal(errors.has('checkout_2026-07-04'), false);
+  assert.equal(errors.has('logs'), true, 'without swallowing a real one');
+
+  assert.deepEqual([...context.api.sweep()], [], 'the sweep runs once per session');
 });
 
-test('the client window matches the one the rules enforce', () => {
-  // If these drift, the client either retries something the rules will always
-  // refuse, or abandons something they would have accepted.
+test('nothing in the client or the rules still writes a date-shaped key', () => {
   const renderer = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
   const rules = fs.readFileSync(path.join(__dirname, '..', 'firestore.rules'), 'utf8');
-  const past = renderer.match(/const CHECKOUT_WRITE_WINDOW_PAST_DAYS = (\d+)/)[1];
-  const future = renderer.match(/const CHECKOUT_WRITE_WINDOW_FUTURE_DAYS = (\d+)/)[1];
-  assert.match(rules, new RegExp(`duration\\.value\\(${past}, 'd'\\)`), 'retention window agrees');
-  assert.match(rules, new RegExp(`duration\\.value\\(${future}, 'd'\\)`), 'skew allowance agrees');
+  assert.doesNotMatch(renderer, /getSyncKeys\(\)[\s\S]{0,200}?'checkout_'/,
+    'getSyncKeys must not synthesise a checkout key');
+  assert.doesNotMatch(stripRulesComments(rules), /checkout_/,
+    'and the rules must not admit one');
 });
 
 // --- Two Macs editing the same sheet at the same moment ----------------------

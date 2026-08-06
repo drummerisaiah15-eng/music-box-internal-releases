@@ -541,34 +541,26 @@ test('P1-7: Staff Hub shows the live role, not the shipped built-in role', () =>
     'returning the built-in entry intact re-introduced the stale role');
 });
 
-test('P1-8: checkout is keyed by lesson identity, not array position', () => {
-  const context = vm.createContext({ String, Array });
-  vm.runInContext(`
-    ${namedFunctionSource('_lessonCheckoutKey')}
-    ${namedFunctionSource('isLessonCheckedOut')}
-    globalThis.api = { key: l => _lessonCheckoutKey(l), on: (s, l, i) => isLessonCheckedOut(s, l, i) };
-  `, context);
-
-  const lessonB = { mbId: 'appt-B', time: '10:00', name: 'B', instructor: 'X' };
-  const key = context.api.key(lessonB);
-  const state = { [key]: true };
-
-  // B was at index 0; inserting A before it shifts B to index 1.
-  assert.equal(context.api.on(state, lessonB, 1), true,
-    'the flag follows the lesson through a reorder');
-  const lessonA = { mbId: 'appt-A', time: '09:00', name: 'A', instructor: 'X' };
-  assert.equal(context.api.on(state, lessonA, 0), false,
-    'and does not transfer to whichever lesson now sits at the old index');
-
-  // Legacy index-keyed state must still resolve so an in-progress day is kept.
-  assert.equal(context.api.on({ 3: true }, lessonA, 3), true, 'legacy index entries still read');
-  // A lesson with no provider id still gets a stable composite key.
-  const noId = { time: '11:00', name: 'C', instructor: 'Y' };
-  assert.equal(context.api.key(noId), context.api.key({ ...noId }), 'composite key is deterministic');
-  assert.notEqual(context.api.key(noId), context.api.key({ ...noId, time: '12:00' }));
-
-  assert.match(namedFunctionSource('setCheckedOut'), /STORE\.mutate\(getCheckoutStateKey\(\)/,
-    'checkout writes merge into the reconciled base rather than replacing the day');
+test('P1-8: lesson check-out is gone, along with every trace of it', () => {
+  // Retired with the MindBody API. The regression this replaces guarded a
+  // keying bug in code that no longer exists; what matters now is that no part
+  // of it survived as dead UI or a dangling call.
+  const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  for (const name of [
+    'getCheckoutStateKey', 'getCheckoutState', '_lessonCheckoutKey',
+    'isLessonCheckedOut', 'setCheckedOut', '_syncMbCheckoutStatus',
+    'getCheckoutNeeded', 'checkoutLesson', 'mbCheckoutLesson',
+    'updateCheckoutBadge', 'renderDashboardCheckout', 'renderScheduleCheckout',
+    'refreshCheckout',
+  ]) {
+    assert.doesNotMatch(html, new RegExp(name), `${name} still appears in the renderer`);
+  }
+  for (const marker of [
+    'schedule-checkout-list', 'dashboard-checkout-list', 'checkout-badge',
+    'stat-checkout', 'btn-checkout', 'Check-Out Status',
+  ]) {
+    assert.equal(html.includes(marker), false, `${marker} is orphaned markup`);
+  }
 });
 
 test('P1-9: an open Morning Brief refreshes when its data arrives', () => {

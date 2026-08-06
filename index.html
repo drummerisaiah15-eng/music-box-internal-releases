@@ -284,46 +284,6 @@
     .room-btn.selected { border-color:var(--accent); background:var(--accent); color:#fff; }
     .room-btn.room-clear { color:var(--text-muted); font-size:11px; }
 
-    /* CHECK-OUT */
-    .checkout-item {
-      display: flex;
-      align-items: center;
-      gap: 14px;
-      padding: 11px 0;
-      border-bottom: 1px solid var(--divider);
-    }
-    .checkout-item:last-child { border-bottom: none; }
-    .checkout-time {
-      font-size: 12px;
-      font-weight: 600;
-      color: var(--text-secondary);
-      min-width: 80px;
-      text-align: right;
-    }
-    .checkout-info { flex: 1; }
-    .checkout-name { font-size: 14px; font-weight: 600; color: var(--text-primary); }
-    .checkout-meta { font-size: 12px; color: var(--text-secondary); margin-top: 2px; }
-    .checkout-status-done {
-      display: flex; align-items: center; gap: 6px;
-      font-size: 12px; font-weight: 600; color: #3a8c5c;
-    }
-    .checkout-status-done svg { color: #3a8c5c; }
-    .btn-checkout {
-      background: #c4922a; color: #fff; border: none;
-      padding: 5px 14px; border-radius: 6px; font-size: 12px;
-      font-weight: 600; cursor: pointer; white-space: nowrap;
-    }
-    .btn-checkout:hover { background: #b07d22; }
-    .checkout-empty {
-      padding: 20px 0;
-      text-align: center;
-      color: var(--text-muted);
-      font-size: 13px;
-    }
-    .checkout-all-clear {
-      display: flex; align-items: center; gap: 8px;
-      padding: 16px 0; color: #3a8c5c; font-size: 13px; font-weight: 600;
-    }
     .schedule-name { font-size: 13.5px; font-weight: 500; }
     .schedule-meta { font-size: 11.5px; color: var(--text-secondary); margin-top: 2px; }
     .schedule-instructor { font-size: 11px; color: var(--text-muted); }
@@ -4246,41 +4206,44 @@ function _unsyncedSyncKeys() {
   return getSyncKeys().filter(key => _syncKeyStatus(key) !== 'current');
 }
 
-// A checkout day that has aged out of the retention window can never be
-// accepted by the rules, no matter how many times it is retried. Retire the
-// delivery rather than failing forever: the encrypted local copy is untouched
-// and still readable here, only the promise to upload it is abandoned — and it
-// is reported, because "kept on this Mac only" is a fact the studio needs.
-function _retireUndeliverableCheckouts(wanted) {
-  const retired = [];
-  for (const key of getSyncKeys()) {
-    if (wanted && !wanted.has(key)) continue;
-    if (!_isCheckoutKey(key) || _checkoutKeyIsWritable(key)) continue;
-    let pending = null;
-    try { pending = _readPendingSyncRecord(key); } catch (_) { pending = true; }
-    if (!pending && !_syncDeliveryErrors.has(key)) continue;
-    try { localStorage.removeItem(_pendingSyncStorageKey(key)); } catch (_) {}
-    try { localStorage.removeItem('tmb_' + key + '_pending_op'); } catch (_) {}
-    try { localStorage.removeItem('tmb_' + key + '_pending_base_revision'); } catch (_) {}
-    _syncDeliveryErrors.delete(key);
-    retired.push(key);
+// Lesson check-out is gone with MindBody, but a Mac upgrading into this build
+// can still be holding queued `checkout_<date>` deliveries — some of them for
+// days the rules would never have accepted anyway. Nothing will ever drain
+// them, so retire the promise to upload rather than leaving orphaned records
+// behind the sync status forever.
+//
+// The encrypted day records themselves (`tmb_checkout_<date>`) are deliberately
+// left alone. They are the studio's data, they cost a few kilobytes, and
+// deleting a user's records as a side effect of removing a feature is not a
+// decision this function gets to make.
+let _legacyCheckoutSweepDone = false;
+function _retireLegacyCheckoutDeliveries() {
+  if (_legacyCheckoutSweepDone) return [];
+  _legacyCheckoutSweepDone = true;
+  const days = new Set();
+  let names = [];
+  try { names = Object.keys(localStorage); } catch (_) { return []; }
+  for (const name of names) {
+    const match = /^tmb_(checkout_\d{4}-\d{2}-\d{2})(_pending_sync|_pending_op|_pending_base_revision|_revision)$/.exec(name);
+    if (!match || !_isLegacyCheckoutKey(match[1])) continue;
+    try { localStorage.removeItem(name); } catch (_) {}
+    days.add(match[1]);
   }
+  for (const key of days) _syncDeliveryErrors.delete(key);
+  // An error can outlive its pending record, so clear those independently.
+  for (const key of [..._syncDeliveryErrors.keys()]) {
+    if (_isLegacyCheckoutKey(key)) { _syncDeliveryErrors.delete(key); days.add(key); }
+  }
+  const retired = [...days].sort();
   if (retired.length) {
-    console.warn(`Retired ${retired.length} checkout day(s) past the cloud retention window: ${retired.join(', ')}`);
-    showToast(
-      `${retired.length} old checkout day${retired.length === 1 ? '' : 's'} ` +
-      `(${retired.map(k => k.slice(9)).join(', ')}) ${retired.length === 1 ? 'is' : 'are'} ` +
-      `older than the ${CHECKOUT_WRITE_WINDOW_PAST_DAYS}-day cloud window. ` +
-      `They are kept on this Mac but will not upload.`,
-      'warning'
-    );
+    console.warn(`Retired ${retired.length} queued lesson check-out day(s); the feature no longer exists: ${retired.join(', ')}`);
   }
   return retired;
 }
 
 async function _flushSyncDeliveries(keys = null) {
   const wanted = keys ? new Set(keys) : null;
-  _retireUndeliverableCheckouts(wanted);
+  _retireLegacyCheckoutDeliveries();
   // V160-008: a quarantined key must be reported even when it has NO pending
   // record. Building targets from pending records alone let a quarantined key
   // with nothing queued pass the flush as a success.
@@ -4782,38 +4745,24 @@ const SYNC_BASE_KEYS = Object.freeze([
   'staff_directory',
 ]);
 
-function _isCheckoutKey(key) {
+// Lesson check-out was a MindBody feature. MindBody is retired, so nothing
+// writes `checkout_<date>` any more. The shape is still recognised for one
+// reason only: existing Macs have queued deliveries and encrypted day records
+// in localStorage, and _retireLegacyCheckoutDeliveries() has to be able to
+// identify them in order to stop retrying them forever.
+function _isLegacyCheckoutKey(key) {
   if (!/^checkout_\d{4}-\d{2}-\d{2}$/.test(key)) return false;
   const value = key.slice(9);
   const parsed = new Date(value + 'T12:00:00');
   return Number.isFinite(parsed.getTime()) && _todayLocal(parsed) === value;
 }
 
-// firestore.rules bounds writable checkout documents to a retention window so a
-// stolen credential cannot pre-create millions of date-shaped documents. The
-// window is deliberately not negotiable from the client — but it means a Mac
-// holding an older checkout day can never deliver it, and retrying forever left
-// sync permanently red with no way out. Keep these numbers in step with
-// writableDataKey() in firestore.rules.
-const CHECKOUT_WRITE_WINDOW_PAST_DAYS = 45;
-const CHECKOUT_WRITE_WINDOW_FUTURE_DAYS = 1;
-
-function _checkoutKeyIsWritable(key, now = new Date()) {
-  if (!_isCheckoutKey(key)) return true; // not a checkout key; not our business
-  const day = key.slice(9);
-  const oldest = new Date(now.getTime() - CHECKOUT_WRITE_WINDOW_PAST_DAYS * 86400000);
-  const newest = new Date(now.getTime() + CHECKOUT_WRITE_WINDOW_FUTURE_DAYS * 86400000);
-  return day >= _todayLocal(oldest) && day <= _todayLocal(newest);
-}
-
 function getSyncKeys() {
-  const keys = new Set([...SYNC_BASE_KEYS, 'checkout_' + _todayLocal()]);
-  for (const key of Object.keys(_decCache)) if (_isCheckoutKey(key)) keys.add(key);
-  return [...keys];
+  return [...SYNC_BASE_KEYS];
 }
 
 function isSyncKey(key) {
-  return SYNC_BASE_KEYS.includes(key) || _isCheckoutKey(key);
+  return SYNC_BASE_KEYS.includes(key);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -5395,7 +5344,6 @@ function _estimateJsonBytes(value) {
 }
 
 function _expectedSyncType(key) {
-  if (_isCheckoutKey(key)) return 'object';
   if (['room_overrides', 'room_by_instructor', 'room_time_rules', 'spreadsheets'].includes(key)) return 'object';
   return 'array';
 }
@@ -5992,9 +5940,6 @@ function _refreshForSyncKey(key, value) {
   }
   if (key === 'room_overrides' || key === 'room_by_instructor' || key === 'room_time_rules' || key === 'room_excluded') {
     try { if (_cachedSchedule) renderScheduleContent(_cachedSchedule, true); } catch {}
-  }
-  if (_isCheckoutKey(key)) {
-    try { refreshCheckout(); } catch {}
   }
   if (key === 'comm_handled_ids') {
     _commHandled = null;
@@ -10498,235 +10443,6 @@ async function authenticateMsAccount(accountId) {
 // ─────────────────────────────────────────────────────────────
 // DASHBOARD
 // ─────────────────────────────────────────────────────────────
-// ─────────────────────────────────────────────────────────────
-// CHECK-OUT
-// ─────────────────────────────────────────────────────────────
-function parseTimeToMinutes(timeStr) {
-  // "9:00 AM" → minutes since midnight
-  const m = timeStr.match(/(\d+):(\d+)\s*(AM|PM)/i);
-  if (!m) return 0;
-  let h = parseInt(m[1]);
-  const min = parseInt(m[2]);
-  const ampm = m[3].toUpperCase();
-  if (ampm === 'PM' && h !== 12) h += 12;
-  if (ampm === 'AM' && h === 12) h = 0;
-  return h * 60 + min;
-}
-
-function getLessonDuration(type) {
-  return type === 'group' ? 60 : 30;
-}
-
-function getLessonEndMinutes(lesson) {
-  return parseTimeToMinutes(lesson.time) + getLessonDuration(lesson.type);
-}
-
-function formatEndTime(endMin) {
-  const h24 = Math.floor(endMin / 60) % 24;
-  const min = endMin % 60;
-  const ampm = h24 >= 12 ? 'PM' : 'AM';
-  const h12 = h24 % 12 || 12;
-  return `${h12}:${String(min).padStart(2,'0')} ${ampm}`;
-}
-
-function getCheckoutStateKey() {
-  return 'checkout_' + _todayLocal();
-}
-
-function getCheckoutState() {
-  return STORE.get(getCheckoutStateKey(), {});
-}
-
-// P1-8: checkout used to be stored as state[arrayIndex]. Inserting or reordering
-// a lesson moved every flag to a different lesson. Key by the provider's stable
-// id where available, otherwise a deterministic composite of the fields that
-// identify a booking within a single day.
-function _lessonCheckoutKey(lesson) {
-  if (!lesson) return null;
-  const stable = lesson.mbId || lesson.appointmentId || lesson.id;
-  if (stable) return 'ls:' + String(stable);
-  return 'lc:' + [lesson.time, lesson.name, lesson.instructor]
-    .map(part => String(part ?? '').trim().toLowerCase()).join('|');
-}
-
-// Legacy state is index-keyed. Resolve it against the schedule so an existing
-// day's checkouts are not lost the first time this runs.
-function isLessonCheckedOut(state, lesson, idx) {
-  if (!state) return false;
-  const key = _lessonCheckoutKey(lesson);
-  if (key && state[key]) return true;
-  return !!state[idx]; // legacy index entry
-}
-
-async function setCheckedOut(idx, lesson = null) {
-  const schedule = _cachedSchedule || DEMO_SCHEDULE;
-  const target = lesson || schedule[idx];
-  const key = _lessonCheckoutKey(target);
-  if (!key) throw new Error('That lesson could not be identified for checkout.');
-  await STORE.mutate(getCheckoutStateKey(), current => {
-    const state = (current && typeof current === 'object' && !Array.isArray(current))
-      ? { ...current } : {};
-    state[key] = true;
-    return state;
-  }, {});
-  return true;
-}
-
-// Auto-mark appointments as checked out when MindBody reports them as Completed.
-// Only applies to appointments — group classes/camps are not checked out via this app.
-// Called every time a fresh schedule is loaded from the API.
-function _syncMbCheckoutStatus(schedule) {
-  if (!schedule || !schedule.length) return;
-  const state = getCheckoutState();
-  let changed = false;
-  schedule.forEach((lesson, idx) => {
-    const key = _lessonCheckoutKey(lesson);
-    if (key && !isLessonCheckedOut(state, lesson, idx) &&
-        lesson.mbType === 'appointment' && lesson.mbStatus === 'Completed') {
-      state[key] = true;
-      changed = true;
-    }
-  });
-  if (changed) {
-    STORE.replace(getCheckoutStateKey(), state, { authoritative: 'whole-day checkout state' }).catch(error => {
-      console.warn('[checkout] automatic status was not saved:', error?.message || error);
-    });
-  }
-}
-
-function nowMinutes() {
-  const now = new Date();
-  return now.getHours() * 60 + now.getMinutes();
-}
-
-function getCheckoutNeeded() {
-  const now = nowMinutes();
-  const cutoff = now - 180; // only show appointments that ended within the last 3 hours
-  const state = getCheckoutState();
-  const schedule = _cachedSchedule || DEMO_SCHEDULE;
-  return schedule.map((lesson, idx) => ({
-    lesson, idx,
-    endMin: getLessonEndMinutes(lesson),
-    checkedOut: isLessonCheckedOut(state, lesson, idx),
-  })).filter(item =>
-    item.endMin <= now &&
-    item.endMin >= cutoff &&
-    // Only appointments need checkout — not group classes or camps
-    (!item.lesson.mbType || item.lesson.mbType === 'appointment')
-  );
-}
-
-async function mbCheckoutLesson() { return false; } // MindBody removed
-async function mbPost() { return null; } // MindBody removed
-
-async function checkoutLesson(idx) {
-  try {
-    await setCheckedOut(idx);
-  } catch (error) {
-    showToast(`Checkout status was not saved: ${error?.message || error}`, 'danger');
-    return false;
-  }
-  renderDashboardCheckout();
-  renderScheduleCheckout();
-  updateCheckoutBadge();
-
-  const schedule = _cachedSchedule || DEMO_SCHEDULE;
-  const lesson = schedule[idx];
-  // Open MindBody website for staff to complete checkout
-  const mbUrl = `https://clients.mindbodyonline.com`;
-  if (window.electronShell?.openExternal) {
-    await window.electronShell.openExternal(mbUrl).catch(() => {});
-  }
-  showToast('Opening MindBody checkout…', 'info');
-  return true;
-}
-
-function updateCheckoutBadge() {
-  const needed = getCheckoutNeeded();
-  const pending = needed.filter(i => !i.checkedOut).length;
-  const badge = document.getElementById('checkout-badge');
-  if (badge) {
-    if (pending > 0) {
-      badge.textContent = pending;
-      badge.style.display = 'inline-flex';
-    } else {
-      badge.style.display = 'none';
-    }
-  }
-  const statEl = document.getElementById('stat-checkout');
-  if (statEl) {
-    if (needed.length === 0) {
-      statEl.textContent = '—';
-    } else if (pending === 0) {
-      statEl.textContent = '✓ All clear';
-      statEl.style.fontSize = '16px';
-      statEl.style.color = '#3a8c5c';
-    } else {
-      statEl.textContent = pending;
-      statEl.style.color = '#c4922a';
-    }
-  }
-}
-
-function renderDashboardCheckout() {
-  const el = document.getElementById('dashboard-checkout-list');
-  if (!el) return;
-  const needed = getCheckoutNeeded();
-  if (needed.length === 0) {
-    el.innerHTML = '<div class="checkout-empty">No lessons have ended yet — check back later.</div>';
-    updateCheckoutBadge();
-    return;
-  }
-  const pending = needed.filter(i => !i.checkedOut);
-  const done = needed.filter(i => i.checkedOut);
-  if (pending.length === 0) {
-    el.innerHTML = '<div class="checkout-all-clear"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M20 6L9 17l-5-5"/></svg>All lessons checked out — great job!</div>';
-  } else {
-    el.innerHTML = pending.map(item => `
-      <div class="checkout-item">
-        <div class="checkout-time">Ended ${escHtml(formatEndTime(item.endMin))}</div>
-        <div class="checkout-info">
-          <div class="checkout-name">${escHtml(item.lesson.name)}</div>
-          <div class="checkout-meta">${escHtml(item.lesson.instructor)} · ${item.lesson.type === 'group' ? escHtml(item.lesson.enrolled) + ' students' : 'Private'}</div>
-        </div>
-        <button class="btn-checkout" onclick="checkoutLesson(${item.idx})">Check Out</button>
-      </div>
-    `).join('') + (done.length > 0 ? `<div style="margin-top:8px;font-size:12px;color:var(--text-muted)">${done.length} already checked out</div>` : '');
-  }
-  updateCheckoutBadge();
-}
-
-function renderScheduleCheckout() {
-  const el = document.getElementById('schedule-checkout-list');
-  if (!el) return;
-  const state = getCheckoutState();
-  const now = nowMinutes();
-  const schedule = _cachedSchedule || DEMO_SCHEDULE;
-  el.innerHTML = schedule.map((lesson, idx) => {
-    const endMin = getLessonEndMinutes(lesson);
-    const ended = endMin <= now;
-    const checkedOut = isLessonCheckedOut(state, lesson, idx);
-    const isAppt = !lesson.mbType || lesson.mbType === 'appointment';
-    return `
-      <div class="checkout-item">
-        <div class="checkout-time">${escHtml(lesson.time)}<br><span style="color:var(--text-muted);font-weight:400">→ ${escHtml(formatEndTime(endMin))}</span></div>
-        <div class="checkout-info">
-          <div class="checkout-name">${escHtml(lesson.name)}</div>
-          <div class="checkout-meta">${escHtml(lesson.instructor)} · ${lesson.type === 'group' ? escHtml(lesson.enrolled) + '/' + escHtml(lesson.capacity) + ' enrolled' : 'Private'}</div>
-        </div>
-        ${!ended
-          ? '<span style="font-size:12px;color:var(--text-muted);font-weight:500">Not yet ended</span>'
-          : !isAppt
-            ? '<span style="font-size:12px;color:var(--text-muted);font-weight:500">Group class</span>'
-            : checkedOut
-              ? '<span class="checkout-status-done"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M20 6L9 17l-5-5"/></svg>Checked Out</span>'
-              : `<button class="btn-checkout" onclick="checkoutLesson(${idx})">Check Out</button>`
-        }
-      </div>
-    `;
-  }).join('');
-}
-
 function refreshDashboard() {
   const msKey = STORE.get('ms_tenant', '');
 
@@ -11136,7 +10852,6 @@ async function loadSchedule() {
   document.getElementById('schedule-connect-banner').classList.add('hidden');
   const schedule = _cachedSchedule || DEMO_SCHEDULE;
   renderScheduleContent(schedule, false);
-  renderScheduleCheckout();
 }
 
 function renderScheduleContent(schedule, isLive) {
@@ -11153,8 +10868,7 @@ function renderScheduleContent(schedule, isLive) {
   <div style="margin-bottom:12px;font-size:12px;color:var(--text-secondary);font-weight:600;text-transform:uppercase;letter-spacing:.07em">${escHtml(dateLabel)}</div>`;
 
   if (view === 'calendar') {
-    document.getElementById('schedule-content').innerHTML = banner + '<div id="schedule-cal-area"></div>' +
-      '<div class="card mt-4"><div style="display:flex;align-items:center;gap:10px;margin-bottom:16px"><div class="card-title" style="margin-bottom:0">Check-Out Status</div></div><div id="schedule-checkout-list"></div></div>';
+    document.getElementById('schedule-content').innerHTML = banner + '<div id="schedule-cal-area"></div>';
     renderScheduleCalendar(schedule);
   } else {
     const groups = schedule.filter(s => s.type === 'group');
@@ -11200,15 +10914,7 @@ function renderScheduleContent(schedule, isLive) {
           </div>`;
         }).join('')}
       </div>
-    </div>
-    <div class="card mt-4">
-      <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px">
-        <div class="card-title" style="margin-bottom:0">Check-Out Status</div>
-        <span style="font-size:12px;color:var(--text-muted)">Mark students checked out after their lesson ends</span>
-      </div>
-      <div id="schedule-checkout-list"></div>
     </div>`;
-    renderScheduleCheckout();
   }
 }
 
@@ -13507,7 +13213,7 @@ async function _decodeCloudEnvelope(cloud, pin = _activePin) {
 async function _tryUnlockFromCloud(pin) {
   if (!window.electronSync?.read) return { found: false, unlocked: false };
   // Never use a cloud passcode to bypass an existing local encrypted profile.
-  const hasLocalOperationalData = [...SYNC_BASE_KEYS, 'checkout_' + _todayLocal()]
+  const hasLocalOperationalData = SYNC_BASE_KEYS
     .some(name => localStorage.getItem('tmb_' + name) !== null);
   if (hasLocalOperationalData) return { found: false, unlocked: false };
   try {
