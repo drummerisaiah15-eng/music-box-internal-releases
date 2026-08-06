@@ -563,6 +563,123 @@ test('P1-8: lesson check-out is gone, along with every trace of it', () => {
   }
 });
 
+// --- MB161-010: sheet activity was a running total since the sheet existed ----
+
+function activityApi(sheet, storedWindow) {
+  const store = new Map();
+  if (storedWindow !== undefined) store.set('tmb__ss_activity_window', storedWindow);
+  const context = vm.createContext({
+    Date, Object, Map, Number, String, Array, JSON,
+    ssActiveSheet: () => sheet,
+    localStorage: {
+      getItem: k => (store.has(k) ? store.get(k) : null),
+      setItem: (k, v) => store.set(k, String(v)),
+    },
+  });
+  vm.runInContext(`
+    ${namedFunctionSource('_ssActivityWindow')}
+    ${namedFunctionSource('_ssActivityWindowStart')}
+    ${namedFunctionSource('_ssContributorSummary')}
+    var SS_ACTIVITY_WINDOW_KEY = 'tmb__ss_activity_window';
+    var SS_ACTIVITY_WINDOWS = ['today', 'week', 'all'];
+    globalThis.api = {
+      window: () => _ssActivityWindow(),
+      start: (w, now) => _ssActivityWindowStart(w, now),
+      summary: since => _ssContributorSummary(since),
+    };
+  `, context);
+  return context.api;
+}
+
+const stamp = (by, at) => ({ by, at });
+
+test('MB161-010: the contributor roster counts a window, not everything ever', () => {
+  const now = new Date('2026-08-06T15:00:00');
+  const sheet = { id: 's1', editedBy: {
+    '0,0': stamp('Carrie', new Date('2026-08-06T09:30:00').toISOString()),
+    '0,1': stamp('Carrie', new Date('2026-08-06T10:00:00').toISOString()),
+    '0,2': stamp('Carrie', new Date('2026-08-03T11:00:00').toISOString()),
+    '0,3': stamp('Carrie', new Date('2026-06-01T11:00:00').toISOString()),
+    '0,4': stamp('Elizabeth', new Date('2026-07-20T11:00:00').toISOString()),
+  } };
+  const api = activityApi(sheet);
+
+  const today = api.summary(api.start('today', now));
+  assert.equal(today.length, 1, 'only people who did something today');
+  assert.equal(today[0].name, 'Carrie');
+  assert.equal(today[0].cells.length, 2, 'and only the changes they made today');
+
+  const week = api.summary(api.start('week', now));
+  assert.equal(week[0].cells.length, 3, 'seven days reaches back further');
+
+  const all = api.summary(null);
+  assert.equal(all.length, 2, 'All still shows everyone');
+  assert.equal(all.find(e => e.name === 'Carrie').cells.length, 4);
+
+  // The point of the change: this is the number that used to be on the chip.
+  assert.notEqual(today[0].cells.length, all.find(e => e.name === 'Carrie').cells.length);
+});
+
+test('MB161-010: "today" is local midnight, not a rolling 24 hours', () => {
+  const api = activityApi({ id: 's1', editedBy: {} });
+  const now = new Date('2026-08-06T15:00:00');
+  const midnight = new Date('2026-08-06T00:00:00');
+  assert.equal(api.start('today', now), midnight.getTime(),
+    'both Macs reset at a time they can agree on without coordinating');
+  assert.equal(api.start('week', now), now.getTime() - 7 * 86400000);
+  assert.equal(api.start('all', now), null, 'All means no lower bound');
+});
+
+test('MB161-010: an unreadable or absent stamp time is not recent work', () => {
+  const now = new Date('2026-08-06T15:00:00');
+  const api = activityApi({ id: 's1', editedBy: {
+    '0,0': stamp('Carrie', 'not a date'),
+    '0,1': stamp('Carrie', undefined),
+    '0,2': stamp('Elizabeth', new Date('2026-08-06T09:00:00').toISOString()),
+  } });
+  const today = api.summary(api.start('today', now));
+  // Joined rather than deep-compared: the array is built inside the vm realm.
+  assert.equal([...today].map(e => e.name).join(','), 'Elizabeth',
+    'a stamp that cannot be dated must not be counted as today’s');
+  assert.equal(api.summary(null).length, 2, 'but All still shows it exists');
+});
+
+test('MB161-010: the window is a device preference and defaults to today', () => {
+  assert.equal(activityApi({}, undefined).window(), 'today');
+  assert.equal(activityApi({}, 'week').window(), 'week');
+  assert.equal(activityApi({}, 'nonsense').window(), 'today', 'a junk value falls back');
+});
+
+test('MB161-010: colours and highlighting stay consistent with the window', () => {
+  // Identity colour must come from the UNwindowed roster: switching to Today
+  // would otherwise reshuffle everyone's colour.
+  assert.match(namedFunctionSource('_ssIdentityRoster'), /_ssContributorSummary\(\)/);
+  assert.doesNotMatch(namedFunctionSource('_ssIdentityRoster'), /_ssActivityWindowStart/);
+
+  // The highlight must use the SAME window as the chip, or "4 changes" lights
+  // up forty cells.
+  assert.match(namedFunctionSource('_ssPaintContributorHighlight'),
+    /_ssContributorSummary\(_ssActivityWindowStart\(\)\)/);
+
+  // Narrowing the window can strip the highlighted person of every cell, which
+  // would dim the entire grid and highlight nothing.
+  assert.match(namedFunctionSource('ssSetActivityWindow'), /_ssHighlightedContributor = null/);
+});
+
+test('MB161-010: per-cell stamps are not deleted by the window', () => {
+  // "Who last changed B4?" has to keep working for old edits. Nothing in the
+  // window code may write to the workbook.
+  for (const name of ['_ssActivityWindow', '_ssActivityWindowStart', '_ssContributorSummary']) {
+    const fn = namedFunctionSource(name);
+    assert.doesNotMatch(fn, /delete /, `${name} must not remove stamps`);
+    assert.doesNotMatch(fn, /editedBy\[/, `${name} must not write stamps`);
+  }
+  // The stamp shown for the selected cell is read straight from the sheet with
+  // no window applied.
+  assert.match(namedFunctionSource('ssRenderActivityBar'),
+    /sheet\?\.editedBy\?\.\[ssKey\(_ssSelR, _ssSelC\)\]/);
+});
+
 test('P1-9: an open Morning Brief refreshes when its data arrives', () => {
   const fn = namedFunctionSource('_refreshOpenBriefing');
   assert.match(fn, /classList\.contains\('hidden'\)/,
@@ -752,7 +869,12 @@ test('the sheet says who changed it, without waiting to be asked', () => {
   assert.match(summary, /Date\.parse\(b\.lastAt\) - Date\.parse\(a\.lastAt\)/, 'most recent first');
 
   const render = namedFunctionSource('ssRenderActivityBar');
-  assert.match(render, /made \$\{count\} change\$\{count === 1 \? '' : 's'\}/, 'names the person and the count');
+  assert.match(render, /nameLine\.textContent = entry\.name/, 'names the person');
+  assert.match(render, /change\$\{count === 1 \? '' : 's'\} · last /, 'with the count and when they last touched it');
+  // MB161-010: built as nodes. A profile name is user-supplied text and this is
+  // the one place it lands in the sidebar.
+  assert.doesNotMatch(render, /innerHTML\s*[+]?=\s*`[^`]*\$\{entry\./,
+    'the name must never be interpolated into markup');
   assert.match(render, /No tracked edits on this sheet yet/,
     'an empty sheet says so rather than showing nothing and looking broken');
   assert.match(render, /bar\.style\.display = 'flex'/, 'the panel is always present once a sheet is open');
