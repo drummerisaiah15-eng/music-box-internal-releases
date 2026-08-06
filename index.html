@@ -7392,13 +7392,30 @@ function _ssAttributionActor() {
   return name.slice(0, MAX_SPREADSHEET_ATTRIBUTION_NAME);
 }
 
+// MB161-009: conflicts are no longer trimmed to a cap, so they are now a
+// plausible reason to be over the size limit — and "exceeds the 600 KB sync
+// limit", surfaced while somebody types a word into a cell, tells them nothing
+// they can act on. Resolving a conflict strictly shrinks the workbook, so
+// naming the conflicts also names the way out.
+function _ssOversizeError(workbook) {
+  const held = Array.isArray(workbook?._conflicts) ? workbook._conflicts.length : 0;
+  return new Error(held
+    ? `spreadsheets exceeds the 600 KB sync limit while holding ${held} ` +
+      `unresolved conflict${held === 1 ? '' : 's'}. Resolve them on the ` +
+      `Spreadsheets page to free the space — no values are lost by doing so.`
+    : 'spreadsheets exceeds the 600 KB sync limit');
+}
+
 function normalizeSpreadsheetWorkbook(value) {
   let serialized;
   try { serialized = JSON.stringify(value); }
   catch { throw new Error('spreadsheets is not JSON serializable'); }
+  // This guard measures the INPUT, before anything is validated, so it is the
+  // one that actually fires on an oversize workbook. It has to explain itself
+  // as well as the one at the end of the function does.
   if (serialized === undefined ||
       new TextEncoder().encode(serialized).byteLength > MAX_SPREADSHEET_SYNC_JSON_BYTES) {
-    throw new Error('spreadsheets exceeds the 600 KB sync limit');
+    throw _ssOversizeError(value);
   }
   let source = JSON.parse(serialized);
   if (!source || typeof source !== 'object' || Array.isArray(source)) {
@@ -7663,7 +7680,7 @@ function normalizeSpreadsheetWorkbook(value) {
   }
   if (new TextEncoder().encode(JSON.stringify(normalized)).byteLength >
       MAX_SPREADSHEET_SYNC_JSON_BYTES) {
-    throw new Error('spreadsheets exceeds the 600 KB sync limit');
+    throw _ssOversizeError(normalized);
   }
   return normalized;
 }
@@ -8660,9 +8677,15 @@ async function ssResolveConflict(id, choice) {
   if (!entry) { ssRenderConflictList(); return false; }
   // Snapshot enough to put the workbook back if the save is refused. Losing a
   // conflict record to a failed write would be the original bug wearing a hat.
-  const priorConflicts = _cloneJson(_ssData._conflicts);
-  const priorResolved = _cloneJson(_ssData._resolvedConflicts);
-  const priorProjects = _cloneJson(_ssData.projects);
+  //
+  // _cloneJson is JSON.parse(JSON.stringify(x)), which THROWS on undefined —
+  // and _resolvedConflicts is undefined until the first conflict is ever
+  // resolved. Cloning it unguarded meant the first resolution anyone attempted
+  // threw before the try block, so the button did nothing and said nothing.
+  const clone = value => (value === undefined ? undefined : _cloneJson(value));
+  const priorConflicts = clone(_ssData._conflicts);
+  const priorResolved = clone(_ssData._resolvedConflicts);
+  const priorProjects = clone(_ssData.projects);
   try {
     if (!_ssApplyConflictChoice(entry, choice)) {
       showToast('That conflict refers to something that no longer exists; it has been cleared.', 'info');
