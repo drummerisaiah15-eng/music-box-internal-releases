@@ -942,3 +942,203 @@ test('MB161-008: the dashboard does not reorder the caller’s array', () => {
     'renderYesterdayLog sorts a copy — sorting in place would be a mutation '
     + 'of whatever getVisibleLogs handed back');
 });
+
+// ── MB161-011: the capacity ceiling ──────────────────────────────────────────
+//
+// The whole workbook is one Firestore document and Firestore caps a document at
+// 1 MiB — a hard limit on every plan, with no documented way to raise it. That
+// used to be discovered at SAVE time: staff typed all afternoon, then got
+// "Spreadsheet changes were not saved" and were dropped to the project list.
+
+function capacityApi(workbook) {
+  const toasts = [];
+  const document = makeDocument(['ss-capacity-notice']);
+  const context = vm.createContext({
+    console: { warn() {}, error() {}, log() {} },
+    Date, Object, Map, Set, Array, JSON, Number, String, Boolean, Math, TextEncoder,
+    document,
+    showToast: (message, kind) => toasts.push({ message, kind }),
+    escHtml: value => String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;'),
+  });
+  vm.runInContext(`
+    var MAX_SPREADSHEET_TOTAL_CELLS = 10000;
+    var MAX_SPREADSHEET_TOTAL_CHARS = 400000;
+    var MAX_SPREADSHEET_SYNC_JSON_BYTES = 600000;
+    var _ssData = ${JSON.stringify(workbook)};
+    ${declaration('_ssCapacity')}
+    ${declaration('_ssCapacityRefusal')}
+    ${declaration('ssRefuseIfFull')}
+    ${declaration('ssRenderCapacityNotice')}
+    globalThis.api = {
+      capacity: () => _ssCapacity(_ssData),
+      refusal: extra => _ssCapacityRefusal(_ssData, extra),
+      refuse: extra => ssRefuseIfFull(extra),
+      notice: () => ssRenderCapacityNotice(),
+    };
+  `, context);
+  return { api: context.api, document, toasts };
+}
+
+// A workbook holding `n` filled cells of `chars` characters each.
+function sizedWorkbook(n, chars = 12) {
+  const cells = {};
+  for (let i = 0; i < n; i += 1) {
+    cells[`${Math.floor(i / 100)},${i % 100}`] = {
+      v: 'x'.repeat(chars), bg: '', tc: '', b: false,
+    };
+  }
+  return {
+    activeProject: 'p1',
+    projects: [{
+      id: 'p1', name: 'P', activeId: 's1',
+      sheets: [{ id: 's1', name: 'S', rows: 200, cols: 100, colWidths: [], cells }],
+    }],
+  };
+}
+
+test('MB161-011: capacity counts filled cells, characters and encoded size', () => {
+  const { api } = capacityApi(sizedWorkbook(500, 10));
+  const capacity = api.capacity();
+  assert.equal(capacity.cells.used, 500, 'only cells that hold something');
+  assert.equal(capacity.characters.used, 5000);
+  assert.ok(capacity.bytes.used > 5000, 'bytes include the structure, not just the text');
+  assert.ok(capacity.fraction > 0 && capacity.fraction < 1);
+});
+
+test('MB161-011: an empty grid position costs nothing', () => {
+  const wide = sizedWorkbook(10, 5);
+  wide.projects[0].sheets[0].rows = 500;
+  wide.projects[0].sheets[0].cols = 100;   // 50,000 grid positions, 10 filled
+  const { api } = capacityApi(wide);
+  assert.equal(api.capacity().cells.used, 10,
+    'a big empty sheet is not a full workbook');
+});
+
+test('MB161-011: the reported measure is the tightest one, not the roomiest', () => {
+  // Few cells, enormous text: quoting the cell count would be true and useless.
+  const { api } = capacityApi(sizedWorkbook(100, 3800));
+  const capacity = api.capacity();
+  assert.equal(capacity.tightest.label, 'characters');
+  assert.ok(capacity.fraction > 0.9);
+
+  const many = capacityApi(sizedWorkbook(9800, 1)).api.capacity();
+  assert.equal(many.tightest.label, 'cells');
+});
+
+test('MB161-011: a change that fits is not refused', () => {
+  const { api, toasts } = capacityApi(sizedWorkbook(100, 10));
+  assert.equal(api.refusal({ cells: 1, characters: 20, bytes: 80 }), null);
+  assert.equal(api.refuse({ cells: 1, characters: 20, bytes: 80 }), false);
+  assert.equal(toasts.length, 0, 'and says nothing about it');
+});
+
+test('MB161-011: a change that would not fit is refused with real numbers', () => {
+  const { api, toasts } = capacityApi(sizedWorkbook(9990, 5));
+  const refusal = api.refusal({ cells: 20, characters: 100, bytes: 900 });
+  assert.match(refusal, /10,010 filled cells against a limit of 10,000/,
+    'the actual figures, not "too large"');
+  assert.match(refusal, /Nothing has been lost/, 'and does not read as data loss');
+  assert.match(refusal, /delete or export a project/, 'with something to actually do');
+
+  assert.equal(api.refuse({ cells: 20, characters: 100, bytes: 900 }), true);
+  assert.equal(toasts.length, 1);
+  assert.equal(toasts[0].kind, 'warning', 'a warning, not a danger — nothing broke');
+});
+
+test('MB161-011: each limit is reported in its own units', () => {
+  assert.match(capacityApi(sizedWorkbook(100, 3900)).api.refusal({ characters: 50000 }),
+    /characters against a limit of 400,000/);
+  assert.match(capacityApi(sizedWorkbook(9000, 40)).api.refusal({ bytes: 400000 }),
+    /\d+ KB against a limit of \d+ KB/, 'bytes are shown as KB, which is how people think');
+});
+
+test('MB161-011: the notice stays quiet until it is worth reading', () => {
+  const quiet = capacityApi(sizedWorkbook(1000, 10));
+  quiet.api.notice();
+  assert.equal(quiet.document.getElementById('ss-capacity-notice').style.display, 'none',
+    'a 10% full workbook is not news');
+
+  const loud = capacityApi(sizedWorkbook(8000, 10));
+  loud.api.notice();
+  const notice = loud.document.getElementById('ss-capacity-notice');
+  assert.equal(notice.style.display, '');
+  assert.match(notice.innerHTML, /80% full/);
+  assert.match(notice.innerHTML, /8,000 of 10,000 cells/, 'in the tightest measure');
+  assert.match(notice.innerHTML, /Everything still syncs/, 'and is not alarming yet');
+});
+
+test('MB161-011: at the wall the notice changes tone and says what happens next', () => {
+  const { api, document } = capacityApi(sizedWorkbook(9800, 10));
+  api.notice();
+  const notice = document.getElementById('ss-capacity-notice');
+  assert.equal(notice.className, 'ss-capacity-critical');
+  assert.match(notice.innerHTML, /98% full/);
+  assert.match(notice.innerHTML, /Further edits will be refused/);
+  assert.match(notice.innerHTML, /Nothing already saved is at risk/,
+    'the distinction that actually matters to somebody looking at this');
+});
+
+test('MB161-011: the guard never blocks a change that shrinks the workbook', () => {
+  // Deleting is the way out. A capacity check that refuses deletions would be
+  // a trap with no exit.
+  const { api } = capacityApi(sizedWorkbook(10000, 39));
+  assert.ok(api.capacity().fraction >= 1, 'this workbook is at the ceiling');
+  assert.equal(api.refusal({}), null, 'no change at all is always allowed');
+  assert.equal(api.refusal({ cells: 0, characters: 0, bytes: 0 }), null);
+
+  // And a workbook that is already OVER — imported by an older build, or synced
+  // from a Mac running one — must still let you dig yourself out.
+  const stuck = capacityApi(sizedWorkbook(12000, 45));
+  const level = stuck.api.capacity();
+  assert.ok(level.cells.used > level.cells.limit, 'this one is past the limit already');
+  assert.equal(stuck.api.refusal({}), null,
+    'refusing every change here would be a trap with no exit');
+  assert.equal(stuck.api.refusal({ cells: -100 }), null, 'deleting is allowed');
+  assert.ok(stuck.api.refusal({ cells: 1, bytes: 100 }),
+    'but making it worse is still refused');
+});
+
+test('MB161-011: capacity is measured, never written', () => {
+  const workbook = sizedWorkbook(200, 10);
+  const before = JSON.stringify(workbook);
+  const { api } = capacityApi(workbook);
+  api.capacity();
+  api.refusal({ cells: 5000 });
+  api.refuse({ cells: 5000 });
+  api.notice();
+  assert.equal(JSON.stringify(workbook), before, 'reading the level does not change it');
+});
+
+test('MB161-011: a missing or malformed workbook does not throw', () => {
+  for (const junk of [null, {}, { projects: null }, { projects: [{ sheets: null }] }]) {
+    const { api } = capacityApi(junk);
+    assert.doesNotThrow(() => api.capacity());
+    assert.doesNotThrow(() => api.notice());
+    assert.equal(api.capacity().cells.used, 0);
+  }
+});
+
+test('MB161-011: the edit paths ask before they mutate, not after', () => {
+  // The whole point is the ORDER. Checking after the mutation would leave the
+  // workbook unsaveable, which is the bug this replaces.
+  const addRow = declaration('ssAddRow');
+  assert.ok(addRow.indexOf('ssRefuseIfFull') < addRow.indexOf('ssPushUndo'),
+    'ssAddRow refuses before it touches anything');
+  const addCol = declaration('ssAddCol');
+  assert.ok(addCol.indexOf('ssRefuseIfFull') < addCol.indexOf('ssPushUndo'),
+    'ssAddCol too');
+
+  const commit = declaration('ssCommitEdit');
+  assert.ok(commit.indexOf('_ssCapacityRefusal') < commit.indexOf('sheet.cells[k] = {'),
+    'ssCommitEdit checks before it writes the cell');
+  assert.match(commit, /value\.length > previous\.length/,
+    'and only when the cell grows, so ordinary typing pays nothing');
+  assert.match(commit, /inp\.textContent = previous/,
+    'a refused edit puts the old text back rather than leaving a phantom');
+
+  const importer = declaration('ssImportBuildProject');
+  assert.ok(importer.indexOf('_ssCapacityRefusal') < importer.indexOf('STORE.replace'),
+    'an import is measured before a single byte is stored');
+  assert.match(importer, /filled cells\. \$\{refusal\}/,
+    'and the refusal names the size of the file that was rejected');
+});

@@ -802,6 +802,23 @@
     }
     .ss-key-add:hover { border-color:var(--sidebar-accent);color:var(--sidebar-accent); }
 
+    /* Capacity */
+    #ss-capacity-notice {
+      display:flex;align-items:center;gap:12px;margin-bottom:14px;
+      padding:10px 15px;border-radius:9px;font-size:12.5px;
+      background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.35);
+      color:var(--text-primary);
+    }
+    #ss-capacity-notice.ss-capacity-critical {
+      background:rgba(196,60,60,.09);border-color:rgba(196,60,60,.45);
+    }
+    .ss-capacity-bar {
+      flex:0 0 96px;height:6px;border-radius:3px;overflow:hidden;
+      background:var(--divider);
+    }
+    .ss-capacity-bar > span { display:block;height:100%;background:#3b82f6; }
+    #ss-capacity-notice.ss-capacity-critical .ss-capacity-bar > span { background:#c43c3c; }
+
     /* Unresolved conflicts */
     #ss-conflict-banner {
       display:flex;align-items:center;gap:12px;margin-bottom:14px;
@@ -1495,6 +1512,11 @@
           <button class="btn btn-primary" onclick="ssNewProject()">+ New Project</button>
         </div>
       </div>
+
+      <!-- MB161-011: the workbook is one Firestore document with a hard ceiling.
+           It used to be discovered at save time; now it is visible on the way
+           there. -->
+      <div id="ss-capacity-notice" style="display:none"></div>
 
       <!-- MB161-009: unresolved conflicts used to be preserved and invisible.
            Every divergence kept a losing value that nobody could see or act on,
@@ -7392,6 +7414,77 @@ function _ssAttributionActor() {
   return name.slice(0, MAX_SPREADSHEET_ATTRIBUTION_NAME);
 }
 
+// MB161-011: how full the workbook is, and how much room a change would need.
+//
+// The whole workbook — every project, every sheet — is one encrypted Firestore
+// document, and Firestore caps a document at 1 MiB. That is where every number
+// below comes from; they are not arbitrary. Roughly 66 bytes per filled cell
+// means the 10,000-cell limit and the 600 KB limit are the same constraint
+// counted two ways.
+//
+// This used to be discovered at SAVE time, which is the worst possible moment:
+// staff typed all afternoon, then got "Spreadsheet changes were not saved" and
+// were dropped back to the project list. Measuring up front lets the app say no
+// to the change that would not fit, while everything already typed stays safe.
+function _ssCapacity(workbook) {
+  let cells = 0;
+  let characters = 0;
+  for (const project of workbook?.projects || []) {
+    for (const sheet of project?.sheets || []) {
+      const entries = Object.entries(sheet?.cells || {});
+      cells += entries.length;
+      for (const [, cell] of entries) characters += String(cell?.v ?? '').length;
+    }
+  }
+  let bytes = 0;
+  try { bytes = new TextEncoder().encode(JSON.stringify(workbook ?? {})).byteLength; }
+  catch (_) { bytes = 0; }
+  const share = value => (value.limit > 0 ? value.used / value.limit : 0);
+  const measures = {
+    cells: { used: cells, limit: MAX_SPREADSHEET_TOTAL_CELLS, label: 'cells' },
+    characters: { used: characters, limit: MAX_SPREADSHEET_TOTAL_CHARS, label: 'characters' },
+    bytes: { used: bytes, limit: MAX_SPREADSHEET_SYNC_JSON_BYTES, label: 'total size' },
+  };
+  // Report against whichever measure is closest to its limit — quoting the
+  // roomiest one would be technically true and completely useless.
+  const tightest = Object.values(measures).reduce((a, b) => (share(b) > share(a) ? b : a));
+  return { ...measures, tightest, fraction: Math.min(1, share(tightest)) };
+}
+
+// A sentence explaining why a change cannot be made, or null if it can.
+// `extra` is what the change would ADD, so a caller can ask before mutating.
+function _ssCapacityRefusal(workbook, extra = {}) {
+  const capacity = _ssCapacity(workbook);
+  const wouldBe = {
+    cells: capacity.cells.used + (extra.cells || 0),
+    characters: capacity.characters.used + (extra.characters || 0),
+    bytes: capacity.bytes.used + (extra.bytes || 0),
+  };
+  // Refuse only a change that BOTH lands over the limit and makes things worse.
+  //
+  // Comparing against the limit alone is a trap with no exit: a workbook that is
+  // already over — imported by an older build, or arrived from a Mac running
+  // one — would have every change refused, including the deletions that are the
+  // only way back under. A change that does not increase a measure can never be
+  // the reason that measure is too big.
+  const blocks = (would, measure) => would > measure.limit && would > measure.used;
+  const over = [
+    blocks(wouldBe.cells, capacity.cells)
+      ? `${wouldBe.cells.toLocaleString()} filled cells against a limit of ${capacity.cells.limit.toLocaleString()}`
+      : null,
+    blocks(wouldBe.characters, capacity.characters)
+      ? `${wouldBe.characters.toLocaleString()} characters against a limit of ${capacity.characters.limit.toLocaleString()}`
+      : null,
+    blocks(wouldBe.bytes, capacity.bytes)
+      ? `${Math.round(wouldBe.bytes / 1024)} KB against a limit of ${Math.round(capacity.bytes.limit / 1024)} KB`
+      : null,
+  ].filter(Boolean);
+  if (!over.length) return null;
+  return `That change would put Spreadsheets at ${over[0]}. ` +
+    `Nothing has been lost — delete or export a project you no longer need, ` +
+    `then try again.`;
+}
+
 // MB161-009: conflicts are no longer trimmed to a cap, so they are now a
 // plausible reason to be over the size limit — and "exceeds the 600 KB sync
 // limit", surfaced while somebody types a word into a cell, tells them nothing
@@ -8488,6 +8581,7 @@ function ssGoHome() {
   }
   ssRenderHomeView();
   ssRenderConflictBanner();
+  ssRenderCapacityNotice();
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -8557,6 +8651,48 @@ function _ssConflictSideLabels(entry) {
     return { local: 'Delete it (this Mac)', remote: 'Restore it (other Mac)' };
   }
   return { local: 'This Mac', remote: 'The other Mac' };
+}
+
+// MB161-011: refuse a change that will not fit, at the moment it is attempted,
+// rather than letting the save throw an hour later. Returns true when the
+// caller must stop.
+function ssRefuseIfFull(extra = {}) {
+  if (!_ssData) return false;
+  const refusal = _ssCapacityRefusal(_ssData, extra);
+  if (!refusal) return false;
+  showToast(refusal, 'warning');
+  try { ssRenderCapacityNotice(); } catch (_) {}
+  return true;
+}
+
+// Silent until it is worth saying something. A permanent gauge on a sheet that
+// is 12% full is noise, and noise is what people stop reading.
+const SS_CAPACITY_NOTICE_AT = 0.75;
+
+function ssRenderCapacityNotice() {
+  const notice = document.getElementById('ss-capacity-notice');
+  if (!notice) return;
+  if (!_ssData) { notice.style.display = 'none'; notice.innerHTML = ''; return; }
+  const capacity = _ssCapacity(_ssData);
+  if (capacity.fraction < SS_CAPACITY_NOTICE_AT) {
+    notice.style.display = 'none';
+    notice.innerHTML = '';
+    return;
+  }
+  const percent = Math.min(100, Math.round(capacity.fraction * 100));
+  const measure = capacity.tightest;
+  const used = measure.label === 'total size'
+    ? `${Math.round(measure.used / 1024)} KB of ${Math.round(measure.limit / 1024)} KB`
+    : `${measure.used.toLocaleString()} of ${measure.limit.toLocaleString()} ${measure.label}`;
+  notice.style.display = '';
+  notice.className = percent >= 95 ? 'ss-capacity-critical' : '';
+  notice.innerHTML =
+    `<span class="ss-capacity-bar"><span style="width:${percent}%"></span></span>` +
+    `<span><strong>Spreadsheets are ${percent}% full</strong> — ${escHtml(used)}. ` +
+    (percent >= 95
+      ? 'Further edits will be refused until something is removed. Nothing already saved is at risk.'
+      : 'Everything still syncs; there is just less room than there was.') +
+    '</span>';
 }
 
 function ssRenderConflictBanner() {
@@ -8751,7 +8887,7 @@ function ssOpenProject(id) {
   ssRender();
 }
 
-function ssRender() { ssRenderTabs(); ssRenderColorKey(); ssRenderGrid(); ssUpdateToolbar(); ssRenderConflictBanner(); }
+function ssRender() { ssRenderTabs(); ssRenderColorKey(); ssRenderGrid(); ssUpdateToolbar(); ssRenderConflictBanner(); ssRenderCapacityNotice(); }
 
 function ssRenderHomeView() {
   const grid = document.getElementById('ss-project-grid');
@@ -9664,6 +9800,28 @@ async function ssImportBuildProject(name, sheets) {
       cells
     };
   });
+    // MB161-011: the import is fully built and measured BEFORE anything is
+    // written, so a file that will not fit is refused with the real numbers
+    // rather than half-importing and failing at save. This is the path most
+    // likely to hit the ceiling — a single file can carry thousands of cells.
+    const incoming = builtSheets.reduce((totals, sheet) => {
+      const entries = Object.values(sheet.cells || {});
+      totals.cells += entries.length;
+      totals.characters += entries.reduce((n, c) => n + String(c?.v ?? '').length, 0);
+      return totals;
+    }, { cells: 0, characters: 0 });
+    incoming.bytes = new TextEncoder().encode(JSON.stringify(builtSheets)).byteLength;
+    const refusal = _ssCapacityRefusal(_ssData, incoming);
+    if (refusal) {
+      showToast(
+        `"${projectName}" was not imported. It holds ${incoming.cells.toLocaleString()} ` +
+        `filled cells. ${refusal}`,
+        'warning'
+      );
+      try { ssRenderCapacityNotice(); } catch (_) {}
+      return false;
+    }
+
     await _flushSpreadsheetSave();
     const next = _cloneJson(normalizeSpreadsheetWorkbook(_ssData));
     next.projects.push({
@@ -9821,7 +9979,28 @@ function ssCommitEdit() {
   if (inp) {
     // Input still in DOM — read its value directly (Enter / Tab / blur before re-render)
     const value = ssBoundedCellValue(inp.textContent);
-    if (!_ssEditUndoCaptured && value !== String(sheet.cells[k]?.v || '')) {
+    const previous = String(sheet.cells[k]?.v || '');
+    // MB161-011: only a cell that GROWS can push the workbook over, so this is
+    // free for ordinary typing and for anything that shortens a cell. Refusing
+    // here keeps what is already on the sheet saveable; letting it through
+    // meant the next save threw and dropped the whole editing session.
+    if (value.length > previous.length) {
+      const refusal = _ssCapacityRefusal(_ssData, {
+        cells: k in sheet.cells ? 0 : 1,
+        characters: value.length - previous.length,
+        bytes: (value.length - previous.length) + (k in sheet.cells ? 0 : 40),
+      });
+      if (refusal) {
+        showToast(refusal, 'warning');
+        inp.textContent = previous;
+        _ssEditCell = null; _ssEditInitChar = null;
+        _ssEditClickPos = null; _ssEditUndoCaptured = false;
+        ssRenderGrid();
+        try { ssRenderCapacityNotice(); } catch (_) {}
+        return;
+      }
+    }
+    if (!_ssEditUndoCaptured && value !== previous) {
       ssPushUndo();
       _ssEditUndoCaptured = true;
     }
@@ -9941,6 +10120,10 @@ function ssAddRow() {
     showToast('This sheet has reached the safe row or grid-size limit.', 'warning');
     return;
   }
+  // MB161-011: an empty row costs almost nothing, but on a workbook already at
+  // the ceiling even the row metadata will not fit — and finding that out at
+  // save time is what loses an afternoon.
+  if (ssRefuseIfFull({ bytes: 200 })) return;
   ssPushUndo();
   // Insert after selected row; if nothing selected, append at end
   const insertAfter = (_ssSelR >= 0 && _ssSelR < s.rows) ? _ssSelR : s.rows - 1;
@@ -9963,6 +10146,7 @@ function ssAddCol() {
     showToast('This sheet has reached the safe column or grid-size limit.', 'warning');
     return;
   }
+  if (ssRefuseIfFull({ bytes: 200 })) return;
   ssPushUndo();
   s.cols++;
   (s.colWidths = s.colWidths || []).push(100);
