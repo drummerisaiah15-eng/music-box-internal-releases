@@ -68,6 +68,8 @@ function splitApi() {
     ${declaration('normalizeSpreadsheetWorkbook')}
     ${declaration('normalizeSpreadsheetProject')}
     ${declaration('normalizeSpreadsheetIndex')}
+    ${declaration('_ssProjectAsDoc')}
+    ${declaration('_ssIndexAfterEdit')}
     ${declaration('_ssSplitWorkbook')}
     ${declaration('_ssAssembleWorkbook')}
     globalThis.api = {
@@ -82,6 +84,8 @@ function splitApi() {
       assemble: (index, documents) => _ssAssembleWorkbook(index, documents),
       normIndex: value => normalizeSpreadsheetIndex(value),
       normProject: doc => normalizeSpreadsheetProject(doc),
+      projectAsDoc: (wb, id) => _ssProjectAsDoc(wb, id),
+      indexAfter: (idx, base, next, at) => _ssIndexAfterEdit(idx, base, next, at),
     };
   `, context);
   return {
@@ -93,6 +97,8 @@ function splitApi() {
     assemble: (i, d) => JSON.parse(JSON.stringify(context.api.assemble(i, d))),
     normIndex: v => JSON.parse(JSON.stringify(context.api.normIndex(v))),
     normProject: d => JSON.parse(JSON.stringify(context.api.normProject(d))),
+    projectAsDoc: (wb, id) => JSON.parse(JSON.stringify(context.api.projectAsDoc(wb, id) ?? null)),
+    indexAfter: (idx, base, next, at) => JSON.parse(JSON.stringify(context.api.indexAfter(idx, base, next, at))),
     raw: context.api,
   };
 }
@@ -738,4 +744,168 @@ test('MB161-012: merging indexes is idempotent', () => {
   assert.deepEqual(merge(once, once), once, 'merging a result with itself changes nothing');
   assert.deepEqual(merge(once, theirs).projects.map(p => p.id).sort(),
     once.projects.map(p => p.id).sort(), 'and re-merging an input adds nothing');
+});
+
+// ── The index after an edit: when absence means deletion, and when it doesn't ─
+//
+// The most dangerous logic in the split. A project whose document has not
+// finished arriving is absent from _ssData. If that absence were read as a
+// deletion, the tombstone would sync and delete the project off the other Mac.
+
+const AT = '2026-08-06T12:00:00.000Z';
+
+test('MB161-012: a project missing from BOTH base and result is untouched', () => {
+  const api = splitApi();
+  // p2 is in the index but its document has not arrived, so it is in neither
+  // the base nor the edited workbook. It must survive completely unchanged.
+  const index = api.normIndex({
+    schema: 2, activeProject: 'p1',
+    projects: [
+      { id: 'p1', version: 1, created: '2026-08-01T00:00:00.000Z' },
+      { id: 'p2', version: 4, created: '2026-08-02T00:00:00.000Z' },
+    ],
+  });
+  const loaded = legacyWorkbook([project('p1', [sheet('s1')])]);
+  const edited = legacyWorkbook([project('p1', [sheet('s1', { '0,0': cell('typed') })])]);
+
+  const next = api.indexAfter(index, loaded, edited, AT);
+  const p2 = next.projects.find(p => p.id === 'p2');
+  assert.ok(p2, 'still listed');
+  assert.equal(p2._deleted, undefined, 'NOT tombstoned — it was never deleted, only not loaded');
+  assert.equal(p2.version, 4, 'and its version is not disturbed');
+});
+
+test('MB161-012: a project deleted during the session IS tombstoned', () => {
+  const api = splitApi();
+  const index = api.normIndex({
+    schema: 2, activeProject: 'p1',
+    projects: [{ id: 'p1', version: 1 }, { id: 'p2', version: 2 }],
+  });
+  const before = legacyWorkbook([project('p1', [sheet('s1')]), project('p2', [sheet('s2')])]);
+  const after = legacyWorkbook([project('p1', [sheet('s1')])]);
+
+  const next = api.indexAfter(index, before, after, AT);
+  const p2 = next.projects.find(p => p.id === 'p2');
+  assert.equal(p2._deleted, true, 'it was there when editing began and is gone now');
+  assert.equal(p2._deletedAt, AT);
+  assert.equal(p2.version, 3, 'the version advances past the live record');
+});
+
+test('MB161-012: a project created during the session is added', () => {
+  const api = splitApi();
+  const index = api.normIndex({ schema: 2, activeProject: 'p1', projects: [{ id: 'p1', version: 1 }] });
+  const before = legacyWorkbook([project('p1', [sheet('s1')])]);
+  const after = legacyWorkbook([project('p1', [sheet('s1')]), project('p2', [sheet('s2')])]);
+
+  const next = api.indexAfter(index, before, after, AT);
+  const p2 = next.projects.find(p => p.id === 'p2');
+  assert.ok(p2, 'the new project is listed');
+  assert.equal(p2.created, AT);
+  assert.equal(p2.version, 1);
+  assert.equal(p2._deleted, undefined);
+});
+
+test('MB161-012: recreating a deleted id is a new generation, not a resurrection', () => {
+  const api = splitApi();
+  // A tombstone whose version does not advance would keep winning the merge,
+  // so the recreated project would silently vanish again.
+  const index = api.normIndex({
+    schema: 2, activeProject: 'p1',
+    projects: [{ id: 'p1', version: 1 }, { id: 'p2', version: 5, _deleted: true, _deletedAt: '2026-08-05T00:00:00.000Z' }],
+  });
+  const before = legacyWorkbook([project('p1', [sheet('s1')])]);
+  const after = legacyWorkbook([project('p1', [sheet('s1')]), project('p2', [sheet('s2')])]);
+
+  const next = api.indexAfter(index, before, after, AT);
+  const p2 = next.projects.find(p => p.id === 'p2');
+  assert.equal(p2._deleted, undefined, 'it is live again');
+  assert.equal(p2.version, 6, 'and outranks the tombstone it replaced');
+});
+
+test('MB161-012: an unchanged session changes nothing in the index', () => {
+  const api = splitApi();
+  const index = api.normIndex({
+    schema: 2, activeProject: 'p1',
+    projects: [{ id: 'p1', version: 3, created: '2026-08-01T00:00:00.000Z' }],
+  });
+  const same = legacyWorkbook([project('p1', [sheet('s1')])]);
+  assert.deepEqual(api.indexAfter(index, same, same, AT), index,
+    'typing in a cell must not churn the index');
+});
+
+test('MB161-012: the first save with no index yet builds one from the session', () => {
+  const api = splitApi();
+  const workbook = legacyWorkbook([project('p1', [sheet('s1')]), project('p2', [sheet('s2')])]);
+  const next = api.indexAfter(null, workbook, workbook, AT);
+  assert.equal(next.schema, 2);
+  assert.deepEqual(next.projects.map(p => p.id), ['p1', 'p2']);
+  assert.equal(next.activeProject, 'p1');
+});
+
+test('MB161-012: the index refuses to record an id it could not address', () => {
+  const api = splitApi();
+  const workbook = legacyWorkbook([
+    project('p1', [sheet('s1')]),
+    project('has/slash', [sheet('s2')]),
+  ]);
+  const next = api.indexAfter(null, workbook, workbook, AT);
+  assert.deepEqual(next.projects.map(p => p.id), ['p1'],
+    'an id with no valid document key is not listed rather than listed and unwritable');
+});
+
+test('MB161-012: deleting every project is still an explicit deletion', () => {
+  const api = splitApi();
+  const index = api.normIndex({ schema: 2, activeProject: 'p1', projects: [{ id: 'p1', version: 1 }] });
+  const before = legacyWorkbook([project('p1', [sheet('s1')])]);
+  const after = { activeProject: undefined, projects: [] };
+  const next = api.indexAfter(index, before, after, AT);
+  assert.equal(next.projects[0]._deleted, true);
+  assert.equal('activeProject' in next, false, 'nothing left to open');
+});
+
+// ── _ssProjectAsDoc, shared by the split and the save ────────────────────────
+
+test('MB161-012: a project doc carries its own conflicts and all the markers', () => {
+  const api = splitApi();
+  const workbook = legacyWorkbook(
+    [project('p1', [sheet('s1')]), project('p2', [sheet('s2')])],
+    {
+      _conflicts: [
+        { id: 'sc_a', kind: 'cell', projectId: 'p1' },
+        { id: 'sc_b', kind: 'cell', projectId: 'p2' },
+      ],
+      _resolvedConflicts: ['sc_x', 'sc_y'],
+    },
+  );
+  const doc = api.projectAsDoc(workbook, 'p1');
+  assert.deepEqual(doc._conflicts.map(c => c.id), ['sc_a'], 'only its own conflicts');
+  assert.deepEqual(doc._resolvedConflicts, ['sc_x', 'sc_y'], 'but every marker');
+  assert.equal(doc.name, 'Project p1');
+  assert.equal('projects' in doc, false);
+});
+
+test('MB161-012: asking for a project that is not there returns nothing', () => {
+  const api = splitApi();
+  const workbook = legacyWorkbook([project('p1', [sheet('s1')])]);
+  assert.equal(api.projectAsDoc(workbook, 'nope'), null);
+  assert.equal(api.projectAsDoc(null, 'p1'), null);
+});
+
+test('MB161-012: the split and the save agree on what a project document is', () => {
+  // They used to be two separate blocks of routing logic. Two implementations
+  // of "which conflict goes where" would eventually disagree, and the
+  // disagreement would look like conflicts vanishing.
+  const api = splitApi();
+  const workbook = legacyWorkbook(
+    [project('p1', [sheet('s1', { '0,0': cell('x') })]), project('p2', [sheet('s2')])],
+    {
+      _conflicts: [{ id: 'sc_a', kind: 'cell', projectId: 'p1' }],
+      _resolvedConflicts: ['sc_z'],
+    },
+  );
+  const { documents } = api.split(workbook);
+  for (const id of ['p1', 'p2']) {
+    assert.deepEqual(documents['spreadsheet_' + id], api.projectAsDoc(workbook, id),
+      `${id} is identical whichever path produced it`);
+  }
 });

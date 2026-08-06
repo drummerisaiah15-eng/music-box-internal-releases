@@ -7624,6 +7624,87 @@ function normalizeSpreadsheetIndex(value) {
   return normalized;
 }
 
+// One project of a whole workbook, as the document that project is stored in.
+// Conflicts name the project they happened in, so they travel with it;
+// resolution markers name a conflict id and cannot be routed, so every project
+// carries the whole set.
+function _ssProjectAsDoc(workbook, projectId) {
+  const wanted = String(projectId ?? '');
+  const project = (workbook?.projects || []).find(entry => String(entry?.id ?? '') === wanted);
+  if (!project) return null;
+  const doc = {
+    id: project.id,
+    name: project.name,
+    activeId: project.activeId,
+    sheets: project.sheets,
+  };
+  if (project.colorKey !== undefined) doc.colorKey = project.colorKey;
+  const conflicts = (workbook?._conflicts || [])
+    .filter(entry => String(entry?.projectId ?? '') === wanted);
+  if (conflicts.length) doc._conflicts = conflicts;
+  if (Array.isArray(workbook?._resolvedConflicts) && workbook._resolvedConflicts.length) {
+    doc._resolvedConflicts = [...workbook._resolvedConflicts];
+  }
+  return doc;
+}
+
+// MB161-012: the index after an editing session.
+//
+// This is the most dangerous function in the split, so it is deliberately
+// derived from what CHANGED between the workbook the user started from and the
+// one they have now — never from _ssData alone.
+//
+// A project whose document has not finished arriving is absent from _ssData.
+// Building the index from _ssData would tombstone it, and that tombstone would
+// sync, deleting a project off the other Mac that this one had simply not
+// finished downloading. Comparing against the base makes a deletion an act
+// somebody performed rather than an inference from absence — the same rule the
+// cell operations already follow.
+function _ssIndexAfterEdit(currentIndex, dirtyBase, dirty, at = new Date().toISOString()) {
+  const index = currentIndex?.schema === SPREADSHEET_INDEX_SCHEMA
+    ? _cloneJson(currentIndex)
+    : { schema: SPREADSHEET_INDEX_SCHEMA, projects: [] };
+  const records = new Map((index.projects || []).map(record => [String(record.id), record]));
+  const idsOf = workbook => new Set((workbook?.projects || [])
+    .map(project => String(project?.id ?? ''))
+    .filter(id => SPREADSHEET_PROJECT_ID_PATTERN.test(id)));
+  const baseIds = idsOf(dirtyBase);
+  const nextIds = idsOf(dirty);
+
+  for (const id of nextIds) {
+    const existing = records.get(id);
+    if (!existing) {
+      records.set(id, { id, created: at, version: 1 });
+    } else if (existing._deleted) {
+      // Re-created after a deletion. A new generation rather than a
+      // resurrection: the version has to advance past the tombstone or the
+      // merge will keep choosing the tombstone.
+      records.set(id, {
+        id,
+        created: existing.created ?? at,
+        version: (existing.version || 1) + 1,
+      });
+    }
+  }
+
+  for (const id of baseIds) {
+    if (nextIds.has(id)) continue;
+    // Present when this session began and gone now: somebody deleted it.
+    const existing = records.get(id) || { id, version: 1 };
+    records.set(id, {
+      ...existing,
+      id,
+      _deleted: true,
+      _deletedAt: at,
+      version: (existing.version || 1) + 1,
+    });
+  }
+
+  index.projects = [...records.values()];
+  if (dirty?.activeProject !== undefined) index.activeProject = dirty.activeProject;
+  return normalizeSpreadsheetIndex(index);
+}
+
 // Split a legacy single-document workbook into the index plus one document per
 // project. Pure: it decides what to write, it does not write anything.
 function _ssSplitWorkbook(workbook) {
@@ -7638,30 +7719,13 @@ function _ssSplitWorkbook(workbook) {
       version: 1,
     })),
   };
+  // One code path for "this project, as its document", shared with the save.
+  // Two implementations of the same routing — which conflict goes where, which
+  // markers are copied — would eventually disagree, and the disagreement would
+  // look like conflicts vanishing.
   for (const project of projects) {
-    const doc = {
-      id: project?.id,
-      name: project?.name,
-      activeId: project?.activeId,
-      sheets: project?.sheets,
-    };
-    if (project?.colorKey !== undefined) doc.colorKey = project.colorKey;
-    documents.set(_ssProjectSyncKey(String(project?.id ?? '')), doc);
-  }
-  // Conflicts belonged to the workbook as a whole and each names the project it
-  // happened in, so they follow their project rather than being dropped or
-  // copied to all of them.
-  for (const entry of (Array.isArray(workbook?._conflicts) ? workbook._conflicts : [])) {
-    const doc = documents.get(_ssProjectSyncKey(String(entry?.projectId ?? '')));
-    if (!doc) continue;
-    (doc._conflicts = doc._conflicts || []).push(entry);
-  }
-  const settled = Array.isArray(workbook?._resolvedConflicts) ? workbook._resolvedConflicts : [];
-  if (settled.length) {
-    // A resolution marker names an id, not a project, so it cannot be routed.
-    // Every project keeps the full set: the cost is bytes, and the cost of
-    // guessing wrong is a resolved conflict coming back.
-    for (const doc of documents.values()) doc._resolvedConflicts = [...settled];
+    const id = String(project?.id ?? '');
+    documents.set(_ssProjectSyncKey(id), _ssProjectAsDoc(workbook, id));
   }
   return { index: normalizeSpreadsheetIndex(index), documents };
 }
