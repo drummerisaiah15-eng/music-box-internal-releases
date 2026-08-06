@@ -1226,3 +1226,79 @@ test('cells clip and the formula bar carries the full value', () => {
   assert.doesNotMatch(source, /white-space:pre-wrap;\s*\n?\s*word-wrap:break-word/,
     'the wrapping editor rule is gone');
 });
+
+// ── MB161-014: Google Sheets, read-only, in the renderer ────────────────────
+
+test('MB161-014: the renderer never talks to Google directly', () => {
+  // Every Google call goes through main via IPC. That is why the CSP does not
+  // need to be widened for sheets.googleapis.com — and it must stay that way,
+  // because a renderer fetch would put an access token in the renderer.
+  const csp = source.match(/content="default-src[^"]*"/)[0];
+  assert.doesNotMatch(csp, /sheets\.googleapis\.com/,
+    'the renderer has no business reaching Google');
+  assert.doesNotMatch(csp, /oauth2\.googleapis\.com/);
+  assert.doesNotMatch(csp, /accounts\.google\.com/);
+
+  for (const name of ['connectGoogleSheets', 'ssGoogleLookup', 'ssGoogleImportTab']) {
+    const fn = namedFunctionSource(name);
+    assert.doesNotMatch(fn, /\bfetch\s*\(/, `${name} must not fetch Google itself`);
+    assert.doesNotMatch(fn, /XMLHttpRequest/);
+  }
+});
+
+test('MB161-014: the PKCE verifier never leaves the renderer', () => {
+  const connect = namedFunctionSource('connectGoogleSheets');
+  assert.match(connect, /crypto\.subtle\.digest\('SHA-256'/,
+    'only the hash of the verifier is sent to Google');
+  assert.match(connect, /beginAuth\(\{ codeChallenge: challenge \}\)/,
+    'begin receives the challenge, not the verifier');
+  assert.match(connect, /completeAuth\(\{ state: payload\?\.state, codeVerifier: verifier \}\)/,
+    'the verifier is only revealed to main at exchange time, to prove the same client started it');
+});
+
+test('MB161-014: the client secret field is cleared after saving', () => {
+  const save = namedFunctionSource('saveGoogleCredentials');
+  assert.match(save, /secretField\.value = ''/,
+    'a secret should not sit in a DOM input after it has been stored in the vault');
+  assert.match(save, /type="password"/.source ? /setCredentials/ : /setCredentials/);
+  assert.match(source, /id="google-client-secret" class="form-input"/);
+  assert.match(source, /<input type="password" id="google-client-secret"/,
+    'and it is a password field, not plain text');
+});
+
+test('MB161-014: import refuses before connecting rather than failing obscurely', () => {
+  const open = namedFunctionSource('ssOpenGoogleImport');
+  assert.match(open, /if \(!status\?\.connected\)/);
+  assert.match(open, /Connect a Google account in Settings first/);
+});
+
+test('MB161-014: an imported tab goes through the existing validated importer', () => {
+  // ssImportBuildProject already bounds every cell, validates dimensions and —
+  // since MB161-011 — refuses before writing anything if it will not fit.
+  // Re-implementing any of that for Google would be a second place to get wrong.
+  // namedFunctionSource stops at the next `function`, and the neighbours here
+  // are `async function`, so bound the slice to this function's own body.
+  const full = namedFunctionSource('ssGoogleImportTab');
+  const importTab = full.slice(0, full.indexOf('\n// \u2500\u2500 Import'));
+  assert.match(importTab, /await ssImportBuildProject\(name, \[\{ sheetName: title, rows: sheet\.rows \}\]\)/,
+    'sheetName is the field the importer reads — `name` silently lands the tab as "Sheet 1"');
+  assert.doesNotMatch(importTab, /STORE\.(replace|set|mutate)/,
+    'the Google path must not write to storage on its own');
+});
+
+test('MB161-014: the read-only promise is stated where somebody will read it', () => {
+  assert.match(source, /spreadsheets\.readonly/,
+    'Settings names the exact scope rather than asking for trust');
+  assert.match(source, /Google refuses the write/);
+  assert.match(source, /Your Google sheet is never modified/,
+    'and the import dialog says it too');
+});
+
+test('MB161-014: the renderer offers no way to write to Google', () => {
+  const script = inlineScript(source);
+  for (const forbidden of ['batchUpdate', 'valueInputOption', 'USER_ENTERED', 'batchClear']) {
+    assert.equal(script.includes(forbidden), false,
+      `the renderer must not contain ${forbidden}`);
+  }
+  assert.doesNotMatch(script, /electronGoogleSheets\.(write|update|append|clear|push)/);
+});

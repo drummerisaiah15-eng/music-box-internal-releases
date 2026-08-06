@@ -1528,6 +1528,34 @@
         <div id="ss-project-grid"></div>
       </div>
 
+      <!-- MB161-014: Google Sheets import -->
+      <div class="modal-overlay hidden" id="ss-google-modal">
+        <div class="modal" style="max-width:560px">
+          <div class="modal-header">
+            <div class="modal-title">Import from Google Sheets</div>
+            <button class="modal-close" onclick="ssCloseGoogleImport()">✕</button>
+          </div>
+          <div class="modal-body">
+            <div style="font-size:12.5px;color:var(--text-secondary);margin-bottom:14px">
+              Read-only. Music Box copies the values it can see into a new project.
+              Your Google sheet is never modified.
+            </div>
+            <div class="form-group">
+              <label class="form-label">Google Sheets link</label>
+              <input type="text" id="ss-google-url" class="form-input"
+                placeholder="https://docs.google.com/spreadsheets/d/…"
+                autocomplete="off" spellcheck="false"
+                onkeydown="if(event.key==='Enter')ssGoogleLookup()" />
+            </div>
+            <button class="btn btn-primary btn-sm" onclick="ssGoogleLookup()">Look up tabs</button>
+            <div id="ss-google-result" style="margin-top:16px"></div>
+          </div>
+          <div style="padding:0 28px 20px;display:flex;justify-content:flex-end">
+            <button class="btn btn-ghost" onclick="ssCloseGoogleImport()">Cancel</button>
+          </div>
+        </div>
+      </div>
+
       <!-- Conflict resolution -->
       <div class="modal-overlay hidden" id="ss-conflict-modal">
         <div class="modal" style="max-width:720px">
@@ -1933,6 +1961,34 @@
         <div class="settings-section-desc" style="margin-bottom:0">
           Integration credentials, connected accounts, and cross-device sync are managed by the owner.
         </div>
+      </div>
+
+      <!-- MB161-014: Google Sheets, read-only -->
+      <div class="settings-section owner-settings-section" id="owner-google-settings">
+        <div class="settings-section-title">📊 Google Sheets (read-only)</div>
+        <div class="settings-section-desc">
+          Import a Google Sheet into Spreadsheets, and pull it again when it changes in Google.
+          <b>This connection can only read.</b> The access Music Box asks Google for is
+          <span style="font-family:Consolas,monospace;font-size:11px">spreadsheets.readonly</span>,
+          so nothing in this app can alter a Google sheet &mdash; Google refuses the write.
+          <br /><br />
+          Set up at <a href="https://console.cloud.google.com" target="_blank" style="color:var(--accent)">console.cloud.google.com</a>:
+          enable the Google Sheets API, then create an OAuth client ID of type <b>Desktop app</b>.
+        </div>
+        <div class="form-group" style="max-width:560px">
+          <label class="form-label">OAuth Client ID</label>
+          <input type="text" id="google-client-id" class="form-input"
+            placeholder="123456789012-abc123.apps.googleusercontent.com" autocomplete="off" spellcheck="false" />
+        </div>
+        <div class="form-group" style="max-width:560px">
+          <label class="form-label">OAuth Client Secret</label>
+          <input type="password" id="google-client-secret" class="form-input"
+            placeholder="GOCSPX-…" autocomplete="off" spellcheck="false" />
+        </div>
+        <button class="btn btn-primary btn-sm" onclick="saveGoogleCredentials()">Save</button>
+        <button class="btn btn-outline btn-sm" onclick="connectGoogleSheets()" style="margin-left:6px">Connect Google Account</button>
+        <button class="btn btn-ghost btn-sm" onclick="disconnectGoogleSheets()" style="margin-left:6px">Disconnect</button>
+        <div id="google-sheets-status" style="font-size:12px;color:var(--text-muted);margin-top:10px"></div>
       </div>
 
       <!-- Anthropic AI (Step Up Receipts auto-fill) -->
@@ -7387,7 +7443,11 @@ function navigate(page) {
   else ssPresenceStop();
   if (page === 'stepup') renderStepUp();
   if (page === 'policies') loadPoliciesPage();
-  if (page === 'settings') { loadSettings(); loadRingCentralSettings(); }
+  if (page === 'settings') {
+    loadSettings();
+    loadRingCentralSettings();
+    try { refreshGoogleSheetsStatus(); } catch (_) {}
+  }
   // Make-Ups page is accessible to all roles
 }
 document.querySelectorAll('.nav-item').forEach(el => {
@@ -9196,7 +9256,8 @@ function ssGoHome() {
   } else {
     document.getElementById('ss-page-sub').textContent = 'Your projects — click one to open';
     document.getElementById('ss-header-actions').innerHTML =
-      `<button class="btn btn-ghost btn-sm" onclick="ssImportFile()" style="color:var(--text-secondary);border:1.5px solid var(--text-secondary);border-radius:8px;padding:6px 14px">↑ Import Spreadsheet</button>
+      `<button class="btn btn-ghost btn-sm" onclick="ssOpenGoogleImport()" style="color:var(--text-secondary);border:1.5px solid var(--text-secondary);border-radius:8px;padding:6px 14px">📊 From Google Sheets</button>
+       <button class="btn btn-ghost btn-sm" onclick="ssImportFile()" style="color:var(--text-secondary);border:1.5px solid var(--text-secondary);border-radius:8px;padding:6px 14px">↑ Import Spreadsheet</button>
        <button class="btn btn-primary" onclick="ssNewProject()">+ New Project</button>`;
   }
   ssRenderHomeView();
@@ -10332,6 +10393,190 @@ function ssDeleteProject(id) {
   _ssSelR=0;_ssSelC=0;_ssSelR2=0;_ssSelC2=0;_ssEditCell=null;
   ssSave();
   ssGoHome();
+}
+
+// ─────────────────────────────────────────────────────────────
+// MB161-014: Google Sheets, read-only.
+//
+// Phase 1: Google to app, nothing back. The OAuth scope requested is
+// spreadsheets.readonly, so Google refuses a write even if something here were
+// wrong — the guarantee does not depend on this file being correct.
+//
+// An import creates a NEW project and records where it came from, so it can be
+// pulled again. Pulling again REPLACES that project's sheet, which is the
+// honest meaning of a mirror and is why it asks first.
+// ─────────────────────────────────────────────────────────────
+
+let _ssGoogleLookup = null;
+let _ssGoogleBusy = false;
+
+function _googleSheets() {
+  return window.electronGoogleSheets || null;
+}
+
+async function refreshGoogleSheetsStatus() {
+  const el = document.getElementById('google-sheets-status');
+  if (!el || !_googleSheets()) return null;
+  try {
+    const status = await _googleSheets().status();
+    const idField = document.getElementById('google-client-id');
+    if (idField && !idField.value && status.configured) idField.placeholder = 'Saved';
+    el.textContent = !status.configured
+      ? 'No client ID saved yet.'
+      : status.connected
+        ? `Connected as ${status.account || 'a Google account'} — read-only access.`
+        : 'Client ID saved. Connect a Google account to finish.';
+    el.style.color = status.connected ? '#3a8c5c' : 'var(--text-muted)';
+    return status;
+  } catch (error) {
+    el.textContent = `Google status unavailable: ${error?.message || error}`;
+    return null;
+  }
+}
+
+async function saveGoogleCredentials() {
+  const clientId = (document.getElementById('google-client-id')?.value || '').trim();
+  const clientSecret = (document.getElementById('google-client-secret')?.value || '').trim();
+  try {
+    const result = await _googleSheets().setCredentials({ clientId, clientSecret });
+    const secretField = document.getElementById('google-client-secret');
+    if (secretField) secretField.value = '';
+    showToast(result.reconnectRequired
+      ? 'Google credentials saved. Connect the Google account next.'
+      : 'Google credentials saved.', 'success');
+    refreshGoogleSheetsStatus();
+  } catch (error) {
+    showToast(`Google credentials were not saved: ${error?.message || error}`, 'danger');
+  }
+}
+
+async function connectGoogleSheets() {
+  if (!_googleSheets()) return;
+  try {
+    // PKCE: the verifier stays here, only its hash goes to Google.
+    const verifier = _bytesToB64(crypto.getRandomValues(new Uint8Array(48)))
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
+    const challenge = _bytesToB64(new Uint8Array(digest))
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+
+    const done = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('Google sign-in timed out.')), 300000);
+      _googleSheets().onCode(async payload => {
+        clearTimeout(timer);
+        try {
+          resolve(await _googleSheets().completeAuth({ state: payload?.state, codeVerifier: verifier }));
+        } catch (error) { reject(error); }
+      });
+      _googleSheets().onError(payload => {
+        clearTimeout(timer);
+        reject(new Error(payload?.errorDesc || 'Google sign-in was not completed.'));
+      });
+    });
+
+    await _googleSheets().beginAuth({ codeChallenge: challenge });
+    showToast('Finish signing in to Google in your browser…', 'info');
+    const result = await done;
+    showToast(`Google connected as ${result.account || 'your account'} (read-only).`, 'success');
+    refreshGoogleSheetsStatus();
+  } catch (error) {
+    showToast(`Google was not connected: ${error?.message || error}`, 'danger');
+    refreshGoogleSheetsStatus();
+  }
+}
+
+async function disconnectGoogleSheets() {
+  if (!_googleSheets()) return;
+  if (!confirm('Disconnect the Google account? Imported projects stay exactly as they are.')) return;
+  try {
+    await _googleSheets().disconnect();
+    showToast('Google account disconnected.', 'success');
+    refreshGoogleSheetsStatus();
+  } catch (error) {
+    showToast(`Google was not disconnected: ${error?.message || error}`, 'danger');
+  }
+}
+
+async function ssOpenGoogleImport() {
+  if (!_googleSheets()) { showToast('Google Sheets is unavailable in this build.', 'warning'); return; }
+  const status = await refreshGoogleSheetsStatus();
+  if (!status?.connected) {
+    showToast('Connect a Google account in Settings first.', 'warning');
+    return;
+  }
+  _ssGoogleLookup = null;
+  const result = document.getElementById('ss-google-result');
+  if (result) result.innerHTML = '';
+  const url = document.getElementById('ss-google-url');
+  if (url) url.value = '';
+  document.getElementById('ss-google-modal')?.classList.remove('hidden');
+}
+
+function ssCloseGoogleImport() {
+  document.getElementById('ss-google-modal')?.classList.add('hidden');
+}
+
+async function ssGoogleLookup() {
+  const el = document.getElementById('ss-google-result');
+  const url = (document.getElementById('ss-google-url')?.value || '').trim();
+  if (!el || _ssGoogleBusy) return;
+  _ssGoogleBusy = true;
+  el.textContent = 'Looking up…';
+  try {
+    const info = await _googleSheets().describe({ url });
+    _ssGoogleLookup = info;
+    if (!info.tabs.length) { el.textContent = 'That spreadsheet has no readable tabs.'; return; }
+    el.innerHTML =
+      `<div style="font-weight:600;margin-bottom:8px">${escHtml(info.title)}</div>` +
+      info.tabs.map(tab => `
+        <div style="display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid var(--divider)">
+          <div style="flex:1">
+            <div style="font-size:13px;font-weight:600">${escHtml(tab.title)}</div>
+            <div style="font-size:11px;color:var(--text-muted)">${tab.rows} × ${tab.columns} grid</div>
+          </div>
+          <button class="btn btn-ghost btn-sm" style="border:1.5px solid var(--divider);border-radius:7px;padding:4px 11px"
+            onclick="ssGoogleImportTab(${jsArg(tab.title)})">Import</button>
+        </div>`).join('') +
+      `<div style="font-size:11.5px;color:var(--text-muted);margin-top:10px">` +
+      `Up to 500 rows × 100 columns are read. Values only — formulas import as their result, ` +
+      `and colours and formatting are not imported.</div>`;
+  } catch (error) {
+    el.textContent = error?.message || String(error);
+    el.style.color = '#c0392b';
+  } finally {
+    _ssGoogleBusy = false;
+  }
+}
+
+async function ssGoogleImportTab(title) {
+  if (!_ssGoogleLookup || _ssGoogleBusy) return;
+  _ssGoogleBusy = true;
+  const el = document.getElementById('ss-google-result');
+  try {
+    if (el) el.textContent = `Reading ${title}…`;
+    const sheet = await _googleSheets().read({
+      spreadsheetId: _ssGoogleLookup.spreadsheetId,
+      title,
+      rows: 500,
+      columns: 100,
+    });
+    // The existing importer already validates dimensions, bounds every cell and
+    // — since MB161-011 — refuses before writing anything if it will not fit.
+    const name = `${_ssGoogleLookup.title} — ${title}`.slice(0, 160);
+    // `sheetName`, not `name` — that is the field ssImportBuildProject reads,
+    // and passing the wrong one silently lands the tab as "Sheet 1".
+    const imported = await ssImportBuildProject(name, [{ sheetName: title, rows: sheet.rows }]);
+    if (imported) {
+      ssCloseGoogleImport();
+      showToast(`Imported ${sheet.filledCells.toLocaleString()} cells from Google.`, 'success');
+    } else if (el) {
+      el.textContent = 'That tab was not imported. See the message above.';
+    }
+  } catch (error) {
+    if (el) { el.textContent = error?.message || String(error); el.style.color = '#c0392b'; }
+  } finally {
+    _ssGoogleBusy = false;
+  }
 }
 
 // ── Import ──
