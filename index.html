@@ -7316,7 +7316,7 @@ function normalizeSpreadsheetWorkbook(value) {
       const kept = source._conflicts.filter(entry =>
         entry && typeof entry === 'object' && !Array.isArray(entry) &&
         typeof entry.id === 'string' && entry.id.length > 0 && entry.id.length <= 128 &&
-        ['cell', 'sheet', 'project'].includes(entry.kind) &&
+        ['cell', 'sheet', 'project', 'project-name', 'sheet-name'].includes(entry.kind) &&
         typeof entry.projectId === 'string' && entry.projectId.length <= 128
       ).slice(-MAX_SPREADSHEET_CONFLICTS);
       if (kept.length) source._conflicts = kept;
@@ -7785,6 +7785,33 @@ function _ssConflictId(parts) {
   return 'sc_' + hash.toString(36);
 }
 
+// Content of a project or sheet, ignoring the bookkeeping that changes without
+// anyone editing anything (attribution stamps, the active-sheet pointer).
+function _ssStructureDigest(structure) {
+  const bare = _cloneJson(structure || {});
+  delete bare.activeId;
+  if (Array.isArray(bare.sheets)) {
+    bare.sheets = bare.sheets.map(sheet => {
+      const copy = { ...sheet };
+      delete copy.editedBy;
+      return copy;
+    });
+  }
+  delete bare.editedBy;
+  const key = JSON.stringify(bare);
+  let hash = 5381;
+  for (let i = 0; i < key.length; i++) hash = ((hash * 33) ^ key.charCodeAt(i)) >>> 0;
+  return hash.toString(36);
+}
+
+// True when the copy being deleted is not the copy the deleter last saw — i.e.
+// somebody else changed it in the meantime. Only that is a conflict; deleting
+// something nobody else touched is just a deletion.
+function _ssStructureWasEditedRemotely(current, base) {
+  if (!base) return true; // unknown ancestry: fail closed and preserve a copy
+  return _ssStructureDigest(current) !== _ssStructureDigest(base);
+}
+
 // Derive the user's intent as operations: base -> next.
 function _deriveSpreadsheetOperations(base, next) {
   const ops = [];
@@ -7796,18 +7823,38 @@ function _deriveSpreadsheetOperations(base, next) {
 
   for (const [projectId, baseProject] of baseProjects) {
     if (!nextProjects.has(projectId)) {
-      ops.push({ kind: 'project.delete', projectId });
+      // Carry what this Mac last saw, so the apply side can tell an ordinary
+      // deletion from one that raced a remote edit.
+      ops.push({ kind: 'project.delete', projectId, base: _cloneJson(baseProject) });
       continue;
     }
     const nextProject = nextProjects.get(projectId);
+    // A rename is an edit like any other. Leaving it out of the operation set
+    // meant the local name was carried over the reconciled base unconditionally:
+    // two Macs renaming the same project ended up with different names, forever,
+    // and nothing recorded that they disagreed.
+    if (baseProject.name !== nextProject.name) {
+      ops.push({
+        kind: 'project.rename', projectId,
+        base: baseProject.name, value: nextProject.name,
+        by: actor, at: stampedAt,
+      });
+    }
     const baseSheets = new Map((baseProject.sheets || []).map(s => [s.id, s]));
     const nextSheets = new Map((nextProject.sheets || []).map(s => [s.id, s]));
     for (const [sheetId, baseSheet] of baseSheets) {
       if (!nextSheets.has(sheetId)) {
-        ops.push({ kind: 'sheet.delete', projectId, sheetId });
+        ops.push({ kind: 'sheet.delete', projectId, sheetId, base: _cloneJson(baseSheet) });
         continue;
       }
       const nextSheet = nextSheets.get(sheetId);
+      if (baseSheet.name !== nextSheet.name) {
+        ops.push({
+          kind: 'sheet.rename', projectId, sheetId,
+          base: baseSheet.name, value: nextSheet.name,
+          by: actor, at: stampedAt,
+        });
+      }
       const baseCells = baseSheet.cells || {};
       const nextCells = nextSheet.cells || {};
       for (const key of new Set([...Object.keys(baseCells), ...Object.keys(nextCells)])) {
@@ -7842,16 +7889,43 @@ function _applySpreadsheetOperations(target, ops) {
   };
 
   for (const op of ops) {
+    if (op.kind === 'project.rename' || op.kind === 'sheet.rename') {
+      const target = op.kind === 'project.rename'
+        ? (workbook.projects || []).find(p => p.id === op.projectId)
+        : _ssSheetOf(workbook, op.projectId, op.sheetId);
+      if (!target) continue; // deleted remotely; the structural conflict covers it
+      if (target.name === op.value) continue;          // already applied
+      if (target.name === op.base) {                    // remote untouched — apply
+        target.name = op.value;
+        continue;
+      }
+      // Both sides renamed the same thing away from the same base. Decide it by
+      // content so both Macs land on the same name, and keep the loser.
+      const localWins = String(op.value) >= String(target.name);
+      note({
+        id: _ssConflictId([op.kind, op.projectId, op.sheetId || '', op.base || '', op.value || '', target.name || '']),
+        kind: op.kind === 'project.rename' ? 'project-name' : 'sheet-name',
+        projectId: op.projectId, sheetId: op.sheetId || null,
+        base: op.base ?? null, local: op.value ?? null, remote: target.name ?? null,
+        at: new Date().toISOString(),
+      });
+      if (localWins) target.name = op.value;
+      continue;
+    }
     if (op.kind === 'project.delete') {
       const project = (workbook.projects || []).find(p => p.id === op.projectId);
       if (!project) continue; // already gone — idempotent
-      // The deletion holds (matching log delete-vs-edit), but the remote content
-      // is preserved so nothing is destroyed.
-      note({
-        id: _ssConflictId(['project', op.projectId]),
-        kind: 'project', projectId: op.projectId,
-        remote: _cloneJson(project), at: new Date().toISOString(),
-      });
+      // Only a contested deletion is a conflict. Recording one for an ordinary
+      // delete meant every removal carried a full copy of the deleted structure
+      // into the synchronized workbook, against a 600 KB ceiling, and presented
+      // routine cleanup to the user as a problem to resolve.
+      if (_ssStructureWasEditedRemotely(project, op.base)) {
+        note({
+          id: _ssConflictId(['project', op.projectId, _ssStructureDigest(project)]),
+          kind: 'project', projectId: op.projectId,
+          remote: _cloneJson(project), at: new Date().toISOString(),
+        });
+      }
       workbook.projects = workbook.projects.filter(p => p.id !== op.projectId);
       continue;
     }
@@ -7859,11 +7933,13 @@ function _applySpreadsheetOperations(target, ops) {
       const project = (workbook.projects || []).find(p => p.id === op.projectId);
       const sheet = (project?.sheets || []).find(s => s.id === op.sheetId);
       if (!sheet) continue; // already gone — idempotent
-      note({
-        id: _ssConflictId(['sheet', op.projectId, op.sheetId]),
-        kind: 'sheet', projectId: op.projectId, sheetId: op.sheetId,
-        remote: _cloneJson(sheet), at: new Date().toISOString(),
-      });
+      if (_ssStructureWasEditedRemotely(sheet, op.base)) {
+        note({
+          id: _ssConflictId(['sheet', op.projectId, op.sheetId, _ssStructureDigest(sheet)]),
+          kind: 'sheet', projectId: op.projectId, sheetId: op.sheetId,
+          remote: _cloneJson(sheet), at: new Date().toISOString(),
+        });
+      }
       project.sheets = project.sheets.filter(s => s.id !== op.sheetId);
       if (!project.sheets.some(s => s.id === project.activeId) && project.sheets.length) {
         project.activeId = project.sheets[0].id;
@@ -7898,7 +7974,10 @@ function _applySpreadsheetOperations(target, ops) {
     // Winner is decided by content so both Macs agree; the loser is preserved.
     const localWins = valueKey >= currentKey;
     note({
-      id: _ssConflictId(['cell', op.projectId, op.sheetId, op.target]),
+      // The id must name the divergence, not just where it happened. Keying on
+      // the target alone meant a second, unrelated collision on the same cell
+      // was silently dropped as a duplicate and its losing value lost.
+      id: _ssConflictId(['cell', op.projectId, op.sheetId, op.target, baseKey, valueKey, currentKey]),
       kind: 'cell', projectId: op.projectId, sheetId: op.sheetId, target: op.target,
       base: _cloneJson(op.base ?? null),
       local: _cloneJson(op.value ?? null),
@@ -7975,7 +8054,9 @@ function _mergeSpreadsheetEdits(base, dirtyBase, dirty) {
     const local = dirtyProjects.get(project.id);
     const origin2 = baseProjects.get(project.id);
     if (!local || !origin2) continue;
-    if (local.name !== origin2.name) project.name = local.name;
+    // Renames are operations now. Copying the local name in here regardless of
+    // what the merge decided is what made two Macs disagree forever: each kept
+    // its own name and neither could see that the other had renamed anything.
     const originSheets = new Set((origin2.sheets || []).map(s => s.id));
     const present = new Set((project.sheets || []).map(s => s.id));
     for (const sheet of local.sheets || []) {
@@ -7987,7 +8068,7 @@ function _mergeSpreadsheetEdits(base, dirtyBase, dirty) {
       const target = (project.sheets || []).find(s => s.id === sheet.id);
       const originSheet = (origin2.sheets || []).find(s => s.id === sheet.id);
       if (!target || !originSheet) continue;
-      if (sheet.name !== originSheet.name) target.name = sheet.name;
+      // Sheet renames likewise travel as operations; do not overwrite here.
       if (sheet.rows !== originSheet.rows) target.rows = sheet.rows;
       if (sheet.cols !== originSheet.cols) target.cols = sheet.cols;
       if (JSON.stringify(sheet.colWidths) !== JSON.stringify(originSheet.colWidths)) {
@@ -8915,7 +8996,9 @@ function ssNewProject() {
     return;
   }
   _ssShowProjNameModal('New Project', 'New Project', name => {
-    const pid = 'proj_' + Date.now();
+    // Date.now() alone collides when two Macs create in the same millisecond,
+  // and the merge then treats two different projects as one.
+  const pid = 'proj_' + _newRecordId();
     const sid = pid + '_s1';
     const sheets = [{ id: sid, name: 'Sheet 1', rows: 20, cols: 8, colWidths: [100,100,100,100,100,100,100,100], cells: {} }];
     _ssData.projects.push({ id: pid, name, activeId: sid, sheets });
@@ -8980,7 +9063,9 @@ async function ssImportBuildProject(name, sheets) {
     showToast('Enter a project name.', 'warning');
     return false;
   }
-  const pid = 'proj_' + Date.now();
+  // Date.now() alone collides when two Macs create in the same millisecond,
+  // and the merge then treats two different projects as one.
+  const pid = 'proj_' + _newRecordId();
   let builtSheets;
   try {
     builtSheets = sheets.map((s, i) => {
@@ -9073,7 +9158,7 @@ function ssNewSheet() {
     showToast(`Spreadsheets can contain at most ${MAX_SPREADSHEET_SHEETS} sheets.`, 'warning');
     return;
   }
-  const id = 'sheet_' + Date.now();
+  const id = 'sheet_' + _newRecordId();
   proj.sheets.push({ id, name:'Sheet '+(proj.sheets.length+1), rows:20, cols:8, colWidths:[90,100,100,100,100,100,100,100], cells:{} });
   proj.activeId = id;
   _ssSelR=0;_ssSelC=0;_ssSelR2=0;_ssSelC2=0;_ssEditCell=null;

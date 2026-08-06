@@ -306,6 +306,8 @@ test('spreadsheet typing in A1 preserves an unrelated remote edit in B1', async 
     _ssData = JSON.parse(JSON.stringify(initial));
     ${declaration('_refreshForSyncKey')}
     ${declaration('_ssCellIsBlank')}
+    ${declaration('_ssStructureDigest')}
+    ${declaration('_ssStructureWasEditedRemotely')}
     ${declaration('_ssSheetOf')}
     ${declaration('_ssCellsOf')}
     ${declaration('_ssStampAttribution')}
@@ -1948,6 +1950,8 @@ test('H-08: _mergeSpreadsheetEdits throws an explicit conflict when a locally-ch
     ${declaration('_cloneJson')}
     const MAX_SPREADSHEET_CONFLICTS = 200;
     ${declaration('_ssCellIsBlank')}
+    ${declaration('_ssStructureDigest')}
+    ${declaration('_ssStructureWasEditedRemotely')}
     ${declaration('_ssSheetOf')}
     ${declaration('_ssCellsOf')}
     ${declaration('_ssStampAttribution')}
@@ -1987,6 +1991,8 @@ test('H-08: _mergeSpreadsheetEdits throws an explicit conflict when a locally-ch
     ${declaration('_cloneJson')}
     const MAX_SPREADSHEET_CONFLICTS = 200;
     ${declaration('_ssCellIsBlank')}
+    ${declaration('_ssStructureDigest')}
+    ${declaration('_ssStructureWasEditedRemotely')}
     ${declaration('_ssSheetOf')}
     ${declaration('_ssCellsOf')}
     ${declaration('_ssStampAttribution')}
@@ -2027,6 +2033,8 @@ test('H-08: _mergeSpreadsheetEdits throws when a locally-cleared cell was concur
     ${declaration('_cloneJson')}
     const MAX_SPREADSHEET_CONFLICTS = 200;
     ${declaration('_ssCellIsBlank')}
+    ${declaration('_ssStructureDigest')}
+    ${declaration('_ssStructureWasEditedRemotely')}
     ${declaration('_ssSheetOf')}
     ${declaration('_ssCellsOf')}
     ${declaration('_ssStampAttribution')}
@@ -2695,6 +2703,8 @@ function ssOpsApi() {
   vm.runInContext(`
     const MAX_SPREADSHEET_CONFLICTS = 200;
     ${declaration('_ssCellIsBlank')}
+    ${declaration('_ssStructureDigest')}
+    ${declaration('_ssStructureWasEditedRemotely')}
     ${declaration('_ssSheetOf')}
     ${declaration('_ssCellsOf')}
     ${declaration('_ssStampAttribution')}
@@ -3147,6 +3157,8 @@ function ssRebaseApi() {
     var MAX_SPREADSHEET_ATTRIBUTION_NAME = 80;
     var currentUser = () => 'Test Editor';
     ${declaration('_ssCellIsBlank')}
+    ${declaration('_ssStructureDigest')}
+    ${declaration('_ssStructureWasEditedRemotely')}
     ${declaration('_ssSheetOf')}
     ${declaration('_ssCellsOf')}
     ${declaration('_ssStampAttribution')}
@@ -3245,4 +3257,105 @@ test('the merge base travels with the pending write and survives more typing', (
   assert.match(renderer, /record\.baseCiphertext !== undefined && record\.baseCiphertext !== null &&/);
   // And the retry stays bounded.
   assert.match(renderer, /mergeAttempts < MAX_SYNC_MERGE_ATTEMPTS/);
+});
+
+// --- MB161-003/004: structural operations -----------------------------------
+//
+// External audit reproduced these against the packaged app: two Macs renaming
+// the same project ended up with different names permanently, ordinary
+// deletions manufactured conflicts, and a second divergence on one cell was
+// dropped as a duplicate of the first.
+
+const ssNamed = (pname, sname, cells = {}) => ({
+  activeProject: 'p1',
+  projects: [{ id: 'p1', name: pname, activeId: 's1', sheets: [
+    { id: 's1', name: sname, rows: 3, cols: 3, colWidths: [], cells },
+  ] }],
+});
+
+test('MB161-003: two Macs renaming the same project converge and record it', () => {
+  const api = ssOpsApi();
+  const base = ssNamed('Original', 'Sheet1');
+  const alpha = ssNamed('Alpha', 'Sheet1');
+  const beta = ssNamed('Beta', 'Sheet1');
+  // Each Mac merges the other's value onto the same common base.
+  const onB = api.merge(alpha, base, beta);
+  const onA = api.merge(beta, base, alpha);
+  assert.equal(onB.projects[0].name, onA.projects[0].name,
+    'both Macs settle on the same name rather than each keeping its own');
+  assert.ok(onB._conflicts?.length, 'and the disagreement is recorded, not silent');
+  assert.equal(onB._conflicts[0].kind, 'project-name');
+  assert.equal(onB._conflicts[0].base, 'Original');
+  assert.ok([onB._conflicts[0].local, onB._conflicts[0].remote].includes('Alpha'));
+  assert.ok([onB._conflicts[0].local, onB._conflicts[0].remote].includes('Beta'));
+});
+
+test('MB161-003: sheet renames converge the same way', () => {
+  const api = ssOpsApi();
+  const base = ssNamed('P', 'Base');
+  const a = ssNamed('P', 'NameA');
+  const b = ssNamed('P', 'NameB');
+  assert.equal(
+    api.merge(a, base, b).projects[0].sheets[0].name,
+    api.merge(b, base, a).projects[0].sheets[0].name,
+  );
+});
+
+test('MB161-003: an uncontested rename still applies without a conflict', () => {
+  const api = ssOpsApi();
+  const base = ssNamed('Original', 'Sheet1');
+  const renamed = ssNamed('Renamed', 'Sheet1');
+  const merged = api.merge(base, base, renamed);
+  assert.equal(merged.projects[0].name, 'Renamed', 'a solo rename is not obstructed');
+  assert.equal(merged._conflicts, undefined, 'and nobody is asked to resolve it');
+});
+
+test('MB161-004: an uncontested deletion is not a conflict', () => {
+  const api = ssOpsApi();
+  const withBoth = () => ({ activeProject: 'p1', projects: [{ id: 'p1', name: 'P', activeId: 's1', sheets: [
+    { id: 's1', name: 'S1', rows: 3, cols: 3, colWidths: [], cells: {} },
+    { id: 's2', name: 'S2', rows: 3, cols: 3, colWidths: [], cells: {} },
+  ] }] });
+  const withOne = () => ({ activeProject: 'p1', projects: [{ id: 'p1', name: 'P', activeId: 's1', sheets: [
+    { id: 's1', name: 'S1', rows: 3, cols: 3, colWidths: [], cells: {} },
+  ] }] });
+  const merged = api.merge(withBoth(), withBoth(), withOne());
+  assert.equal(merged._conflicts, undefined,
+    'routine cleanup does not present itself as a problem to resolve');
+  assert.equal(merged.projects[0].sheets.length, 1);
+
+  // But a deletion that raced a remote edit still preserves the remote copy.
+  const remoteEdited = withBoth();
+  remoteEdited.projects[0].sheets[1].cells['0,0'] = { v: 'theirs', bg: '', tc: '', b: false };
+  const contested = api.merge(remoteEdited, withBoth(), withOne());
+  assert.ok(contested._conflicts?.length, 'a contested deletion is still recorded');
+  assert.equal(contested._conflicts[0].remote.cells['0,0'].v, 'theirs',
+    'and carries the copy that would otherwise be destroyed');
+});
+
+test('MB161-004: a second divergence on one cell does not erase the first', () => {
+  const api = ssOpsApi();
+  const cell = v => ssNamed('P', 'S', { '0,0': ssCell(v) });
+  const first = api.merge(cell('remote1'), cell('base1'), cell('local1'));
+  const second = api.merge(cell('remote2'), cell('base2'), cell('local2'));
+  assert.notEqual(first._conflicts[0].id, second._conflicts[0].id,
+    'the id names the divergence, not merely where it happened');
+});
+
+test('MB161-007: projects and sheets do not mint ids from the clock alone', () => {
+  const renderer = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  assert.doesNotMatch(renderer, /'proj_' \+ Date\.now\(\)/);
+  assert.doesNotMatch(renderer, /'sheet_' \+ Date\.now\(\)/);
+  assert.match(renderer, /'proj_' \+ _newRecordId\(\)/);
+  assert.match(renderer, /'sheet_' \+ _newRecordId\(\)/);
+});
+
+test('MB161-003: the local name is no longer copied over the merged result', () => {
+  const renderer = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const fn = renderer.slice(renderer.indexOf('function _mergeSpreadsheetEdits('));
+  const body = fn.slice(0, fn.indexOf('\nfunction ', 1));
+  assert.doesNotMatch(body, /if \(local\.name !== origin2\.name\) project\.name = local\.name;/);
+  assert.doesNotMatch(body, /if \(sheet\.name !== originSheet\.name\) target\.name = sheet\.name;/);
+  // Dimensions are not operations yet and must still be carried.
+  assert.match(body, /if \(sheet\.rows !== originSheet\.rows\) target\.rows = sheet\.rows;/);
 });
