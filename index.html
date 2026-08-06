@@ -7415,11 +7415,14 @@ function normalizeSpreadsheetWorkbook(value) {
     }
     return input;
   };
+  // A colour is decoration. Refusing to save a whole workbook over one is the
+  // wrong trade every time: it cost the operator every unsaved edit in the
+  // project and threw them back to the project list. Anything unusable becomes
+  // "no colour", which is exactly what the renderer already does with
+  // safeCssColor(). Only real content — text, structure, ids — may refuse.
   const optionalColor = (input, label) => {
-    if (input === undefined || input === '') return '';
-    if (typeof input !== 'string' || input.length > 32) {
-      throw new Error(`spreadsheets has an invalid ${label}`);
-    }
+    if (typeof input !== 'string') return '';
+    if (input.length > 32) return '';
     return input;
   };
 
@@ -9434,10 +9437,15 @@ function ssFormulaBarFocus() {
 }
 
 function ssApplyColor(ci) { const c=SS_COLORS[ci]; ssApplyBg(c.bg,c.tc); }
-function ssApplyCustomColor(bg) { ssApplyBg(bg,null); }
-function ssClearColor() { ssApplyBg(null,null); }
+function ssApplyCustomColor(bg) { ssApplyBg(bg,''); }
+function ssClearColor() { ssApplyBg('',''); }
 
+// "No colour" is the empty string, never null. Writing null here is what made
+// clearing a fill poison the workbook: the validator accepted undefined and ''
+// but not null, so one click on the no-fill button made every later save fail.
 function ssApplyBg(bg, tc) {
+  bg = typeof bg === 'string' ? bg : '';
+  tc = typeof tc === 'string' ? tc : '';
   ssPushUndo();
   const sheet=ssActiveSheet();
   const r1=Math.min(_ssSelR,_ssSelR2),r2=Math.max(_ssSelR,_ssSelR2);

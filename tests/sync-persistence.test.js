@@ -3400,3 +3400,57 @@ test('MB161-003: the local name is no longer copied over the merged result', () 
   // Dimensions are not operations yet and must still be carried.
   assert.match(body, /if \(sheet\.rows !== originSheet\.rows\) target\.rows = sheet\.rows;/);
 });
+
+test('clearing a fill does not make the workbook unsaveable', () => {
+  // Reported from real use: "Spreadsheet changes were not saved: spreadsheets
+  // has an invalid cell background", after which the project closed. The
+  // no-fill button wrote bg: null, and the validator accepted undefined and ''
+  // but threw on null — so one click poisoned every later save, and the
+  // save-failure path then dropped the operator back to the project list.
+  const context = contextWith({ TextEncoder });
+  vm.runInContext(`
+    var MAX_SPREADSHEET_CELL_CHARS=50000, MAX_SPREADSHEET_SHEETS=25,
+        MAX_SPREADSHEET_ROWS=500, MAX_SPREADSHEET_COLS=100,
+        MAX_SPREADSHEET_GRID_CELLS=10000, MAX_SPREADSHEET_TOTAL_CELLS=10000,
+        MAX_SPREADSHEET_TOTAL_CHARS=400000, MAX_SPREADSHEET_SYNC_JSON_BYTES=600000,
+        MAX_SPREADSHEET_CONFLICTS=200, MAX_SPREADSHEET_ATTRIBUTIONS=200,
+        MAX_SPREADSHEET_ATTRIBUTION_NAME=80;
+    ${declaration('_normalizeSpreadsheetAttribution')}
+    ${declaration('normalizeSpreadsheetWorkbook')}
+    globalThis.norm = v => normalizeSpreadsheetWorkbook(v);
+  `, context);
+
+  const withCell = cell => ({ activeProject: 'p1', projects: [{ id: 'p1', name: 'P',
+    activeId: 's1', sheets: [{ id: 's1', name: 'S', rows: 3, cols: 3, colWidths: [],
+      cells: { '0,0': cell } }] }] });
+
+  // The exact shape the no-fill button produced.
+  const poisoned = withCell({ v: 'keep me', bg: null, tc: null, b: false });
+  assert.doesNotThrow(() => context.norm(poisoned),
+    'a colour must never cost the operator their unsaved work');
+  const healed = context.norm(poisoned);
+  assert.equal(healed.projects[0].sheets[0].cells['0,0'].v, 'keep me',
+    'and the text survives the repair');
+  assert.equal(healed.projects[0].sheets[0].cells['0,0'].bg, '');
+
+  // Other unusable shapes are coerced rather than thrown, including workbooks
+  // already carrying them on disk from before the fix.
+  for (const bad of [null, 0, {}, [], 'x'.repeat(64)]) {
+    assert.doesNotThrow(() => context.norm(withCell({ v: 'a', bg: bad, tc: bad, b: false })));
+  }
+  // A real colour is still preserved exactly.
+  assert.equal(
+    context.norm(withCell({ v: 'a', bg: '#7ed957', tc: '#333333', b: false }))
+      .projects[0].sheets[0].cells['0,0'].bg,
+    '#7ed957');
+
+  // And the source of the nulls is closed.
+  const renderer = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  assert.match(renderer, /function ssClearColor\(\) \{ ssApplyBg\('',''\); \}/);
+  assert.match(renderer, /function ssApplyCustomColor\(bg\) \{ ssApplyBg\(bg,''\); \}/);
+  assert.doesNotMatch(renderer, /ssApplyBg\(null,null\)/);
+
+  // Content is still allowed to refuse: this guard is for decoration only.
+  assert.throws(() => context.norm(withCell({ v: {}, bg: '', tc: '', b: false })),
+    /non-text cell value/);
+});
