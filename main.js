@@ -1284,6 +1284,18 @@ function _customStaffProfilesFromVault(vault) {
 // — built-in included — can be re-roled or removed.
 const PROFILE_ROLE_OVERRIDES_VAULT_KEY = 'app_profile_roles_v1';
 const REMOVED_BUILTIN_PROFILES_VAULT_KEY = 'app_removed_builtins_v1';
+// Custom profiles used to be removed by simply dropping them from the vault.
+// The directory merge treats absence as "not seen", never as deletion, so the
+// other Mac's copy put them straight back. Removals are now remembered.
+const REMOVED_CUSTOM_PROFILES_VAULT_KEY = 'app_removed_custom_v1';
+
+function _removedCustomProfiles(vault) {
+  const stored = vault[REMOVED_CUSTOM_PROFILES_VAULT_KEY];
+  if (!Array.isArray(stored)) return [];
+  return stored
+    .filter(record => _isPlainObject(record) && _boundedString(record.name, 120))
+    .slice(0, 200);
+}
 // Owner is deliberately NOT assignable: owner login is proved by the single
 // owner passcode, and app-session-authenticate-owner resolves to the built-in
 // owner identity. Granting Owner to another name would create a profile that
@@ -1523,6 +1535,17 @@ _secureHandle('app-session-add-staff-profile', async (_, requestedName) => {
   }
   profiles.push({ name, role: 'Front Desk', createdAt: Date.now() });
   vault[STAFF_PROFILES_VAULT_KEY] = profiles;
+  // Re-adding a name that was removed before must clear its tombstone, or the
+  // directory would publish the new profile and its own deletion together.
+  const clearedTombstones = _removedCustomProfiles(vault)
+    .filter(record => record.name.toLocaleLowerCase('en-US') !== folded);
+  if (clearedTombstones.length) vault[REMOVED_CUSTOM_PROFILES_VAULT_KEY] = clearedTombstones;
+  else delete vault[REMOVED_CUSTOM_PROFILES_VAULT_KEY];
+  // The id is reused, so its causality must restart rather than inherit the
+  // version the deleted profile ended on.
+  const meta = _directoryMeta(vault);
+  delete meta[_directoryEntryId(name)];
+  vault[DIRECTORY_META_VAULT_KEY] = meta;
   _saveSecretVault(vault);
   return { ok: true, profile: { name, role: 'Front Desk', builtIn: false } };
 });
@@ -1566,6 +1589,15 @@ _secureHandle('app-session-remove-staff-profile', async (_, requestedName) => {
     );
     if (remaining.length) vault[STAFF_PROFILES_VAULT_KEY] = remaining;
     else delete vault[STAFF_PROFILES_VAULT_KEY];
+    // Record the removal so it can be published as a tombstone. Without this
+    // the other Mac reads absence as "never heard of it" and reintroduces the
+    // profile from its own stale copy.
+    const removedCustom = _removedCustomProfiles(vault)
+      .filter(record => record.name.toLocaleLowerCase('en-US') !== folded);
+    vault[REMOVED_CUSTOM_PROFILES_VAULT_KEY] = [
+      ...removedCustom,
+      { name: canonical, at: new Date().toISOString() },
+    ].slice(-200);
   }
 
   // A removed profile keeps no role override behind it.
@@ -1601,32 +1633,79 @@ function _directoryEntryId(name) {
 
 // Snapshot of this Mac's profile configuration, shaped as a tombstoned record
 // list so it merges with the same rules as logs.
+// Per-entry causality. Every entry used to publish as version 1 with a fresh
+// timestamp, so the merge had nothing to reason about: an unchanged republish
+// manufactured conflicts purely because `updated` moved, and a genuine role
+// change could lose to stale data because both sides looked equally recent.
+// The version now advances only when the entry's content actually changes, and
+// `updated` holds still otherwise.
+const DIRECTORY_META_VAULT_KEY = 'app_directory_meta_v1';
+
+function _directoryMeta(vault) {
+  const stored = vault[DIRECTORY_META_VAULT_KEY];
+  return _isPlainObject(stored) ? stored : {};
+}
+
+function _directoryEntryDigest(entry) {
+  return [entry.name, entry.role, entry.builtIn === true, entry._deleted === true].join(' ');
+}
+
+function _stampDirectoryEntry(entry, meta, now) {
+  const previous = _isPlainObject(meta[entry.id]) ? meta[entry.id] : null;
+  const digest = _directoryEntryDigest(entry);
+  if (previous && previous.digest === digest &&
+      Number.isSafeInteger(previous.version) && previous.version >= 1 &&
+      typeof previous.updated === 'string') {
+    entry.version = previous.version;
+    entry.updated = previous.updated;
+    return meta;
+  }
+  const version = previous && Number.isSafeInteger(previous.version) ? previous.version + 1 : 1;
+  entry.version = version;
+  entry.updated = now;
+  meta[entry.id] = { digest, version, updated: now };
+  return meta;
+}
+
 function _buildStaffDirectory() {
   const vault = _loadSecretVault();
-  const removed = _removedBuiltInProfiles(vault);
+  const removedBuiltIns = _removedBuiltInProfiles(vault);
+  const removedCustom = _removedCustomProfiles(vault);
   const now = new Date().toISOString();
+  const meta = _directoryMeta(vault);
+
   const entries = _allAppProfiles().map(profile => ({
     id: _directoryEntryId(profile.name),
     name: profile.name,
     role: profile.role,
     builtIn: profile.builtIn === true,
-    version: 1,
-    updated: now,
   }));
-  // Removed built-ins travel as tombstones so other Macs apply the removal
-  // rather than resurrecting the profile from their own defaults.
-  for (const name of removed) {
+  // Removals travel as tombstones so other Macs apply them. Absence is not a
+  // deletion to the merge — it reads as "this Mac simply has not heard of it" —
+  // so a custom profile removed here was being reintroduced by the stale copy
+  // still held in the cloud and on the other Mac.
+  for (const name of removedBuiltIns) {
     entries.push({
-      id: _directoryEntryId(name),
-      name,
+      id: _directoryEntryId(name), name,
       role: APP_PROFILE_ROLES[name] || 'Front Desk',
-      builtIn: true,
-      _deleted: true,
-      _deletedAt: now,
-      version: 1,
-      updated: now,
+      builtIn: true, _deleted: true, _deletedAt: now,
     });
   }
+  for (const record of removedCustom) {
+    entries.push({
+      id: _directoryEntryId(record.name), name: record.name,
+      role: 'Front Desk', builtIn: false,
+      _deleted: true, _deletedAt: record.at || now,
+    });
+  }
+
+  const live = new Set(entries.map(entry => entry.id));
+  for (const entry of entries) _stampDirectoryEntry(entry, meta, now);
+  // Forget bookkeeping for ids this Mac no longer publishes at all.
+  for (const id of Object.keys(meta)) if (!live.has(id)) delete meta[id];
+  vault[DIRECTORY_META_VAULT_KEY] = meta;
+  _saveSecretVault(vault);
+
   return entries;
 }
 

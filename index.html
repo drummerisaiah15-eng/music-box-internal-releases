@@ -2576,9 +2576,21 @@ async function addLoginUser() {
       throw new Error(result?.error || 'The new user was not added.');
     }
     await refreshLoginProfiles();
-    await publishStaffDirectory();
+    // Publishing is owner-only, so adding a user from the signed-out login
+    // screen cannot reach the other Macs. Saying "added" without qualification
+    // told people the profile existed studio-wide when it existed on this Mac
+    // alone — and they only found out when the other Mac disagreed.
+    const published = await publishStaffDirectory();
     hideAddLoginUserForm();
-    showToast(`${result.profile.name} was added with Front Desk access.`, 'success');
+    if (published) {
+      showToast(`${result.profile.name} was added with Front Desk access.`, 'success');
+    } else {
+      showToast(
+        `${result.profile.name} was added on this Mac with Front Desk access, but not yet ` +
+        `shared with the other Macs. Elizabeth can sign in here to publish it.`,
+        'warning'
+      );
+    }
     return true;
   } catch (error) {
     showToast(`New user was not added: ${error?.message || error}`, 'danger');

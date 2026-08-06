@@ -531,6 +531,10 @@ function removalHarness({ role = 'Owner', signedInAs = 'Elizabeth Chaves', vault
     ${sliceFunction(main, '_customStaffProfilesFromVault')}
     ${sliceFunction(main, '_profileRoleOverrides')}
     ${sliceFunction(main, '_removedBuiltInProfiles')}
+    ${sliceFunction(main, '_boundedString')}
+    ${sliceFunction(main, '_removedCustomProfiles')}
+    var REMOVED_CUSTOM_PROFILES_VAULT_KEY = 'app_removed_custom_v1';
+    var DIRECTORY_META_VAULT_KEY = 'app_directory_meta_v1';
     ${sliceFunction(main, '_allAppProfiles')}
     ${sliceFunction(main, '_ownerProfileCount')}
     ${sliceFunction(main, '_findProfileByFoldedName')}
@@ -820,9 +824,16 @@ function directoryHarness({ role = 'Owner', signedInAs = 'Elizabeth Chaves', vau
     ${sliceFunction(main, '_customStaffProfilesFromVault')}
     ${sliceFunction(main, '_profileRoleOverrides')}
     ${sliceFunction(main, '_removedBuiltInProfiles')}
+    ${sliceFunction(main, '_boundedString')}
+    ${sliceFunction(main, '_removedCustomProfiles')}
+    var REMOVED_CUSTOM_PROFILES_VAULT_KEY = 'app_removed_custom_v1';
+    var DIRECTORY_META_VAULT_KEY = 'app_directory_meta_v1';
     ${sliceFunction(main, '_allAppProfiles')}
     ${sliceFunction(main, '_roleForAppProfile')}
     ${sliceFunction(main, '_directoryEntryId')}
+    ${sliceFunction(main, '_directoryMeta')}
+    ${sliceFunction(main, '_directoryEntryDigest')}
+    ${sliceFunction(main, '_stampDirectoryEntry')}
     ${sliceFunction(main, '_buildStaffDirectory')}
     ${sliceFunction(main, '_validDirectoryEntry')}
     ${sliceFunction(main, '_applyStaffDirectory')}
@@ -1176,4 +1187,86 @@ test('any signed-in profile can start cloud sync, but only on a provisioned Mac'
     assert.match(extractFunction(main, fn), /firebaseRuntimeSecretIssued = false/,
       `${fn} re-arms the credential release`);
   }
+});
+
+// --- MB161-005: directory causality -----------------------------------------
+//
+// External audit: every entry published as version 1 with a fresh timestamp, so
+// the merge had nothing to reason about. Removals of custom profiles were not
+// published at all, and the other Mac put them straight back.
+
+const dirEntries = harness => [...harness.api.build()].map(e => ({ ...e }));
+
+test('MB161-005: an unchanged republish does not move version or timestamp', () => {
+  const harness = directoryHarness();
+  const first = dirEntries(harness);
+  const second = dirEntries(harness);
+  assert.deepEqual(second, first,
+    'republishing an unchanged directory is byte-identical, so it cannot manufacture conflicts');
+  assert.ok(first.every(entry => Number.isSafeInteger(entry.version) && entry.version >= 1));
+});
+
+test('MB161-005: a real change advances only that entry', () => {
+  const harness = directoryHarness();
+  const before = dirEntries(harness);
+  const target = before.find(entry => entry.name === 'Dana Reed');
+  harness.state.vault.app_profile_roles_v1 = { 'Dana Reed': 'Operations & Events' };
+  const after = dirEntries(harness);
+  const changed = after.find(entry => entry.name === 'Dana Reed');
+  assert.equal(changed.role, 'Operations & Events');
+  assert.equal(changed.version, target.version + 1, 'the changed entry advances');
+  for (const entry of after) {
+    if (entry.name === 'Dana Reed') continue;
+    assert.deepEqual(entry, before.find(e => e.id === entry.id), `${entry.name} was not touched`);
+  }
+});
+
+test('MB161-005: removing a custom profile publishes a tombstone', () => {
+  const harness = directoryHarness();
+  dirEntries(harness);
+  // What the removal handler records.
+  delete harness.state.vault.app_staff_profiles_v1;
+  harness.state.vault.app_removed_custom_v1 = [{ name: 'Dana Reed', at: '2026-08-05T00:00:00.000Z' }];
+  const tombstone = dirEntries(harness).find(entry => entry.name === 'Dana Reed');
+  assert.ok(tombstone, 'the removal is published rather than simply omitted');
+  assert.equal(tombstone._deleted, true,
+    'absence reads as "not seen" to the merge, so the other Mac would resurrect it');
+  assert.ok(tombstone._deletedAt);
+});
+
+test('MB161-005: a removed custom profile does not come back from a stale peer', () => {
+  const owner = directoryHarness();
+  delete owner.state.vault.app_staff_profiles_v1;
+  owner.state.vault.app_removed_custom_v1 = [{ name: 'Dana Reed', at: '2026-08-05T00:00:00.000Z' }];
+  // The other Mac still holds the profile from before the removal.
+  const peer = directoryHarness();
+  assert.ok([...peer.api.profiles()].includes('Dana Reed:Front Desk'), 'peer has it to begin with');
+  peer.api.apply(dirEntries(owner));
+  assert.ok(![...peer.api.profiles()].some(p => p.startsWith('Dana Reed:')),
+    'the tombstone removes it instead of the peer reintroducing it');
+});
+
+test('MB161-005: re-adding a removed name publishes it once, not alongside its deletion', () => {
+  const harness = directoryHarness();
+  delete harness.state.vault.app_staff_profiles_v1;
+  harness.state.vault.app_removed_custom_v1 = [{ name: 'Dana Reed', at: '2026-08-05T00:00:00.000Z' }];
+  dirEntries(harness);
+  // What the add handler records: profile back, tombstone and meta cleared.
+  harness.state.vault.app_staff_profiles_v1 = [{ name: 'Dana Reed', role: 'Front Desk', createdAt: 2 }];
+  delete harness.state.vault.app_removed_custom_v1;
+  delete harness.state.vault.app_directory_meta_v1['profile:dana reed'];
+  const matches = dirEntries(harness).filter(entry => entry.name === 'Dana Reed');
+  assert.equal(matches.length, 1, 'the profile is not published alongside its own deletion');
+  assert.notEqual(matches[0]._deleted, true);
+  assert.equal(matches[0].version, 1, 'the reused id does not inherit the old version');
+});
+
+test('MB161-005: adding a user that could not be published says so', () => {
+  const renderer = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const fn = renderer.slice(renderer.indexOf('async function addLoginUser'));
+  const body = fn.slice(0, fn.indexOf('\nfunction ', 1));
+  assert.match(body, /const published = await publishStaffDirectory\(\);/,
+    'the publish result is read, not discarded');
+  assert.match(body, /not yet[\s\S]*shared with the other Macs/,
+    'and a local-only add is described as local-only');
 });
