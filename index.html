@@ -887,7 +887,22 @@
       border:1px solid #d4d4d4;padding:0;position:relative;overflow:hidden;
     }
     #ss-grid th { white-space:nowrap;height:26px; }
-    #ss-grid td { white-space:normal;word-break:break-word;overflow-wrap:break-word;vertical-align:top; }
+    /* A schedule is read by scanning rows and columns. Letting one long note
+       grow its cell pushed every neighbouring row out of alignment and made the
+       grid unreadable, so cells hold a fixed height and clip. The full value is
+       always available in the formula bar, and a cell that genuinely needs more
+       room is merged deliberately. */
+    #ss-grid td {
+      white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+      vertical-align:middle;height:26px;
+    }
+    /* A merged cell is the deliberate exception: it was given the room, so it
+       may use it. */
+    #ss-grid td[rowspan]:not([rowspan="1"]),
+    #ss-grid td[colspan]:not([colspan="1"]) {
+      white-space:normal;word-break:break-word;overflow-wrap:break-word;
+      vertical-align:top;height:auto;
+    }
     #ss-grid th {
       background:#f3f3f3;text-align:center;font-weight:500;
       font-size:11px;color:#555;user-select:none;
@@ -897,6 +912,13 @@
     #ss-grid td { cursor:cell;background:#fff; }
     #ss-grid td.ss-selected {
       outline:2px solid #1a73e8;outline-offset:-2px;z-index:2;
+    }
+    /* The cell being typed in has to show what is being typed, so it escapes
+       the clipping the rest of the grid uses and floats above its neighbours. */
+    #ss-grid td.ss-editing { overflow:visible;z-index:6; }
+    #ss-grid td.ss-editing .ss-cell-input {
+      min-height:100%;height:auto;background:#fff;
+      box-shadow:0 2px 10px rgba(0,0,0,.18);outline:2px solid #1a73e8;
     }
     #ss-grid td.ss-in-range { background-color:rgba(26,115,232,.08) !important; }
     #ss-grid td.ss-editing {
@@ -1498,6 +1520,13 @@
             <button class="ss-toolbar-btn" id="ss-undo-btn" onclick="ssUndo()" title="Undo (⌘Z)" disabled style="opacity:.4">↩ Undo</button>
             <div class="ss-sep"></div>
             <input id="ss-cell-ref" readonly placeholder="A1" title="Cell reference" />
+            <!-- Cells clip rather than grow, so this is where the whole value is
+                 readable. It was styled and wired but never actually placed in
+                 the document, which is why it never appeared. -->
+            <input id="ss-formula-bar" placeholder="Select a cell to see its full text"
+              spellcheck="false" autocapitalize="off" autocorrect="off"
+              onkeydown="ssFormulaBarKey(event)" onblur="ssUpdateToolbar()"
+              title="Full contents of the selected cell — edit here and press Return" />
             <div class="ss-sep"></div>
             <span style="font-size:11px;color:var(--text-muted);font-weight:600;white-space:nowrap;flex-shrink:0">FILL:</span>
             <div class="ss-color-clear" onclick="ssClearColor()" title="No fill">✕</div>

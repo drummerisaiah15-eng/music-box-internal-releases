@@ -1069,3 +1069,29 @@ test('double-clicking a cell enters edit mode even though selecting rebuilds the
   // caret lands where it was clicked.
   assert.match(down, /if \(_ssEditCell && _ssEditCell\.r===r && _ssEditCell\.c===c\) return;/);
 });
+
+test('cells clip and the formula bar carries the full value', () => {
+  // A schedule is read by scanning rows and columns. One long note growing its
+  // cell pushed every neighbouring row out of alignment, so cells now hold a
+  // fixed height and the whole value lives in the formula bar.
+  assert.match(source, /#ss-grid td \{\s*\n\s*white-space:nowrap;overflow:hidden;text-overflow:ellipsis;/);
+  assert.doesNotMatch(source, /#ss-grid td \{ white-space:normal;word-break:break-word/,
+    'the growing-cell rule is gone');
+
+  // A merged cell was deliberately given the room, so it may use it.
+  assert.match(source, /#ss-grid td\[rowspan\]:not\(\[rowspan="1"\]\),/);
+  assert.match(source, /white-space:normal;word-break:break-word;overflow-wrap:break-word;/);
+
+  // The formula bar was styled and wired but never placed in the document,
+  // which is why selecting a cell never showed anything.
+  assert.match(source, /<input id="ss-formula-bar"[\s\S]*?onkeydown="ssFormulaBarKey\(event\)"/);
+  const toolbar = namedFunctionSource('ssUpdateToolbar');
+  assert.match(toolbar, /const fb = document\.getElementById\('ss-formula-bar'\)/);
+  assert.match(toolbar, /if \(fb && document\.activeElement !== fb\) fb\.value = cell\.v \|\| ''/,
+    'it follows the selection without fighting someone typing in it');
+  assert.match(namedFunctionSource('ssFormulaBarKey'), /ssBoundedCellValue\(e\.target\.value\)/,
+    'and editing through it is bounded like any other cell write');
+
+  // The cell being typed in must still show what is being typed.
+  assert.match(source, /#ss-grid td\.ss-editing \{ overflow:visible;z-index:6; \}/);
+});
