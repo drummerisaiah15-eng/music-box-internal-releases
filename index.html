@@ -3738,7 +3738,7 @@ function _resetLocalSyncRevisionsForNewCloud(keys = null) {
 // it — it is another full encrypted copy, and carrying one for every key would
 // double this Mac's pending storage for no benefit.
 function _needsMergeBase(key) {
-  return SYNC_MERGE_STRATEGIES[key] === 'spreadsheet-operations';
+  return _syncMergeStrategy(key) === 'spreadsheet-operations';
 }
 
 function _validatePendingSyncRecord(key, record) {
@@ -3887,12 +3887,27 @@ const SYNC_MERGE_STRATEGIES = Object.freeze({
   // whole workbook and discarding the other person's afternoon. Sound without
   // tombstones because deletions are derived as explicit operations and the
   // ones that cannot be reconciled throw instead of guessing.
-  spreadsheets: 'spreadsheet-operations',
+  // MB161-012: the index is a record list of which projects exist. Content
+  // lives in spreadsheet_<projectId>, which uses the operation merge below.
+  spreadsheets: 'spreadsheet-index',
 });
 const MAX_SYNC_MERGE_ATTEMPTS = 3;
 
+// MB161-012: project keys are dynamic, so the strategy can no longer be a
+// plain lookup. `spreadsheets` keeps the operation merge while it still holds a
+// legacy workbook — the migration has to be able to run on a Mac that is
+// already syncing, which means the old shape must stay mergeable until it is
+// gone.
+function _syncMergeStrategy(key) {
+  if (_ssIsProjectSyncKey(key)) return 'spreadsheet-operations';
+  if (key === 'spreadsheets' && _ssIsLegacyWorkbook(_decCache?.spreadsheets)) {
+    return 'spreadsheet-operations';
+  }
+  return SYNC_MERGE_STRATEGIES[key];
+}
+
 function _canAutoMergeSyncKey(key) {
-  return !!SYNC_MERGE_STRATEGIES[key];
+  return !!_syncMergeStrategy(key);
 }
 
 // Thrown when a rebase cannot be decided without the person. Distinct from a
@@ -3907,9 +3922,12 @@ class SyncRebaseUndecidable extends Error {
 }
 
 function _mergeSyncValuesForKey(key, { localValue, remoteValue, baseValue }) {
-  const strategy = SYNC_MERGE_STRATEGIES[key];
+  const strategy = _syncMergeStrategy(key);
   if (strategy === 'tombstoned-record-list') {
     return _mergeTombstonedRecordLists(localValue, remoteValue);
+  }
+  if (strategy === 'spreadsheet-index') {
+    return _mergeSpreadsheetIndexes(localValue, remoteValue);
   }
   if (strategy === 'spreadsheet-operations') {
     if (!baseValue) {
@@ -5483,12 +5501,23 @@ function _estimateJsonBytes(value) {
 }
 
 function _expectedSyncType(key) {
+  if (_ssIsProjectSyncKey(key)) return 'object';
   if (['room_overrides', 'room_by_instructor', 'room_time_rules', 'spreadsheets'].includes(key)) return 'object';
   return 'array';
 }
 
 function _normalizeSyncValue(key, value) {
-  if (key === 'spreadsheets') return normalizeSpreadsheetWorkbook(value);
+  // MB161-012: a project document is validated by the workbook validator, so
+  // the two can never disagree about what a sheet may contain.
+  if (_ssIsProjectSyncKey(key)) return normalizeSpreadsheetProject(value);
+  if (key === 'spreadsheets') {
+    // The legacy single-document workbook must stay readable until the
+    // migration has run. A Mac that is already syncing has to be able to load
+    // the old shape, split it, and only then start writing the new one — and a
+    // Mac that has not migrated yet must not have its data rejected.
+    if (_ssIsLegacyWorkbook(value)) return normalizeSpreadsheetWorkbook(value);
+    return normalizeSpreadsheetIndex(value);
+  }
   const expected = _expectedSyncType(key);
   const valid = expected === 'array'
     ? Array.isArray(value)
@@ -7635,6 +7664,26 @@ function _ssSplitWorkbook(workbook) {
     for (const doc of documents.values()) doc._resolvedConflicts = [...settled];
   }
   return { index: normalizeSpreadsheetIndex(index), documents };
+}
+
+// MB161-012: merging two indexes is merging two record lists, which is already
+// solved. A project created on one Mac and one deleted on the other are not in
+// competition — both facts survive, and the tombstone is what carries the
+// deletion, so absence never means anything.
+//
+// `activeProject` is which project this person has open. It rides in the shared
+// index because it always has, but it is a view preference: prefer whatever
+// this Mac had, and let normalizeSpreadsheetIndex correct it if that project is
+// gone. Taking the remote value would drag one person to whatever the other had
+// open, which is the same bug the sheet-level fix in _refreshForSyncKey exists
+// to prevent.
+function _mergeSpreadsheetIndexes(localValue, remoteValue) {
+  const merged = {
+    schema: SPREADSHEET_INDEX_SCHEMA,
+    activeProject: localValue?.activeProject ?? remoteValue?.activeProject,
+    projects: _mergeTombstonedRecordLists(localValue?.projects, remoteValue?.projects),
+  };
+  return normalizeSpreadsheetIndex(merged);
 }
 
 // Rebuild the whole-workbook shape the editor works with. A project named in

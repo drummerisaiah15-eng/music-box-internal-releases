@@ -56,6 +56,12 @@ function contextWith(values = {}) {
     crypto: globalThis.crypto,
     BigInt,
     showToast() {},
+    _decCache: {},
+    // Declared beside the functions in index.html, so some declaration()
+    // slices carry them and some do not. Supplying them as context globals
+    // works either way: a lexical declaration in the script simply shadows it.
+    SPREADSHEET_PROJECT_KEY_PREFIX: 'spreadsheet_',
+    SPREADSHEET_PROJECT_ID_PATTERN: /^[A-Za-z0-9_-]{1,100}$/,
     // Some harnesses pick this up incidentally via declaration('_ssCellIsBlank');
     // others do not extract it at all. A context global covers both without
     // colliding with a lexical declaration.
@@ -82,7 +88,10 @@ test('rapid same-key writes retain immutable operation ancestry until each ackno
     tmb_logs_revision: '0',
   });
   const context = contextWith({ localStorage });
-  vm.runInContext(`
+  vm.runInContext(`    ${declaration('_ssIsProjectSyncKey')}
+    ${declaration('_ssIsLegacyWorkbook')}
+    ${declaration('_syncMergeStrategy')}
+
     const SYNC_PENDING_STORAGE_VERSION = 1;
     const MAX_SYNC_SUPERSEDED_OPS = 32;
     ${declaration('_pendingSyncStorageKey')}
@@ -536,7 +545,10 @@ test('an iCloud apply rolls back if its durable Firebase pending record cannot b
     _normalizeSyncValue: (_key, value) => JSON.parse(JSON.stringify(value)),
     _scheduleSyncDrain: async () => false,
   });
-  vm.runInContext(`
+  vm.runInContext(`    ${declaration('_ssIsProjectSyncKey')}
+    ${declaration('_ssIsLegacyWorkbook')}
+    ${declaration('_syncMergeStrategy')}
+
     const SYNC_PENDING_STORAGE_VERSION = 1;
     const MAX_SYNC_SUPERSEDED_OPS = 32;
     ${declaration('_pendingSyncStorageKey')}
@@ -838,7 +850,10 @@ test('restore path reapplies encrypted data, preserves CAS revision, and snapsho
     _updateSyncConflictActions: () => {},
     showToast: (message, kind) => toasts.push({ message, kind }),
   });
-  vm.runInContext(`
+  vm.runInContext(`    ${declaration('_ssIsProjectSyncKey')}
+    ${declaration('_ssIsLegacyWorkbook')}
+    ${declaration('_syncMergeStrategy')}
+
     const SYNC_CONFLICT_BACKUP_INDEX_KEY = 'tmb__sync_conflict_backup_index';
     const SYNC_CONFLICT_BACKUP_POINTER_KEY = 'tmb__last_sync_conflict_backup';
     const MAX_SYNC_CONFLICT_BACKUPS = 3;
@@ -2165,7 +2180,10 @@ function mergeApi() {
   const context = contextWith({
     _cloneJson: v => JSON.parse(JSON.stringify(v)),
   });
-  vm.runInContext(`
+  vm.runInContext(`    ${declaration('_ssIsProjectSyncKey')}
+    ${declaration('_ssIsLegacyWorkbook')}
+    ${declaration('_syncMergeStrategy')}
+
     const SYNC_MERGE_STRATEGIES = Object.freeze({ logs: 'tombstoned-record-list' });
     ${declaration('_canAutoMergeSyncKey')}
     ${declaration('_recordSortTime')}
@@ -3441,7 +3459,10 @@ test('nothing in the client or the rules still writes a date-shaped key', () => 
 
 function ssRebaseApi() {
   const context = contextWith({ _cloneJson: v => JSON.parse(JSON.stringify(v)) });
-  vm.runInContext(`
+  vm.runInContext(`    ${declaration('_ssIsProjectSyncKey')}
+    ${declaration('_ssIsLegacyWorkbook')}
+    ${declaration('_syncMergeStrategy')}
+
     const MAX_SPREADSHEET_CONFLICTS = 200;
     var MAX_SPREADSHEET_ATTRIBUTIONS = 200;
     var MAX_SPREADSHEET_ATTRIBUTION_NAME = 80;
@@ -3547,7 +3568,11 @@ test('the merge base travels with the pending write and survives more typing', (
   // local value, or this Mac's edits get replayed twice.
   assert.match(renderer, /const rebasedBase = _needsMergeBase\(key\)\s*\n\s*\? await _aesEncrypt\(JSON\.stringify\(remoteValue\)\)/);
   // Only carried where a strategy reads it; it is a second full encrypted copy.
-  assert.match(renderer, /function _needsMergeBase\(key\) \{\s*\n\s*return SYNC_MERGE_STRATEGIES\[key\] === 'spreadsheet-operations';/);
+  // MB161-012: project keys are dynamic, so the strategy is resolved by a
+  // function rather than a plain lookup. The property that matters is unchanged:
+  // only the operation merge needs a recorded base.
+  assert.match(renderer, /function _needsMergeBase\(key\) \{\s*\n\s*return _syncMergeStrategy\(key\) === 'spreadsheet-operations';/);
+  assert.match(renderer, /function _syncMergeStrategy\(key\) \{[\s\S]*?if \(_ssIsProjectSyncKey\(key\)\) return 'spreadsheet-operations';/);
   // Older records lack the field entirely and must stay readable.
   assert.match(renderer, /record\.baseCiphertext !== undefined && record\.baseCiphertext !== null &&/);
   // And the retry stays bounded.

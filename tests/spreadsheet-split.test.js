@@ -517,3 +517,225 @@ test('MB161-012: every project the index names is a synchronized key', () => {
   assert.equal(context.api.is('spreadsheet_bad/id'), false);
   assert.equal(context.api.is('logs'), true);
 });
+
+// ── Routing: which strategy and which validator a key gets ───────────────────
+
+function routingApi(decCache = {}) {
+  const context = vm.createContext({
+    console: { warn() {}, error() {}, log() {} },
+    Date, Object, Map, Set, Array, JSON, Number, String, Boolean, Math, TextEncoder,
+    _cloneJson: value => JSON.parse(JSON.stringify(value)),
+    _decCache: decCache,
+    _estimateJsonBytes: value => JSON.stringify(value).length,
+  });
+  vm.runInContext(`
+    var SPREADSHEET_INDEX_SCHEMA = 2;
+    var MAX_SPREADSHEET_PROJECTS = 25;
+    var SPREADSHEET_PROJECT_KEY_PREFIX = 'spreadsheet_';
+    var SPREADSHEET_PROJECT_ID_PATTERN = /^[A-Za-z0-9_-]{1,100}$/;
+    var MAX_SYNC_PLAINTEXT_BYTES = 620000;
+    var MAX_RESOLVED_CONFLICT_IDS = 200;
+    var MAX_SPREADSHEET_CONFLICTS = 200;
+    var MAX_SPREADSHEET_CELL_CHARS = 50000, MAX_SPREADSHEET_SHEETS = 25,
+        MAX_SPREADSHEET_ROWS = 500, MAX_SPREADSHEET_COLS = 100,
+        MAX_SPREADSHEET_GRID_CELLS = 10000, MAX_SPREADSHEET_TOTAL_CELLS = 10000,
+        MAX_SPREADSHEET_TOTAL_CHARS = 400000, MAX_SPREADSHEET_SYNC_JSON_BYTES = 600000,
+        MAX_SPREADSHEET_ATTRIBUTIONS = 200, MAX_SPREADSHEET_ATTRIBUTION_NAME = 80;
+    var SYNC_MERGE_STRATEGIES = {
+      logs: 'tombstoned-record-list',
+      staff_directory: 'tombstoned-record-list',
+      spreadsheets: 'spreadsheet-index',
+    };
+    ${declaration('_ssProjectSyncKey')}
+    ${declaration('_ssIsProjectSyncKey')}
+    ${declaration('_ssIsLegacyWorkbook')}
+    ${declaration('_syncMergeStrategy')}
+    ${declaration('_canAutoMergeSyncKey')}
+    ${declaration('_needsMergeBase')}
+    ${declaration('_expectedSyncType')}
+    ${declaration('_ssProjectDocToWorkbook')}
+    ${declaration('_ssWorkbookToProjectDoc')}
+    ${declaration('_ssOversizeError')}
+    ${declaration('_normalizeSpreadsheetAttribution')}
+    ${declaration('normalizeSpreadsheetWorkbook')}
+    ${declaration('normalizeSpreadsheetProject')}
+    ${declaration('normalizeSpreadsheetIndex')}
+    ${declaration('_normalizeSyncValue')}
+    globalThis.api = {
+      strategy: key => _syncMergeStrategy(key),
+      canMerge: key => _canAutoMergeSyncKey(key),
+      needsBase: key => _needsMergeBase(key),
+      type: key => _expectedSyncType(key),
+      normalize: (key, value) => _normalizeSyncValue(key, value),
+    };
+  `, context);
+  return context.api;
+}
+
+test('MB161-012: a project key gets the operation merge and needs a base', () => {
+  const api = routingApi();
+  assert.equal(api.strategy('spreadsheet_p1'), 'spreadsheet-operations');
+  assert.equal(api.canMerge('spreadsheet_p1'), true);
+  assert.equal(api.needsBase('spreadsheet_p1'), true,
+    'a rebase without the starting point cannot tell whose edit is whose');
+  assert.equal(api.type('spreadsheet_p1'), 'object');
+});
+
+test('MB161-012: the index gets the record-list merge and needs no base', () => {
+  const api = routingApi({ spreadsheets: { schema: 2, projects: [] } });
+  assert.equal(api.strategy('spreadsheets'), 'spreadsheet-index');
+  assert.equal(api.canMerge('spreadsheets'), true);
+  assert.equal(api.needsBase('spreadsheets'), false,
+    'a tombstoned record list merges from both sides alone');
+});
+
+test('MB161-012: while a legacy workbook is still stored, the old merge applies', () => {
+  // The migration has to be able to run on a Mac that is already syncing, so
+  // the old shape must stay mergeable right up until it is gone. Getting this
+  // wrong would strand an un-migrated Mac with an unmergeable key.
+  const legacy = routingApi({
+    spreadsheets: legacyWorkbook([project('p1', [sheet('s1')])]),
+  });
+  assert.equal(legacy.strategy('spreadsheets'), 'spreadsheet-operations');
+  assert.equal(legacy.needsBase('spreadsheets'), true);
+
+  // And once migrated, it flips without anything else changing.
+  const migrated = routingApi({ spreadsheets: { schema: 2, projects: [{ id: 'p1' }] } });
+  assert.equal(migrated.strategy('spreadsheets'), 'spreadsheet-index');
+});
+
+test('MB161-012: an unknown key still has no merge strategy at all', () => {
+  const api = routingApi();
+  assert.equal(api.strategy('todo_items'), undefined);
+  assert.equal(api.canMerge('todo_items'), false,
+    'auto-merge stays opt-in — a collection without tombstones must not be guessed at');
+  assert.equal(api.canMerge('spreadsheet_bad/key'), false);
+});
+
+test('MB161-012: _normalizeSyncValue routes each shape to its own validator', () => {
+  const api = routingApi();
+
+  const doc = api.normalize('spreadsheet_p1', {
+    id: 'p1', name: 'Fall', activeId: 's1', sheets: [sheet('s1', { '0,0': cell('x') })],
+  });
+  assert.equal(doc.id, 'p1');
+  assert.equal(doc.sheets[0].cells['0,0'].v, 'x');
+  assert.equal('projects' in doc, false, 'a project document is not a workbook');
+
+  const index = api.normalize('spreadsheets', {
+    schema: 2, activeProject: 'p1', projects: [{ id: 'p1', version: 1 }],
+  });
+  assert.equal(index.schema, 2);
+  assert.deepEqual(index.projects.map(p => p.id), ['p1']);
+
+  // The legacy shape is still accepted, or a Mac mid-migration loses its data.
+  const legacy = api.normalize('spreadsheets', legacyWorkbook([project('p1', [sheet('s1')])]));
+  assert.equal(legacy.projects[0].sheets.length, 1, 'read as a workbook, not an index');
+  assert.equal('schema' in legacy, false);
+});
+
+test('MB161-012: a project document that is not a project is refused', () => {
+  const api = routingApi();
+  assert.throws(() => api.normalize('spreadsheet_p1', null), /./);
+  assert.throws(() => api.normalize('spreadsheet_p1', []), /./);
+  assert.throws(() => api.normalize('spreadsheet_p1', { id: 'p1' }), /./,
+    'no sheets is not a valid project');
+});
+
+// ── Merging two indexes ──────────────────────────────────────────────────────
+
+function indexMergeApi() {
+  const context = vm.createContext({
+    console: { warn() {}, error() {}, log() {} },
+    Date, Object, Map, Set, Array, JSON, Number, String, Boolean,
+    _cloneJson: value => JSON.parse(JSON.stringify(value)),
+  });
+  vm.runInContext(`
+    var SPREADSHEET_INDEX_SCHEMA = 2;
+    var MAX_SPREADSHEET_PROJECTS = 25;
+    var SPREADSHEET_PROJECT_ID_PATTERN = /^[A-Za-z0-9_-]{1,100}$/;
+    ${declaration('_recordSortTime')}
+    ${declaration('_recordContentKey')}
+    ${declaration('_conflictVariantId')}
+    ${declaration('_mergeResolvedConflictIds')}
+    ${declaration('_mergeConflictVariants')}
+    ${declaration('_mergeDivergentRecords')}
+    ${declaration('_syncRecordOrderKey')}
+    ${declaration('_compareSyncRecords')}
+    ${declaration('_mergeTombstonedRecordLists')}
+    ${declaration('normalizeSpreadsheetIndex')}
+    ${declaration('_mergeSpreadsheetIndexes')}
+    globalThis.merge = (a, b) => _mergeSpreadsheetIndexes(a, b);
+  `, context);
+  return (a, b) => JSON.parse(JSON.stringify(context.merge(a, b)));
+}
+
+const idx = (projects, activeProject) => ({
+  schema: 2, activeProject, projects,
+});
+
+test('MB161-012: a project created on each Mac survives on both', () => {
+  const merge = indexMergeApi();
+  const mine = idx([{ id: 'p1', version: 1 }, { id: 'p2', version: 1 }], 'p2');
+  const theirs = idx([{ id: 'p1', version: 1 }, { id: 'p3', version: 1 }], 'p3');
+  const merged = merge(mine, theirs);
+  assert.deepEqual(merged.projects.map(p => p.id).sort(), ['p1', 'p2', 'p3']);
+  assert.equal(merged.activeProject, 'p2', 'and each Mac keeps the project it had open');
+
+  // Symmetric: merging the other way round gives the same set.
+  assert.deepEqual(
+    merge(theirs, mine).projects.map(p => p.id).sort(), ['p1', 'p2', 'p3']);
+});
+
+test('MB161-012: a deletion beats a concurrent presence, and stays deleted', () => {
+  const merge = indexMergeApi();
+  const deletedHere = idx([
+    { id: 'p1', version: 1 },
+    { id: 'p2', version: 2, _deleted: true, _deletedAt: '2026-08-06T10:00:00.000Z' },
+  ], 'p1');
+  const stillThere = idx([{ id: 'p1', version: 1 }, { id: 'p2', version: 1 }], 'p1');
+
+  for (const merged of [merge(deletedHere, stillThere), merge(stillThere, deletedHere)]) {
+    const p2 = merged.projects.find(p => p.id === 'p2');
+    assert.ok(p2, 'the tombstone is kept — absence would let it come back');
+    assert.equal(p2._deleted, true, 'and it stays deleted whichever side merged');
+  }
+});
+
+test('MB161-012: the open project is not dragged to whatever the other Mac had', () => {
+  const merge = indexMergeApi();
+  const mine = idx([{ id: 'p1', version: 1 }, { id: 'p2', version: 1 }], 'p1');
+  const theirs = idx([{ id: 'p1', version: 1 }, { id: 'p2', version: 1 }], 'p2');
+  assert.equal(merge(mine, theirs).activeProject, 'p1');
+  assert.equal(merge(theirs, mine).activeProject, 'p2');
+});
+
+test('MB161-012: an open project deleted on the other Mac falls back cleanly', () => {
+  const merge = indexMergeApi();
+  const mine = idx([{ id: 'p1', version: 1 }, { id: 'p2', version: 1 }], 'p2');
+  const theirs = idx([
+    { id: 'p1', version: 1 },
+    { id: 'p2', version: 2, _deleted: true, _deletedAt: '2026-08-06T10:00:00.000Z' },
+  ], 'p1');
+  const merged = merge(mine, theirs);
+  assert.equal(merged.activeProject, 'p1', 'never left pointing at a tombstone');
+});
+
+test('MB161-012: merging an index with nothing on one side loses nothing', () => {
+  const merge = indexMergeApi();
+  const mine = idx([{ id: 'p1', version: 1 }], 'p1');
+  assert.deepEqual(merge(mine, null).projects.map(p => p.id), ['p1']);
+  assert.deepEqual(merge(mine, idx([], undefined)).projects.map(p => p.id), ['p1']);
+  assert.deepEqual(merge(null, mine).projects.map(p => p.id), ['p1'],
+    'a Mac with no index yet must not erase the one that has it');
+});
+
+test('MB161-012: merging indexes is idempotent', () => {
+  const merge = indexMergeApi();
+  const mine = idx([{ id: 'p1', version: 1 }, { id: 'p2', version: 2, _deleted: true }], 'p1');
+  const theirs = idx([{ id: 'p1', version: 1 }, { id: 'p3', version: 1 }], 'p3');
+  const once = merge(mine, theirs);
+  assert.deepEqual(merge(once, once), once, 'merging a result with itself changes nothing');
+  assert.deepEqual(merge(once, theirs).projects.map(p => p.id).sort(),
+    once.projects.map(p => p.id).sort(), 'and re-merging an input adds nothing');
+});
