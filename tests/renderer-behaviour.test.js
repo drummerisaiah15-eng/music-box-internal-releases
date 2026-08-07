@@ -1502,3 +1502,26 @@ test('MB161-028: removing a checkbox does not leave "FALSE" behind', () => {
   assert.equal(styled.bg, '#cccccc');
   assert.equal(styled.b, true);
 });
+
+test('MB161-030: importing and syncing are not credited as edits', () => {
+  // An import stamped one attribution per filled cell, so the activity panel
+  // reported "179 changes" and outlined the whole schedule in the importer's
+  // colour — burying the few real edits the panel exists to surface.
+  const context = vm.createContext({ String });
+  vm.runInContext(`
+    var MAX_SPREADSHEET_ATTRIBUTION_NAME = 80;
+    var _ssMirroringFromGoogle = false;
+    var currentUser = () => 'Elizabeth Chaves';
+    ${declaration('_ssAttributionActor')}
+    globalThis.api = {
+      actor: () => _ssAttributionActor(),
+      mirroring: on => { _ssMirroringFromGoogle = on; },
+    };
+  `, context);
+
+  assert.equal(context.api.actor(), 'Elizabeth Chaves', 'a real edit still names its author');
+  context.api.mirroring(true);
+  assert.equal(context.api.actor(), null, 'cells arriving from Google credit nobody');
+  context.api.mirroring(false);
+  assert.equal(context.api.actor(), 'Elizabeth Chaves', 'and it is only suppressed while mirroring');
+});

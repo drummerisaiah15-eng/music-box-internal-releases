@@ -1678,3 +1678,24 @@ test('MB161-028: imported columns use Google’s widths, not a guess', () => {
   assert.match(build, /maxLen \* 8/);
   assert.match(namedFunctionSource('_ssGoogleImport'), /colWidths: sheet\.columnWidths/);
 });
+
+test('MB161-030: the mirroring flag is always cleared, on every path', () => {
+  // A flag that suppresses attribution is exactly the kind that must not stick:
+  // left set, every subsequent edit by a real person would be recorded as
+  // nobody's, which is silent and would not be noticed for a long time.
+  const build = namedFunctionSource('ssImportBuildProject');
+  assert.match(build, /\} finally \{\s*_ssMirroringFromGoogle = false;/,
+    'cleared in a finally around the write');
+  assert.match(build, /catch \(error\) \{\s*_ssMirroringFromGoogle = false;/,
+    'and on the failure path before the write');
+
+  const pull = namedFunctionSource('ssPullFromGoogle');
+  assert.match(pull, /try \{ await ssSave\(\); \} finally \{ _ssMirroringFromGoogle = false; \}/,
+    'and around the sync save');
+
+  // It has to be held across the write, not just the build: the attribution is
+  // stamped by the operations derived during the commit.
+  const set = build.indexOf('_ssMirroringFromGoogle = true');
+  const replace = build.indexOf("STORE.replace('spreadsheets'");
+  assert.ok(set > -1 && replace > set, 'set before the write that carries the cells');
+});

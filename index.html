@@ -7592,7 +7592,27 @@ function _normalizeSpreadsheetAttribution(source, cells) {
   return Object.fromEntries(entries.slice(-MAX_SPREADSHEET_ATTRIBUTIONS));
 }
 
+// MB161-030: true while cells are arriving from Google rather than from a person.
+//
+// Copying a sheet in produced one attribution per filled cell, so the activity
+// panel announced "179 changes" and outlined the entire schedule in the
+// importer's colour — burying the handful of real edits it exists to show.
+// Nobody wants to know who pressed Import; they want to know who changed a
+// lesson.
+//
+// A sync is the same: a change somebody made in Google is not an edit by
+// whoever's Mac happened to notice it, and crediting them would be worse than
+// saying nothing.
+let _ssMirroringFromGoogle = false;
+
 function _ssAttributionActor() {
+  // `typeof` rather than a bare read. The declaration sits above this function,
+  // so whether a given test harness has it depends on which neighbouring
+  // function it happened to slice in — a bare read is a ReferenceError in the
+  // ones that do not, and re-declaring it is a syntax error in the ones that
+  // do. This is the same "bookkeeping must never throw" rule the catch below
+  // already follows.
+  if (typeof _ssMirroringFromGoogle !== 'undefined' && _ssMirroringFromGoogle) return null;
   // Bookkeeping must never be able to fail a merge. An unknown author costs a
   // line of UI; a thrown error here would cost the edit itself.
   let name = null;
@@ -11329,7 +11349,8 @@ async function ssPullFromGoogle(projectId, options) {
       // would re-apply changes it has already taken.
       if (clashes) _ssData._conflicts = conflicts;
       project.googleLink = { ...link, pulledAt: new Date().toISOString(), tabs };
-      await ssSave();
+      _ssMirroringFromGoogle = true;
+      try { await ssSave(); } finally { _ssMirroringFromGoogle = false; }
     }
 
     ssRender();
@@ -11612,6 +11633,7 @@ async function ssImportBuildProject(name, sheets, extraBytes, linkFor) {
     }
 
     await _flushSpreadsheetSave();
+    _ssMirroringFromGoogle = true;
     const next = _cloneJson(normalizeSpreadsheetWorkbook(_ssData));
     // MB161-026: the Google link is attached HERE, inside the one commit that
     // creates the project, rather than by mutating it afterwards and saving
@@ -11635,7 +11657,15 @@ async function ssImportBuildProject(name, sheets, extraBytes, linkFor) {
     }
     next.projects.push(record);
     const normalized = normalizeSpreadsheetWorkbook(next);
-    await STORE.replace('spreadsheets', normalized, { authoritative: 'confirmed workbook import' });
+    try {
+      await STORE.replace('spreadsheets', normalized, { authoritative: 'confirmed workbook import' });
+      // Held until the write that carries the imported cells has completed —
+      // the attribution is stamped by the operations derived during that
+      // commit, not by the build above.
+      await _flushSpreadsheetSave();
+    } finally {
+      _ssMirroringFromGoogle = false;
+    }
     _ssData = normalized;
     showToast('✅ Imported "' + projectName + '" (' + builtSheets.length + ' sheet' + (builtSheets.length !== 1 ? 's' : '') + ')', 'success');
     ssGoHome();
@@ -11644,6 +11674,7 @@ async function ssImportBuildProject(name, sheets, extraBytes, linkFor) {
     // find it again, which is only correct while nothing else can append.
     return (_ssData.projects || []).find(project => project.id === pid) || true;
   } catch (error) {
+    _ssMirroringFromGoogle = false;
     showToast(`That spreadsheet was not imported: ${error?.message || error}`, 'danger');
     return false;
   }
