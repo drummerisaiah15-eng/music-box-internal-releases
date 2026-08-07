@@ -1965,7 +1965,13 @@
 
       <!-- MB161-014: Google Sheets, read-only -->
       <div class="settings-section owner-settings-section" id="owner-google-settings">
-        <div class="settings-section-title">📊 Google Sheets (read-only)</div>
+        <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+          <div class="settings-section-title" style="margin-bottom:0">📊 Google Sheets (read-only)</div>
+          <div class="api-status" id="google-sheets-badge">
+            <div class="api-status-dot"></div>
+            <span>Not connected</span>
+          </div>
+        </div>
         <div class="settings-section-desc">
           Import a Google Sheet into Spreadsheets, and pull it again when it changes in Google.
           <b>This connection can only read.</b> The access Music Box asks Google for is
@@ -10414,11 +10420,28 @@ function _googleSheets() {
   return window.electronGoogleSheets || null;
 }
 
+// MB161-015: the last thing that went wrong, kept so it can be read after the
+// fact. A connection failure used to be a toast that appeared while the person
+// was still in their browser approving the request — by the time they came
+// back it was gone, and all they could see was "not connected" with no reason.
+let _googleLastError = null;
+
 async function refreshGoogleSheetsStatus() {
   const el = document.getElementById('google-sheets-status');
-  if (!el || !_googleSheets()) return null;
+  if (!_googleSheets()) return null;
+  let status = null;
   try {
-    const status = await _googleSheets().status();
+    status = await _googleSheets().status();
+  } catch (error) {
+    // Distinct from "not connected". Returning null for both made the import
+    // dialog tell people to connect an account they had already connected.
+    if (el) el.textContent = `Google status could not be read: ${error?.message || error}`;
+    return null;
+  }
+  // The same pill every other integration in Settings uses, so "is this on?"
+  // is answerable at a glance rather than by reading a sentence.
+  try { setApiStatus('google-sheets-badge', !!status.connected); } catch (_) {}
+  if (el) {
     const idField = document.getElementById('google-client-id');
     if (idField && !idField.value && status.configured) idField.placeholder = 'Saved';
     el.textContent = !status.configured
@@ -10426,12 +10449,12 @@ async function refreshGoogleSheetsStatus() {
       : status.connected
         ? `Connected as ${status.account || 'a Google account'} — read-only access.`
         : 'Client ID saved. Connect a Google account to finish.';
-    el.style.color = status.connected ? '#3a8c5c' : 'var(--text-muted)';
-    return status;
-  } catch (error) {
-    el.textContent = `Google status unavailable: ${error?.message || error}`;
-    return null;
+    if (!status.connected && _googleLastError) {
+      el.textContent += `  Last attempt failed: ${_googleLastError}`;
+    }
+    el.style.color = status.connected ? '#3a8c5c' : (_googleLastError ? '#c0392b' : 'var(--text-muted)');
   }
+  return status;
 }
 
 async function saveGoogleCredentials() {
@@ -10477,10 +10500,15 @@ async function connectGoogleSheets() {
     await _googleSheets().beginAuth({ codeChallenge: challenge });
     showToast('Finish signing in to Google in your browser…', 'info');
     const result = await done;
+    _googleLastError = null;
     showToast(`Google connected as ${result.account || 'your account'} (read-only).`, 'success');
     refreshGoogleSheetsStatus();
   } catch (error) {
-    showToast(`Google was not connected: ${error?.message || error}`, 'danger');
+    // Recorded, not just toasted: the person is usually still in their browser
+    // when this fires, so a transient message is one they never see.
+    _googleLastError = String(error?.message || error).slice(0, 300);
+    console.warn('[google] connection failed:', _googleLastError);
+    showToast(`Google was not connected: ${_googleLastError}`, 'danger');
     refreshGoogleSheetsStatus();
   }
 }
@@ -10500,8 +10528,19 @@ async function disconnectGoogleSheets() {
 async function ssOpenGoogleImport() {
   if (!_googleSheets()) { showToast('Google Sheets is unavailable in this build.', 'warning'); return; }
   const status = await refreshGoogleSheetsStatus();
-  if (!status?.connected) {
-    showToast('Connect a Google account in Settings first.', 'warning');
+  if (!status) {
+    showToast('Google Sheets status could not be read. See Settings → Google Sheets.', 'danger');
+    return;
+  }
+  if (!status.connected) {
+    // Say which of the two things is missing, and carry the last failure —
+    // "connect an account" is unhelpful advice for somebody who just did.
+    showToast(!status.configured
+      ? 'Add the Google OAuth client ID in Settings first.'
+      : _googleLastError
+        ? `Google is not connected. Last attempt failed: ${_googleLastError}`
+        : 'Connect a Google account in Settings → Google Sheets.',
+      'warning');
     return;
   }
   _ssGoogleLookup = null;

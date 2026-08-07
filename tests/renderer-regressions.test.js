@@ -1268,8 +1268,17 @@ test('MB161-014: the client secret field is cleared after saving', () => {
 
 test('MB161-014: import refuses before connecting rather than failing obscurely', () => {
   const open = namedFunctionSource('ssOpenGoogleImport');
-  assert.match(open, /if \(!status\?\.connected\)/);
-  assert.match(open, /Connect a Google account in Settings first/);
+  // MB161-015: "couldn't read the status" and "not connected" are different
+  // problems. Collapsing them told people to connect an account they had just
+  // connected, which is the least useful thing the dialog could have said.
+  assert.match(open, /if \(!status\) \{/, 'an unreadable status says so');
+  assert.match(open, /status could not be read/);
+  assert.match(open, /if \(!status\.connected\)/);
+  assert.match(open, /!status\.configured/,
+    'and a missing client ID is named separately from a missing account');
+  assert.match(open, /Last attempt failed: \$\{_googleLastError\}/,
+    'a failed connection carries its reason forward — the toast fired while the '
+    + 'person was still in their browser');
 });
 
 test('MB161-014: an imported tab goes through the existing validated importer', () => {

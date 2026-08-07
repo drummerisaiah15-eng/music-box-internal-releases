@@ -1223,10 +1223,15 @@ const GOOGLE_TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
 let pendingGoogleOAuth = null;
 let googleOAuthServer = null;
 
+// MB161-015: this page is served the moment Google hands back the authorization
+// code — BEFORE Music Box exchanges it for a token. Saying "connected" here was
+// a lie: the browser reported success while the app was still not connected,
+// and the exchange could fail with the person having been told it worked.
 const GOOGLE_SUCCESS_HTML = `<!doctype html><html><head><meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'">
-<title>Music Box — Connected</title><style>body{font-family:system-ui,sans-serif;text-align:center;padding:80px;background:#f5f2ec;color:#1a1a1a}</style>
-</head><body><h2>Google Sheets connected</h2><p>Read-only access. You can close this tab and return to Music Box.</p></body></html>`;
+<title>Music Box — Returning</title><style>body{font-family:system-ui,sans-serif;text-align:center;padding:80px;background:#f5f2ec;color:#1a1a1a}</style>
+</head><body><h2>Google approved the request</h2><p>Close this tab and go back to Music Box &mdash;
+it will say whether the connection finished.</p></body></html>`;
 const GOOGLE_ERROR_HTML = `<!doctype html><html><head><meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'">
 <title>Music Box — Sign-in failed</title><style>body{font-family:system-ui,sans-serif;text-align:center;padding:80px;background:#f5f2ec;color:#1a1a1a}</style>
