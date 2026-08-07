@@ -1676,6 +1676,11 @@ function workloadApi(now = Date.parse('2026-08-07T12:00:00Z')) {
     ${declaration('_wlEmpty')}
     ${declaration('_ssWorkloadStats')}
     globalThis.api = {
+      seedRoles: (logs, profiles) => {
+        _store.logs = logs; _store.todo_items = []; _store.assigned_tasks = [];
+        _ssData = { projects: [] };
+        _loginProfiles = profiles;
+      },
       seed: (logs, todos, tasks, sheets, roster) => {
         _store.logs = logs; _store.todo_items = todos; _store.assigned_tasks = tasks;
         _ssData = { projects: [{ sheets }] };
@@ -1827,4 +1832,68 @@ test('MB161-042: ordinary fast typing is never mistaken for an import', () => {
   }
   assert.equal(Object.keys(context.norm(stamps, cells)).length, 39,
     'thirty-nine in one second is still credited');
+});
+
+test('MB161-043: an overlapping merge is repaired, not made fatal', () => {
+  // This threw, which meant one bad span made the ENTIRE workbook unsaveable:
+  // the save was refused, the editor was thrown back to the project list, and
+  // the same failure recurred on load — locking people out of their own data.
+  // A span is layout, not content: dropping it keeps the cell and its text.
+  const api = roundTripApi();
+  const out = api.norm({
+    activeProject: 'p1',
+    projects: [{
+      id: 'p1', name: 'P', activeId: 's1',
+      sheets: [{
+        id: 's1', name: 'S', rows: 6, cols: 6, colWidths: [],
+        cells: {
+          // Two merges claiming 1,0.
+          '0,0': { v: 'first',  bg: '', tc: '', b: false, rs: 3, cs: 1 },
+          '1,0': { v: 'second', bg: '', tc: '', b: false, rs: 2, cs: 1 },
+          '4,4': { v: 'elsewhere', bg: '', tc: '', b: false },
+        },
+      }],
+    }],
+  });
+  const cells = out.projects[0].sheets[0].cells;
+  // Nothing was lost, and the workbook loaded at all — which is the point.
+  assert.equal(cells['4,4'].v, 'elsewhere');
+  assert.ok(cells['0,0'] || cells['1,0'], 'the merged cells survive');
+  // And no two spans still claim the same cell.
+  const claimed = new Set();
+  for (const [key, cell] of Object.entries(cells)) {
+    const [row, col] = key.split(',').map(Number);
+    for (let r = row; r < row + (cell.rs || 1); r += 1) {
+      for (let c = col; c < col + (cell.cs || 1); c += 1) {
+        const at = `${r},${c}`;
+        assert.ok(!claimed.has(at), `${at} is claimed twice`);
+        claimed.add(at);
+      }
+    }
+  }
+});
+
+test('MB161-044: the workload leaves out whoever is reading it', () => {
+  // The Owner and the Operations Manager are the reviewers. Listing them beside
+  // the reviewed invites a comparison that means nothing — most of their work
+  // never becomes a log entry or a ticked-off to-do in the first place.
+  const now = Date.now();
+  const day = new Date(now).toISOString().slice(0, 10);
+  const at = new Date(now - 1000).toISOString();
+  const api = workloadApi();
+  api.seedRoles(
+    [{ author: 'Elizabeth', date: day, created: at },
+     { author: 'Megan',     date: day, created: at },
+     { author: 'Ana',       date: day, created: at }],
+    [{ name: 'Elizabeth', role: 'Owner' },
+     { name: 'Megan',     role: 'Operations Manager' },
+     { name: 'Ana',       role: 'Front Desk' },
+     { name: 'Kylie',     role: 'Front Desk' }],
+  );
+  const stats = api.stats(now - 30 * 24 * 60 * 60 * 1000);
+  const people = new Map(stats.people);
+  assert.deepEqual([...people.keys()].sort(), ['Ana', 'Kylie']);
+  // And a reviewer is not reported as a departed profile — she is sitting right
+  // there; her records are simply out of scope.
+  assert.equal(stats.departed, 0);
 });

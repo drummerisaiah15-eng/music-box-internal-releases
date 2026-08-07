@@ -183,9 +183,11 @@ test('Firebase password retrieval needs a session, is issue-once, and is cleared
   // offline until the owner happens to log in. Writing and clearing the
   // credential are still owner-only, which is the boundary that matters:
   // this releases an existing secret rather than letting anyone create one.
+  // MB161-045: "every signed-in profile" is COMMUNICATION_ROLES. Spelling the
+  // roles out here is what let a later role be left behind without failing.
   assert.match(
     mainSource,
-    /_secureHandle\('firebase-runtime-config'[\s\S]*?_requireAppRole\(new Set\(\['Owner', 'Operations & Events', 'Front Desk'\]\)\)/
+    /_secureHandle\('firebase-runtime-config'[\s\S]*?_requireAppRole\(COMMUNICATION_ROLES\)/
   );
   assert.match(mainSource, /if \(firebaseRuntimeSecretIssued\)[\s\S]*already delivered for this app session/);
   assert.match(mainSource, /if \(_validFirebaseConfig\(config\)\) firebaseRuntimeSecretIssued = true/);

@@ -1184,7 +1184,12 @@ test('any signed-in profile can start cloud sync, but only on a provisioned Mac'
   // renderer inheriting a live session already had full Firestore access.
   const handler = main.slice(main.indexOf("_secureHandle('firebase-runtime-config'"));
   const body = handler.slice(0, handler.indexOf('});') + 3);
-  assert.match(body, /_requireAppRole\(new Set\(\['Owner', 'Operations & Events', 'Front Desk'\]\)\)/);
+  // MB161-045: the intent is "any signed-in profile", and this used to assert a
+  // hand-written list of the roles that existed at the time. When Operations
+  // Manager was added, the literal silently excluded it — and the test, by
+  // pinning the literal, made sure it stayed excluded. Assert the set, which is
+  // what the sentence above actually means.
+  assert.match(body, /_requireAppRole\(COMMUNICATION_ROLES\)/);
   // A session is still mandatory: this must not be reachable before login.
   assert.match(body, /_requireAppRole\(/);
   assert.match(body, /firebaseRuntimeSecretIssued/, 'and it is still issue-once per session');
@@ -1693,4 +1698,27 @@ test('MB161-031: the owner keeps everything that is about ownership or secrets',
     assert.match(body, /_requireAppRole\(OPERATIONS_MANAGER_ROLES\)/,
       `${handler} is available to an Operations Manager`);
   }
+});
+
+test('MB161-045: no handler spells out the role list instead of using the set', () => {
+  // Three separate hand-written copies of the role list have now silently
+  // excluded a newly added role: the Manage Users dropdown, the profile-list
+  // validator, and firebase-runtime-config — which left an Operations Manager
+  // running local-only, with no sync and a badge that explained nothing.
+  //
+  // Any handler that means "every signed-in role" must say COMMUNICATION_ROLES.
+  const literals = [...main.matchAll(/_requireAppRole\(new Set\(\[([^\]]*)\]\)\)/g)]
+    .map(match => match[1].trim());
+  for (const literal of literals) {
+    assert.equal(literal, "'Owner'",
+      `a literal role list is a copy waiting to go stale: [${literal}]`);
+  }
+  // And the one set that means "everybody" really does include everybody.
+  const assignable = main.match(/ASSIGNABLE_PROFILE_ROLES = Object\.freeze\(\[([^\]]*)\]\)/)[1];
+  const communication = main.match(/COMMUNICATION_ROLES = new Set\(\[([^\]]*)\]\)/)[1];
+  for (const role of assignable.match(/'[^']+'/g)) {
+    assert.ok(communication.includes(role),
+      `${role} can be assigned but is not in COMMUNICATION_ROLES`);
+  }
+  assert.match(main, /_secureHandle\('firebase-runtime-config'[\s\S]{0,600}?_requireAppRole\(COMMUNICATION_ROLES\)/);
 });

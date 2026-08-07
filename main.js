@@ -2673,7 +2673,14 @@ _secureHandle('firebase-config-status', async () => {
 // secret to an existing session rather than letting anyone create one.
 _secureHandle('firebase-runtime-config', async () => {
   // A session is still required: this must not be reachable before login.
-  _requireAppRole(new Set(['Owner', 'Operations & Events', 'Front Desk']));
+  //
+  // MB161-045: COMMUNICATION_ROLES, not a hand-written copy of it. Spelling the
+  // roles out here meant a role added later — Operations Manager — silently
+  // could not fetch the Firebase configuration, so that profile ran entirely
+  // local-only: no sync, no attribution reaching the other Macs, and a "Local
+  // only" badge with nothing explaining it. Third list of this kind in this
+  // change; every one of them is now derived rather than repeated.
+  _requireAppRole(COMMUNICATION_ROLES);
   if (firebaseRuntimeSecretIssued) {
     throw new Error('Firebase runtime credentials were already delivered for this app session.');
   }

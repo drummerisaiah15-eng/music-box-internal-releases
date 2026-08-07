@@ -926,7 +926,7 @@
        disappeared against the pale fills a schedule is made of, so rows were
        hard to follow across. */
     #ss-grid th, #ss-grid td {
-      border:1px solid #bdc1c6;padding:0;position:relative;overflow:hidden;
+      border:1px solid #9aa0a6;padding:0;position:relative;overflow:hidden;
     }
     #ss-grid th { white-space:nowrap;height:26px; }
     /* A schedule is read by scanning rows and columns. Letting one long note
@@ -8626,22 +8626,53 @@ function normalizeSpreadsheetWorkbook(value) {
         positions.set(cellKey, { row, col, rowSpan, colSpan });
       }
 
+      // MB161-043: repair overlapping merges instead of refusing the workbook.
+      //
+      // This used to throw, which meant one bad merge made the ENTIRE workbook
+      // unsaveable: the save was refused, the editor was thrown back to the
+      // project list, and the same failure recurred on load — locking people
+      // out of their own data over a spanning attribute.
+      //
+      // Nothing is lost by repairing. A span is layout, not content: dropping
+      // it leaves the anchor cell and its text exactly where they are, and the
+      // sheet simply shows an unmerged cell. Refusing the whole workbook, by
+      // contrast, loses everything until somebody intervenes.
       const covered = new Set();
+      let repairedMerges = 0;
       for (const [cellKey, position] of positions) {
-        if (covered.has(cellKey)) {
-          throw new Error('spreadsheets contains overlapping merged cells');
-        }
         if (position.rowSpan === 1 && position.colSpan === 1) continue;
-        for (let row = position.row; row < position.row + position.rowSpan; row++) {
-          for (let col = position.col; col < position.col + position.colSpan; col++) {
-            const coveredKey = `${row},${col}`;
-            if (coveredKey === cellKey) continue;
-            if (Object.prototype.hasOwnProperty.call(cells, coveredKey) || covered.has(coveredKey)) {
-              throw new Error('spreadsheets contains overlapping merged cells');
+        const claims = [];
+        let collides = covered.has(cellKey);
+        if (!collides) {
+          for (let row = position.row; row < position.row + position.rowSpan && !collides; row++) {
+            for (let col = position.col; col < position.col + position.colSpan; col++) {
+              const coveredKey = `${row},${col}`;
+              if (coveredKey === cellKey) continue;
+              if (Object.prototype.hasOwnProperty.call(cells, coveredKey) || covered.has(coveredKey)) {
+                collides = true;
+                break;
+              }
+              claims.push(coveredKey);
             }
-            covered.add(coveredKey);
           }
         }
+        if (collides) {
+          // Keep the cell, drop only the span that cannot be honoured.
+          delete cells[cellKey].rs;
+          delete cells[cellKey].cs;
+          repairedMerges += 1;
+          continue;
+        }
+        for (const claimed of claims) covered.add(claimed);
+      }
+      if (repairedMerges) {
+        try {
+          showToast(
+            `${repairedMerges} overlapping merged cell${repairedMerges === 1 ? ' was' : 's were'} unmerged ` +
+            `so the sheet could be saved. No text was lost.`,
+            'warning'
+          );
+        } catch (_) {}
       }
 
       const normalizedSheet = { id: sheetId, name: sheetName, rows, cols, colWidths, cells };
@@ -10698,9 +10729,47 @@ function ssToggleCheckboxCells() {
 
 function ssMergeCells() {
   const sheet = ssActiveSheet(); if (!sheet) return;
-  const r1=Math.min(_ssSelR,_ssSelR2), r2=Math.max(_ssSelR,_ssSelR2);
-  const c1=Math.min(_ssSelC,_ssSelC2), c2=Math.max(_ssSelC,_ssSelC2);
+  let r1=Math.min(_ssSelR,_ssSelR2), r2=Math.max(_ssSelR,_ssSelR2);
+  let c1=Math.min(_ssSelC,_ssSelC2), c2=Math.max(_ssSelC,_ssSelC2);
   if (r1===r2 && c1===c2) { showToast('Select more than one cell to merge.','warning'); return; }
+
+  // MB161-043: grow the selection over any merge it touches, then clear them.
+  //
+  // Merging only cleared cells INSIDE the selection. A merged block starting
+  // above or to the left of it, but reaching in, kept its span — so the new
+  // merge and the old one both claimed the same cells. The validator refused
+  // the whole workbook, the save failed, and the editor was thrown back to the
+  // project list leaving a half-drawn shape behind. An imported schedule is
+  // built almost entirely from two-row merges, so this was hard to avoid.
+  //
+  // Expanding is what a spreadsheet does: you cannot merge half of a merged
+  // block, so selecting part of one means selecting all of it.
+  for (let grew = true; grew; ) {
+    grew = false;
+    for (const [key, cell] of Object.entries(sheet.cells)) {
+      const rowSpan = cell?.rs > 1 ? cell.rs : 1;
+      const colSpan = cell?.cs > 1 ? cell.cs : 1;
+      if (rowSpan === 1 && colSpan === 1) continue;
+      const [row, column] = key.split(',').map(Number);
+      if (!Number.isSafeInteger(row) || !Number.isSafeInteger(column)) continue;
+      const overlaps = row <= r2 && row + rowSpan - 1 >= r1 &&
+                       column <= c2 && column + colSpan - 1 >= c1;
+      if (!overlaps) continue;
+      const nr1 = Math.min(r1, row), nr2 = Math.max(r2, row + rowSpan - 1);
+      const nc1 = Math.min(c1, column), nc2 = Math.max(c2, column + colSpan - 1);
+      if (nr1 !== r1 || nr2 !== r2 || nc1 !== c1 || nc2 !== c2) grew = true;
+      r1 = nr1; r2 = nr2; c1 = nc1; c2 = nc2;
+    }
+  }
+  // Every span inside the final rectangle is dropped; the loop below then
+  // rebuilds one merge over the whole of it.
+  for (let r = r1; r <= r2; r += 1) {
+    for (let c = c1; c <= c2; c += 1) {
+      const cell = sheet.cells[ssKey(r, c)];
+      if (cell) { delete cell.rs; delete cell.cs; }
+    }
+  }
+  _ssSelR = r1; _ssSelC = c1; _ssSelR2 = r2; _ssSelC2 = c2;
   // Collect all text from the range into anchor
   let combinedText = '';
   for (let r=r1;r<=r2;r++) for (let c=c1;c<=c2;c++) {
@@ -17057,12 +17126,25 @@ function _ssWorkloadStats(sinceMs) {
   // recorded activity is exactly who a workload review should surface. So
   // every current profile starts at zero and appears, and a name belonging to
   // nobody current is counted as departed rather than listed as staff.
-  const roster = new Set((_loginProfiles || []).map(profile => profile.name));
+  // MB161-044: staff only. The Owner and the Operations Manager are the people
+  // READING this, and listing the reviewer alongside the reviewed invites a
+  // comparison that is meaningless — their work is mostly not the kind that
+  // becomes a log entry or a ticked-off to-do in the first place.
+  const roster = new Set((_loginProfiles || [])
+    .filter(profile => profile.role !== 'Owner' && profile.role !== 'Operations Manager')
+    .map(profile => profile.name));
   for (const name of roster) people.set(name, _wlEmpty());
   let departed = 0;
 
+  const reviewers = new Set((_loginProfiles || [])
+    .filter(profile => profile.role === 'Owner' || profile.role === 'Operations Manager')
+    .map(profile => profile.name));
   const of = name => {
     const who = String(name || 'Unknown').slice(0, 80);
+    // A reviewer's own records are out of scope, not the trace of a departed
+    // profile — counting them as departed would report a person who is sitting
+    // right there as gone.
+    if (reviewers.has(who)) return null;
     if (!roster.has(who)) { departed += 1; return null; }
     if (!people.has(who)) people.set(who, _wlEmpty());
     return people.get(who);
