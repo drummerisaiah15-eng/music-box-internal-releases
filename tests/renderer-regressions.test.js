@@ -316,11 +316,10 @@ test('spreadsheet typing, paste, and imports have explicit resource bounds', () 
   assert.match(script, /MAX_SPREADSHEET_CELL_CHARS = 50000/);
   assert.match(script, /MAX_SPREADSHEET_GRID_CELLS = 10000/);
   assert.match(script, /MAX_SPREADSHEET_SYNC_JSON_BYTES = 600000/);
-  assert.match(mainSource, /MAX_SPREADSHEET_SOURCE_BYTES = 5 \* 1024 \* 1024/);
+  // MB161-029: the file importer and its worker are gone. The utility process
+  // remains for PDF text extraction, which is a different feature.
   assert.match(mainSource, /utilityProcess\.fork\(workerPath/);
-  assert.match(mainSource, /spreadsheet-worker\.js/);
-  assert.match(preloadSource, /importFile:\s+\(\) => ipcRenderer\.invoke\('import-spreadsheet'\)/);
-  assert.doesNotMatch(namedFunctionSource('ssImportFile'), /FileReader|XLSX\.read/);
+  assert.ok(!mainSource.includes('spreadsheet-worker.js'));
   assert.match(namedFunctionSource('ssImportBuildProject'), /normalizeSpreadsheetWorkbook\(next\)/);
   // V160-005: import is an explicit whole-workbook replacement, so it uses the
   // reviewed STORE.replace() path rather than STORE.set(). It must NOT silently

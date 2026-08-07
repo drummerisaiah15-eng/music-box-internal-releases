@@ -337,7 +337,8 @@ test('build config pins deterministic updater artifact names', () => {
   assert.equal(packageMetadata.devDependencies['@electron/fuses'], '1.8.0');
   assert.equal(packageMetadata.devDependencies['@electron/asar'], '3.4.1');
   assert.ok(packageMetadata.build.files.includes('pdf-worker.js'));
-  assert.ok(packageMetadata.build.files.includes('spreadsheet-worker.js'));
+  // MB161-029: spreadsheet-worker.js is gone with the file importer.
+  assert.ok(!packageMetadata.build.files.includes('spreadsheet-worker.js'));
   assert.ok(
     packageMetadata.build.asarUnpack.includes('node_modules/@napi-rs/canvas/**'),
   );

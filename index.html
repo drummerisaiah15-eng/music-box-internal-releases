@@ -9451,7 +9451,6 @@ function ssGoHome() {
     document.getElementById('ss-page-sub').textContent = 'Your projects — click one to open';
     document.getElementById('ss-header-actions').innerHTML =
       `<button class="btn btn-ghost btn-sm" onclick="ssOpenGoogleImport()" style="color:var(--text-secondary);border:1.5px solid var(--text-secondary);border-radius:8px;padding:6px 14px">📊 From Google Sheets</button>
-       <button class="btn btn-ghost btn-sm" onclick="ssImportFile()" style="color:var(--text-secondary);border:1.5px solid var(--text-secondary);border-radius:8px;padding:6px 14px">↑ Import Spreadsheet</button>
        <button class="btn btn-primary" onclick="ssNewProject()">+ New Project</button>`;
   }
   ssRenderHomeView();
@@ -11411,25 +11410,6 @@ function _ssCellKeyFromA1(a1) {
 }
 
 // ── Import ──
-let _ssImportInFlight = false;
-
-async function ssImportFile() {
-  if (_ssBlockedWorkbook || _ssAwaitingAuthority || _ssImportInFlight || !window.electronSpreadsheet?.importFile) return;
-  _ssImportInFlight = true;
-  try {
-    const result = await window.electronSpreadsheet.importFile();
-    if (!result?.ok) throw new Error(result?.error || 'The spreadsheet could not be imported.');
-    if (result.canceled) return;
-    _ssShowProjNameModal('Name This Project', result.suggestedName, async name => {
-      await ssImportBuildProject(name, result.sheets);
-    });
-  } catch (error) {
-    showToast(`Could not import spreadsheet: ${error?.message || error}`, 'danger');
-  } finally {
-    _ssImportInFlight = false;
-  }
-}
-
 // MB161-018: a fill or text colour arriving from outside the app. Strict on
 // purpose — anything that is not a plain six-digit hex becomes "no colour"
 // rather than being stored and rendered as whatever CSS makes of it.

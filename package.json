@@ -60,8 +60,7 @@
     "files": [
       "main.js",
       "preload.js",
-      "pdf-worker.js",
-      "spreadsheet-worker.js"
+      "pdf-worker.js"
     ],
     "extraResources": [
       {

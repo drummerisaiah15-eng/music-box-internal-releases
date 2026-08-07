@@ -38,7 +38,6 @@ const pendingFlushRequests = new Map();
 const MAX_IPC_STRING = 32 * 1024;
 const MAX_SYNC_BYTES = 8 * 1024 * 1024;
 const MAX_IMPORT_BYTES = 20 * 1024 * 1024;
-const MAX_SPREADSHEET_SOURCE_BYTES = 5 * 1024 * 1024;
 const MAX_SPREADSHEET_RESULT_BYTES = 700000;
 const MAX_SPREADSHEET_RECOVERY_BYTES = 8 * 1024 * 1024;
 const MAX_PDF_TEXT_BYTES = 4 * 1024 * 1024;
@@ -846,92 +845,14 @@ _secureHandle('read-text-file', async (_event, capability) => {
   }
 });
 
-function _parseSpreadsheetInUtility(filePath) {
-  return new Promise((resolve, reject) => {
-    const workerPath = path.join(__dirname, 'spreadsheet-worker.js');
-    const vendorPath = path.join(
-      app.isPackaged ? process.resourcesPath : __dirname,
-      'vendor',
-      'sheetjs-0.20.3',
-      'xlsx.full.min.js'
-    );
-    let settled = false;
-    let child;
-    const finish = (error, result) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (child?.pid) child.kill();
-      if (error) reject(error);
-      else resolve(result);
-    };
-    const timer = setTimeout(() => {
-      finish(new Error('Spreadsheet import timed out after 20 seconds.'));
-    }, 20000);
-
-    try {
-      child = utilityProcess.fork(workerPath, [], {
-        env: {
-          LANG: typeof process.env.LANG === 'string' ? process.env.LANG : 'en_US.UTF-8',
-          LC_ALL: typeof process.env.LC_ALL === 'string' ? process.env.LC_ALL : 'en_US.UTF-8',
-        },
-        execArgv: ['--max-old-space-size=256'],
-        stdio: 'ignore',
-        serviceName: 'Music Box Spreadsheet Parser',
-        allowLoadingUnsignedLibraries: false,
-      });
-      child.once('spawn', () => child.postMessage({ filePath, vendorPath }));
-      child.once('message', message => {
-        let serialized = '';
-        try { serialized = JSON.stringify(message); } catch (_) {}
-        if (!_isPlainObject(message) || message.ok !== true ||
-            !Array.isArray(message.sheets) || message.sheets.length < 1 ||
-            Buffer.byteLength(serialized, 'utf8') > MAX_SPREADSHEET_RESULT_BYTES) {
-          finish(new Error(
-            _isPlainObject(message) && typeof message.error === 'string'
-              ? message.error.slice(0, 500)
-              : 'The separate spreadsheet parser returned an invalid result.'
-          ));
-          return;
-        }
-        finish(null, message.sheets);
-      });
-      child.once('error', () => finish(new Error('The separate spreadsheet parser stopped unexpectedly.')));
-      child.once('exit', code => {
-        if (!settled) finish(new Error(`The separate spreadsheet parser exited before completing (${code}).`));
-      });
-    } catch (error) {
-      finish(error);
-    }
-  });
-}
-
-_secureHandle('import-spreadsheet', async () => {
-  _requireAppRole(COMMUNICATION_ROLES);
-  const result = await dialog.showOpenDialog(mainWindow, {
-    properties: ['openFile'],
-    filters: [{ name: 'Spreadsheets', extensions: ['csv', 'xlsx', 'xls'] }],
-  });
-  if (result.canceled || !result.filePaths?.length) return { ok: true, canceled: true };
-  const selectedPath = await fs.promises.realpath(result.filePaths[0]);
-  const extension = path.extname(selectedPath).toLowerCase();
-  const stat = await fs.promises.stat(selectedPath);
-  if (!['.csv', '.xlsx', '.xls'].includes(extension) ||
-      !stat.isFile() || stat.size < 1 || stat.size > MAX_SPREADSHEET_SOURCE_BYTES) {
-    return { ok: false, error: 'Choose a non-empty CSV, XLSX, or XLS file no larger than 5 MB.' };
-  }
-  try {
-    const sheets = await _parseSpreadsheetInUtility(selectedPath);
-    return {
-      ok: true,
-      canceled: false,
-      suggestedName: path.basename(selectedPath, extension).slice(0, 160) || 'Imported Spreadsheet',
-      sheets,
-    };
-  } catch (error) {
-    return { ok: false, error: error?.message || 'The spreadsheet could not be imported.' };
-  }
-});
+// MB161-029: importing a spreadsheet FILE is gone.
+//
+// The studio brings its sheets in from Google, so the file path was a second
+// way to do the same job that nobody used — and it was the larger attack
+// surface of the two: a file dialog, a path realpath'd and stat'd, and an
+// untrusted .xlsx parsed in a utility process. Removing it removes all of that.
+// Exporting a recovery bundle is a different thing and stays; it is the only
+// way out of a quarantined workbook.
 
 function _isAllowedHttpsUrl(value, allowedDomains) {
   try {

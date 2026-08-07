@@ -1860,8 +1860,6 @@ test('V160-002: the read-only hold is released in both directions', () => {
 });
 
 test('V160-002: every editing entry point is refused while the editor is held', () => {
-  assert.ok(script.includes('_ssBlockedWorkbook || _ssAwaitingAuthority || _ssImportInFlight'),
-    'ssImportFile is gated');
   assert.ok(script.includes('_ssBlockedWorkbook || _ssAwaitingAuthority || !_ssData'),
     'ssImportBuildProject and ssOpenProject are gated');
   // The chokepoint every edit funnels through.

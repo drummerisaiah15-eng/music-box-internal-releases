@@ -73,9 +73,10 @@ contextBridge.exposeInMainWorld('electronSync', {
   write: (data) => ipcRenderer.invoke('write-sync-file', data),
 });
 
+// MB161-029: exporting a recovery bundle only. Importing a spreadsheet file was
+// removed with its handler — sheets come from Google now.
 contextBridge.exposeInMainWorld('electronSpreadsheet', {
   exportRecovery: (contents) => ipcRenderer.invoke('export-spreadsheet-recovery', contents),
-  importFile:     () => ipcRenderer.invoke('import-spreadsheet'),
 });
 
 // MB161-014/021: Google Sheets, READ ONLY. There is no write method on this

@@ -397,26 +397,38 @@ test('PDF import uses a bounded utility process with expression evaluation disab
   assert.match(main, /_execFileText\('\/usr\/bin\/textutil'/);
 });
 
-test('spreadsheet import and recovery use bounded main-process capabilities', () => {
-  const worker = fs.readFileSync(path.join(__dirname, '..', 'spreadsheet-worker.js'), 'utf8');
-  assert.match(main, /_secureHandle\('import-spreadsheet'/);
-  assert.match(main, /_requireAppRole\(COMMUNICATION_ROLES\)/);
-  assert.match(main, /MAX_SPREADSHEET_SOURCE_BYTES = 5 \* 1024 \* 1024/);
-  assert.match(main, /Music Box Spreadsheet Parser/);
-  assert.match(main, /Spreadsheet import timed out after 20 seconds/);
-  assert.match(worker, /const MAX_GRID_CELLS = 10000/);
-  assert.match(worker, /const MAX_TOTAL_CHARS = 400000/);
-  assert.ok(
-    worker.indexOf('validateWorksheetRange(XLSX, worksheet, totals)') <
-      worker.indexOf('XLSX.utils.sheet_to_json(worksheet'),
-    'declared XLSX dimensions are checked before row expansion'
-  );
+test('MB161-029: importing a spreadsheet FILE is gone, recovery export is not', () => {
+  // The studio brings sheets in from Google, so the file path was a second way
+  // to do the same job that nobody used — and it was the larger attack surface
+  // of the two: a file dialog, a path realpath'd and stat'd, and an untrusted
+  // .xlsx parsed in a utility process. Asserted as absence, since that is the
+  // property that regresses quietly.
+  for (const gone of [
+    "_secureHandle('import-spreadsheet'", '_parseSpreadsheetInUtility',
+    'MAX_SPREADSHEET_SOURCE_BYTES', 'Music Box Spreadsheet Parser',
+    'Spreadsheet import timed out',
+  ]) {
+    assert.ok(!main.includes(gone), `main.js must not contain ${gone}`);
+  }
+  assert.ok(!preload.includes("invoke('import-spreadsheet')"),
+    'and the bridge does not offer it');
+  // The parser it forked is no longer shipped at all.
+  assert.ok(!fs.existsSync(path.join(__dirname, '..', 'spreadsheet-worker.js')),
+    'the worker file is deleted');
+  const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+  assert.ok(!pkg.build.files.includes('spreadsheet-worker.js'),
+    'and is not listed for packaging');
+
+  // Exporting a recovery bundle is a different thing and must survive: it is
+  // the only way out of a quarantined workbook.
   assert.match(main, /_secureHandle\('export-spreadsheet-recovery'/);
   assert.match(main, /MAX_SPREADSHEET_RECOVERY_BYTES = 8 \* 1024 \* 1024/);
   assert.match(main, /await _atomicWriteFile\(destination, contents, 0o600\)/);
   assert.match(preload, /exposeInMainWorld\('electronSpreadsheet'/);
-  assert.match(preload, /ipcRenderer\.invoke\('import-spreadsheet'\)/);
   assert.match(preload, /ipcRenderer\.invoke\('export-spreadsheet-recovery', contents\)/);
+
+  // The PDF parser still forks a utility process; only the spreadsheet one went.
+  assert.match(main, /Music Box PDF Parser/);
 });
 
 test('only exact packaged vendor scripts are admitted by the file request gate', () => {
