@@ -10665,6 +10665,22 @@ let _ssGoogleBusy = false;
 // So an action somebody actually took waits for its turn and says so, and only
 // gives up after a bounded wait. Background work still yields immediately —
 // it has nothing to prove and will run again shortly.
+// MB161-024: hand the main thread back so the window can repaint.
+//
+// Everything after the last read — trimming, checkpointing, building six
+// sheets, normalising, encrypting — is synchronous, and on a six-tab schedule
+// that is seconds of work with the UI pinned. Without a yield the modal keeps
+// showing "Reading Saturday… (6 of 6)" throughout, so the app looks frozen on
+// the read that in fact finished first.
+function _ssYield() {
+  return new Promise(resolve => setTimeout(resolve, 0));
+}
+
+async function _ssGoogleStatus(el, text) {
+  if (el) el.textContent = text;
+  await _ssYield();
+}
+
 async function _ssGoogleAcquire(waitMs = 10000) {
   const started = Date.now();
   while (_ssGoogleBusy) {
@@ -10872,6 +10888,28 @@ async function ssGoogleLookup() {
 const GOOGLE_IMPORT_ROWS = 500;
 const GOOGLE_IMPORT_COLUMNS = 100;
 
+// MB161-024: ask for the tab that exists, not the biggest tab allowed.
+//
+// Every read requested 500x100 no matter what, so a 26-column schedule came
+// back with 74 columns of nothing — and since every cell now carries a fill, a
+// text colour and both of Google's two ways of expressing each, "nothing" is
+// not cheap. Roughly three quarters of the response, the JSON parse and the
+// per-cell loop were spent on cells that do not exist.
+//
+// `describe` already reports each tab's real grid; the UI prints it. Using it
+// costs nothing and is bounded by the same ceilings as before.
+function _ssTabWindow(title) {
+  const tab = (_ssGoogleLookup?.tabs || []).find(entry => entry.title === title);
+  const rows = Number(tab?.rows);
+  const columns = Number(tab?.columns);
+  return {
+    rows: Math.min(Number.isSafeInteger(rows) && rows > 0 ? rows : GOOGLE_IMPORT_ROWS,
+                   GOOGLE_IMPORT_ROWS),
+    columns: Math.min(Number.isSafeInteger(columns) && columns > 0 ? columns : GOOGLE_IMPORT_COLUMNS,
+                      GOOGLE_IMPORT_COLUMNS),
+  };
+}
+
 function ssGoogleImportTab(title) { return _ssGoogleImport([title]); }
 
 function ssGoogleImportAllTabs() {
@@ -10902,17 +10940,18 @@ async function _ssGoogleImport(titles) {
   try {
     const read = [];
     for (const title of wanted) {
-      if (el) el.textContent = wanted.length > 1
+      await _ssGoogleStatus(el, wanted.length > 1
         ? `Reading ${title}… (${read.length + 1} of ${wanted.length})`
-        : `Reading ${title}…`;
+        : `Reading ${title}…`);
       // Sequential on purpose. Six parallel grid reads is the shape that trips
       // Google's per-minute quota, and the failure it returns then looks like a
       // permissions problem rather than a rate limit.
+      const window = _ssTabWindow(title);
       read.push(await _googleSheets().read({
         spreadsheetId: _ssGoogleLookup.spreadsheetId,
         title,
-        rows: GOOGLE_IMPORT_ROWS,
-        columns: GOOGLE_IMPORT_COLUMNS,
+        rows: window.rows,
+        columns: window.columns,
       }));
     }
 
@@ -10939,6 +10978,28 @@ async function _ssGoogleImport(titles) {
       }
     }
 
+    // MB161-024: the reads already report how many filled cells each tab holds,
+    // so an import that cannot possibly fit is refused here — in microseconds —
+    // rather than after building six sheets, stringifying them and measuring
+    // the result. The whole workbook is capped at MAX_SPREADSHEET_TOTAL_CELLS,
+    // and six tabs of a full schedule sail past it, so this is the common case
+    // rather than an edge one. The real check still runs inside the importer;
+    // this only stops the expensive path being taken to reach a refusal.
+    const incomingCells = read.reduce((sum, sheet) => sum + (sheet.filledCells || 0), 0);
+    const earlyRefusal = _ssCapacityRefusal(_ssData, { cells: incomingCells });
+    if (earlyRefusal) {
+      if (el) {
+        el.textContent = `That would add ${incomingCells.toLocaleString()} filled cells. ${earlyRefusal}`;
+        el.style.color = '#c0392b';
+      }
+      try { ssRenderCapacityNotice(); } catch (_) {}
+      return;
+    }
+
+    await _ssGoogleStatus(el, wanted.length > 1
+      ? `Building ${wanted.length} sheets…`
+      : 'Building the sheet…');
+
     // The importer validates dimensions, bounds every cell and — since
     // MB161-011 — refuses before writing anything if it will not fit.
     const name = (wanted.length === 1
@@ -10954,6 +11015,7 @@ async function _ssGoogleImport(titles) {
 
     // `sheetName`, not `name` — that is the field the importer reads, and
     // passing the wrong one silently lands the tab as "Sheet 1".
+    await _ssGoogleStatus(el, 'Saving…');
     const created = await ssImportBuildProject(name, read.map((sheet, i) => ({
       sheetName: wanted[i],
       rows: sheet.rows,
@@ -10967,10 +11029,13 @@ async function _ssGoogleImport(titles) {
         if (!read[i]) return;
         tabs[sheet.id] = { title: wanted[i], checkpoint: checkpoints[i] };
       });
+      const windows = wanted.map(_ssTabWindow);
       created.googleLink = {
         spreadsheetId: _ssGoogleLookup.spreadsheetId,
-        rows: GOOGLE_IMPORT_ROWS,
-        columns: GOOGLE_IMPORT_COLUMNS,
+        // The widest tab imported, so a later sync reads enough for all of them
+        // without going back to asking for the maximum allowed.
+        rows: Math.max(...windows.map(w => w.rows)),
+        columns: Math.max(...windows.map(w => w.columns)),
         pulledAt: new Date().toISOString(),
         tabs,
       };

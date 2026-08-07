@@ -1516,3 +1516,50 @@ test('MB161-019: an ordinary cell is still one clipped line', () => {
   assert.match(rule, /text-overflow:ellipsis/);
   assert.match(rule, /height:26px/);
 });
+
+test('MB161-024: a read asks for the tab that exists, not the largest allowed', () => {
+  // Every read requested 500x100 regardless, so a 26-column schedule came back
+  // with 74 columns of nothing — and since MB161-022 each cell carries a fill,
+  // a text colour and both of Google's two ways of expressing each, "nothing"
+  // is not cheap. Roughly three quarters of the payload, the parse and the
+  // per-cell loop went on cells that do not exist.
+  const window = namedFunctionSource('_ssTabWindow');
+  assert.match(window, /_ssGoogleLookup\?\.tabs \|\| \[\]/, 'the real grid comes from describe');
+  assert.match(window, /Math\.min\([\s\S]*GOOGLE_IMPORT_ROWS\)/, 'still bounded by the ceiling');
+  assert.match(window, /Math\.min\([\s\S]*GOOGLE_IMPORT_COLUMNS\)/);
+
+  const importPath = namedFunctionSource('_ssGoogleImport');
+  assert.match(importPath, /const window = _ssTabWindow\(title\)/);
+  assert.match(importPath, /rows: window\.rows/);
+  assert.match(importPath, /columns: window\.columns/);
+  // And the stored link records what was actually needed, so later syncs are
+  // just as cheap rather than reverting to the maximum.
+  assert.match(importPath, /rows: Math\.max\(\.\.\.windows\.map\(w => w\.rows\)\)/);
+});
+
+test('MB161-024: the phase is named, so a slow step is not mistaken for a stuck one', () => {
+  // Reported as "freezing on the last sheet". It was not the last sheet: the
+  // label said "Reading Saturday… (6 of 6)" and then never changed, while
+  // trimming, checkpointing, building six sheets, normalising and encrypting
+  // all ran synchronously behind it. The read had already finished.
+  const importPath = namedFunctionSource('_ssGoogleImport');
+  assert.match(importPath, /_ssGoogleStatus\(el, wanted\.length > 1/, 'reads are announced');
+  assert.match(importPath, /Building \$\{wanted\.length\} sheets…/, 'and so is the build');
+  assert.match(importPath, /_ssGoogleStatus\(el, 'Saving…'\)/, 'and the save');
+
+  const status = namedFunctionSource('_ssGoogleStatus');
+  assert.match(status, /await _ssYield\(\)/,
+    'setting text is useless without giving the thread back to paint it');
+  assert.match(namedFunctionSource('_ssYield'), /setTimeout\(resolve, 0\)/);
+});
+
+test('MB161-024: an import that cannot fit is refused before it is built', () => {
+  // The reads already report filled-cell counts, so a workbook-capacity
+  // refusal costs microseconds here instead of arriving after six sheets have
+  // been built, stringified and measured.
+  const importPath = namedFunctionSource('_ssGoogleImport');
+  const build = importPath.indexOf('await ssImportBuildProject');
+  const early = importPath.indexOf('_ssCapacityRefusal');
+  assert.ok(early > -1 && early < build, 'the cheap check comes first');
+  assert.match(importPath, /read\.reduce\(\(sum, sheet\) => sum \+ \(sheet\.filledCells \|\| 0\), 0\)/);
+});
