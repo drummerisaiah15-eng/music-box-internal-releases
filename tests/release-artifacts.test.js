@@ -1211,3 +1211,19 @@ test('release gate fails when the DMG has no stapled notarization ticket', t => 
     /ticket was not found/,
   );
 });
+
+test('MB1188 minor: App Transport Security is not claimed to be narrowed', () => {
+  // A previous attempt set mac.extendInfo.NSAppTransportSecurity with
+  // NSAllowsArbitraryLoads: false. Verifying the BUILT Info.plist showed it had
+  // no effect: electron-builder deep-merges extendInfo into Electron's own ATS
+  // block and the existing `true` wins, so the shipped app still allowed
+  // arbitrary loads while package.json said otherwise.
+  //
+  // Config that does not do what it says is worse than absent config, so it is
+  // gone. Narrowing ATS needs an afterPack step that rewrites the plist, plus a
+  // check of the built artifact — not a config key that is silently ignored.
+  const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+  const ats = pkg.build?.mac?.extendInfo?.NSAppTransportSecurity;
+  assert.equal(ats, undefined,
+    'if this is set again, verify NSAllowsArbitraryLoads in the built Info.plist');
+});

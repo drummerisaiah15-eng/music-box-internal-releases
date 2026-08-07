@@ -47,13 +47,7 @@
           ]
         }
       ],
-      "darkModeSupport": true,
-      "extendInfo": {
-        "NSAppTransportSecurity": {
-          "NSAllowsArbitraryLoads": false,
-          "NSAllowsLocalNetworking": true
-        }
-      }
+      "darkModeSupport": true
     },
     "dmg": {
       "title": "Music Box Internal",
