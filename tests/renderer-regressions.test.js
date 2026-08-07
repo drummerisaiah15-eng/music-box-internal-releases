@@ -2075,3 +2075,55 @@ test('MB1188-019: typing in the formula bar and clicking away saves it', () => {
   assert.match(blur, /sheet\.cells\[k\] = \{ \.\.\.\(sheet\.cells\[k\] \|\| \{\}\), v: ssBoundedCellValue\(e\.target\.value\) \}/);
   assert.match(blur, /ssSave\(\)/);
 });
+
+test('MB1188-004/005: the pull holds ids, never objects, across its awaits', () => {
+  // `project`, `link` and each `target` were captured before the loop, and the
+  // first `await ssSave()` replaces _ssData with a freshly normalized clone. So
+  // from tab two onward the writes landed in a detached copy: a six-tab pull
+  // persisted tab one, reported all six, advanced no checkpoint — so the next
+  // pull repeated the whole thing — and silently dropped any conflict it had
+  // just told the user was kept.
+  const pull = namedFunctionSource('ssPullFromGoogle');
+
+  // Only ids and plain values survive the loop boundary.
+  assert.match(pull, /const projectId = project\.id;/);
+  assert.match(pull, /const plan = linked\.map\(entry => \(\{ sheetId: entry\.sheet\.id, tab: entry\.tab \}\)\);/);
+  assert.match(pull, /for \(const \{ sheetId, tab \} of plan\)/);
+
+  // The live objects are re-acquired after the read, which is itself an await.
+  assert.match(pull, /const live = \(_ssData\?\.projects \|\| \[\]\)\.find\(entry => entry\.id === projectId\)/);
+  assert.match(pull, /const target = \(live\.sheets \|\| \[\]\)\.find\(entry => entry\.id === sheetId\)/);
+  // And the case where it vanished mid-pull is handled rather than crashed on.
+  assert.match(pull, /if \(!live\) break;/);
+  assert.match(pull, /if \(!target\) continue;/);
+  assert.match(pull, /if \(!liveLink\) break;/);
+
+  // Nothing accumulates outside the loop any more.
+  assert.doesNotMatch(pull, /const tabs = \{ \.\.\.link\.tabs \};/);
+  assert.doesNotMatch(pull, /project\.googleLink = \{/,
+    'the detached project reference must not be written to');
+
+  // Cells, checkpoint, link and conflicts all go into the live workbook before
+  // the save that persists them.
+  const write = pull.indexOf('live.googleLink = {');
+  const conflict = pull.indexOf('_ssData._conflicts = [');
+  const save = pull.indexOf('const saving = ssSave();');
+  assert.ok(write > -1 && conflict > -1 && save > -1);
+  assert.ok(write < save && conflict < save,
+    'a checkpoint that advances without its cells, or a conflict announced but not stored, is worse than skipping the tab');
+});
+
+test('MB1188-002: importing does not revert the studio to legacy storage', () => {
+  // The 'spreadsheets' key is the INDEX under split storage. Writing a whole
+  // workbook into it undid the per-project isolation, made migration run again
+  // on the next launch, and put every project back in one contended document.
+  const build = namedFunctionSource('ssImportBuildProject');
+  assert.match(build, /if \(_ssStorageMode\(\) === 'split'\) \{/);
+  const split = build.slice(build.indexOf("if (_ssStorageMode() === 'split')"), build.indexOf('} else {'));
+  assert.doesNotMatch(split, /STORE\.replace/,
+    'a split store commits through the normal save path, not a whole-key write');
+  assert.match(split, /_ssData = normalized;\s*\n\s*await _flushSpreadsheetSave\(\);/);
+  // The legacy branch survives for a Mac that has not migrated, where the key
+  // really does hold a workbook.
+  assert.match(build, /await STORE\.replace\('spreadsheets', normalized, \{ authoritative: 'confirmed workbook import' \}\)/);
+});

@@ -11508,14 +11508,34 @@ async function ssPullFromGoogle(projectId, options) {
     let changed = 0;
     let dropped = 0;
     let clashes = 0;
-    const tabs = { ...link.tabs };
-    const conflicts = Array.isArray(_ssData._conflicts) ? [..._ssData._conflicts] : [];
+    // MB1188-004/005: hold IDs across the loop, never objects.
+    //
+    // `project`, `link` and each `target` were captured before the loop, and
+    // the first `await ssSave()` replaces _ssData with a freshly normalized
+    // clone. From the second tab onward every one of those references pointed
+    // at a detached copy — the writes went somewhere real, just not into the
+    // workbook about to be saved. So a six-tab pull persisted tab one and
+    // reported all six, and no checkpoint advanced, so the next pull did it all
+    // over again. The same detachment threw away any conflict raised along the
+    // way, after the UI had already promised it was kept.
+    const projectId = project.id;
+    const plan = linked.map(entry => ({ sheetId: entry.sheet.id, tab: entry.tab }));
+    const spreadsheetId = link.spreadsheetId;
+    const readRows = link.rows;
+    const readColumns = link.columns;
 
-    for (const { sheet: target, tab } of linked) {
+    for (const { sheetId, tab } of plan) {
       const remote = await _googleSheets().read({
-        spreadsheetId: link.spreadsheetId, title: tab.title,
-        rows: link.rows, columns: link.columns,
+        spreadsheetId, title: tab.title, rows: readRows, columns: readColumns,
       });
+
+      // Re-acquired AFTER the read, because the read is an await as well.
+      const live = (_ssData?.projects || []).find(entry => entry.id === projectId);
+      if (!live) break;                      // project deleted while reading
+      const target = (live.sheets || []).find(entry => entry.id === sheetId);
+      if (!target) continue;                 // sheet deleted while reading
+      const liveLink = live.googleLink;
+      if (!liveLink) break;                  // unlinked while reading
       // A tab that grew in Google returns more rows than the sheet has. Writing
       // them anyway produces an out-of-range cell, which the workbook validator
       // refuses outright — the sync would appear to work and then quarantine the
@@ -11556,6 +11576,7 @@ async function ssPullFromGoogle(projectId, options) {
       const checkpoint = tab.checkpoint || {};
       const existing = target.cells || {};
       const cells = {};
+      const newConflicts = [];
       const keys = new Set([
         ...Object.keys(existing), ...incoming.keys(), ...Object.keys(checkpoint),
       ]);
@@ -11578,7 +11599,7 @@ async function ssPullFromGoogle(projectId, options) {
           if (outcome.cell) cells[key] = outcome.cell;
           if (outcome.take === 'conflict') {
             clashes += 1;
-            conflicts.push({
+            newConflicts.push({
               id: _ssConflictId(['google', link.spreadsheetId, tab.title, key,
                 String(checkpoint[key] ?? ''), String(local?.v ?? ''), String(incomingCell?.v ?? '')]),
               kind: 'cell', projectId: project.id, sheetId: target.id, target: key,
@@ -11611,14 +11632,27 @@ async function ssPullFromGoogle(projectId, options) {
       // The checkpoint describes exactly the extent the app kept, never what
       // Google sent, so a row that did not fit cannot later read as "deleted".
       const kept = (remote.rows || []).slice(0, rowsThatFit).map(row => row.slice(0, colsThatFit));
-      tabs[target.id] = { ...tab, checkpoint: _ssGoogleCheckpoint(kept), mergeSig };
       changed += tabChanged;
+
+      // Cells, checkpoint, link and any conflict this tab produced are written
+      // into the LIVE workbook and committed together. A checkpoint that
+      // advanced without its cells, or a conflict announced without being
+      // stored, is worse than not syncing the tab at all.
+      live.googleLink = {
+        ...liveLink,
+        pulledAt: new Date().toISOString(),
+        tabs: { ...liveLink.tabs, [sheetId]: { ...tab, checkpoint: _ssGoogleCheckpoint(kept), mergeSig } },
+      };
+      if (newConflicts.length) {
+        _ssData._conflicts = [
+          ...(Array.isArray(_ssData._conflicts) ? _ssData._conflicts : []),
+          ...newConflicts,
+        ];
+      }
 
       // Persisted per tab. A failure on the fourth tab must not leave the first
       // three merged in memory against their old checkpoints, or the next sync
       // would re-apply changes it has already taken.
-      if (clashes) _ssData._conflicts = conflicts;
-      project.googleLink = { ...link, pulledAt: new Date().toISOString(), tabs };
       // MB161-040: the flag is set and cleared around the save with nothing
       // awaited in between. Holding it ACROSS an await would suppress the
       // attribution of anything a person typed while a background sync happened
@@ -11935,11 +11969,30 @@ async function ssImportBuildProject(name, sheets, extraBytes, linkFor) {
     next.projects.push(record);
     const normalized = normalizeSpreadsheetWorkbook(next);
     try {
-      await STORE.replace('spreadsheets', normalized, { authoritative: 'confirmed workbook import' });
-      // Held until the write that carries the imported cells has completed —
-      // the attribution is stamped by the operations derived during that
-      // commit, not by the build above.
-      await _flushSpreadsheetSave();
+      // MB1188-002: commit through the SAME path a normal edit uses.
+      //
+      // This used to write the whole workbook straight into the 'spreadsheets'
+      // key. Under split storage that key is the INDEX — a list of project
+      // ids — so putting a workbook there silently reverted the whole studio
+      // to the legacy single-document model. That undid the per-project
+      // isolation, made migration run again on the next launch, and put every
+      // project back into one contended document.
+      //
+      // Assigning _ssData and staging an ordinary save routes through
+      // _ssCommitSplitWorkbook, which writes one new project document plus the
+      // index record — exactly what creating a project by hand does. The
+      // legacy path is kept for a Mac that has not migrated yet, where the key
+      // really does hold a workbook.
+      if (_ssStorageMode() === 'split') {
+        _ssData = normalized;
+        await _flushSpreadsheetSave();
+      } else {
+        await STORE.replace('spreadsheets', normalized, { authoritative: 'confirmed workbook import' });
+        // Held until the write that carries the imported cells has completed —
+        // the attribution is stamped by the operations derived during that
+        // commit, not by the build above.
+        await _flushSpreadsheetSave();
+      }
     } finally {
       _ssMirroringFromGoogle = false;
     }
