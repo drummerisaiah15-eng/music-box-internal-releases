@@ -1660,3 +1660,90 @@ test('MB161-036: four Macs each keep their own subtotal against one cap', () => 
   api.spend('claude-haiku-4-5-20251001', 5_000_000, 0);       // +$5 => $21
   assert.equal(api.capped(), true, 'and one more tips the studio over it');
 });
+
+// ── MB161-039: workload analytics ──────────────────────────────────────────
+
+function workloadApi(now = Date.parse('2026-08-07T12:00:00Z')) {
+  const context = vm.createContext({ Object, Array, Number, String, Math, JSON, Map, Set, Date });
+  vm.runInContext(`
+    var _now = ${now};
+    var Date_ = Date;
+    var _store = {};
+    var STORE = { get: (k, d) => (k in _store ? _store[k] : d) };
+    var _ssData = { projects: [] };
+    var _timestampMs = v => (typeof v === 'string' ? (Date.parse(v) || 0) : 0);
+    ${declaration('_wlEmpty')}
+    ${declaration('_ssWorkloadStats')}
+    globalThis.api = {
+      seed: (logs, todos, tasks, sheets) => {
+        _store.logs = logs; _store.todo_items = todos; _store.assigned_tasks = tasks;
+        _ssData = { projects: [{ sheets }] };
+      },
+      stats: since => {
+        const s = _ssWorkloadStats(since);
+        return { people: [...s.people.entries()], weeks: s.weeks, unattributed: s.unattributed };
+      },
+    };
+  `, context);
+  return context.api;
+}
+
+test('MB161-039: spreadsheet edits count towards a profile, imports do not', () => {
+  const now = Date.now();
+  const since = now - 30 * 24 * 60 * 60 * 1000;
+  const recent = new Date(now - 2 * 24 * 60 * 60 * 1000).toISOString();
+  const api = workloadApi();
+  api.seed(
+    [{ author: 'Emma', date: new Date(now).toISOString().slice(0, 10), created: recent }],
+    [{ done: true, doneBy: 'Emma', doneAt: recent }],
+    [],
+    [{ editedBy: {
+      '0,0': { by: 'Emma', at: recent },
+      '0,1': { by: 'Carrie', at: recent },
+      // Older than the window.
+      '0,2': { by: 'Emma', at: new Date(now - 90 * 24 * 60 * 60 * 1000).toISOString() },
+      // An import leaves no `by` at all (MB161-030), so it cannot be counted.
+      '0,3': { at: recent },
+    } }],
+  );
+  const stats = api.stats(since);
+  const people = new Map(stats.people);
+  assert.equal(people.get('Emma').cells, 1, 'only the edit inside the window');
+  assert.equal(people.get('Carrie').cells, 1);
+  assert.equal(people.get('Emma').logs, 1);
+  assert.equal(people.get('Emma').todos, 1);
+  // An unattributed stamp creates no phantom profile.
+  assert.ok(!people.has('undefined') && !people.has(''));
+});
+
+test('MB161-039: the three counts are never merged into one number', () => {
+  // A person who edits 300 cells has not done thirty times the work of somebody
+  // who wrote ten log entries. Keeping them separate is the whole point; a
+  // single total would invite exactly that reading.
+  const api = workloadApi();
+  const now = Date.now();
+  const at = new Date(now - 1000).toISOString();
+  api.seed([], [], [], [{ editedBy: Object.fromEntries(
+    Array.from({ length: 300 }, (_, i) => [`0,${i}`, { by: 'Ana', at }])) }]);
+  const counts = new Map(api.stats(now - 30 * 24 * 60 * 60 * 1000).people).get('Ana');
+  assert.equal(counts.cells, 300);
+  assert.equal(counts.logs, 0);
+  assert.equal(counts.todos, 0);
+  // No combined figure exists to be mistaken for a productivity number.
+  assert.deepEqual(Object.keys(counts).sort(), ['cells', 'logs', 'todos']);
+
+  // And the prompt says so, since the model would otherwise happily add them.
+  const run = declaration('ssRunStaffWorkload');
+  assert.match(run, /Never add them together or treat a larger number as more work done/);
+});
+
+test('MB161-039: the charts do not depend on the AI answering', () => {
+  // The counts are arithmetic on data already present. Drawing them only after
+  // a successful AI call would mean a spent budget or a network failure left
+  // the page blank, when the numbers were available the whole time.
+  const run = declaration('ssRunStaffWorkload');
+  const charts = run.indexOf('_ssWorkloadChartHtml(stats)');
+  const send = run.indexOf('_sendAiMessage(');
+  assert.ok(charts > -1 && send > -1 && charts < send,
+    'the charts are rendered before the request is made');
+});

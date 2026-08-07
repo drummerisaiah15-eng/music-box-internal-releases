@@ -1765,9 +1765,12 @@ test('MB161-032: completions record who, and unknown ones stay unknown', () => {
   assert.match(mark, /const \{ doneBy, doneAt, \.\.\.rest \} = item/,
     'un-ticking clears the name, so it cannot linger on a task that is open again');
 
-  const run = namedFunctionSource('ssRunStaffWorkload');
-  assert.match(run, /if \(!item\.doneBy\) \{ unattributed \+= 1; return; \}/);
-  assert.match(run, /have no name recorded/, 'and the count is shown rather than hidden');
+  // The counting moved into _ssWorkloadStats when the charts arrived; the rule
+  // did not change.
+  assert.match(namedFunctionSource('_ssWorkloadStats'),
+    /if \(!item\.doneBy\) \{ unattributed \+= 1; return; \}/);
+  assert.match(namedFunctionSource('ssRunStaffWorkload'), /have no name recorded/,
+    'and the count is shown rather than hidden');
 });
 
 test('MB161-033: every AI caller respects the monthly pause and records its spend', () => {

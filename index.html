@@ -1016,6 +1016,23 @@
       cursor:pointer;user-select:none;
     }
     .ss-check.ss-check-on { background:#1a73e8;border-color:#1a73e8;color:#fff; }
+    /* MB161-039: workload charts. Plain divs rather than a charting library —
+       the CSP forbids remote scripts, and a stacked bar is a width. */
+    .wl-row { display:flex;align-items:center;gap:12px;padding:7px 0; }
+    .wl-name { width:150px;flex-shrink:0;font-size:13px;font-weight:600;color:var(--text-primary);
+               overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
+    .wl-track { flex:1;display:flex;height:20px;border-radius:5px;overflow:hidden;background:var(--surface-2);min-width:60px; }
+    .wl-seg { height:100%; }
+    .wl-total { width:104px;flex-shrink:0;text-align:right;font-size:12px;color:var(--text-secondary);font-variant-numeric:tabular-nums; }
+    .wl-legend { display:flex;gap:16px;flex-wrap:wrap;margin:2px 0 14px;font-size:11.5px;color:var(--text-secondary); }
+    .wl-key { display:inline-flex;align-items:center;gap:6px; }
+    .wl-dot { width:10px;height:10px;border-radius:3px;display:inline-block; }
+    .wl-weeks { display:flex;align-items:flex-end;gap:10px;height:96px;padding:6px 0 0; }
+    .wl-week { flex:1;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;gap:5px; }
+    .wl-bar { width:100%;max-width:56px;border-radius:4px 4px 0 0;background:var(--sidebar-accent, #c4922a);min-height:2px; }
+    .wl-week-label { font-size:10.5px;color:var(--text-muted);white-space:nowrap; }
+    .wl-heading { font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;
+                  color:var(--text-muted);margin:0 0 10px; }
     .ss-cell-input {
       position:absolute;inset:0;border:none;outline:none;
       padding:3px 6px;font-size:13px;font-family:inherit;
@@ -1468,6 +1485,10 @@
           <b>Not a performance score</b>, and not sound grounds on its own for a decision
           about someone's job.
         </div>
+      </div>
+
+      <div class="card mb-5" id="workload-charts-card" style="display:none">
+        <div id="workload-charts"></div>
       </div>
 
       <div class="card" id="workload-card">
@@ -16951,6 +16972,125 @@ function hasOperationsRole() {
 // serious thing to get wrong. So the prompt is told to describe and compare
 // workload, to say when the log is too thin to support a conclusion, and not to
 // rank anybody, and the modal says the same in plain sight above the result.
+// MB161-039: the numbers behind the workload review.
+//
+// Three sources, deliberately kept separate rather than added into one score:
+// entries written in the Daily Log, to-dos ticked off, and cells edited in a
+// spreadsheet. They measure different things and are not interchangeable — a
+// person who edits 300 cells has not done thirty times the work of somebody who
+// wrote ten log entries, and stacking them into a single "points" figure would
+// invite exactly that reading.
+const WL_COLOURS = Object.freeze({
+  logs:   '#c4922a',
+  todos:  '#0f9d58',
+  cells:  '#4f7cc4',
+});
+
+function _wlEmpty() { return { logs: 0, todos: 0, cells: 0 }; }
+
+function _ssWorkloadStats(sinceMs) {
+  const sinceDay = new Date(sinceMs).toISOString().slice(0, 10);
+  const people = new Map();
+  const weeks = [0, 0, 0, 0];
+  const of = name => {
+    const who = String(name || 'Unknown').slice(0, 80);
+    if (!people.has(who)) people.set(who, _wlEmpty());
+    return people.get(who);
+  };
+  const weekIndex = ms => {
+    const age = Date.now() - ms;
+    if (!Number.isFinite(age) || age < 0) return 0;
+    return Math.min(3, Math.floor(age / (7 * 24 * 60 * 60 * 1000)));
+  };
+
+  let unattributed = 0;
+
+  for (const entry of STORE.get('logs', []) || []) {
+    if (String(entry?.date || '') < sinceDay) continue;
+    of(entry.author).logs += 1;
+    weeks[weekIndex(_timestampMs(entry.created) || Date.parse(entry.date) || Date.now())] += 1;
+  }
+
+  const countTick = item => {
+    if (!item?.done) return;
+    const at = _timestampMs(item.doneAt);
+    if (item.doneAt && at < sinceMs) return;
+    // Completions before MB161-032 carry no name. Counted separately rather
+    // than assigned to somebody who may not have done it.
+    if (!item.doneBy) { unattributed += 1; return; }
+    of(item.doneBy).todos += 1;
+    weeks[weekIndex(at || Date.now())] += 1;
+  };
+  (STORE.get('todo_items', []) || []).forEach(countTick);
+  (STORE.get('assigned_tasks', []) || []).forEach(countTick);
+
+  // Spreadsheet edits. `editedBy` is per sheet and already excludes imports and
+  // syncs (MB161-030), so this is somebody actually typing in a cell.
+  for (const project of _ssData?.projects || []) {
+    for (const sheet of project.sheets || []) {
+      for (const stamp of Object.values(sheet.editedBy || {})) {
+        const at = _timestampMs(stamp?.at);
+        if (!stamp?.by || at < sinceMs) continue;
+        of(stamp.by).cells += 1;
+        weeks[weekIndex(at)] += 1;
+      }
+    }
+  }
+
+  return { people, weeks, unattributed };
+}
+
+// A stacked bar per person, and a four-week trend. Widths are shares of the
+// busiest person, so the chart shows relative load rather than implying that a
+// long bar is a good one.
+function _ssWorkloadChartHtml(stats) {
+  const rows = [...stats.people.entries()]
+    .map(([name, counts]) => ({ name, counts, total: counts.logs + counts.todos + counts.cells }))
+    .filter(row => row.total > 0)
+    .sort((a, b) => b.total - a.total);
+  if (!rows.length) return '';
+  const busiest = rows[0].total || 1;
+
+  const legend = `<div class="wl-legend">
+    <span class="wl-key"><span class="wl-dot" style="background:${WL_COLOURS.logs}"></span>Log entries</span>
+    <span class="wl-key"><span class="wl-dot" style="background:${WL_COLOURS.todos}"></span>To-dos ticked off</span>
+    <span class="wl-key"><span class="wl-dot" style="background:${WL_COLOURS.cells}"></span>Spreadsheet cells edited</span>
+  </div>`;
+
+  const bars = rows.map(row => {
+    const share = row.total / busiest;
+    const seg = (value, colour, label) => value > 0
+      ? `<div class="wl-seg" style="width:${((value / row.total) * 100).toFixed(2)}%;background:${colour}" title="${escAttr(label)}"></div>`
+      : '';
+    return `<div class="wl-row">
+      <div class="wl-name" title="${escAttr(row.name)}">${escHtml(row.name)}</div>
+      <div class="wl-track" style="max-width:${(share * 100).toFixed(2)}%">
+        ${seg(row.counts.logs,  WL_COLOURS.logs,  `${row.counts.logs} log entries`)}
+        ${seg(row.counts.todos, WL_COLOURS.todos, `${row.counts.todos} to-dos`)}
+        ${seg(row.counts.cells, WL_COLOURS.cells, `${row.counts.cells} cells`)}
+      </div>
+      <div class="wl-total">${row.counts.logs} · ${row.counts.todos} · ${row.counts.cells}</div>
+    </div>`;
+  }).join('');
+
+  const peak = Math.max(...stats.weeks, 1);
+  const weekLabels = ['This week', '1 week ago', '2 weeks ago', '3 weeks ago'];
+  const trend = stats.weeks.map((count, i) => `<div class="wl-week">
+      <div class="wl-week-label">${count}</div>
+      <div class="wl-bar" style="height:${Math.round((count / peak) * 62)}px"></div>
+      <div class="wl-week-label">${escHtml(weekLabels[i])}</div>
+    </div>`).reverse().join('');
+
+  return `<div class="wl-heading">Recorded activity by profile</div>${legend}${bars}
+    <div class="wl-heading" style="margin-top:22px">Everything recorded, by week</div>
+    <div class="wl-weeks">${trend}</div>
+    <div style="font-size:11.5px;color:var(--text-muted);margin-top:10px">
+      Bars are relative to the busiest profile. The three figures are log entries,
+      to-dos ticked off and spreadsheet cells edited — kept separate because they
+      measure different things and do not add up into a score.
+    </div>`;
+}
+
 async function ssRunStaffWorkload() {
   if (!canManageStudio()) return;
   const out = document.getElementById('workload-result');
@@ -16975,6 +17115,16 @@ async function ssRunStaffWorkload() {
     const sinceMs = Date.now() - 30 * 24 * 60 * 60 * 1000;
     const sinceDay = new Date(sinceMs).toISOString().slice(0, 10);
 
+    // MB161-039: the counts are arithmetic on data already here, so they are
+    // drawn straight away rather than waiting on the AI — and they are still
+    // there if the AI call fails or the month's budget is spent.
+    const stats = _ssWorkloadStats(sinceMs);
+    const chartsCard = document.getElementById('workload-charts-card');
+    const chartsEl = document.getElementById('workload-charts');
+    const chartHtml = _ssWorkloadChartHtml(stats);
+    if (chartsEl) chartsEl.innerHTML = chartHtml;
+    if (chartsCard) chartsCard.style.display = chartHtml ? '' : 'none';
+
     // ── What people wrote down ──
     const entries = (STORE.get('logs', []) || [])
       .filter(entry => String(entry?.date || '') >= sinceDay);
@@ -16985,22 +17135,9 @@ async function ssRunStaffWorkload() {
     // MB161-032, so anything finished before this build is counted as unknown
     // rather than quietly assigned to somebody. Saying "we do not know" is the
     // only honest option when the record was never kept.
-    const ticks = new Map();
-    let unattributed = 0;
-    const countTick = (item, kind) => {
-      if (!item?.done) return;
-      const at = _timestampMs(item.doneAt);
-      if (item.doneAt && at < sinceMs) return;
-      if (!item.doneBy) { unattributed += 1; return; }
-      const who = String(item.doneBy).slice(0, 80);
-      if (!ticks.has(who)) ticks.set(who, { team: 0, personal: 0 });
-      ticks.get(who)[kind] += 1;
-    };
-    (STORE.get('todo_items', []) || []).forEach(item => countTick(item, 'team'));
-    (STORE.get('assigned_tasks', []) || []).forEach(item => countTick(item, 'personal'));
-
-    if (!entries.length && !ticks.size) {
-      out.textContent = 'Nothing logged or ticked off in the last 30 days.';
+    const unattributed = stats.unattributed;
+    if (!stats.people.size) {
+      out.textContent = 'Nothing logged, ticked off or edited in the last 30 days.';
       return;
     }
 
@@ -17016,17 +17153,20 @@ async function ssRunStaffWorkload() {
       }
     }
 
-    const everyone = [...new Set([...byAuthor.keys(), ...ticks.keys()])].sort();
+    const everyone = [...stats.people.keys()].sort();
     const counts = everyone.map(name => {
-      const tick = ticks.get(name) || { team: 0, personal: 0 };
-      return `${name}: ${(byAuthor.get(name) || []).length} log entries, ` +
-             `${tick.personal} personal to-dos and ${tick.team} team to-dos ticked off`;
+      const c = stats.people.get(name);
+      return `${name}: ${c.logs} log entries, ${c.todos} to-dos ticked off, ` +
+             `${c.cells} spreadsheet cells edited`;
     }).join('\n');
 
+    const totals = [...stats.people.values()].reduce((sum, c) => ({
+      logs: sum.logs + c.logs, todos: sum.todos + c.todos, cells: sum.cells + c.cells,
+    }), _wlEmpty());
     if (countsEl) {
       countsEl.textContent =
-        `${entries.length} log entries and ${[...ticks.values()].reduce((n, t) => n + t.team + t.personal, 0)} ` +
-        `completed to-dos across ${everyone.length} profiles` +
+        `${totals.logs} log entries, ${totals.todos} completed to-dos and ` +
+        `${totals.cells.toLocaleString()} spreadsheet edits across ${everyone.length} profiles` +
         (unattributed ? ` · ${unattributed} to-dos completed before this build have no name recorded` : '');
     }
 
@@ -17048,6 +17188,11 @@ async function ssRunStaffWorkload() {
         'how consistently they log and close out to-dos, and anything they appear ' +
         'to be carrying alone. Then give a short "worth a conversation" list of ' +
         'workload imbalances or gaps in coverage.\n\n' +
+        'You are given three counts per person: log entries, to-dos ticked off, ' +
+        'and spreadsheet cells edited. They measure different things and are NOT ' +
+        'interchangeable — editing three hundred cells is not thirty times the ' +
+        'work of ten log entries, it is usually one afternoon of scheduling. ' +
+        'Never add them together or treat a larger number as more work done.\n\n' +
         'Rules you must follow:\n' +
         '- Do NOT rank people, score them, or say who is most or least productive.\n' +
         '- These records show what somebody wrote down and ticked off, not what ' +
