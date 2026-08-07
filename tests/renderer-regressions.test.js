@@ -421,9 +421,12 @@ test('task dropdown behavior includes added users at the intended authority leve
     ['Elizabeth Chaves', 'Carrie Gass', 'Ana Chaves', "Quinn O'Neil"]);
   assert.deepEqual(evaluateFor('Carrie Gass'),
     ['Carrie Gass', 'Ana Chaves', "Quinn O'Neil"]);
-  assert.deepEqual(evaluateFor('Ana Chaves'), ['Ana Chaves'],
-    'front desk delegates to nobody, but still gets themselves');
-  assert.deepEqual(evaluateFor("Quinn O'Neil"), ["Quinn O'Neil"]);
+  // MB161-048: front desk assigns nothing at all. My Tasks is where work is
+  // HANDED to somebody; a front-desk profile writing its own entries there
+  // turns a delegation list into a second private to-do list nobody watches.
+  // Team To-Do is the shared list and stays open to everyone.
+  assert.deepEqual(evaluateFor('Ana Chaves'), []);
+  assert.deepEqual(evaluateFor("Quinn O'Neil"), []);
 
   // MB161-031: an Operations Manager delegates to everyone except the Owner.
   profiles.push({ name: 'Dana Reid', role: 'Operations Manager' });
@@ -433,7 +436,7 @@ test('task dropdown behavior includes added users at the intended authority leve
     'and never the Owner');
 
   // Nobody appears twice, whichever branch put them there.
-  for (const who of ['Elizabeth Chaves', 'Carrie Gass', 'Ana Chaves', 'Dana Reid']) {
+  for (const who of ['Elizabeth Chaves', 'Carrie Gass', 'Dana Reid']) {
     const list = evaluateFor(who);
     assert.equal(new Set(list).size, list.length, `${who} is listed once`);
     assert.ok(list.includes(who), `${who} can assign to themselves`);
@@ -1959,4 +1962,36 @@ test('MB161-046: the figures refresh themselves, the AI summary does not', () =>
     'refreshing the charts must never trigger a paid request');
   assert.doesNotMatch(bodyOf('ssWorkloadDataChanged'), /_sendAiMessage|ssRunStaffWorkload/);
   assert.doesNotMatch(bodyOf('ssRenderWorkloadCharts'), /_sendAiMessage/);
+});
+
+test('MB161-047: no key lock is ever taken twice on the same path', () => {
+  // _serializeKeyMutation is a promise chain per key, so asking for a key the
+  // caller already holds chains the request onto the very task waiting for it.
+  // It can never resolve.
+  //
+  // _ssCommitSplitWorkbook runs INSIDE the 'spreadsheets' mutation and used to
+  // take that lock again to write the index. It only bites when the index
+  // changes — an ordinary cell edit rewrites a project document and leaves the
+  // index alone — which is why it looked intermittent: importing froze at
+  // "Saving…", deleting hung, and the sync badge stuck because the queue behind
+  // it never moved again.
+  // namedFunctionSource stops at the next `\nfunction `, and the neighbour here
+  // is `async function`, so the slice overruns into the migration — which uses
+  // that lock legitimately, because it runs outside the save path. Bound it.
+  const whole = namedFunctionSource('_ssCommitSplitWorkbook');
+  const commit = whole.slice(0, whole.indexOf('\n}\n') + 2);
+  assert.ok(commit.includes('_ssReadStoredWorkbook()'), 'the slice covers the real body');
+  assert.doesNotMatch(commit, /_serializeKeyMutation\('spreadsheets'/,
+    "the caller already holds 'spreadsheets'; taking it again deadlocks");
+  // The index is still written, just directly.
+  assert.match(commit, /await _commitEncryptedSnapshot\('spreadsheets', JSON\.stringify\(nextIndex\)/);
+  // Per-project keys are different keys, so those locks are correct and stay.
+  assert.match(commit, /await _serializeKeyMutation\(key, async \(\) => \{/);
+
+  // And the save path really is the holder, which is what makes the above true.
+  assert.match(script, /const write = _serializeKeyMutation\('spreadsheets', async \(\) => \{/);
+
+  // The migration writes the index under the lock, which is correct because it
+  // runs outside the save path — fire-and-forget from the loader.
+  assert.match(script, /_ssMigrateToSplitStorage\(\)\.catch\(\(\) => \{\}\)/);
 });

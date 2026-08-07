@@ -3823,3 +3823,47 @@ test('MB161-036: nothing in sync assumes exactly two Macs', () => {
   //    two people editing different projects never touch the same document.
   assert.ok(script.includes('_ssProjectSyncKey'));
 });
+
+test('MB161-047: awaiting a key lock you already hold never returns', async () => {
+  // The claim behind the fix, demonstrated with the real function rather than
+  // reasoned about — the failure was invisible: no error, no rejection, just a
+  // promise that never settles and a save queue that never moves again.
+  //
+  // Note the precise shape. Re-entering is only fatal when the outer task
+  // AWAITS the inner one, which is what the real code did. My first attempt at
+  // this test did not await, so the inner call simply ran after the outer
+  // finished and the test reported no deadlock at all.
+  const context = vm.createContext({ Promise, Map, Set, setTimeout });
+  vm.runInContext(`
+    var _keyMutationChains = new Map();
+    ${declaration('_serializeKeyMutation')}
+    globalThis.serialize = (key, task) => _serializeKeyMutation(key, task);
+  `, context);
+
+  const raced = async (promise, ms) => {
+    let timedOut = false;
+    await Promise.race([
+      promise.then(() => {}, () => {}),
+      new Promise(resolve => setTimeout(() => { timedOut = true; resolve(); }, ms)),
+    ]);
+    return timedOut;
+  };
+
+  // A DIFFERENT key from inside: completes normally. This is the pattern the
+  // per-project document writes use, and it has to keep working.
+  let otherKeyRan = false;
+  const differentKey = context.serialize('spreadsheets', async () => {
+    await context.serialize('spreadsheet_proj_1', async () => { otherKeyRan = true; });
+  });
+  assert.equal(await raced(differentKey, 100), false, 'a different key does not block');
+  assert.equal(otherKeyRan, true);
+
+  // The SAME key, awaited from inside: never settles.
+  let sameKeyRan = false;
+  const sameKey = context.serialize('logs', async () => {
+    await context.serialize('logs', async () => { sameKeyRan = true; });
+  });
+  assert.equal(await raced(sameKey, 150), true,
+    'awaiting a lock this task already holds waits on itself, forever');
+  assert.equal(sameKeyRan, false, 'and the inner task never runs');
+});

@@ -8243,11 +8243,23 @@ async function _ssCommitSplitWorkbook(dirtyBase, dirty) {
     : null;
   const nextIndex = _ssIndexAfterEdit(currentIndex, dirtyBase, dirty, at, [..._ssDeletedProjectIds]);
   if (JSON.stringify(nextIndex) !== JSON.stringify(currentIndex)) {
-    await _serializeKeyMutation('spreadsheets', async () => {
-      await _commitEncryptedSnapshot('spreadsheets', JSON.stringify(nextIndex), nextIndex, {
-        sync: true,
-        operationId: _newOperationId(),
-      });
+    // MB161-047: written WITHOUT re-acquiring the 'spreadsheets' lock.
+    //
+    // _serializeKeyMutation is a promise chain per key, so asking for a key the
+    // caller already holds chains the request onto the very task that is
+    // waiting for it. It can never resolve. This runs inside the
+    // 'spreadsheets' mutation, so taking that lock again deadlocked — silently
+    // and permanently, taking the save queue with it.
+    //
+    // It only bites when the INDEX changes, which is why it looked
+    // intermittent: an ordinary cell edit rewrites a project document and
+    // leaves the index alone. Adding or deleting a project changes it — so
+    // importing froze at "Saving…", deleting hung, imported projects never
+    // finished being written, and the sync badge stuck at "1 not synced"
+    // because the queue behind it never moved again.
+    await _commitEncryptedSnapshot('spreadsheets', JSON.stringify(nextIndex), nextIndex, {
+      sync: true,
+      operationId: _newOperationId(),
     });
     written.push('spreadsheets');
   }
@@ -17513,9 +17525,18 @@ function getAssignableStaff() {
         .filter(profile => profile.role === 'Front Desk')
         .map(profile => profile.name);
     }
-    // Front Desk delegates to nobody — but still gets themselves, below.
-    return [];
+    // MB161-048: Front Desk assigns nothing at all, not even to themselves.
+    //
+    // I gave them self-assignment in MB161-038 on the reasoning that a to-do
+    // for yourself is not authority over anybody. That reasoning still holds in
+    // the abstract, and it was still the wrong call here: My Tasks is where
+    // work is HANDED to a person, and a front-desk profile writing its own
+    // entries there turns a delegation list into a second, private to-do list
+    // that nobody else is watching. Team To-Do is the shared list and remains
+    // open to everyone.
+    return null;
   })();
+  if (others === null) return [];
   if (!me) return others;
   return others.includes(me) ? others : [me, ...others];
 }
