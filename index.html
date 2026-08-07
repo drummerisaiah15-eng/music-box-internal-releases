@@ -1754,7 +1754,8 @@
             <span id="ss-formula-label">CELL</span>
             <input id="ss-formula-bar" placeholder="Select a cell to see its full text"
               spellcheck="false" autocapitalize="off" autocorrect="off"
-              onkeydown="ssFormulaBarKey(event)" onblur="ssUpdateToolbar()"
+              onkeydown="ssFormulaBarKey(event)"
+              onfocus="ssFormulaBarFocus()" onblur="ssFormulaBarBlur(event)"
               title="Full contents of the selected cell — edit here and press Return" />
           </div>
           <!-- Color Key -->
@@ -6507,12 +6508,17 @@ async function _bootstrapSync() {
 // spinner is worth bounding regardless. A timeout does not make a stuck write
 // succeed; it makes it SAYABLE, which is the difference between a bug somebody
 // can report and one they can only describe as "it froze".
-function _withTimeout(promise, ms, what) {
+function _withTimeout(promise, ms, what, local = false) {
   return Promise.race([
     promise,
     new Promise((_, reject) => setTimeout(
+      // MB1188-015: stage-specific. The same wrapper guards the local write and
+      // the cloud write, and claiming "still saved locally" when it was the
+      // LOCAL step that timed out would be a reassurance we cannot support.
       () => reject(new Error(`${what} did not finish within ${Math.round(ms / 1000)} seconds. ` +
-        `Nothing was lost — your work is still here and still saved locally.`)),
+        (local
+          ? 'Your work is still on screen and nothing was discarded, but it may not be written to this Mac yet — try Save All again.'
+          : 'Your work is saved on this Mac; it has not reached the cloud yet.'))),
       ms)),
   ]);
 }
@@ -6522,8 +6528,8 @@ async function saveAllData() {
   if (btn) { btn.textContent = '💾 Saving…'; btn.disabled = true; }
   try {
     const keys = getSyncKeys().filter(key => Object.prototype.hasOwnProperty.call(_decCache, key));
-    await _withTimeout(_flushSpreadsheetSave(), 30000, 'Saving the spreadsheets');
-    await _withTimeout(STORE.flush(keys), 30000, 'The local save');
+    await _withTimeout(_flushSpreadsheetSave(), 30000, 'Saving the spreadsheets', true);
+    await _withTimeout(STORE.flush(keys), 30000, 'The local save', true);
     if (!_syncReady || !_firestoreDb || !_syncBootstrapComplete) {
       throw new Error('Firebase is not connected; local encrypted saves completed, but cloud sync did not');
     }
@@ -7581,6 +7587,7 @@ const PAGE_TITLES = {
   dashboard: 'Dashboard',
   email: 'Email Hub',
   imessage: 'Messages Hub',
+  voicemail: 'Voicemail Hub',
   log: 'Daily Log',
   workload: 'Staff Workload',
   spreadsheets: 'Spreadsheets',
@@ -7838,6 +7845,7 @@ function _ssProjectDocToWorkbook(doc) {
     sheets: doc?.sheets,
   };
   if (doc && doc.colorKey !== undefined) project.colorKey = doc.colorKey;
+  if (doc && doc.googleLink !== undefined) project.googleLink = doc.googleLink;
   const workbook = { activeProject: doc?.id, projects: [project] };
   if (Array.isArray(doc?._conflicts) && doc._conflicts.length) {
     workbook._conflicts = doc._conflicts;
@@ -7858,6 +7866,7 @@ function _ssWorkbookToProjectDoc(workbook) {
     sheets: project.sheets,
   };
   if (project.colorKey !== undefined) doc.colorKey = project.colorKey;
+  if (project.googleLink !== undefined) doc.googleLink = project.googleLink;
   if (Array.isArray(workbook._conflicts) && workbook._conflicts.length) {
     doc._conflicts = workbook._conflicts;
   }
@@ -7980,7 +7989,16 @@ function _ssProjectAsDoc(workbook, projectId) {
     activeId: project.activeId,
     sheets: project.sheets,
   };
+  // MB1188-001: googleLink travels with the project, in EVERY direction.
+  //
+  // colorKey was carried and googleLink was not, so a linked project lost its
+  // spreadsheet id, tab map and checkpoints the moment it went through split
+  // storage — on save, on assembly, on migration, on restart. The card stopped
+  // showing the badge, "Sync now" vanished, and nothing explained why. It also
+  // made an imported project look like it had disappeared, because the thing
+  // that made it a Google project was gone.
   if (project.colorKey !== undefined) doc.colorKey = project.colorKey;
+  if (project.googleLink !== undefined) doc.googleLink = project.googleLink;
   const conflicts = (workbook?._conflicts || [])
     .filter(entry => String(entry?.projectId ?? '') === wanted);
   if (conflicts.length) doc._conflicts = conflicts;
@@ -8125,6 +8143,7 @@ function _ssAssembleWorkbook(index, documents) {
     if (!doc) continue;
     const project = { id: doc.id, name: doc.name, activeId: doc.activeId, sheets: doc.sheets };
     if (doc.colorKey !== undefined) project.colorKey = doc.colorKey;
+    if (doc.googleLink !== undefined) project.googleLink = doc.googleLink;
     projects.push(project);
     for (const conflict of (doc._conflicts || [])) conflicts.push(conflict);
     for (const id of (doc._resolvedConflicts || [])) settled.push(id);
@@ -9979,6 +9998,15 @@ function ssOpenProject(id) {
   // content and must not trigger a full workbook sync write. Active project/sheet
   // selection is saved as a side effect of the next real content edit.
   const proj = ssActiveProject();
+  // MB1188-006: start automatic Google checking HERE, on the path people
+  // actually use.
+  //
+  // I put this in ssSwitchProject, which has no call sites at all — every
+  // project card calls ssOpenProject. So Settings promised the app checks
+  // Google every few minutes and nothing was ever scheduled. The dead function
+  // is removed below rather than left to be found again.
+  ssStartAutoSync();
+  ssAutoSyncTick(true);
   document.getElementById('ss-home-view').style.display = 'none';
   document.getElementById('ss-editor-view').style.display = '';
   document.getElementById('ss-page-title').textContent = proj.name;
@@ -10857,17 +10885,10 @@ function ssUpdateCellRef() {
 }
 
 // ── Project-level ──
-function ssSwitchProject(id) {
-  if (_ssEditCell) ssCommitEdit();
-  _ssData.activeProject = id;
-  _ssSelR=0;_ssSelC=0;_ssSelR2=0;_ssSelC2=0;_ssEditCell=null;
-  // MB-008: Switching projects is view-state navigation; no workbook sync write.
-  ssRender();
-  // MB161-021: opening a linked project is the moment somebody most wants it to
-  // be current, so check then rather than waiting out the interval.
-  ssStartAutoSync();
-  ssAutoSyncTick(true);
-}
+// MB1188-006: ssSwitchProject is gone. It had no call sites — every project
+// card calls ssOpenProject — so the automatic-sync start it contained never
+// ran. Deleted rather than fixed, because a function nobody calls is where
+// the next piece of dead behaviour would have gone too.
 
 let _ssProjNameCallback = null;
 function _ssShowProjNameModal(title, defaultVal, cb) {
@@ -11209,7 +11230,7 @@ async function ssGoogleLookup() {
         </div>`).join('') +
       `<div style="font-size:11.5px;color:var(--text-muted);margin-top:10px">` +
       `Up to 500 rows × 100 columns are read. Fills, text colour, bold, checkboxes and ` +
-      `merged cells come across; formulas import as their result, and column widths do not.</div>`;
+      `merged cells and column widths all come across; formulas import as their result.</div>`;
   } catch (error) {
     el.textContent = error?.message || String(error);
     el.style.color = '#c0392b';

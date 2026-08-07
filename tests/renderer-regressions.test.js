@@ -2013,7 +2013,65 @@ test('MB161-049: Save All cannot wait forever', () => {
     assert.ok(awaited.startsWith('_withTimeout('),
       `unbounded await in Save All: ${awaited.slice(0, 60)}`);
   }
-  // And the message says the work is safe, because "did not finish" otherwise
-  // reads as "was lost".
-  assert.match(namedFunctionSource('_withTimeout'), /Nothing was lost/);
+  // MB1188-015: the message is stage-specific now. The same wrapper guards the
+  // local write and the cloud write, and telling somebody their work is "saved
+  // locally" when it was the LOCAL step that timed out is a reassurance we
+  // cannot support.
+  const wrapper = namedFunctionSource('_withTimeout');
+  assert.match(wrapper, /may not be written to this Mac yet/, 'the local stage is honest');
+  assert.match(wrapper, /saved on this Mac; it has not reached the cloud yet/);
+  assert.match(save, /'Saving the spreadsheets', true\)/, 'local stages are marked local');
+  assert.match(save, /'The local save', true\)/);
+});
+
+test('MB1188-006: automatic Google checking starts on the path people use', () => {
+  // I put ssStartAutoSync in ssSwitchProject, which had NO call sites — every
+  // project card calls ssOpenProject. So Settings promised the app checks
+  // Google every few minutes and nothing was ever scheduled. Nothing failed,
+  // nothing errored; the feature simply did not exist at runtime.
+  const open = namedFunctionSource('ssOpenProject');
+  assert.match(open, /ssStartAutoSync\(\);/);
+  assert.match(open, /ssAutoSyncTick\(true\);/, 'and checks immediately, not in three minutes');
+
+  // The dead function is gone rather than left to be rediscovered.
+  assert.ok(!/function ssSwitchProject\(/.test(script),
+    'ssSwitchProject had no callers and has been removed');
+
+  // The cards really do call ssOpenProject — the premise of the whole fix.
+  assert.match(source, /class="ss-proj-card" onclick="ssOpenProject\(/);
+});
+
+test('MB1188-006: every renderer function is reachable from somewhere', () => {
+  // The bug above was a function nobody called. Cheap to check for the rest of
+  // the spreadsheet surface: a handler with no call site and no onclick is
+  // either dead code or a feature that silently does not exist.
+  const declared = [...script.matchAll(/^(?:async )?function (ss[A-Z]\w+)\(/gm)].map(m => m[1]);
+  assert.ok(declared.length > 20, 'found the spreadsheet functions');
+  const orphans = declared.filter(name => {
+    const needle = name + '(';
+    const calls = script.split(needle).length - 1;
+    const markup = source.split(needle).length - 1;
+    return calls <= 1 && markup <= 1;   // its own declaration only
+  });
+  assert.deepEqual(orphans, [], `unreachable: ${orphans.join(', ')}`);
+});
+
+test('MB1188-019: typing in the formula bar and clicking away saves it', () => {
+  // The formula bar's onblur called ssUpdateToolbar(), which only repaints —
+  // so anything typed there was DISCARDED the moment focus left. ssFormulaBarBlur
+  // (which commits) and ssFormulaBarFocus (which closes an open inline edit
+  // first) both existed and neither was wired to anything.
+  //
+  // This is almost certainly the "I typed in a cell, clicked another cell, came
+  // back and the text was gone" report I could not trace by reading the edit
+  // path — because the loss was not in the edit path at all.
+  assert.match(source, /onfocus="ssFormulaBarFocus\(\)" onblur="ssFormulaBarBlur\(event\)"/);
+  assert.doesNotMatch(source, /id="ss-formula-bar"[\s\S]{0,300}?onblur="ssUpdateToolbar\(\)"/,
+    'onblur must commit, not merely repaint');
+
+  const blur = namedFunctionSource('ssFormulaBarBlur');
+  assert.match(blur, /if \(e\.target\.value !== currentVal\)/, 'only saves a real change');
+  assert.match(blur, /ssPushUndo\(\)/, 'and it is undoable');
+  assert.match(blur, /sheet\.cells\[k\] = \{ \.\.\.\(sheet\.cells\[k\] \|\| \{\}\), v: ssBoundedCellValue\(e\.target\.value\) \}/);
+  assert.match(blur, /ssSave\(\)/);
 });

@@ -85,6 +85,8 @@ function splitApi() {
         return { index: result.index, documents: Object.fromEntries(result.documents) };
       },
       assemble: (index, documents) => _ssAssembleWorkbook(index, documents),
+      docToWorkbook: doc => _ssProjectDocToWorkbook(doc),
+      workbookToDoc: wb => _ssWorkbookToProjectDoc(wb),
       normIndex: value => normalizeSpreadsheetIndex(value),
       normProject: doc => normalizeSpreadsheetProject(doc),
       projectAsDoc: (wb, id) => _ssProjectAsDoc(wb, id),
@@ -98,6 +100,8 @@ function splitApi() {
     isLegacy: v => context.api.isLegacy(v),
     split: w => JSON.parse(JSON.stringify(context.api.split(w))),
     assemble: (i, d) => JSON.parse(JSON.stringify(context.api.assemble(i, d))),
+    docToWorkbook: d => JSON.parse(JSON.stringify(context.api.docToWorkbook(d))),
+    workbookToDoc: w => JSON.parse(JSON.stringify(context.api.workbookToDoc(w))),
     normIndex: v => JSON.parse(JSON.stringify(context.api.normIndex(v))),
     normProject: d => JSON.parse(JSON.stringify(context.api.normProject(d))),
     projectAsDoc: (wb, id) => JSON.parse(JSON.stringify(context.api.projectAsDoc(wb, id) ?? null)),
@@ -1401,4 +1405,48 @@ test('MB161-027: a junk id in the pending set cannot corrupt the index', () => {
   const after = legacyWorkbook([project('p1', [sheet('s1')])]);
   const next = api.indexAfter(index, after, after, AT, ['', 'not a valid id!', '../escape']);
   assert.deepEqual(next.projects.map(p => p.id), ['p1'], 'nothing else was added');
+});
+
+test('MB1188-001: a Google link survives every split conversion', () => {
+  // colorKey was carried through and googleLink was not, so a linked project
+  // lost its spreadsheet id, tab map and checkpoints the moment it went through
+  // split storage — on save, on assembly, on migration, on restart. The badge
+  // disappeared, "Sync now" went with it, and an imported project looked like
+  // it had vanished, because the thing that made it a Google project was gone.
+  const api = splitApi();
+  const link = {
+    spreadsheetId: '1zZ4M7ewY7cFBePc2nV-kX2j-YHr0rilPQ6bFvB7WYrg',
+    rows: 500, columns: 26, pulledAt: '2026-08-07T12:00:00.000Z',
+    tabs: {
+      s1: { title: 'Monday',  checkpoint: { '0,0': 'TIME' }, mergeSig: 'abc123' },
+      s2: { title: 'Tuesday', checkpoint: { '0,0': 'TIME' } },
+    },
+  };
+  const workbook = {
+    activeProject: 'p1',
+    projects: [{
+      id: 'p1', name: 'Color Block', activeId: 's1',
+      sheets: [sheet('s1'), sheet('s2')],
+      googleLink: link,
+    }],
+  };
+
+  // Every individual conversion.
+  const asDoc = api.projectAsDoc(workbook, 'p1');
+  assert.deepEqual(asDoc.googleLink, link, '_ssProjectAsDoc');
+  const backToWorkbook = api.docToWorkbook(asDoc);
+  assert.deepEqual(backToWorkbook.projects[0].googleLink, link, '_ssProjectDocToWorkbook');
+  const toDoc = api.workbookToDoc(backToWorkbook);
+  assert.deepEqual(toDoc.googleLink, link, '_ssWorkbookToProjectDoc');
+
+  // Through the normalizer a project document actually goes through on save.
+  const normalized = api.normProject(asDoc);
+  assert.deepEqual(normalized.googleLink, link, 'normalizeSpreadsheetProject');
+
+  // And through assembly, which is what a restart does.
+  const assembled = api.assemble(
+    { schema: 2, activeProject: 'p1', projects: [{ id: 'p1', version: 1 }] },
+    new Map([['spreadsheet_p1', normalized]]),
+  );
+  assert.deepEqual(assembled.projects[0].googleLink, link, '_ssAssembleWorkbook');
 });
