@@ -12571,6 +12571,14 @@ function selectAiModel(query) {
 // document every month forever; this one carries the month it describes and is
 // reset the first time anybody spends in a new one.
 const AI_SPEND_KEY = 'ai_spend';
+// MB161-036: bound the device map.
+//
+// Each Mac keeps its own subtotal, so the map is as long as the number of Macs
+// that have ever spent this month — and a device id changes when somebody
+// reinstalls or resets a machine, so over a long enough period this grows
+// without limit inside a synced document. Four Macs is nowhere near it; the
+// bound exists so nothing has to be true about how many there are.
+const MAX_AI_SPEND_DEVICES = 24;
 
 function _aiSpendMonth() {
   const d = new Date();
@@ -12584,12 +12592,16 @@ function _aiSpendRecord() {
   const stored = STORE.get(AI_SPEND_KEY, null);
   if (!stored || typeof stored !== 'object' || Array.isArray(stored)) return { month: _aiSpendMonth(), devices: {} };
   if (stored.month !== _aiSpendMonth()) return { month: _aiSpendMonth(), devices: {} };
-  const devices = {};
+  const entries = [];
   for (const [device, amount] of Object.entries(stored.devices || {})) {
     const value = Number(amount);
-    if (Number.isFinite(value) && value > 0) devices[String(device).slice(0, 80)] = value;
+    if (Number.isFinite(value) && value > 0) entries.push([String(device).slice(0, 80), value]);
   }
-  return { month: stored.month, devices };
+  // Over the bound, the LARGEST subtotals are kept. Dropping the big spenders
+  // would understate the month and quietly raise the cap; dropping the small
+  // ones loses a few cents of accuracy and nothing else.
+  entries.sort((a, b) => b[1] - a[1]);
+  return { month: stored.month, devices: Object.fromEntries(entries.slice(0, MAX_AI_SPEND_DEVICES)) };
 }
 
 // The whole studio's estimate for this month.
@@ -12602,7 +12614,16 @@ function addAiSpend(model, inputTokens, outputTokens) {
   const cost = (inputTokens / 1_000_000) * rates.input + (outputTokens / 1_000_000) * rates.output;
   const record = _aiSpendRecord();
   const device = _deviceId();
+  // This Mac's own entry is never the one evicted, or it would spend forever
+  // against a total that keeps forgetting it.
   record.devices[device] = Math.round(((record.devices[device] || 0) + cost) * 100000) / 100000;
+  if (Object.keys(record.devices).length > MAX_AI_SPEND_DEVICES) {
+    const kept = Object.entries(record.devices)
+      .filter(([id]) => id !== device)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, MAX_AI_SPEND_DEVICES - 1);
+    record.devices = Object.fromEntries([...kept, [device, record.devices[device]]]);
+  }
   persistInBackground(AI_SPEND_KEY, record, 'AI usage estimate');
   return Object.values(record.devices).reduce((sum, amount) => sum + amount, 0);
 }

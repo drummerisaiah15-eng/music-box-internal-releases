@@ -3778,3 +3778,38 @@ test('clearing a fill does not make the workbook unsaveable', () => {
   assert.throws(() => context.norm(withCell({ v: {}, bg: '', tc: '', b: false })),
     /non-text cell value/);
 });
+
+test('MB161-036: nothing in sync assumes exactly two Macs', () => {
+  // The design is per-key compare-and-swap with rebase-on-conflict, not a
+  // two-way diff, so it converges for any number of writers. This pins the
+  // parts that would quietly cap it at two if somebody changed them.
+
+  // 1. Writes are bound to the revision they were derived from, and a losing
+  //    writer rebases onto what it just observed rather than giving up or
+  //    overwriting. That is what makes a third and fourth writer safe.
+  assert.ok(script.includes('if (current !== expectedRevision && !recognizedSupersededWrite && !explicitlyKeepLocal)'),
+    'a write that lost the race is refused rather than clobbering');
+  assert.ok(script.includes('throw new SyncConflictError(key, expectedRevision, current)'));
+  assert.ok(script.includes('expectedRevision: pending.baseRevision'),
+    'and the retry carries a base, so it can be rebased instead of re-sent blind');
+
+  // 2. The writer is identified per device, not per "other Mac".
+  assert.ok(script.includes('writer: _deviceId()'));
+
+  // 3. Presence has room for more than two, and a colour for each.
+  const peers = script.match(/SS_PRESENCE_MAX_PEERS = (\d+)/);
+  assert.ok(peers && Number(peers[1]) >= 4, 'presence holds at least four peers');
+  const colours = script.match(/SS_PRESENCE_COLORS = \[([\s\S]*?)\]/);
+  assert.ok((colours[1].match(/#/g) || []).length >= 4,
+    'and enough distinct colours that two Macs are not shown as one');
+
+  // 4. Conflicts accumulate rather than being capped at a pair. More writers
+  //    means more collisions, and losing one silently is the thing that must
+  //    not happen.
+  assert.ok(!/\.slice\(-MAX_SPREADSHEET_CONFLICTS\)/.test(script),
+    'unresolved conflicts are never evicted to make room');
+
+  // 5. Per-project documents are what keep four Macs out of each other's way:
+  //    two people editing different projects never touch the same document.
+  assert.ok(script.includes('_ssProjectSyncKey'));
+});

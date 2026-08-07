@@ -1537,6 +1537,7 @@ function spendApi() {
     var _deviceId = () => _device;
     var AI_TEAM_MONTHLY_CAP_USD = 20;
     var AI_SPEND_KEY = 'ai_spend';
+    var MAX_AI_SPEND_DEVICES = 24;
     var AI_MODEL_COSTS = {
       'claude-sonnet-4-6':         { input: 3, output: 15 },
       'claude-haiku-4-5-20251001': { input: 1, output: 5 },
@@ -1621,4 +1622,41 @@ test('MB161-034: the cheap model is the default, not the fallback', () => {
     'why did attendance drop in July and what should we do about it',
     'draft an email to parents explaining the new schedule',
   ]) assert.equal(context.pick(q), 'sonnet', `"${q}" needs reasoning`);
+});
+
+test('MB161-036: the shared spend record is bounded, and keeps this Mac', () => {
+  // Each Mac holds its own subtotal, so the map is as long as the number of
+  // machines that have spent this month — and a device id changes on reinstall,
+  // so it grows without limit inside a synced document. Four Macs is nowhere
+  // near the bound; the bound exists so nothing has to be true about how many.
+  const api = spendApi();
+  const many = {};
+  for (let i = 0; i < 40; i += 1) many[`mac-${i}`] = i + 1;   // 1..40
+  api.seed({ month: new Date().toISOString().slice(0, 7), devices: many });
+
+  api.asDevice('mac-new');
+  api.spend('claude-haiku-4-5-20251001', 1_000_000, 0);       // $1
+  const record = api.raw();
+  const ids = Object.keys(record.devices);
+  assert.ok(ids.length <= 24, `bounded, got ${ids.length}`);
+  assert.ok(ids.includes('mac-new'),
+    "this Mac is never the entry evicted, or it spends against a total that keeps forgetting it");
+  // The big spenders survive: dropping them would understate the month and
+  // quietly raise the cap.
+  assert.ok(ids.includes('mac-39'), 'the largest subtotals are kept');
+  assert.ok(!ids.includes('mac-0'), 'the smallest are the ones dropped');
+});
+
+test('MB161-036: four Macs each keep their own subtotal against one cap', () => {
+  const api = spendApi();
+  for (const mac of ['mac-a', 'mac-b', 'mac-c', 'mac-d']) {
+    api.asDevice(mac);
+    api.spend('claude-haiku-4-5-20251001', 4_000_000, 0);     // $4 each
+  }
+  assert.equal(Object.keys(api.raw().devices).length, 4);
+  assert.equal(Math.round(api.total() * 100) / 100, 16);
+  assert.equal(api.capped(), false, 'still under the shared $20');
+  api.asDevice('mac-a');
+  api.spend('claude-haiku-4-5-20251001', 5_000_000, 0);       // +$5 => $21
+  assert.equal(api.capped(), true, 'and one more tips the studio over it');
 });
