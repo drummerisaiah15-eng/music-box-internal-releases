@@ -6497,18 +6497,39 @@ async function _bootstrapSync() {
 // ─── MANUAL SAVE ALL ────────────────────────────────────────────────────────
 // Waits for every queued encrypted local write, then requires Firebase to
 // acknowledge every pending sync record before reporting success.
+// MB161-049: Save All must not be able to wait forever.
+//
+// It awaits the save queue, so anything stuck in that queue took the button
+// with it — permanently, with no error and no way back except relaunching. That
+// is how MB161-047's deadlock presented here: "Saving…" and nothing else, ever.
+//
+// The deadlock is fixed, but a button whose only failure mode is an eternal
+// spinner is worth bounding regardless. A timeout does not make a stuck write
+// succeed; it makes it SAYABLE, which is the difference between a bug somebody
+// can report and one they can only describe as "it froze".
+function _withTimeout(promise, ms, what) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(
+      () => reject(new Error(`${what} did not finish within ${Math.round(ms / 1000)} seconds. ` +
+        `Nothing was lost — your work is still here and still saved locally.`)),
+      ms)),
+  ]);
+}
+
 async function saveAllData() {
   const btn = document.getElementById('save-all-btn');
   if (btn) { btn.textContent = '💾 Saving…'; btn.disabled = true; }
   try {
     const keys = getSyncKeys().filter(key => Object.prototype.hasOwnProperty.call(_decCache, key));
-    await _flushSpreadsheetSave();
-    await STORE.flush(keys);
+    await _withTimeout(_flushSpreadsheetSave(), 30000, 'Saving the spreadsheets');
+    await _withTimeout(STORE.flush(keys), 30000, 'The local save');
     if (!_syncReady || !_firestoreDb || !_syncBootstrapComplete) {
       throw new Error('Firebase is not connected; local encrypted saves completed, but cloud sync did not');
     }
     const pendingCount = keys.filter(key => !!_readPendingSyncRecord(key)).length;
-    await STORE.flush(keys, { includeSync: true, requireSync: true });
+    await _withTimeout(
+      STORE.flush(keys, { includeSync: true, requireSync: true }), 60000, 'The cloud save');
     // V159-003: verify after the flush. A quarantined or still-pending key must
     // never be reported as saved to the cloud.
     const unsynced = _unsyncedSyncKeys();
@@ -17270,7 +17291,7 @@ function _ssWorkloadChartHtml(stats) {
 
   const departed = stats.departed
     ? `<div class="wl-none" style="margin-top:14px">${stats.departed} record${stats.departed === 1 ? '' : 's'}
-       belong to a name with no current profile, and are not shown.</div>`
+       ${stats.departed === 1 ? 'belongs' : 'belong'} to a name with no current profile, and ${stats.departed === 1 ? 'is' : 'are'} not shown.</div>`
     : '';
 
   return `<div class="wl-cols">${columns}</div>

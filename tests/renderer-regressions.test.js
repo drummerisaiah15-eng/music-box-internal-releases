@@ -1995,3 +1995,25 @@ test('MB161-047: no key lock is ever taken twice on the same path', () => {
   // runs outside the save path — fire-and-forget from the loader.
   assert.match(script, /_ssMigrateToSplitStorage\(\)\.catch\(\(\) => \{\}\)/);
 });
+
+test('MB161-049: Save All cannot wait forever', () => {
+  // It awaits the save queue, so anything stuck in that queue took the button
+  // with it — permanently, with no error and no way back but relaunching. That
+  // is how the MB161-047 deadlock presented here: "Saving…" and nothing else.
+  //
+  // A timeout does not make a stuck write succeed. It makes it sayable, which
+  // is the difference between a bug somebody can report and one they can only
+  // describe as "it froze".
+  const save = namedFunctionSource('saveAllData');
+  assert.match(save, /_withTimeout\(_flushSpreadsheetSave\(\), 30000/);
+  assert.match(save, /_withTimeout\(STORE\.flush\(keys\), 30000/);
+  assert.match(save, /_withTimeout\(\s*\n?\s*STORE\.flush\(keys, \{ includeSync: true, requireSync: true \}\), 60000/);
+  // Every await in the function is bounded; an unbounded one reintroduces it.
+  for (const [, awaited] of save.matchAll(/await (\w+[^;]*);/g)) {
+    assert.ok(awaited.startsWith('_withTimeout('),
+      `unbounded await in Save All: ${awaited.slice(0, 60)}`);
+  }
+  // And the message says the work is safe, because "did not finish" otherwise
+  // reads as "was lost".
+  assert.match(namedFunctionSource('_withTimeout'), /Nothing was lost/);
+});
