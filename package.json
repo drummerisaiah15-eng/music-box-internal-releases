@@ -1,6 +1,6 @@
 {
   "name": "music-box-internal",
-  "version": "1.1.67",
+  "version": "1.1.68",
   "description": "The Music Box — Internal Operations",
   "main": "main.js",
   "scripts": {
