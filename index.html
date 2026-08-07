@@ -17100,23 +17100,43 @@ function isCarrie() {
 }
 // Everyone can add tasks (at minimum Team tasks); Eliz/Carrie can also assign to individuals
 function canAddTasks()   { return !!currentUser(); }
-function canAssignTasks(){ return isElizabeth() || isOperationsManager() || isCarrie(); }
+// Anyone with somebody to assign to — which, since MB161-038, is everyone,
+// because everyone can at least write themselves a task.
+function canAssignTasks(){ return getAssignableStaff().length > 0; }
+
+// MB161-038: everybody can give themselves a task.
+//
+// Delegation was modelled purely as authority over other people, so the list
+// was "who may I assign to" with the current user filtered out — which left
+// Front Desk with an empty dropdown and no way to note anything down, and left
+// the Owner unable to write herself a task either, since she was excluded by
+// her own "everyone except Owners" rule. Neither makes sense: a to-do for
+// yourself is not an exercise of authority over anybody.
+//
+// So self is always present, and the rest of the list is what that role may
+// hand to OTHER people.
 function getAssignableStaff() {
+  const me = currentUser();
   // My Tasks is person-specific only — Team To-Do is the separate shared section
-  // MB161-031: an Operations Manager delegates to everyone except the Owner —
-  // the same reach the Owner has, minus the Owner. Deliberately not "everyone
-  // except herself": she can give herself a task like anybody else.
-  if (isElizabeth() || isOperationsManager()) {
-    return _loginProfiles
-      .filter(profile => profile.role !== 'Owner')
-      .map(profile => profile.name);
-  }
-  if (isCarrie()) {
-    return _loginProfiles
-      .filter(profile => profile.role === 'Front Desk')
-      .map(profile => profile.name);
-  }
-  return []; // Front Desk profiles cannot assign personal tasks to others
+  const others = (() => {
+    // The Owner's reach, and an Operations Manager's: everyone except an Owner
+    // other than themselves.
+    if (isElizabeth() || isOperationsManager()) {
+      return _loginProfiles
+        .filter(profile => profile.role !== 'Owner' || profile.name === me)
+        .map(profile => profile.name);
+    }
+    // Operations & Events hands work to the front desk.
+    if (isCarrie()) {
+      return _loginProfiles
+        .filter(profile => profile.role === 'Front Desk')
+        .map(profile => profile.name);
+    }
+    // Front Desk delegates to nobody — but still gets themselves, below.
+    return [];
+  })();
+  if (!me) return others;
+  return others.includes(me) ? others : [me, ...others];
 }
 
 function renderMyTasks() {

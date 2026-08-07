@@ -405,23 +405,37 @@ test('task dropdown behavior includes added users at the intended authority leve
       isElizabeth: () => current === 'Elizabeth Chaves',
       isCarrie: () => current === 'Carrie Gass',
       isOperationsManager: () => (profiles.find(p => p.name === current) || {}).role === 'Operations Manager',
+      currentUser: () => current,
     };
     vm.runInNewContext(`${namedFunctionSource('getAssignableStaff')}; this.result = getAssignableStaff();`, sandbox);
     return JSON.parse(JSON.stringify(sandbox.result));
   };
-  assert.deepEqual(evaluateFor('Elizabeth Chaves'), ['Carrie Gass', 'Ana Chaves', "Quinn O'Neil"]);
-  assert.deepEqual(evaluateFor('Carrie Gass'), ['Ana Chaves', "Quinn O'Neil"]);
-  assert.deepEqual(evaluateFor('Ana Chaves'), []);
-  assert.deepEqual(evaluateFor("Quinn O'Neil"), []);
+  // MB161-038: everybody can give themselves a task, so self is always present.
+  // A to-do for yourself is not an exercise of authority over anybody, and
+  // modelling delegation purely as authority left Front Desk with an empty
+  // dropdown — and the Owner unable to write herself a task, since she was
+  // excluded by her own "everyone except Owners" rule.
+  assert.deepEqual(evaluateFor('Elizabeth Chaves'),
+    ['Elizabeth Chaves', 'Carrie Gass', 'Ana Chaves', "Quinn O'Neil"]);
+  assert.deepEqual(evaluateFor('Carrie Gass'),
+    ['Carrie Gass', 'Ana Chaves', "Quinn O'Neil"]);
+  assert.deepEqual(evaluateFor('Ana Chaves'), ['Ana Chaves'],
+    'front desk delegates to nobody, but still gets themselves');
+  assert.deepEqual(evaluateFor("Quinn O'Neil"), ["Quinn O'Neil"]);
 
-  // MB161-031: an Operations Manager delegates to everyone except the Owner —
-  // the Owner's reach minus the Owner. Including herself: she can take a task
-  // like anybody else.
+  // MB161-031: an Operations Manager delegates to everyone except the Owner.
   profiles.push({ name: 'Dana Reid', role: 'Operations Manager' });
   assert.deepEqual(evaluateFor('Dana Reid'),
     ['Carrie Gass', 'Ana Chaves', "Quinn O'Neil", 'Dana Reid']);
   assert.ok(!evaluateFor('Dana Reid').includes('Elizabeth Chaves'),
     'and never the Owner');
+
+  // Nobody appears twice, whichever branch put them there.
+  for (const who of ['Elizabeth Chaves', 'Carrie Gass', 'Ana Chaves', 'Dana Reid']) {
+    const list = evaluateFor(who);
+    assert.equal(new Set(list).size, list.length, `${who} is listed once`);
+    assert.ok(list.includes(who), `${who} can assign to themselves`);
+  }
 });
 
 test('CSV export neutralizes formula-like text without changing ordinary values', () => {
@@ -1841,4 +1855,18 @@ test('MB161-037: a synced key must declare its shape, or every write is refused'
   assert.ok(keys.includes('ai_spend'));
   assert.ok(objectKeys.includes('ai_spend'),
     'ai_spend is synced, so its shape has to be declared');
+});
+
+test('MB161-038: a task you gave yourself can be ticked off and removed', () => {
+  // Otherwise letting people self-assign is half a fix — Front Desk could write
+  // a to-do and then have no way to close it.
+  const toggle = namedFunctionSource('toggleAssignedTask');
+  assert.match(toggle, /task\.assignee !== user/,
+    'the assignee may complete their own task');
+  const remove = namedFunctionSource('deleteAssignedTask');
+  assert.match(remove, /task\.assignedBy !== currentUser\(\)/,
+    'and whoever created it may delete it — which for a self-assigned task is the same person');
+  // And they can see it: a self-assigned task matches on both counts.
+  const render = namedFunctionSource('renderMyTasks');
+  assert.match(render, /t\.assignee === user \|\|\s*\n?\s*t\.assignedBy === user/);
 });
