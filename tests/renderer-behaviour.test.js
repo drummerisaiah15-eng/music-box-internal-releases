@@ -1366,8 +1366,10 @@ test('MB161-020: a non-boolean checkbox flag is refused, not coerced', () => {
 // ── MB161-021: Google's changes arrive without discarding work done here ────
 
 function mergeApi() {
-  const context = vm.createContext({ String });
+  const context = vm.createContext({ String, JSON, Object, Array });
   vm.runInContext(`
+    ${declaration('_ssCheckpointCell')}
+    ${declaration('_ssCellSignature')}
     ${declaration('_ssMergeCellFromGoogle')}
     globalThis.api = (base, remote, local) => _ssMergeCellFromGoogle(base, remote, local);
   `, context);
@@ -1898,4 +1900,86 @@ test('MB161-044: the workload leaves out whoever is reading it', () => {
   // And a reviewer is not reported as a departed profile — she is sitting right
   // there; her records are simply out of scope.
   assert.equal(stats.departed, 0);
+});
+
+// ── MB1188-011: formatting is part of the cell, not decoration ──────────────
+
+function richMergeApi() {
+  const context = vm.createContext({ String, JSON, Object, Array });
+  vm.runInContext(`
+    ${declaration('_ssCheckpointEntry')}
+    ${declaration('_ssCheckpointCell')}
+    ${declaration('_ssCellSignature')}
+    ${declaration('_ssMergeCellFromGoogle')}
+    globalThis.api = {
+      merge: (base, remote, local) => _ssMergeCellFromGoogle(base, remote, local),
+      entry: cell => _ssCheckpointEntry(cell),
+      signature: cell => _ssCellSignature(cell),
+    };
+  `, context);
+  return context.api;
+}
+
+const gcell = over => ({ v: 'Booked', bg: '', tc: '', b: false, ...over });
+
+test('MB1188-011: a fill applied in Google arrives instead of vanishing', () => {
+  const api = richMergeApi();
+  // Text identical on all three sides; only Google's fill moved. Comparing
+  // `.v` alone classified this "take local" and the colour was lost silently.
+  const base = api.entry(gcell({}));
+  const outcome = api.merge(base, gcell({ bg: '#ffd966' }), gcell({}));
+  assert.equal(outcome.take, 'remote');
+  assert.equal(outcome.cell.bg, '#ffd966');
+});
+
+test('MB1188-011: a checkbox ticked in Google arrives', () => {
+  const api = richMergeApi();
+  const base = api.entry(gcell({ v: '', cb: true }));
+  const outcome = api.merge(base, { v: 'TRUE', bg: '', tc: '', b: false, cb: true },
+    gcell({ v: '', cb: true }));
+  assert.equal(outcome.take, 'remote', 'the tick is a change like any other');
+});
+
+test('MB1188-011: bold and text colour count too', () => {
+  const api = richMergeApi();
+  for (const change of [{ b: true }, { tc: '#c0392b' }]) {
+    const base = api.entry(gcell({}));
+    assert.equal(api.merge(base, gcell(change), gcell({})).take, 'remote',
+      `${JSON.stringify(change)} is a change`);
+  }
+});
+
+test('MB1188-011: formatting changed on both sides is a conflict, not a silent loss', () => {
+  const api = richMergeApi();
+  const base = api.entry(gcell({}));
+  const outcome = api.merge(base, gcell({ bg: '#ffd966' }), gcell({ bg: '#6aa84f' }));
+  assert.equal(outcome.take, 'conflict');
+  assert.equal(outcome.cell.bg, '#6aa84f', 'and this Mac keeps its own until resolved');
+});
+
+test('MB1188-011: an unformatted cell still checkpoints as a bare string', () => {
+  // Both for backward compatibility with every checkpoint already written and
+  // because an object per cell across a full sheet is real sync weight.
+  const api = richMergeApi();
+  assert.equal(api.entry(gcell({})), 'Booked');
+  assert.deepEqual(JSON.parse(JSON.stringify(api.entry(gcell({ bg: '#ffd966' })))),
+    { v: 'Booked', bg: '#ffd966' });
+  assert.equal(api.entry({ v: '', bg: '', tc: '', b: false }), null, 'a blank cell is not recorded');
+});
+
+test('MB1188-011: a legacy text-only checkpoint still reads correctly', () => {
+  const api = richMergeApi();
+  // Written by an older build: a plain string. Google has not changed it.
+  assert.equal(api.merge('Booked', gcell({}), gcell({ v: 'Edited here' })).take, 'local',
+    'an old checkpoint must not suddenly read as a change');
+  assert.equal(api.merge('Booked', gcell({ v: 'Changed in Google' }), gcell({})).take, 'remote');
+});
+
+test('MB1188-011: absent, blank and unformatted-blank are the same cell', () => {
+  const api = richMergeApi();
+  assert.equal(api.signature(null), '');
+  assert.equal(api.signature({ v: '', bg: '', tc: '', b: false }), '');
+  assert.equal(api.signature({ v: '', bg: '', tc: '', b: false, cb: false }), '');
+  assert.notEqual(api.signature({ v: '', bg: '', tc: '', b: false, cb: true }), '',
+    'an empty checkbox cell is not nothing');
 });

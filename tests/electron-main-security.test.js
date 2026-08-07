@@ -992,8 +992,16 @@ test('directory: the renderer publishes on every profile change and merges on ar
   assert.match(renderer, /staff_directory: 'tombstoned-record-list'/,
     'two Macs editing different profiles merge instead of clobbering');
   assert.match(renderer, /if \(key === 'staff_directory'\)/, 'arrivals are applied');
-  const publishes = (renderer.match(/await publishStaffDirectory\(\);/g) || []).length;
-  assert.equal(publishes, 3, 'add, remove and role change each publish');
+  // Assert the intent, not a call count. This used to require exactly three
+  // occurrences of `await publishStaffDirectory();` anywhere in the file, which
+  // says nothing about WHICH paths publish — and broke the moment a legitimate
+  // fourth caller (the pending-publication retry) was added.
+  for (const name of ['addLoginUser', 'removeLoginUser', 'setProfileRole']) {
+    const start = renderer.indexOf(`async function ${name}(`);
+    assert.notEqual(start, -1, `${name} exists`);
+    const body = renderer.slice(start, renderer.indexOf('\n}\n', start) + 2);
+    assert.match(body, /publishStaffDirectory\(\)/, `${name} publishes the directory`);
+  }
   // Only the owner may publish.
   const fn = renderer.slice(renderer.indexOf('async function publishStaffDirectory('));
   assert.match(fn.slice(0, fn.indexOf('\n}') + 2), /isElizabeth\(\)/);
@@ -1011,6 +1019,9 @@ function snapshotHarness(dir) {
   const context = vm.createContext({
     Object, Error, Date, JSON, Set, Array, Number, String, Boolean, Buffer,
     console, Promise, RegExp,
+    // _atomicWriteFile names its temp file with the pid; without this it throws
+    // and the sequence counter silently falls back to rebuilding from disk.
+    process,
     fs: require('node:fs'),
     path: require('node:path'),
     os: osMod,
@@ -1031,15 +1042,19 @@ function snapshotHarness(dir) {
     ${constBlock}
     ${sliceFunction(main, '_backupDeviceId')}
     ${sliceFunction(main, '_snapshotFileName')}
+    ${sliceFunction(main, '_atomicWriteFile')}
+    ${sliceFunction(main, '_nextSnapshotSequence')}
     ${sliceFunction(main, '_listBackupSnapshots')}
     ${sliceFunction(main, '_pruneBackupSnapshots')}
     ${sliceFunction(main, '_readBackupCandidate')}
     globalThis.api = {
-      name: (d, when) => _snapshotFileName(d, when),
+      // MB1188-014: the sequence sits between the device and the timestamp.
+      name: (d, when, seq = 0) => _snapshotFileName(d, seq, when),
       list: () => _listBackupSnapshots(),
       prune: async () => _pruneBackupSnapshots(await _listBackupSnapshots()),
       read: () => _readBackupCandidate(),
       deviceId: () => _backupDeviceId(),
+      nextSeq: async d => _nextSnapshotSequence(d, await _listBackupSnapshots()),
     };
   `, context);
   return context.api;
@@ -1721,4 +1736,78 @@ test('MB161-045: no handler spells out the role list instead of using the set', 
       `${role} can be assigned but is not in COMMUNICATION_ROLES`);
   }
   assert.match(main, /_secureHandle\('firebase-runtime-config'[\s\S]{0,600}?_requireAppRole\(COMMUNICATION_ROLES\)/);
+});
+
+// ── MB1188-014: a wrong clock must not decide what survives ────────────────
+
+test('MB1188-014: a device orders its own snapshots by sequence, not by clock', async () => {
+  const dir = tmpDir();
+  const api = snapshotHarness(dir);
+  // Same Mac, three backups. Its clock jumps BACKWARDS between them — an NTP
+  // correction, a manual date change, the end of daylight saving.
+  fs.writeFileSync(path.join(dir, api.name('aaaaaaaaaaaa', new Date(Date.UTC(2026, 7, 1, 12, 0)), 1)),
+    JSON.stringify({ which: 'first' }));
+  fs.writeFileSync(path.join(dir, api.name('aaaaaaaaaaaa', new Date(Date.UTC(2026, 7, 1, 9, 0)), 2)),
+    JSON.stringify({ which: 'second' }));
+  fs.writeFileSync(path.join(dir, api.name('aaaaaaaaaaaa', new Date(Date.UTC(2026, 7, 1, 10, 0)), 3)),
+    JSON.stringify({ which: 'third' }));
+  const listed = [...await api.list()];
+  assert.deepEqual(listed.map(entry => entry.sequence), [3, 2, 1],
+    'the newest is the highest sequence, whatever the timestamps say');
+  const candidate = await api.read();
+  assert.equal(candidate.data.which, 'third', 'and that is what a restore reads');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('MB1188-014: a snapshot written by an earlier build is still read', async () => {
+  const dir = tmpDir();
+  const api = snapshotHarness(dir);
+  // No sequence in the name — every backup already in the folder looks like this.
+  const legacy = 'sync-cccccccccccc-2026-08-01T10-00-00-000Z.json';
+  fs.writeFileSync(path.join(dir, legacy), JSON.stringify({ which: 'legacy' }));
+  const listed = [...await api.list()];
+  assert.equal(listed.length, 1);
+  assert.equal(listed[0].sequence, 0, 'read as sequence zero');
+  assert.equal((await api.read()).data.which, 'legacy');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('MB1188-014: the sequence only ever increases, and survives a lost counter', async () => {
+  const dir = tmpDir();
+  const api = snapshotHarness(dir);
+  assert.equal(await api.nextSeq('dddddddddddd'), 1, 'first backup on this Mac');
+  assert.equal(await api.nextSeq('dddddddddddd'), 2);
+  // The counter file is deleted — a reinstall, or a wiped application folder.
+  fs.rmSync(path.join(dir, 'icloud-snapshot-seq.json'), { force: true });
+  fs.writeFileSync(path.join(dir, api.name('dddddddddddd', new Date(Date.UTC(2026, 7, 1, 10, 0)), 7)),
+    JSON.stringify({}));
+  assert.equal(await api.nextSeq('dddddddddddd'), 8,
+    'the snapshots in the folder are themselves the record of how far it got');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('MB1188-014: a Mac with a clock years ahead cannot crowd the others out', async () => {
+  const dir = tmpDir();
+  const api = snapshotHarness(dir);
+  // Four Macs. One of them believes it is 2031, so under timestamp-ordered
+  // retention every one of its snapshots sorts ahead of everybody else's.
+  for (let i = 0; i < 5; i++) {
+    fs.writeFileSync(
+      path.join(dir, api.name('feeeeeeeeeee', new Date(Date.UTC(2031, 0, 1, 10, i)), i + 1)),
+      JSON.stringify({ from: 'future' }));
+  }
+  for (const device of ['aaaaaaaaaaaa', 'bbbbbbbbbbbb', 'cccccccccccc']) {
+    for (let i = 0; i < 5; i++) {
+      fs.writeFileSync(
+        path.join(dir, api.name(device, new Date(Date.UTC(2026, 7, 1, 10, i)), i + 1)),
+        JSON.stringify({ from: device }));
+    }
+  }
+  await api.prune();
+  const left = [...await api.list()];
+  for (const device of ['aaaaaaaaaaaa', 'bbbbbbbbbbbb', 'cccccccccccc', 'feeeeeeeeeee']) {
+    assert.ok(left.some(entry => entry.deviceId === device),
+      `${device} still has a recovery point`);
+  }
+  fs.rmSync(dir, { recursive: true, force: true });
 });

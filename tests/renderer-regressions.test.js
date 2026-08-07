@@ -1450,9 +1450,11 @@ test('MB161-018: a trimmed pull cannot delete the rows it trimmed', () => {
   // silently delete rows in Google that it had only declined to display.
   const pull = namedFunctionSource('ssPullFromGoogle');
   assert.match(pull, /const kept = \(remote\.rows \|\| \[\]\)\.slice\(0, rowsThatFit\)\.map\(row => row\.slice\(0, colsThatFit\)\)/);
-  assert.match(pull, /checkpoint: _ssGoogleCheckpoint\(kept\)/,
+  assert.match(pull, /checkpoint: _ssGoogleCheckpoint\(kept, keptFormats\)/,
     'the checkpoint describes what was kept, never what was sent');
-  assert.doesNotMatch(pull, /_ssGoogleCheckpoint\(remote\.rows\)/,
+  assert.match(pull, /const keptFormats = \(remote\.formats \|\| \[\]\)\.slice\(0, rowsThatFit\)/,
+    'and MB1188-011: its formatting is trimmed to the same extent');
+  assert.doesNotMatch(pull, /_ssGoogleCheckpoint\(remote\.rows/,
     'the untrimmed grid must not be the checkpoint');
 });
 
@@ -2126,4 +2128,118 @@ test('MB1188-002: importing does not revert the studio to legacy storage', () =>
   // The legacy branch survives for a Mac that has not migrated, where the key
   // really does hold a workbook.
   assert.match(build, /await STORE\.replace\('spreadsheets', normalized, \{ authoritative: 'confirmed workbook import' \}\)/);
+});
+
+// ── MB1188-012: a Google link survives a rename, and says when it does not ──
+
+test('MB1188-012: the pull resolves tabs by Google sheetId, not by title', () => {
+  const pull = namedFunctionSource('ssPullFromGoogle');
+  assert.match(pull, /_googleSheets\(\)\.describe\(\{ url: spreadsheetId \}\)/,
+    'it asks what the tabs are called now, before reading any of them');
+  assert.match(pull, /Number\.isSafeInteger\(tab\.sheetId\) \? bySheetId\.get\(tab\.sheetId\) : null/,
+    'id first');
+  assert.match(pull, /\|\| byTitle\.get\(tab\.title\)/,
+    'title second, so a link written before this still works');
+  assert.match(pull, /title: readTitle/,
+    'and the stored title is corrected from Google');
+  assert.match(pull, /Number\.isSafeInteger\(remoteTab\?\.sheetId\) \? \{ sheetId: remoteTab\.sheetId \} : \{\}/,
+    'a title-only link adopts the id, so it is rename-proof from then on');
+});
+
+test('MB1188-012: the read window follows the tab, not the size frozen at import', () => {
+  const pull = namedFunctionSource('ssPullFromGoogle');
+  assert.match(pull, /Math\.max\(readRows, Math\.min\(remoteTab\?\.rows \|\| 0, MAX_SPREADSHEET_ROWS\)\)/,
+    'growth beyond the imported window is observable');
+  assert.match(pull, /Math\.max\(readColumns,\s*\n?\s*Math\.min\(remoteTab\?\.columns \|\| 0, MAX_SPREADSHEET_COLS\)\)/,
+    'in both directions, still inside the app ceilings');
+  assert.doesNotMatch(pull, /rows: readRows, columns: readColumns/,
+    'the frozen window must not be what is requested');
+});
+
+test('MB1188-012: column widths are applied on every pull, not only at import', () => {
+  const pull = namedFunctionSource('ssPullFromGoogle');
+  assert.match(pull, /\(remote\.columnWidths \|\| \[\]\)\.forEach/);
+  assert.match(pull, /Number\.isFinite\(width\) && width > 0/,
+    'a hidden column reports 0 in Google and must not collapse the column here');
+});
+
+test('MB1188-012: a failed background sync leaves a durable trace', () => {
+  const pull = namedFunctionSource('ssPullFromGoogle');
+  assert.match(pull, /lastError: String\(error\?\.message \|\| error\)/,
+    'a silent failure looked exactly like a link with nothing to report');
+  assert.match(pull, /lastErrorAt: new Date\(\)\.toISOString\(\)/);
+  assert.match(pull, /delete nextLink\.lastError;/,
+    'and a completed sync clears it');
+  assert.match(namedFunctionSource('_ssGoogleLinkNotice'), /link\.lastError/,
+    'the project card shows it');
+});
+
+test('MB1188-012: tabs added in Google after the import are reported', () => {
+  const pull = namedFunctionSource('ssPullFromGoogle');
+  assert.match(pull, /nextLink\.newTabs = discovered\.slice\(0, 25\)/);
+  assert.match(namedFunctionSource('_ssGoogleLinkNotice'), /new tab\$\{count === 1 \? '' : 's'\} in Google/);
+});
+
+test('MB1188-012: the link keeps its new fields through validation', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  // Round-tripping is what matters: a field the normalizer drops is a field
+  // that survives exactly until the next save.
+  for (const field of ['lastError', 'lastErrorAt', 'newTabs']) {
+    assert.match(source, new RegExp(`googleLink\\.${field} =|'${field}'`),
+      `${field} is preserved by normalizeSpreadsheetWorkbook`);
+  }
+});
+
+test('MB1188-012: every page id has a title, so none renders its route key', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const titles = source.slice(source.indexOf('const PAGE_TITLES'),
+    source.indexOf('};', source.indexOf('const PAGE_TITLES')));
+  const pages = [...source.matchAll(/id="page-([a-z-]+)"/g)].map(match => match[1]);
+  for (const page of new Set(pages)) {
+    assert.match(titles, new RegExp(`^\\s*${page}:`, 'm'),
+      `page-${page} needs an entry in PAGE_TITLES or the top bar shows "${page}"`);
+  }
+});
+
+test('MB1188-007: no caller awaits between reading a shared list and saving it', () => {
+  // _persistRecordList derives its base from the stored value at save time.
+  // That equals what the caller read only while nothing is awaited in between.
+  // An await introduced there would make a record another Mac added in the
+  // window look like a deletion this caller intended — the original bug,
+  // reintroduced one level up. Callers that must await are expected to pass
+  // options.base instead, which this check allows for.
+  const source = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const readers = {
+    'getTodos()': ['persistTodos(', 'saveTodos('],
+    'getAssignedTasks()': ['persistAssignedTasks(', 'saveAssignedTasks('],
+    'getPolicies()': ['savePolicies('],
+    'getStepUpReceipts()': ['saveStepUpReceipts('],
+  };
+  const lines = source.split('\n');
+  const offences = [];
+  for (const [reader, savers] of Object.entries(readers)) {
+    lines.forEach((line, index) => {
+      if (!line.includes(reader)) return;
+      // Walk forward to the first save of the same list.
+      let awaited = null;
+      for (let cursor = index + 1; cursor < Math.min(index + 60, lines.length); cursor++) {
+        const ahead = lines[cursor];
+        if (savers.some(saver => ahead.includes(saver))) {
+          if (awaited !== null && !ahead.includes('base:')) {
+            offences.push(`${reader} at line ${index + 1}: awaits at line ${awaited + 1} ` +
+              `before saving at line ${cursor + 1}`);
+          }
+          return;
+        }
+        // A later read of the same list supersedes this one; it gets its own
+        // pass. Without this, a read used only for a count is paired with a
+        // save that belongs to a different read entirely.
+        if (ahead.includes(reader)) return;
+        if (/\bawait\b/.test(ahead) && awaited === null) awaited = cursor;
+        if (/^(async )?function /.test(ahead)) return;  // left the function
+      }
+    });
+  }
+  assert.deepEqual(offences, [],
+    'pass options.base with the list you read, or move the read after the await');
 });

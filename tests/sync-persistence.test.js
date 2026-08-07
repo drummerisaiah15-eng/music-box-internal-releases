@@ -214,6 +214,8 @@ test('a local log added during remote decode preserves the unrelated cloud log',
     ${declaration('_commitEncryptedSnapshot')}
     ${declaration('_readSyncMutationBase')}
     ${declaration('_queueEncryptedMutation')}
+    ${declaration('_digestOfValue')}
+    ${declaration('_readSyncMutationBase')}
     ${declaration('_queueEncryptedWrite')}
     ${declaration('_persistRemoteValue')}
     globalThis.mutationApi = {
@@ -2243,7 +2245,11 @@ function mergeApi() {
     ${declaration('_canAutoMergeSyncKey')}
     ${declaration('_recordSortTime')}
     ${declaration('_recordContentKey')}
+    ${declaration('_ssDigest')}
+    ${declaration('_conflictVariantKey')}
+    ${declaration('_conflictVariantIdLegacy')}
     ${declaration('_conflictVariantId')}
+    ${declaration('_conflictVariantIds')}
     ${declaration('_mergeResolvedConflictIds')}
     ${declaration('_mergeConflictVariants')}
     ${declaration('_mergeDivergentRecords')}
@@ -2389,6 +2395,8 @@ test('P0/§3: a stale STORE.replace cannot silently overwrite a remote edit', as
     ${classDeclaration('SyncConflictError')}
     ${declaration('_commitEncryptedSnapshot')}
     ${declaration('_persistRemoteValue')}
+    ${declaration('_digestOfValue')}
+    ${declaration('_readSyncMutationBase')}
     ${declaration('_queueEncryptedWrite')}
     globalThis.api = {
       remote: g => _serializeKeyReconcile('logs', async () => {
@@ -2447,6 +2455,8 @@ test('P0/§3: a replacement derived from the current revision still commits', as
     ${declaration('_localSyncRevision')}
     ${classDeclaration('SyncConflictError')}
     ${declaration('_commitEncryptedSnapshot')}
+    ${declaration('_digestOfValue')}
+    ${declaration('_readSyncMutationBase')}
     ${declaration('_queueEncryptedWrite')}
     globalThis.api = {
       replace: () => _queueEncryptedWrite('logs', ['base', 'LOCAL'], { operationId: 'op' }),
@@ -2496,7 +2506,11 @@ function logMergeApi() {
   vm.runInContext(`
     ${declaration('_recordSortTime')}
     ${declaration('_recordContentKey')}
+    ${declaration('_ssDigest')}
+    ${declaration('_conflictVariantKey')}
+    ${declaration('_conflictVariantIdLegacy')}
     ${declaration('_conflictVariantId')}
+    ${declaration('_conflictVariantIds')}
     ${declaration('_mergeResolvedConflictIds')}
     ${declaration('_mergeConflictVariants')}
     ${declaration('_mergeDivergentRecords')}
@@ -2696,7 +2710,11 @@ function conflictMergeApi() {
   vm.runInContext(`
     ${declaration('_recordSortTime')}
     ${declaration('_recordContentKey')}
+    ${declaration('_ssDigest')}
+    ${declaration('_conflictVariantKey')}
+    ${declaration('_conflictVariantIdLegacy')}
     ${declaration('_conflictVariantId')}
+    ${declaration('_conflictVariantIds')}
     ${declaration('_mergeResolvedConflictIds')}
     ${declaration('_mergeConflictVariants')}
     ${declaration('_mergeDivergentRecords')}
@@ -2765,8 +2783,9 @@ test('P1-1: resolution markers converge and stay bounded', () => {
   assert.deepEqual([...ab[0]._resolvedConflicts], ['cv_a', 'cv_b', 'cv_c'], 'union, sorted');
   assert.equal(JSON.stringify(ab), JSON.stringify(ba), 'marker merging is commutative');
   assert.ok(script.includes('MAX_RESOLVED_CONFLICT_IDS'), 'markers are bounded');
-  assert.ok(script.includes('MAX_CONFLICT_VARIANTS'), 'variants are bounded');
-  assert.match(cvId({ id: 'r1', body: 'x' }), /^cv_[a-z0-9]+_[a-z0-9]+$/, 'stable variant digest');
+  // MB1188-017: variants are deliberately NOT capped any more — human-authored
+  // text is never evicted to satisfy a limit. See the boundary tests below.
+  assert.match(cvId({ id: 'r1', body: 'x' }), /^cv2_[a-z0-9]+_[a-z0-9]+$/, 'stable variant digest');
 });
 
 test('P1-1: resolveLogConflict records the variants it retires', () => {
@@ -3866,4 +3885,789 @@ test('MB161-047: awaiting a key lock you already hold never returns', async () =
   assert.equal(await raced(sameKey, 150), true,
     'awaiting a lock this task already holds waits on itself, forever');
   assert.equal(sameKeyRan, false, 'and the inner task never runs');
+});
+
+test('MB1188-003: a project saved during migration survives it', async () => {
+  // The failure this reproduces: migration read the legacy workbook OUTSIDE any
+  // lock, then wrote documents and an index derived from that snapshot. A
+  // project created while those writes were in flight saved normally — and was
+  // erased seconds later when the stale index landed on top of it. The operator
+  // saw a successful save, then watched the project vanish.
+  //
+  // This drives the real _ssMigrateToSplitStorage and the real
+  // _serializeKeyMutation. Nothing here asserts on source text.
+  const commits = [];
+  const durable = new Map();
+  let releaseFirstDocument;
+  const heldAtFirstDocument = new Promise(resolve => { releaseFirstDocument = resolve; });
+  let documentsSeen = 0;
+
+  const context = vm.createContext({
+    Promise, Map, Set, Array, Object, JSON, Number, String, Boolean, Date, setTimeout, TextEncoder,
+    console: { warn() {}, error() {}, info() {}, log() {} },
+    showToast() {},
+    _cloneJson: value => JSON.parse(JSON.stringify(value)),
+    heldAtFirstDocument,
+    onDocument: () => { documentsSeen += 1; },
+    record: (key, value) => commits.push({ key, value: JSON.parse(JSON.stringify(value)) }),
+  });
+
+  vm.runInContext(`
+    var _keyMutationChains = new Map();
+    var SPREADSHEET_INDEX_SCHEMA = 2;
+    var SPREADSHEET_PROJECT_KEY_PREFIX = 'spreadsheet_';
+    var SPREADSHEET_PROJECT_ID_PATTERN = /^[A-Za-z0-9_-]{1,100}$/;
+    var MAX_SPREADSHEET_TOMBSTONES = 175;
+    var MAX_SPREADSHEET_INDEX_RECORDS = 400;
+    var MAX_SPREADSHEET_INDEX_BYTES = 64000;
+    var MAX_SPREADSHEET_PROJECTS = 25;
+    var MAX_SPREADSHEET_CELL_CHARS = 50000, MAX_SPREADSHEET_SHEETS = 25,
+        MAX_SPREADSHEET_ROWS = 500, MAX_SPREADSHEET_COLS = 100,
+        MAX_SPREADSHEET_GRID_CELLS = 10000, MAX_SPREADSHEET_TOTAL_CELLS = 10000,
+        MAX_SPREADSHEET_TOTAL_CHARS = 400000, MAX_SPREADSHEET_SYNC_JSON_BYTES = 600000,
+        MAX_SPREADSHEET_ATTRIBUTIONS = 200, MAX_SPREADSHEET_ATTRIBUTION_NAME = 80,
+        MAX_RESOLVED_CONFLICT_IDS = 200, MAX_SPREADSHEET_CONFLICTS = 200;
+    // _ssAwaitingAuthority and _ssBlockedWorkbook are NOT declared here: they
+    // arrive as top-level \`let\`s inside the normalizeSpreadsheetWorkbook
+    // slice, and both already initialise falsy.
+    var _syncReady = false, _syncBootstrapComplete = false;
+    var _durableStoreSnapshots = new Map();
+    var _ssMigrationRan = false, _ssMigrationInFlight = null;
+    var _newOperationId = () => 'op';
+
+    // The store the app reads through. Writing here is what "durable" means.
+    var _stored = new Map();
+    var STORE = { get: (key, fallback) => _stored.has(key) ? _stored.get(key) : fallback };
+
+    // Stands in for the encrypted write. It holds the FIRST project document
+    // open, which is exactly where the original race was reproduced.
+    async function _commitEncryptedSnapshot(key, serialized, normalized) {
+      if (key !== 'spreadsheets') {
+        onDocument();
+        await heldAtFirstDocument;
+      }
+      _stored.set(key, normalized);
+      _durableStoreSnapshots.set(key, normalized);
+      record(key, normalized);
+    }
+
+    ${declaration('_serializeKeyMutation')}
+    ${declaration('_ssProjectSyncKey')}
+    ${declaration('_ssIsLegacyWorkbook')}
+    ${declaration('_ssStorageMode')}
+    ${declaration('_ssProjectAsDoc')}
+    ${declaration('_ssProjectDocToWorkbook')}
+    ${declaration('_ssWorkbookToProjectDoc')}
+    ${declaration('_ssOversizeError')}
+    ${declaration('_normalizeSpreadsheetAttribution')}
+    ${declaration('_mergeResolvedConflictIds')}
+    ${declaration('normalizeSpreadsheetWorkbook')}
+    ${declaration('normalizeSpreadsheetProject')}
+    ${declaration('normalizeSpreadsheetIndex')}
+    ${declaration('_ssSplitWorkbook')}
+    ${declaration('_ssMigrateToSplitStorage')}
+
+    // Seed one legacy project, the way a pre-split Mac has it on disk.
+    var legacy = normalizeSpreadsheetWorkbook({
+      activeProject: 'old',
+      projects: [{ id: 'old', name: 'Existing', activeId: 's1',
+                   sheets: [{ id: 's1', name: 'Sheet1', rows: 5, cols: 5,
+                              colWidths: [100, 100, 100, 100, 100], cells: {} }] }],
+    });
+    _stored.set('spreadsheets', legacy);
+    _durableStoreSnapshots.set('spreadsheets', legacy);
+
+    globalThis.migrate = () => _ssMigrateToSplitStorage();
+    globalThis.storageMode = () => _ssStorageMode();
+    globalThis.stored = key => _stored.get(key);
+
+    // What a concurrent save does: take the SAME key and write a workbook that
+    // includes a project the migration's snapshot never saw.
+    globalThis.saveNewProjectConcurrently = () => _serializeKeyMutation('spreadsheets', async () => {
+      globalThis.saveSawMode = _ssStorageMode();
+      var current = _stored.get('spreadsheets');
+      globalThis.saveRanAfterIndex = current && current.schema === SPREADSHEET_INDEX_SCHEMA;
+      // A split-aware save writes its own document plus an index record.
+      var doc = { id: 'fresh', name: 'Created during migration', activeId: 's1',
+                  sheets: [{ id: 's1', name: 'Sheet1', rows: 5, cols: 5,
+                             colWidths: [100, 100, 100, 100, 100], cells: {} }] };
+      _stored.set('spreadsheet_fresh', doc);
+      _durableStoreSnapshots.set('spreadsheet_fresh', doc);
+      var index = _cloneJson(current);
+      index.projects.push({ id: 'fresh', version: 1 });
+      _stored.set('spreadsheets', index);
+      _durableStoreSnapshots.set('spreadsheets', index);
+    });
+  `, context);
+
+  assert.equal(context.storageMode(), 'legacy', 'starts legacy');
+
+  const migration = context.migrate();
+  // Wait until migration is genuinely inside its first document write.
+  while (documentsSeen === 0) await new Promise(resolve => setTimeout(resolve, 5));
+
+  // Now the user creates a project. Under the old code this ran immediately,
+  // in legacy mode, and was overwritten. It must instead queue behind the
+  // migration and run against split storage.
+  const save = context.saveNewProjectConcurrently();
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(context.saveSawMode, undefined,
+    'the save has not started: migration holds the spreadsheets key');
+
+  releaseFirstDocument();
+  await migration;
+  await save;
+
+  assert.equal(context.saveRanAfterIndex, true,
+    'the save ran after the migration index was committed, not before it');
+  assert.equal(context.saveSawMode, 'split',
+    'and it saw split storage, so it took the split branch');
+
+  const index = context.stored('spreadsheets');
+  const ids = index.projects.map(entry => entry.id).sort();
+  assert.deepEqual(ids, ['fresh', 'old'],
+    'both the migrated project and the one created during migration are in the index');
+  assert.ok(context.stored('spreadsheet_old'), 'the migrated project has its document');
+  assert.ok(context.stored('spreadsheet_fresh'), 'so does the one created during migration');
+
+  // The index must be the LAST spreadsheets write, never a stale one landing after.
+  const spreadsheetWrites = commits.filter(entry => entry.key === 'spreadsheets');
+  assert.equal(spreadsheetWrites.length, 1, 'migration writes the index exactly once');
+});
+
+test('MB1188-003: a second migration call joins the one in flight', async () => {
+  // Two callers must not queue two migrations; the second would rebuild an
+  // index from a workbook the first already replaced.
+  const context = vm.createContext({
+    Promise, Map, Set, Array, Object, JSON, Number, String, Boolean, Date, setTimeout, TextEncoder,
+    console: { warn() {}, error() {}, info() {}, log() {} },
+    showToast() {},
+    _cloneJson: value => JSON.parse(JSON.stringify(value)),
+  });
+  vm.runInContext(`
+    var _keyMutationChains = new Map();
+    var SPREADSHEET_INDEX_SCHEMA = 2;
+    var SPREADSHEET_PROJECT_KEY_PREFIX = 'spreadsheet_';
+    var SPREADSHEET_PROJECT_ID_PATTERN = /^[A-Za-z0-9_-]{1,100}$/;
+    var MAX_SPREADSHEET_TOMBSTONES = 175, MAX_SPREADSHEET_INDEX_RECORDS = 400;
+    var MAX_SPREADSHEET_INDEX_BYTES = 64000, MAX_SPREADSHEET_PROJECTS = 25;
+    var MAX_SPREADSHEET_CELL_CHARS = 50000, MAX_SPREADSHEET_SHEETS = 25,
+        MAX_SPREADSHEET_ROWS = 500, MAX_SPREADSHEET_COLS = 100,
+        MAX_SPREADSHEET_GRID_CELLS = 10000, MAX_SPREADSHEET_TOTAL_CELLS = 10000,
+        MAX_SPREADSHEET_TOTAL_CHARS = 400000, MAX_SPREADSHEET_SYNC_JSON_BYTES = 600000,
+        MAX_SPREADSHEET_ATTRIBUTIONS = 200, MAX_SPREADSHEET_ATTRIBUTION_NAME = 80,
+        MAX_RESOLVED_CONFLICT_IDS = 200, MAX_SPREADSHEET_CONFLICTS = 200;
+    var _syncReady = false, _syncBootstrapComplete = false;
+    var _durableStoreSnapshots = new Map();
+    var _ssMigrationRan = false, _ssMigrationInFlight = null;
+    var _newOperationId = () => 'op';
+    var indexWriteCount = 0;
+    var _stored = new Map();
+    var STORE = { get: (key, fallback) => _stored.has(key) ? _stored.get(key) : fallback };
+    async function _commitEncryptedSnapshot(key, serialized, normalized) {
+      await new Promise(done => setTimeout(done, 5));
+      if (key === 'spreadsheets') indexWriteCount += 1;
+      _stored.set(key, normalized);
+      _durableStoreSnapshots.set(key, normalized);
+    }
+    ${declaration('_serializeKeyMutation')}
+    ${declaration('_ssProjectSyncKey')}
+    ${declaration('_ssIsLegacyWorkbook')}
+    ${declaration('_ssStorageMode')}
+    ${declaration('_ssProjectAsDoc')}
+    ${declaration('_ssProjectDocToWorkbook')}
+    ${declaration('_ssWorkbookToProjectDoc')}
+    ${declaration('_ssOversizeError')}
+    ${declaration('_normalizeSpreadsheetAttribution')}
+    ${declaration('_mergeResolvedConflictIds')}
+    ${declaration('normalizeSpreadsheetWorkbook')}
+    ${declaration('normalizeSpreadsheetProject')}
+    ${declaration('normalizeSpreadsheetIndex')}
+    ${declaration('_ssSplitWorkbook')}
+    ${declaration('_ssMigrateToSplitStorage')}
+    var legacy = normalizeSpreadsheetWorkbook({ activeProject: 'old', projects: [{
+      id: 'old', name: 'Existing', activeId: 's1',
+      sheets: [{ id: 's1', name: 'Sheet1', rows: 5, cols: 5,
+                 colWidths: [100, 100, 100, 100, 100], cells: {} }] }] });
+    _stored.set('spreadsheets', legacy);
+    _durableStoreSnapshots.set('spreadsheets', legacy);
+    globalThis.migrate = () => _ssMigrateToSplitStorage();
+    globalThis.indexWrites = () => indexWriteCount;
+  `, context);
+
+  const [first, second] = await Promise.all([context.migrate(), context.migrate()]);
+  assert.equal(first, true, 'the first call reports it migrated');
+  assert.equal(second, true, 'the second reports the same outcome rather than a fresh run');
+  assert.equal(context.indexWrites(), 1, 'the index is written once, not twice');
+});
+
+// ─────────────────────────────────────────────────────────────
+// MB1188-007: shared human lists converge instead of overwriting.
+//
+// Every case below is one row of the two-device matrix. "Mac A" is the caller:
+// it read `base` and saved `next`. "Mac B" already landed its change, so it is
+// the difference between `base` and `current`. The merge must keep both.
+// ─────────────────────────────────────────────────────────────
+function recordListApi() {
+  const context = vm.createContext({
+    Map, Set, Array, Object, JSON, String, Number, Boolean,
+    console: { warn() {}, error() {}, log() {} },
+    _cloneJson: value => JSON.parse(JSON.stringify(value)),
+  });
+  vm.runInContext(`
+    ${declaration('_recordListHasStableIds')}
+    ${declaration('_recordListDelta')}
+    ${declaration('_mergeRecordFields')}
+    ${declaration('_applyRecordListDelta')}
+    // What _persistRecordList does, minus the store: derive the delta from what
+    // this Mac saw, then apply it to whatever is actually there now.
+    globalThis.converge = (base, next, current) =>
+      _applyRecordListDelta(current, _recordListDelta(base, next));
+    globalThis.delta = (base, next) => _recordListDelta(base, next);
+    globalThis.apply = (current, d) => _applyRecordListDelta(current, d);
+    globalThis.stableIds = list => _recordListHasStableIds(list);
+  `, context);
+  return context;
+}
+
+const todo = (id, over = {}) => ({ id, text: 'item ' + id, done: false, ...over });
+const ids = list => Array.from(list, record => record.id);
+
+test('MB1188-007: add + add — both Macs keep their item', () => {
+  const api = recordListApi();
+  const base = [todo('a')];
+  // Mac A adds "b"; Mac B has already added "c".
+  const result = api.converge(base, [todo('a'), todo('b')], [todo('a'), todo('c')]);
+  assert.deepEqual(ids(result).sort(), ['a', 'b', 'c'],
+    'the whole-value save used to drop whichever add landed first');
+});
+
+test('MB1188-007: edit A + add B', () => {
+  const api = recordListApi();
+  const base = [todo('a')];
+  const result = api.converge(base, [todo('a', { done: true })], [todo('a'), todo('b')]);
+  assert.deepEqual(ids(result).sort(), ['a', 'b']);
+  assert.equal(result.find(r => r.id === 'a').done, true, 'the tick survives');
+});
+
+test('MB1188-007: edit A + edit B — different records, both edits survive', () => {
+  const api = recordListApi();
+  const base = [todo('a'), todo('b')];
+  const result = api.converge(
+    base,
+    [todo('a', { text: 'A edited' }), todo('b')],
+    [todo('a'), todo('b', { text: 'B edited' })],
+  );
+  assert.equal(result.find(r => r.id === 'a').text, 'A edited');
+  assert.equal(result.find(r => r.id === 'b').text, 'B edited');
+});
+
+test('MB1188-007: same record, different fields — both survive', () => {
+  const api = recordListApi();
+  const base = [todo('a', { text: 'original', done: false })];
+  // A ticks the box; B rewrites the text. Neither should lose.
+  const result = api.converge(
+    base,
+    [todo('a', { text: 'original', done: true })],
+    [todo('a', { text: 'B rewrote this', done: false })],
+  );
+  assert.equal(result.length, 1);
+  assert.equal(result[0].done, true, "A's tick survives");
+  assert.equal(result[0].text, 'B rewrote this', "B's text survives");
+});
+
+test('MB1188-007: same record, same field — last writer wins, and only that field', () => {
+  const api = recordListApi();
+  const base = [todo('a', { text: 'original', done: false })];
+  const result = api.converge(
+    base,
+    [todo('a', { text: 'A version', done: true })],
+    [todo('a', { text: 'B version', done: false })],
+  );
+  // Documented behaviour, not an accident: a genuine same-field divergence on
+  // a to-do is resolved in favour of the save being made. The tick, which only
+  // A changed, is still kept.
+  assert.equal(result[0].text, 'A version');
+  assert.equal(result[0].done, true);
+});
+
+test('MB1188-007: delete A + add B', () => {
+  const api = recordListApi();
+  const base = [todo('a'), todo('b')];
+  const result = api.converge(base, [todo('b')], [todo('a'), todo('b'), todo('c')]);
+  assert.deepEqual(ids(result).sort(), ['b', 'c'], 'the delete applies and the add survives');
+});
+
+test('MB1188-007: delete on one Mac + edit on the other keeps the human text', () => {
+  const api = recordListApi();
+  const base = [todo('a', { text: 'original' })];
+  // A edited it; B deleted it.
+  const result = api.converge(base, [todo('a', { text: 'A typed this' })], []);
+  assert.equal(result.length, 1, 'losing typing is worse than an extra row');
+  assert.equal(result[0].text, 'A typed this');
+});
+
+test('MB1188-007: a record this Mac never saw is not treated as a deletion', () => {
+  const api = recordListApi();
+  // This is the exact shape of the original bug. Mac A read a list without
+  // "c", so "c" is missing from what A saves — not because anyone deleted it.
+  const base = [todo('a')];
+  const result = api.converge(base, [todo('a'), todo('b')], [todo('a'), todo('c')]);
+  assert.ok(result.some(r => r.id === 'c'), 'c is untouched, not pruned');
+});
+
+test('MB1188-007: replaying the same delta twice changes nothing', () => {
+  const api = recordListApi();
+  const base = [todo('a')];
+  const d = api.delta(base, [todo('a', { done: true }), todo('b')]);
+  const once = api.apply([todo('a')], d);
+  const twice = api.apply(once, d);
+  assert.deepEqual(JSON.parse(JSON.stringify(twice)), JSON.parse(JSON.stringify(once)),
+    'duplicate delivery is idempotent');
+});
+
+test('MB1188-007: the order on screen is preserved, with unseen records after it', () => {
+  const api = recordListApi();
+  const base = [todo('a'), todo('b')];
+  const result = api.converge(
+    base,
+    [todo('b'), todo('a')],                       // A reordered
+    [todo('a'), todo('b'), todo('remote')],       // B added one
+  );
+  assert.deepEqual(ids(result), ['b', 'a', 'remote'],
+    "the caller's order leads; what they never saw follows");
+});
+
+test('MB1188-007: a list without usable ids is refused, never merged by guess', () => {
+  const api = recordListApi();
+  assert.equal(api.stableIds([{ id: 'a' }, { id: 'b' }]), true);
+  assert.equal(api.stableIds([{ id: 'a' }, { id: 'a' }]), false, 'duplicate ids');
+  assert.equal(api.stableIds([{ id: 'a' }, { text: 'no id' }]), false, 'missing id');
+  assert.equal(api.stableIds([{ id: 'a' }, null]), false, 'not a record');
+  assert.equal(api.stableIds('nope'), false);
+});
+
+test('MB1188-007: the shared list savers no longer replace whole values', () => {
+  // The four keys the audit named. If one of these regresses to STORE.replace,
+  // every convergence property above becomes untrue at the call site while
+  // still passing as a unit.
+  for (const fn of ['saveTodos', 'saveAssignedTasks', 'savePolicies', 'saveStepUpReceipts']) {
+    const body = declaration(fn);
+    assert.doesNotMatch(body, /STORE\.replace\(/, `${fn} must not replace the whole list`);
+    assert.match(body, /_persistRecordList\(/, `${fn} must save a semantic delta`);
+  }
+});
+
+test('MB1188-007: shared records get collision-resistant ids, not Date.now()', () => {
+  // Two Macs creating a to-do in the same millisecond produced the same id,
+  // and the merge then treated two different items as one record.
+  for (const fn of ['addTodoItem', 'addDashboardTodo', 'generateTodoFromLog',
+                    'saveAssignedTask', 'addPolicy']) {
+    let body;
+    try { body = declaration(fn); } catch (_) { continue; }
+    assert.doesNotMatch(body, /id: Date\.now\(\)/,
+      `${fn} must not mint record ids from the clock alone`);
+  }
+});
+
+test('MB1188-007: a replacement is refused when the durable base moved at the same revision', async () => {
+  // The race the audit reproduced. The revision only moves when Firebase
+  // delivers; a local commit changes the value and leaves it alone. The old
+  // guard compared revisions only, so this replacement passed and erased an
+  // already-acknowledged record with no error at all.
+  const localStorage = new MemoryStorage({
+    tmb_logs: 'E:["base"]',
+    tmb_logs_revision: '4',
+  });
+  const durable = new Map([['logs', ['base']]]);
+  const context = contextWith({
+    localStorage,
+    _encKey: {},
+    _decCache: Object.assign(Object.create(null), { logs: ['base'] }),
+    _durableStoreSnapshots: durable,
+    _cloneJson: v => JSON.parse(JSON.stringify(v)),
+    _lockedStorageKeys: new Set(),
+    _storeWriteChains: new Map(),
+    _storeWriteErrors: new Map(),
+    _keyMutationChains: new Map(),
+    _optimisticStoreValues: new Map(),
+    _syncReady: false,
+    _syncBootstrapComplete: false,
+    isSyncKey: k => k === 'logs',
+    _newOperationId: () => 'op-local',
+    _aesEncrypt: async p => 'E:' + p,
+    _normalizeSyncValue: (_k, v) => JSON.parse(JSON.stringify(v)),
+    _scheduleSyncDrain: async () => false,
+    _writePendingSyncRecord: () => ({}),
+  });
+  vm.runInContext(`
+    ${declaration('_serializeKeyMutation')}
+    ${declaration('_localSyncRevision')}
+    ${classDeclaration('SyncConflictError')}
+    ${declaration('_commitEncryptedSnapshot')}
+    ${declaration('_digestOfValue')}
+    ${declaration('_readSyncMutationBase')}
+    ${declaration('_queueEncryptedWrite')}
+    globalThis.api = {
+      // A semantic predecessor commits inside the same key lock. The revision
+      // is untouched — this is a local write, not a Firebase delivery.
+      predecessor: () => _serializeKeyMutation('logs', async () => {
+        _durableStoreSnapshots.set('logs', ['base', 'predecessor']);
+        _decCache.logs = ['base', 'predecessor'];
+      }),
+      replace: () => _queueEncryptedWrite('logs', ['base', 'replacement'], { operationId: 'op' }),
+      cached: () => _decCache.logs,
+      revision: () => _localSyncRevision('logs'),
+    };
+  `, context);
+
+  const predecessor = context.api.predecessor();
+  let code = null;
+  const replacement = context.api.replace().catch(error => { code = error?.code; });
+  await Promise.all([predecessor, replacement]);
+
+  assert.equal(context.api.revision(), 4, 'the revision never moved — that is the point');
+  assert.equal(code, 'SYNC_CONFLICT',
+    'the replacement is refused because the value it was derived from is gone');
+  assert.deepEqual([...context.api.cached()], ['base', 'predecessor'],
+    'the acknowledged record survives instead of being silently erased');
+});
+
+// ─────────────────────────────────────────────────────────────
+// MB1188-008: a profile added from the signed-out login screen reaches the
+// other Macs. The login screen already promised this ("Elizabeth can sign in
+// here to publish it") — the code simply never did it.
+// ─────────────────────────────────────────────────────────────
+function directoryPublishApi(overrides = {}) {
+  const localStorage = new MemoryStorage(overrides.storage || {});
+  const published = [];
+  const context = contextWith({
+    localStorage,
+    _syncReady: overrides.syncReady === true,
+    _syncBootstrapComplete: overrides.syncReady === true,
+    isElizabeth: () => overrides.owner === true,
+    showToast: (message, tone) => published.push({ toast: message, tone }),
+    renderManageProfiles: () => {},
+    STORE: {
+      replace: async (key, value) => { published.push({ key, value }); return true; },
+      flush: async () => {
+        if (overrides.flushFails) throw new Error('Firebase is not connected');
+        return true;
+      },
+    },
+    window: {
+      electronSession: overrides.bridgeMissing ? {} : {
+        exportDirectory: async () => overrides.exportResult ||
+          ({ ok: true, directory: [{ name: 'QA Front Desk', role: 'Front Desk' }] }),
+      },
+    },
+  });
+  vm.runInContext(`
+    var DIRECTORY_PUBLISH_PENDING_KEY = 'tmb__directory_publish_pending';
+    ${declaration('_directoryPublicationPending')}
+    ${declaration('_setDirectoryPublicationPending')}
+    ${declaration('publishStaffDirectory')}
+    ${declaration('flushPendingDirectoryPublication')}
+    globalThis.api = {
+      publish: () => publishStaffDirectory(),
+      flushPending: () => flushPendingDirectoryPublication(),
+      pending: () => _directoryPublicationPending(),
+      markPending: () => _setDirectoryPublicationPending(true),
+    };
+  `, context);
+  return { context, published, localStorage };
+}
+
+test('MB1188-008: adding a profile while signed out records the debt', async () => {
+  const { context } = directoryPublishApi({ owner: false });
+  assert.equal(await context.api.publish(), false, 'a non-owner cannot publish');
+  assert.equal(context.api.pending(), true,
+    'the Mac remembers that its profile list is ahead of the others');
+});
+
+test('MB1188-008: the marker survives a restart', () => {
+  // It is plain localStorage on purpose: the situation that creates it happens
+  // before encrypted storage is unlocked.
+  const first = directoryPublishApi({ owner: false });
+  first.context.api.markPending();
+  const carried = Object.fromEntries(first.localStorage.values);
+  const second = directoryPublishApi({ owner: true, storage: carried });
+  assert.equal(second.context.api.pending(), true, 'still owed after a relaunch');
+});
+
+test('MB1188-008: the owner signing in publishes and clears the marker', async () => {
+  const { context, published } = directoryPublishApi({ owner: true, storage: {
+    tmb__directory_publish_pending: '1',
+  } });
+  assert.equal(context.api.pending(), true);
+  await context.api.flushPending();
+  assert.equal(context.api.pending(), false, 'the debt is settled');
+  const write = published.find(entry => entry.key === 'staff_directory');
+  assert.ok(write, 'the directory was actually written');
+  assert.deepEqual(Array.from(write.value, row => row.name), ['QA Front Desk']);
+});
+
+test('MB1188-008: someone else signing in leaves the marker for the owner', async () => {
+  const { context, published } = directoryPublishApi({ owner: false, storage: {
+    tmb__directory_publish_pending: '1',
+  } });
+  await context.api.flushPending();
+  assert.equal(context.api.pending(), true, 'still pending — only the owner can publish');
+  assert.equal(published.some(entry => entry.key === 'staff_directory'), false,
+    'and nothing was written');
+});
+
+test('MB1188-008: the marker stays set when the write does not reach the cloud', async () => {
+  const { context } = directoryPublishApi({
+    owner: true, syncReady: true, flushFails: true,
+    storage: { tmb__directory_publish_pending: '1' },
+  });
+  assert.equal(await context.api.publish(), false);
+  assert.equal(context.api.pending(), true,
+    'clearing on the local save alone is what made the old promise untrue');
+});
+
+test('MB1188-008: a rejected export does not clear the marker', async () => {
+  const { context } = directoryPublishApi({
+    owner: true, exportResult: { ok: false, error: 'refused' },
+    storage: { tmb__directory_publish_pending: '1' },
+  });
+  assert.equal(await context.api.publish(), false);
+  assert.equal(context.api.pending(), true);
+});
+
+test('MB1188-008: publication is a post-login maintenance job with a manual retry', () => {
+  assert.match(declaration('runPostLoginMaintenance'),
+    /\['staff directory publication', flushPendingDirectoryPublication\]/,
+    'owner login must settle the debt, not just record it');
+  assert.match(declaration('renderManageProfiles'), /retryDirectoryPublication\(\)/,
+    'and the owner needs a way to retry it by hand');
+  assert.match(declaration('renderManageProfiles'), /_directoryPublicationPending\(\)/,
+    'shown only when something is actually pending');
+});
+
+// ── MB1188-017: a log body somebody wrote is never silently discarded ───────
+
+test('MB1188-017: the 51st variant does not delete the 1st', () => {
+  const { merge } = conflictMergeApi();
+  // The audit supplied 51 unique bodies to the boundary and got 50 back:
+  // body-00 was gone, with no error and nothing left to recover it from.
+  let out = [{ ...CB, body: 'body-00', version: 2, baseVersion: 1,
+    updated: '2026-08-01T10:00:00.000Z' }];
+  for (let index = 1; index <= 60; index++) {
+    const stamp = new Date(Date.parse('2026-08-01T10:00:00.000Z') + index * 1000).toISOString();
+    out = merge(out, [{ ...CB, body: 'body-' + String(index).padStart(2, '0'),
+      version: 2, baseVersion: 1, updated: stamp }]);
+  }
+  const kept = JSON.stringify(out);
+  for (let index = 0; index <= 60; index++) {
+    const body = 'body-' + String(index).padStart(2, '0');
+    assert.ok(kept.includes(body), `${body} survives the boundary`);
+  }
+  assert.ok((out[0]._conflicts || []).length > 50, 'well past the old cap of 50');
+});
+
+test('MB1188-017: variants are bounded by refusal, not by deletion', () => {
+  const source = declaration('_mergeConflictVariants');
+  assert.doesNotMatch(source, /\.slice\(-MAX_CONFLICT_VARIANTS\)/, 'silent eviction is gone');
+  assert.match(source, /CONFLICT_VARIANT_WARN_AT/, 'replaced by a warning');
+  assert.match(script, /const CONFLICT_VARIANT_WARN_AT = 50;/);
+});
+
+test('MB1188-017: a resolution marker from an older build still settles its variant', () => {
+  // The variant id moved to a 64-bit digest. Had the old form stopped being
+  // recognised, every conflict already resolved would have come back once.
+  const context = contextWith({ _cloneJson: v => JSON.parse(JSON.stringify(v)) });
+  vm.runInContext(`
+    ${declaration('_recordContentKey')}
+    ${declaration('_ssDigest')}
+    ${declaration('_conflictVariantKey')}
+    ${declaration('_conflictVariantIdLegacy')}
+    ${declaration('_conflictVariantId')}
+    ${declaration('_conflictVariantIds')}
+    ${declaration('_mergeConflictVariants')}
+    globalThis.api = {
+      legacyId: v => _conflictVariantIdLegacy(_conflictVariantKey(v)),
+      merge: (groups, settled) => _mergeConflictVariants(groups, settled),
+    };
+  `, context);
+  const variant = { id: 'r1', body: 'settled long ago' };
+  const legacy = context.api.legacyId(variant);
+  assert.match(legacy, /^cv_/, 'precondition: the old form');
+  assert.equal(context.api.merge([[variant]], [legacy]).length, 0,
+    'an old marker still retires its variant');
+});
+
+test('MB1188-017: the variant digest is 64-bit and markers are kept longer', () => {
+  assert.match(declaration('_conflictVariantId'), /_ssDigest\(key\)/,
+    'a 32-bit hash can collide, and a collision merges two people\u2019s text into one');
+  assert.match(script, /const MAX_RESOLVED_CONFLICT_IDS = 2000;/);
+});
+
+// ── MB1188-018: one key's pending change must not retire the whole envelope ──
+
+function icloudLoadApi(options) {
+  const localStorage = new MemoryStorage(options.storage || {});
+  const applied = [];
+  const context = contextWith({
+    localStorage,
+    _encKey: {},
+    window: { electronSync: { read: async () => ({ ok: true, data: options.envelope }) } },
+    _assessCloudPinEpoch: async () => {},
+    _decodeCloudEnvelope: async () => ({ decoded: options.decoded, rejected: [] }),
+    _serializeKeyReconcile: (_key, task) => task(),
+    _readPendingSyncRecord: name => options.pending.has(name),
+    _localSyncRevision: () => 0,
+    _persistRemoteValue: async (name, value) => { applied.push({ name, value }); },
+    _refreshForSyncKey: () => {},
+    showToast: () => {},
+  });
+  vm.runInContext(`
+    ${declaration('_timestampMs')}
+    ${declaration('loadFromiCloud')}
+    globalThis.load = () => loadFromiCloud();
+  `, context);
+  return {
+    load: () => context.load(),
+    applied,
+    watermark: () => localStorage.getItem('tmb__cloud_last_loaded'),
+    storage: () => Object.fromEntries(localStorage.values),
+  };
+}
+
+const ENVELOPE_AT = '2026-08-06T12:00:00.000Z';
+const decodedPair = () => new Map([
+  ['policies', { value: [{ id: 'p1' }], revision: 3, updated: ENVELOPE_AT }],
+  ['todo_items', { value: [{ id: 't1' }], revision: 3, updated: ENVELOPE_AT }],
+]);
+
+test('MB1188-018: a key skipped for a pending change leaves the envelope unconsumed', async () => {
+  // policies applies; todo_items is skipped because this Mac has not sent its
+  // own change yet. Advancing the watermark here retired the envelope for BOTH,
+  // and todo_items was never looked at again.
+  const api = icloudLoadApi({
+    envelope: { lastUpdated: ENVELOPE_AT },
+    decoded: decodedPair(),
+    pending: new Set(['todo_items']),
+  });
+  await api.load();
+  assert.deepEqual(api.applied.map(entry => entry.name), ['policies'],
+    'the unblocked key still applies');
+  assert.equal(api.watermark(), null,
+    'and the envelope is NOT marked consumed while a key is still unreviewed');
+  assert.ok(api.storage().tmb_todo_items_cloud_deferred,
+    'the skipped key leaves an explicit record rather than disappearing');
+});
+
+test('MB1188-018: the same envelope is reconsidered once the pending change clears', async () => {
+  const first = icloudLoadApi({
+    envelope: { lastUpdated: ENVELOPE_AT },
+    decoded: decodedPair(),
+    pending: new Set(['todo_items']),
+  });
+  await first.load();
+  // Next login: the local change has been delivered, so nothing is pending.
+  const second = icloudLoadApi({
+    envelope: { lastUpdated: ENVELOPE_AT },
+    decoded: decodedPair(),
+    pending: new Set(),
+    storage: first.storage(),
+  });
+  await second.load();
+  assert.ok(second.applied.some(entry => entry.name === 'todo_items'),
+    'the backup copy that was never reviewed is finally considered');
+  assert.equal(second.watermark(), ENVELOPE_AT, 'and now the envelope is consumed');
+  assert.equal(second.storage().tmb_todo_items_cloud_deferred, undefined,
+    'the deferral record is cleared once it has been dealt with');
+});
+
+test('MB1188-018: an envelope with nothing deferred is consumed as before', async () => {
+  const api = icloudLoadApi({
+    envelope: { lastUpdated: ENVELOPE_AT },
+    decoded: decodedPair(),
+    pending: new Set(),
+  });
+  await api.load();
+  assert.equal(api.applied.length, 2);
+  assert.equal(api.watermark(), ENVELOPE_AT);
+});
+
+// ── MB1188-013: a malformed cloud record is refused, not stored ─────────────
+
+function syncValidatorApi() {
+  const context = contextWith({});
+  vm.runInContext(`
+    var MAX_SYNC_PLAINTEXT_BYTES = 600000;
+    ${declaration('_ssIsProjectSyncKey')}
+    ${declaration('_estimateJsonBytes')}
+    ${declaration('_expectedSyncType')}
+    ${declaration('_validateSyncRecordList')}
+    globalThis.api = {
+      check: (key, value) => _validateSyncRecordList(key, value),
+      identity: () => SYNC_RECORD_IDENTITY,
+    };
+  `, context);
+  return context.api;
+}
+
+test('MB1188-013: a record without a usable id is refused', () => {
+  const api = syncValidatorApi();
+  for (const bad of [{ text: 'no id' }, { id: {} }, { id: [] }, { id: null }, { id: '' }]) {
+    assert.throws(() => api.check('todo_items', [bad]), /todo_items record 1/,
+      `${JSON.stringify(bad)} is refused`);
+  }
+});
+
+test('MB1188-013: two records sharing an id are refused rather than merged', () => {
+  // A merge keyed on identity would treat two different people's items as one.
+  const api = syncValidatorApi();
+  assert.throws(() => api.check('assigned_tasks', [{ id: 'a' }, { id: 'a' }]),
+    /repeats id "a"/);
+});
+
+test('MB1188-013: a non-record entry is refused', () => {
+  const api = syncValidatorApi();
+  for (const bad of [null, 'text', 42, ['nested']]) {
+    assert.throws(() => api.check('policies', [bad]), /is not a record/);
+  }
+});
+
+test('MB1188-013: an oversized field is refused, not truncated', () => {
+  // Truncating would be a silent edit to somebody's writing.
+  const api = syncValidatorApi();
+  assert.throws(() => api.check('staff_notes', [{ id: 'n1', body: 'x'.repeat(200001) }]),
+    /oversized "body"/);
+});
+
+test('MB1188-013: staff_directory is keyed by name, which is all it has ever had', () => {
+  const api = syncValidatorApi();
+  api.check('staff_directory', [{ name: 'Ana', role: 'Front Desk' }]);
+  assert.throws(() => api.check('staff_directory', [{ role: 'Front Desk' }]),
+    /has no usable name/);
+  assert.throws(() => api.check('staff_directory',
+    [{ name: 'Ana', role: 'Front Desk' }, { name: 'Ana', role: 'Owner' }]),
+    /repeats name "Ana"/);
+});
+
+test('MB1188-013: well-formed data passes untouched', () => {
+  const api = syncValidatorApi();
+  const todos = [{ id: 'r_1', text: 'Tune piano', done: false }, { id: 'r_2', text: 'Order reeds' }];
+  assert.doesNotThrow(() => api.check('todo_items', todos));
+  // Keys with no declared identity are not policed by this validator, so a
+  // cache or an id list is unaffected.
+  assert.doesNotThrow(() => api.check('comm_handled_ids', ['abc', 'def']));
+  assert.doesNotThrow(() => api.check('sent_emails', [{ id: 1 }, { id: 1 }]));
+});
+
+test('MB1188-013: every human-data key has a declared identity', () => {
+  // A new synchronized key that holds records should be added here on purpose,
+  // not left to fall through unvalidated.
+  const api = syncValidatorApi();
+  const identity = api.identity();
+  for (const key of ['logs', 'staff_notes', 'todo_items', 'assigned_tasks',
+                     'policies', 'step_up_receipts', 'staff_directory']) {
+    assert.ok(identity[key], `${key} declares how its records are identified`);
+  }
+  assert.match(declaration('_normalizeSyncValue'), /_validateSyncRecordList\(key, value\)/,
+    'and the validator actually runs on the sync path');
 });

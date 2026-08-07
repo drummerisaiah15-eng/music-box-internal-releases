@@ -675,7 +675,11 @@ function indexMergeApi() {
     var SPREADSHEET_PROJECT_ID_PATTERN = /^[A-Za-z0-9_-]{1,100}$/;
     ${declaration('_recordSortTime')}
     ${declaration('_recordContentKey')}
+    ${declaration('_ssDigest')}
+    ${declaration('_conflictVariantKey')}
+    ${declaration('_conflictVariantIdLegacy')}
     ${declaration('_conflictVariantId')}
+    ${declaration('_conflictVariantIds')}
     ${declaration('_mergeResolvedConflictIds')}
     ${declaration('_mergeConflictVariants')}
     ${declaration('_mergeDivergentRecords')}

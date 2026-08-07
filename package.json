@@ -1,6 +1,6 @@
 {
   "name": "music-box-internal",
-  "version": "1.1.89",
+  "version": "1.1.90",
   "description": "The Music Box — Internal Operations",
   "main": "main.js",
   "scripts": {
@@ -47,7 +47,13 @@
           ]
         }
       ],
-      "darkModeSupport": true
+      "darkModeSupport": true,
+      "extendInfo": {
+        "NSAppTransportSecurity": {
+          "NSAllowsArbitraryLoads": false,
+          "NSAllowsLocalNetworking": true
+        }
+      }
     },
     "dmg": {
       "title": "Music Box Internal",

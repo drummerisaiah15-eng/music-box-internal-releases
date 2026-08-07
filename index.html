@@ -811,6 +811,12 @@
     .ss-google-dot {
       width:6px;height:6px;border-radius:50%;background:#0f9d58;display:inline-block;
     }
+    /* MB1188-012: a link that stopped working, or tabs nobody has imported. */
+    .ss-google-warn {
+      display:inline-flex;align-items:center;margin-top:5px;
+      padding:2px 8px;border-radius:10px;font-size:10.5px;font-weight:700;
+      background:rgba(224,164,88,.14);color:#8a5a12;border:1px solid rgba(224,164,88,.45);
+    }
     .ss-google-actions { display:flex;gap:5px;margin-top:8px; }
     .ss-google-actions button {
       flex:1;font-size:10.5px;font-weight:700;padding:3px 0;border-radius:6px;
@@ -2651,17 +2657,98 @@ function populateProfileSelects() {
 
 // V159-005: publish this Mac's profile configuration so other Macs converge.
 // Owner-only: the export handler enforces that, and main re-validates on import.
+// MB1188-008: the profile list on this Mac can move ahead of what the other
+// Macs have, because publishing is owner-only and profiles can be added from
+// the signed-out login screen. This marker is the record of that debt.
+//
+// It is deliberately plain localStorage: it must survive a restart, it is not
+// sensitive, and it must be readable before encrypted storage is unlocked —
+// which is the exact situation that creates it.
+const DIRECTORY_PUBLISH_PENDING_KEY = 'tmb__directory_publish_pending';
+
+function _directoryPublicationPending() {
+  try { return localStorage.getItem(DIRECTORY_PUBLISH_PENDING_KEY) === '1'; }
+  catch (_) { return false; }
+}
+
+function _setDirectoryPublicationPending(pending) {
+  try {
+    if (pending) localStorage.setItem(DIRECTORY_PUBLISH_PENDING_KEY, '1');
+    else localStorage.removeItem(DIRECTORY_PUBLISH_PENDING_KEY);
+  } catch (_) {}
+  try { renderManageProfiles(); } catch (_) {}
+}
+
 async function publishStaffDirectory() {
-  if (!isElizabeth() || !window.electronSession?.exportDirectory) return false;
+  if (!window.electronSession?.exportDirectory) {
+    _setDirectoryPublicationPending(true);
+    return false;
+  }
+  if (!isElizabeth()) {
+    // Publishing is owner-only. Recording the debt is what makes the message
+    // on the login screen true: before this, "Elizabeth can sign in here to
+    // publish it" described a flow that did not exist, and the new employee
+    // stayed missing from the other Macs indefinitely.
+    _setDirectoryPublicationPending(true);
+    return false;
+  }
   try {
     const result = await window.electronSession.exportDirectory();
-    if (result?.ok !== true || !Array.isArray(result.directory)) return false;
+    if (result?.ok !== true || !Array.isArray(result.directory)) {
+      _setDirectoryPublicationPending(true);
+      return false;
+    }
     await STORE.replace('staff_directory', result.directory, { authoritative: 'owner-published directory snapshot' });
+    // Clear the marker only once the write is durable. When Firebase is up we
+    // also wait for it to take the record; when it is not, the write stays
+    // durably pending and the post-bootstrap drain delivers it.
+    const cloudRunning = _syncReady && _syncBootstrapComplete;
+    await STORE.flush(['staff_directory'], {
+      includeSync: cloudRunning,
+      requireSync: cloudRunning,
+    });
+    _setDirectoryPublicationPending(false);
     return true;
   } catch (error) {
     console.warn('[profiles] directory was not published:', error?.message || error);
+    _setDirectoryPublicationPending(true);
     return false;
   }
+}
+
+// Runs as a post-login maintenance job. This is the half that was missing:
+// add recorded the debt, and nothing ever settled it.
+async function flushPendingDirectoryPublication() {
+  if (!_directoryPublicationPending()) return true;
+  // Only the owner can publish. Anyone else signing in leaves the marker alone
+  // so it is still there when Elizabeth does.
+  if (!isElizabeth()) return true;
+  const published = await publishStaffDirectory();
+  if (published) {
+    showToast(
+      'Profiles added on this Mac while signed out are now shared with the other Macs.',
+      'success');
+  } else {
+    showToast(
+      'Profiles added on this Mac are still not shared. ' +
+      'Open Settings → Manage Users to retry.',
+      'warning');
+  }
+  return true;
+}
+
+async function retryDirectoryPublication() {
+  if (!isElizabeth()) {
+    showToast('Only the owner can share profiles with the other Macs.', 'warning');
+    return false;
+  }
+  const published = await publishStaffDirectory();
+  showToast(
+    published
+      ? 'Profiles on this Mac are now shared with the other Macs.'
+      : 'Profiles could not be shared yet. Check the connection and try again.',
+    published ? 'success' : 'danger');
+  return published;
 }
 
 // Applies a directory that arrived from another Mac. Main re-validates every
@@ -2760,10 +2847,20 @@ function renderManageProfiles() {
         : `<span style="font-size:11.5px;color:var(--text-muted);width:70px;text-align:right">${escHtml(why)}</span>`}
     </div>`;
   }).join('');
+  // MB1188-008: say so when this Mac's list has not reached the others, and
+  // give a way to fix it that does not require guessing.
+  const pendingBanner = _directoryPublicationPending()
+    ? `<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:10px;padding:9px 11px;border-radius:8px;background:var(--warning-bg,#fdf3e3);border:1px solid var(--warning,#e0a458)">
+         <span style="flex:1;min-width:220px;font-size:12.5px">
+           Profile changes made on this Mac have not been shared with the other Macs yet.
+         </span>
+         <button class="btn btn-outline btn-sm" onclick="retryDirectoryPublication()">Share now</button>
+       </div>`
+    : '';
   list.innerHTML = rows + `<div style="font-size:11.5px;color:var(--text-muted);margin-top:8px">
     ${_loginProfiles.length} profile${_loginProfiles.length === 1 ? '' : 's'} on this Mac.
     Owner is set by the owner passcode and cannot be reassigned.
-  </div>`;
+  </div>` + pendingBanner;
 }
 
 async function setProfileRole(name, role) {
@@ -4162,20 +4259,47 @@ function _recordContentKey(record) {
 
 // P0-4/P1-1: a conflict variant is identified by a stable digest of its content,
 // so a resolution recorded on one Mac can name exactly which variants it settled.
-function _conflictVariantId(variant) {
+// MB1188-017: 32 bits plus a length is small enough for a collision to be
+// possible in principle, and a collision here silently merges two people's
+// different text into one variant. The digest is 64-bit now.
+//
+// The old form is still recognised. Changing the id outright would have
+// orphaned every resolution marker already written, and an orphaned marker
+// means an already-settled conflict quietly comes back.
+function _conflictVariantKey(variant) {
   const bare = { ...variant };
   delete bare._conflicts;
   delete bare._resolvedConflicts;
-  const key = _recordContentKey(bare);
+  return _recordContentKey(bare);
+}
+
+function _conflictVariantIdLegacy(key) {
   let hash = 5381;
   for (let i = 0; i < key.length; i++) hash = ((hash * 33) ^ key.charCodeAt(i)) >>> 0;
   return 'cv_' + hash.toString(36) + '_' + key.length.toString(36);
 }
 
+function _conflictVariantId(variant) {
+  const key = _conflictVariantKey(variant);
+  return 'cv2_' + _ssDigest(key) + '_' + key.length.toString(36);
+}
+
+// Both forms, so a marker written by an older build still settles its variant.
+function _conflictVariantIds(variant) {
+  const key = _conflictVariantKey(variant);
+  return ['cv2_' + _ssDigest(key) + '_' + key.length.toString(36), _conflictVariantIdLegacy(key)];
+}
+
 // Unbounded conflict history could eventually make the synchronized document too
 // large to save. Keep the newest variants; the cap is deliberately generous.
-const MAX_CONFLICT_VARIANTS = 50;
-const MAX_RESOLVED_CONFLICT_IDS = 200;
+// MB1188-017: a warning threshold, not a cap. Human-authored text is never
+// evicted to satisfy it — see _mergeConflictVariants.
+const CONFLICT_VARIANT_WARN_AT = 50;
+// Resolution markers ARE capped, because they grow forever otherwise. Eviction
+// here is by sorted id, which is arbitrary rather than oldest-first, so the cap
+// is set high enough that reaching it is not an ordinary occurrence: losing a
+// marker lets a very stale peer reattach a conflict somebody already settled.
+const MAX_RESOLVED_CONFLICT_IDS = 2000;
 
 // Conflict variants are stored on the surviving record. The list is sorted and
 // de-duplicated so the merge stays commutative, associative and idempotent —
@@ -4192,15 +4316,36 @@ function _mergeConflictVariants(groups, resolvedIds = []) {
       const bare = { ...variant };
       delete bare._conflicts;
       delete bare._resolvedConflicts;
-      const id = _conflictVariantId(bare);
-      if (settled.has(id)) continue; // already resolved; never reattach
+      // already resolved; never reattach — under either id form
+      if (_conflictVariantIds(bare).some(id => settled.has(id))) continue;
       seen.set(_recordContentKey(bare), bare);
     }
   }
-  return [...seen.entries()]
+  const variants = [...seen.entries()]
     .sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0))
-    .map(entry => entry[1])
-    .slice(-MAX_CONFLICT_VARIANTS);
+    .map(entry => entry[1]);
+
+  // MB1188-017: nothing is dropped here.
+  //
+  // This used to end by trimming the sorted list to a fixed cap of 50. Every
+  // entry in it is the only surviving copy of something a person wrote, so
+  // that trim deleted somebody's log body with no error and no record — a 51st
+  // variant simply made the 1st disappear. The list shrinks by being resolved
+  // and by nothing else, which is the same rule the spreadsheet conflicts
+  // already follow.
+  //
+  // It is still bounded, but by the synchronized-value size limit, which
+  // refuses the write loudly instead of quietly discarding text. This warns
+  // well before that so it can be dealt with while it is still routine.
+  if (variants.length >= CONFLICT_VARIANT_WARN_AT) {
+    try {
+      showToast(
+        `${variants.length} unresolved versions of a log entry are being kept. ` +
+        `Open Daily Log and settle them — nothing is lost, but they take up sync space.`,
+        'warning');
+    } catch (_) {}
+  }
+  return variants;
 }
 
 // Resolution markers are a growing set, so they are unioned, sorted for
@@ -4698,6 +4843,30 @@ async function _commitEncryptedSnapshot(k, serialized, snapshot, options = {}) {
 // V159-002: the authoritative base for a local edit is the value most recently
 // committed for that key — including a remote reconciliation that landed while
 // the edit was queued. Read inside the per-key lock, never before it.
+// MB1188-007: a stable fingerprint of a durable value, for guarding a write
+// against the base it was derived from. Keyed on content, so it notices a
+// change that arrived by any route — Firebase, a local commit, or an iCloud
+// reconcile — rather than only the ones that bump the sync revision.
+// FNV-1a over the serialization, with the length appended: two values that
+// collide on the hash would also have to be the same length.
+function _digestOfValue(value) {
+  let serialized;
+  try {
+    serialized = JSON.stringify(value ?? null);
+  } catch (_) {
+    // Unserializable means we cannot prove the base is unchanged, so return a
+    // value that never matches and let the guard fail closed.
+    return 'unhashable:' + Math.random();
+  }
+  if (serialized === undefined) serialized = 'undefined';
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < serialized.length; index++) {
+    hash ^= serialized.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(36) + ':' + serialized.length.toString(36);
+}
+
 function _readSyncMutationBase(k, fallback = null) {
   if (_durableStoreSnapshots.has(k)) return _cloneJson(_durableStoreSnapshots.get(k));
   if (k in _decCache) return _cloneJson(_decCache[k]);
@@ -4821,6 +4990,18 @@ function _queueEncryptedWrite(k, value, options = {}) {
     ? _localSyncRevision(k)
     : null;
 
+  // MB1188-007: the revision alone is not enough.
+  //
+  // The revision only moves when Firebase delivers. A local encrypted commit
+  // or an iCloud reconcile changes the durable VALUE while leaving the
+  // revision exactly where it was — so a replacement that queued behind such a
+  // write saw an unchanged revision, passed the guard, and erased a record
+  // that had already been acknowledged. No error, no conflict, no trace.
+  //
+  // Bind to the base itself. If the durable value moved at all, by any route,
+  // this snapshot was derived from something that no longer exists.
+  const guardBase = guardRevision === null ? null : _digestOfValue(_readSyncMutationBase(k, null));
+
   const optimisticToken = {};
   _optimisticStoreValues.set(k, { token: optimisticToken, value: snapshot });
   const write = _serializeKeyMutation(k, async () => {
@@ -4829,6 +5010,9 @@ function _queueEncryptedWrite(k, value, options = {}) {
       if (currentRevision !== guardRevision) {
         // Whole-value replacement carries no merge intent, so we cannot rebase
         // it. Surface an explicit conflict; both copies remain intact.
+        throw new SyncConflictError(k, guardRevision, currentRevision);
+      }
+      if (_digestOfValue(_readSyncMutationBase(k, null)) !== guardBase) {
         throw new SyncConflictError(k, guardRevision, currentRevision);
       }
     }
@@ -5717,6 +5901,61 @@ function _expectedSyncType(key) {
   return 'array';
 }
 
+// MB1188-013: bounded, per-key validation for the keys that hold human data.
+//
+// Spreadsheets had a detailed validator; everything else was checked only as
+// "is it an array" plus a total size limit. A malformed-but-type-correct record
+// arriving from the cloud — a to-do whose id is an object, a policy whose body
+// is an array — would be stored, and then poison the feature that reads it
+// until somebody recovered the key by hand.
+//
+// These validators REFUSE. They never strip a field or drop a record to make a
+// value acceptable: quietly discarding part of somebody's data is precisely the
+// failure they exist to prevent. A refusal quarantines the incoming value and
+// leaves the local one intact, which is recoverable; a silent edit is not.
+const MAX_SYNC_RECORDS_PER_KEY = 20000;
+const MAX_SYNC_FIELD_CHARS = 200000;
+const SYNC_RECORD_IDENTITY = Object.freeze({
+  logs: 'id',
+  staff_notes: 'id',
+  todo_items: 'id',
+  assigned_tasks: 'id',
+  policies: 'id',
+  step_up_receipts: 'id',
+  // Profiles are identified by name; they have never carried an id.
+  staff_directory: 'name',
+});
+
+function _validateSyncRecordList(key, list) {
+  const identity = SYNC_RECORD_IDENTITY[key];
+  if (!identity) return;
+  if (list.length > MAX_SYNC_RECORDS_PER_KEY) {
+    throw new Error(`${key} has more records than this app can hold (${list.length})`);
+  }
+  const seen = new Set();
+  list.forEach((record, index) => {
+    const where = `${key} record ${index + 1}`;
+    if (!record || typeof record !== 'object' || Array.isArray(record)) {
+      throw new Error(`${where} is not a record`);
+    }
+    const id = record[identity];
+    if (typeof id !== 'string' && typeof id !== 'number') {
+      throw new Error(`${where} has no usable ${identity}`);
+    }
+    const idText = String(id);
+    if (!idText || idText.length > 200) throw new Error(`${where} has an invalid ${identity}`);
+    // Two records sharing an identity is what makes a merge combine two
+    // different people's work into one, so it is refused rather than resolved.
+    if (seen.has(idText)) throw new Error(`${where} repeats ${identity} "${idText}"`);
+    seen.add(idText);
+    for (const [field, fieldValue] of Object.entries(record)) {
+      if (typeof fieldValue === 'string' && fieldValue.length > MAX_SYNC_FIELD_CHARS) {
+        throw new Error(`${where} has an oversized "${field}"`);
+      }
+    }
+  });
+}
+
 function _normalizeSyncValue(key, value) {
   // MB161-012: a project document is validated by the workbook validator, so
   // the two can never disagree about what a sheet may contain.
@@ -5736,6 +5975,7 @@ function _normalizeSyncValue(key, value) {
       ? !!value && typeof value === 'object' && !Array.isArray(value)
       : typeof value === expected;
   if (!valid) throw new Error(`${key} expected ${expected} data`);
+  if (expected === 'array') _validateSyncRecordList(key, value);
   const serialized = JSON.stringify(value);
   if (serialized === undefined) throw new Error(`${key} is not JSON serializable`);
   const clone = JSON.parse(serialized);
@@ -6194,6 +6434,135 @@ function _newOperationId() {
   return _deviceId() + ':' + Date.now().toString(36) + ':' +
     _bytesToB64(crypto.getRandomValues(new Uint8Array(9)))
       .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+}
+
+// ─────────────────────────────────────────────────────────────
+// MB1188-007: shared human lists save as a semantic delta, never as a whole
+// value.
+//
+// The old shape was `saveTodos(wholeArray)` → STORE.replace. Two Macs adding
+// two different to-dos meant the second write carried a complete array that
+// had never seen the first one, and the first item was gone — with no error,
+// because from the store's point of view the caller "owned" the whole value.
+//
+// These helpers turn "here is the list I ended up with" into "here is what I
+// changed", which is the only form that can be replayed against a base that
+// moved underneath it. The delta is computed ONCE, outside the mutator, so
+// re-running the mutator against a newer base is idempotent.
+// ─────────────────────────────────────────────────────────────
+
+// Identity has to be trustworthy before any of this means anything. A list
+// with a missing or duplicated id cannot be merged by id at all, and quietly
+// collapsing two records into one would be worse than refusing.
+function _recordListHasStableIds(list) {
+  if (!Array.isArray(list)) return false;
+  const seen = new Set();
+  for (const record of list) {
+    if (!record || typeof record !== 'object' || Array.isArray(record)) return false;
+    const id = record.id;
+    if (id === undefined || id === null || id === '') return false;
+    const key = String(id);
+    if (seen.has(key)) return false;
+    seen.add(key);
+  }
+  return true;
+}
+
+function _recordListDelta(base, next) {
+  const baseList = Array.isArray(base) ? base : [];
+  const nextList = Array.isArray(next) ? next : [];
+  const baseById = new Map(baseList.map(record => [String(record?.id), record]));
+  const nextById = new Map(nextList.map(record => [String(record?.id), record]));
+  const added = [];
+  const patched = [];
+  const removedIds = [];
+  for (const [id, record] of nextById) {
+    const before = baseById.get(id);
+    if (before === undefined) added.push([id, record]);
+    else if (JSON.stringify(before) !== JSON.stringify(record)) patched.push([id, before, record]);
+  }
+  // Only ids the caller actually SAW count as deletions. A record that arrived
+  // from another Mac after this caller read the list is absent from `next`
+  // because the caller never knew about it — not because anyone deleted it.
+  for (const id of baseById.keys()) if (!nextById.has(id)) removedIds.push(id);
+  return { added, patched, removedIds, order: [...nextById.keys()] };
+}
+
+// Three-way field merge for one record. "Edit the note on A" and "tick the
+// checkbox on A" are different intentions and both survive; only two Macs
+// writing the SAME field differently is last-writer-wins.
+function _mergeRecordFields(baseRecord, nextRecord, currentRecord) {
+  if (!currentRecord || !baseRecord) return _cloneJson(nextRecord);
+  const merged = _cloneJson(currentRecord);
+  const fields = new Set([...Object.keys(baseRecord), ...Object.keys(nextRecord)]);
+  for (const field of fields) {
+    const before = JSON.stringify(baseRecord[field]);
+    const after = JSON.stringify(nextRecord[field]);
+    if (before === after) continue;      // this Mac did not touch this field
+    if (!(field in nextRecord)) delete merged[field];
+    else merged[field] = _cloneJson(nextRecord[field]);
+  }
+  return merged;
+}
+
+function _applyRecordListDelta(current, delta) {
+  const list = Array.isArray(current) ? current.map(record => _cloneJson(record)) : [];
+  const byId = new Map();
+  for (const record of list) byId.set(String(record?.id), record);
+
+  for (const id of delta.removedIds) byId.delete(id);
+  for (const [id, before, after] of delta.patched) {
+    // A record edited here but deleted elsewhere comes back. Losing somebody's
+    // typing is worse than an extra row they can delete again, and this is the
+    // same no-loss rule the spreadsheet and log merges follow.
+    byId.set(id, _mergeRecordFields(before, after, byId.get(id)));
+  }
+  for (const [id, record] of delta.added) {
+    if (!byId.has(id)) byId.set(id, _cloneJson(record));
+  }
+
+  // The caller's order first — that is the order on their screen — then
+  // anything they never saw, keeping its existing relative position.
+  const result = [];
+  const placed = new Set();
+  for (const id of delta.order) {
+    if (byId.has(id) && !placed.has(id)) { result.push(byId.get(id)); placed.add(id); }
+  }
+  for (const record of list) {
+    const id = String(record?.id);
+    if (byId.has(id) && !placed.has(id)) { result.push(byId.get(id)); placed.add(id); }
+  }
+  for (const [id, record] of byId) {
+    if (!placed.has(id)) { result.push(record); placed.add(id); }
+  }
+  return result;
+}
+
+// The call sites keep their `save(wholeList)` shape — there are a dozen of
+// them and rewriting each into explicit add/patch/remove calls would be a dozen
+// chances to get it wrong. The delta is derived here instead, from the value
+// this Mac was looking at when the save was requested.
+// IMPORTANT INVARIANT. `base` defaults to the stored value read HERE, which is
+// only the same thing the caller derived `nextList` from if nothing was awaited
+// between their read and this call. Every current caller reads and saves in one
+// synchronous block, so that holds.
+//
+// If you add an `await` between `getTodos()` and `persistTodos()`, pass the
+// list you read as `options.base`. Without it, a record another Mac added in
+// that window is present in the base, absent from your list, and therefore
+// looks like a deletion you intended — which is the exact bug this function
+// exists to prevent, reintroduced one level up.
+function _persistRecordList(key, nextList, options = {}) {
+  const { reason = 'record list save' } = options;
+  const base = options.base !== undefined ? options.base : STORE.get(key, []);
+  if (!_recordListHasStableIds(base) || !_recordListHasStableIds(nextList)) {
+    // Fail loudly rather than merge by a guessed identity. The replacement
+    // still carries a digest guard, so it cannot silently overwrite either.
+    console.warn(`[storage] ${key} has records without usable ids; saving as a whole value.`);
+    return STORE.replace(key, nextList, { authoritative: `${reason} (no stable record ids)` });
+  }
+  const delta = _recordListDelta(base, nextList);
+  return STORE.mutate(key, current => _applyRecordListDelta(current, delta), []);
 }
 
 function _deviceId() {
@@ -7593,6 +7962,7 @@ const PAGE_TITLES = {
   spreadsheets: 'Spreadsheets',
   stepup: 'Step Up Receipts',
   policies: 'Musicbox Agent',
+  staff: 'Staff',
   settings: 'Settings',
 };
 
@@ -8329,50 +8699,92 @@ async function _ssCommitSplitWorkbook(dirtyBase, dirty) {
 // compare-and-set, the documents written are byte-identical because they are
 // derived from the same workbook, and the index merge is a record list.
 let _ssMigrationRan = false;
+// MB1188-003: set while the migration holds the 'spreadsheets' key, so a
+// second caller joins the run in progress instead of queueing a duplicate.
+let _ssMigrationInFlight = null;
 async function _ssMigrateToSplitStorage() {
   if (_ssMigrationRan) return false;
-  const stored = STORE.get('spreadsheets', null);
-  if (_ssStorageMode(stored) !== 'legacy') return false;
-  // Never migrate a workbook this Mac invented. The same rule that stops a
-  // fabricated default being published: if remote state is unknown, wait.
+  // Cheap pre-checks so an already-split store does not take the lock on every
+  // load. They are all repeated inside the lock, where they actually bind.
+  if (_ssStorageMode(STORE.get('spreadsheets', null)) !== 'legacy') return false;
   if (_ssAwaitingAuthority || _ssBlockedWorkbook) return false;
+  if (_ssMigrationInFlight) {
+    return _ssMigrationInFlight.then(done => done !== false && done !== undefined, () => false);
+  }
 
-  const workbook = normalizeSpreadsheetWorkbook(stored);
-  const { index, documents } = _ssSplitWorkbook(workbook);
-  _ssMigrationRan = true;
-  try {
-    for (const [key, doc] of documents) {
-      const normalized = normalizeSpreadsheetProject(doc);
-      await _serializeKeyMutation(key, async () => {
-        await _commitEncryptedSnapshot(key, JSON.stringify(normalized), normalized, {
-          sync: true,
-          operationId: _newOperationId(),
+  // MB1188-003: the ENTIRE migration runs inside one 'spreadsheets' mutation.
+  //
+  // It used to read the legacy workbook outside any lock, then write the
+  // documents and index derived from that snapshot. A project created while
+  // those writes were in flight saved normally — into the legacy key, in
+  // legacy mode — and was then erased seconds later when the migration
+  // committed an index built before the project existed. The operator saw a
+  // successful save, then watched the project disappear.
+  //
+  // Holding the key for the whole migration means every edit joins it: the
+  // save path takes the same lock and re-decides legacy-vs-split INSIDE it,
+  // so anything queued behind the migration runs against split storage and
+  // anything already committed ahead of it is picked up by the re-read below.
+  const run = _serializeKeyMutation('spreadsheets', async () => {
+    if (_ssMigrationRan) return false;
+    // Rebase inside the critical section. The durable snapshot is what the
+    // save path treats as authoritative, so a commit that landed while this
+    // was queued is visible here rather than being overwritten by a stale one.
+    const stored = _durableStoreSnapshots.has('spreadsheets')
+      ? _cloneJson(_durableStoreSnapshots.get('spreadsheets'))
+      : STORE.get('spreadsheets', null);
+    if (_ssStorageMode(stored) !== 'legacy') return false;
+    // Never migrate a workbook this Mac invented. The same rule that stops a
+    // fabricated default being published: if remote state is unknown, wait.
+    if (_ssAwaitingAuthority || _ssBlockedWorkbook) return false;
+
+    const workbook = normalizeSpreadsheetWorkbook(stored);
+    const { index, documents } = _ssSplitWorkbook(workbook);
+    _ssMigrationRan = true;
+    try {
+      for (const [key, doc] of documents) {
+        const normalized = normalizeSpreadsheetProject(doc);
+        // Different keys, so these do not re-enter the lock held above.
+        await _serializeKeyMutation(key, async () => {
+          await _commitEncryptedSnapshot(key, JSON.stringify(normalized), normalized, {
+            sync: true,
+            operationId: _newOperationId(),
+          });
         });
-      });
-    }
-    await _serializeKeyMutation('spreadsheets', async () => {
+      }
+      // MB161-047: written WITHOUT re-acquiring the 'spreadsheets' lock this
+      // task already holds. _serializeKeyMutation chains onto the task that is
+      // waiting, so asking for it here would deadlock permanently.
       await _commitEncryptedSnapshot('spreadsheets', JSON.stringify(index), index, {
         sync: true,
         operationId: _newOperationId(),
       });
-    });
-  } catch (error) {
-    // The old document is still intact and still authoritative — the index is
-    // written last precisely so a failure here leaves it that way.
-    _ssMigrationRan = false;
-    console.warn('Spreadsheet split migration did not complete:', error?.message || error);
-    showToast(
-      `Spreadsheets could not be upgraded to per-project storage: ${error?.message || error}. ` +
-      `Your data is unchanged.`,
-      'warning');
-    return false;
-  }
-  if (_syncReady && _syncBootstrapComplete) {
-    for (const key of [...documents.keys(), 'spreadsheets']) {
-      _scheduleSyncDrain(key).catch(() => {});
+    } catch (error) {
+      // The old document is still intact and still authoritative — the index is
+      // written last precisely so a failure here leaves it that way.
+      _ssMigrationRan = false;
+      console.warn('Spreadsheet split migration did not complete:', error?.message || error);
+      showToast(
+        `Spreadsheets could not be upgraded to per-project storage: ${error?.message || error}. ` +
+        `Your data is unchanged.`,
+        'warning');
+      return false;
     }
+    if (_syncReady && _syncBootstrapComplete) {
+      for (const key of [...documents.keys(), 'spreadsheets']) {
+        _scheduleSyncDrain(key).catch(() => {});
+      }
+    }
+    return documents.size;
+  });
+  _ssMigrationInFlight = run;
+  let count;
+  try {
+    count = await run;
+  } finally {
+    if (_ssMigrationInFlight === run) _ssMigrationInFlight = null;
   }
-  const count = documents.size;
+  if (count === false || count === undefined) return false;
   console.info(`Spreadsheets migrated to per-project storage: ${count} project document(s).`);
   showToast(
     `Spreadsheets now store each project separately, so each one gets its own space ` +
@@ -8751,10 +9163,11 @@ function normalizeSpreadsheetWorkbook(value) {
     if (!localSheetIds.has(activeId)) {
       throw new Error('spreadsheets active sheet does not exist');
     }
-    // MB161-016: where this project came from, so it can be pulled again and
-    // pushed back. Validated strictly — a link is what decides which remote
-    // spreadsheet gets written to, so a malformed one is dropped rather than
-    // trusted.
+    // MB161-016: where this project came from, so it can be pulled again.
+    // Validated strictly — a link is what decides which remote spreadsheet is
+    // read, so a malformed one is dropped rather than trusted. (Nothing is
+    // written back: the OAuth scope is spreadsheets.readonly and there is no
+    // write path. See the note above the Google section in main.js.)
     const link = project.googleLink;
     let googleLink;
     if (link !== undefined && link !== null) {
@@ -8762,7 +9175,8 @@ function normalizeSpreadsheetWorkbook(value) {
         throw new Error('spreadsheets has an invalid Google link');
       }
       if (!Object.keys(link).every(key =>
-          ['spreadsheetId', 'title', 'sheetId', 'rows', 'columns', 'pulledAt', 'checkpoint', 'tabs'].includes(key))) {
+          ['spreadsheetId', 'title', 'sheetId', 'rows', 'columns', 'pulledAt', 'checkpoint', 'tabs',
+           'lastError', 'lastErrorAt', 'newTabs'].includes(key))) {
         throw new Error('spreadsheets has an invalid Google link');
       }
       const spreadsheetId = String(link.spreadsheetId ?? '');
@@ -8775,6 +9189,16 @@ function normalizeSpreadsheetWorkbook(value) {
         columns: Number.isSafeInteger(link.columns) && link.columns > 0 ? Math.min(link.columns, 100) : 30,
       };
       if (link.pulledAt !== undefined) googleLink.pulledAt = String(link.pulledAt).slice(0, 40);
+      // MB1188-012: a background sync that fails has to leave a trace. Without
+      // one, a link that stopped working looked exactly like a link that had
+      // nothing to report.
+      if (link.lastError !== undefined) googleLink.lastError = String(link.lastError).slice(0, 300);
+      if (link.lastErrorAt !== undefined) googleLink.lastErrorAt = String(link.lastErrorAt).slice(0, 40);
+      if (Array.isArray(link.newTabs)) {
+        googleLink.newTabs = link.newTabs
+          .slice(0, 25)
+          .map(title => checkedString(title, 'Google tab name', 200));
+      }
 
       const readCheckpoint = (input) => {
         if (input === undefined) return undefined;
@@ -8784,7 +9208,24 @@ function normalizeSpreadsheetWorkbook(value) {
         const checkpoint = {};
         for (const [cellKey, value] of Object.entries(input)) {
           if (!/^(0|[1-9]\d*),(0|[1-9]\d*)$/.test(cellKey)) continue;
-          checkpoint[cellKey] = String(value ?? '').slice(0, MAX_SPREADSHEET_CELL_CHARS);
+          // MB1188-011: a plain string is a text-only cell (and every
+          // checkpoint written before this change); an object carries the
+          // formatting too. Anything else is not a checkpoint entry.
+          if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+            if (!Object.keys(value).every(field => ['v', 'bg', 'tc', 'b', 'cb'].includes(field))) {
+              throw new Error('spreadsheets has an invalid Google checkpoint cell');
+            }
+            const entry = { v: String(value.v ?? '').slice(0, MAX_SPREADSHEET_CELL_CHARS) };
+            const bg = optionalColor(value.bg, 'Google checkpoint background');
+            const tc = optionalColor(value.tc, 'Google checkpoint text color');
+            if (bg) entry.bg = bg;
+            if (tc) entry.tc = tc;
+            if (value.b === true) entry.b = true;
+            if (value.cb === true) entry.cb = true;
+            checkpoint[cellKey] = entry;
+          } else {
+            checkpoint[cellKey] = String(value ?? '').slice(0, MAX_SPREADSHEET_CELL_CHARS);
+          }
         }
         return Object.keys(checkpoint).length ? checkpoint : undefined;
       };
@@ -10072,9 +10513,10 @@ function ssRenderHomeView() {
       </div>
       <div class="ss-proj-card-name">${escHtml(p.name)}</div>
       <div class="ss-proj-card-meta">${p.sheets.length} sheet${p.sheets.length!==1?'s':''}</div>
-      ${p.googleLink ? `<div class="ss-google-tag" title="Linked to ${escAttr(_ssGoogleTabSummary(p))} in Google Sheets">
+      ${p.googleLink ? `<div class="ss-google-tag" title="Linked to ${escAttr(_ssGoogleTabSummary(p))} in Google Sheets${p.googleLink.pulledAt ? ' · last checked ' + escAttr(_ssShortWhen(p.googleLink.pulledAt)) : ''}">
         <span class="ss-google-dot"></span>Google Sheets
       </div>
+      ${_ssGoogleLinkNotice(p)}
       <div class="ss-google-actions" onclick="event.stopPropagation()">
         <button onclick="ssPullFromGoogle(${jsArg(p.id)})" title="Check Google now. Edits made in Google come in; your work here is kept.">↓ Sync now</button>
       </div>` : ''}
@@ -10988,7 +11430,10 @@ async function _ssPersistDeletion(what) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// MB161-014/016: Google Sheets, two-way.
+// MB161-014/016: Google Sheets, one way — Google to the app.
+//
+// Two-way sync existed briefly and was removed on purpose. The studio edits in
+// the app; Google is a source, not a destination.
 //
 // An import creates a NEW project and records where it came from, so it can be
 // pulled again. Pulling again REPLACES that project's sheet, which is the
@@ -11229,7 +11674,7 @@ async function ssGoogleLookup() {
             onclick="ssGoogleImportTab(${jsArg(tab.title)})">Import</button>
         </div>`).join('') +
       `<div style="font-size:11.5px;color:var(--text-muted);margin-top:10px">` +
-      `Up to 500 rows × 100 columns are read. Fills, text colour, bold, checkboxes and ` +
+      `Up to 500 rows × 100 columns are read. Fills, text colour, bold, checkboxes, ` +
       `merged cells and column widths all come across; formulas import as their result.</div>`;
   } catch (error) {
     el.textContent = error?.message || String(error);
@@ -11360,11 +11805,11 @@ async function _ssGoogleImport(titles) {
       ? `${_ssGoogleLookup.title} — ${wanted[0]}`
       : _ssGoogleLookup.title).slice(0, 160);
     // MB161-016/018: remember what Google held at this moment. Without the
-    // checkpoint a later push cannot tell an app edit from a Google edit, and
-    // would overwrite both. Built BEFORE the import so its size can be counted
+    // checkpoint a later sync cannot tell an app edit from a Google edit, and
+    // would overwrite one with the other. Built BEFORE the import so its size can be counted
     // against the project's budget — it is attached afterwards, and an import
     // that fits only because the checkpoint was ignored cannot be saved.
-    const checkpoints = read.map(sheet => _ssGoogleCheckpoint(sheet.rows));
+    const checkpoints = read.map(sheet => _ssGoogleCheckpoint(sheet.rows, sheet.formats));
     const linkBytes = new TextEncoder().encode(JSON.stringify(checkpoints)).byteLength;
 
     // `sheetName`, not `name` — that is the field the importer reads, and
@@ -11381,7 +11826,11 @@ async function _ssGoogleImport(titles) {
       const tabs = {};
       builtSheets.forEach((sheet, i) => {
         if (!read[i]) return;
+        // MB1188-012: store Google's own sheetId. A title is a label people
+        // rename; the id is what actually identifies the tab.
+        const discovered = (_ssGoogleLookup.tabs || []).find(tab => tab.title === wanted[i]);
         tabs[sheet.id] = { title: wanted[i], checkpoint: checkpoints[i] };
+        if (Number.isSafeInteger(discovered?.sheetId)) tabs[sheet.id].sheetId = discovered.sheetId;
       });
       return {
         spreadsheetId: _ssGoogleLookup.spreadsheetId,
@@ -11417,7 +11866,7 @@ async function _ssGoogleImport(titles) {
   }
 }
 
-// ── MB161-016: two-way sync with a linked Google tab ────────────────────────
+// ── MB161-016: one-way sync from a linked Google tab ────────────────────────
 
 function _ssGoogleLinkOf(projectId) {
   const project = (_ssData?.projects || []).find(p => p.id === (projectId || _ssData?.activeProject));
@@ -11427,6 +11876,32 @@ function _ssGoogleLinkOf(projectId) {
 // What the badge says a project is linked to. One tab is named; several are
 // counted, because six tab names do not fit in a tooltip and the count is the
 // part somebody is actually checking.
+// MB1188-012: what the link itself has to say — a failure it hit, or tabs in
+// Google nobody here has imported. Both used to be knowable only from a toast
+// that had already gone.
+function _ssGoogleLinkNotice(project) {
+  const link = project?.googleLink;
+  if (!link) return '';
+  if (link.lastError) {
+    return `<div class="ss-google-warn" title="${escAttr(link.lastError)}">` +
+      `Last check failed${link.lastErrorAt ? ' · ' + escHtml(_ssShortWhen(link.lastErrorAt)) : ''}</div>`;
+  }
+  if (Array.isArray(link.newTabs) && link.newTabs.length) {
+    const count = link.newTabs.length;
+    return `<div class="ss-google-warn" title="${escAttr(link.newTabs.join(', '))}">` +
+      `${count} new tab${count === 1 ? '' : 's'} in Google</div>`;
+  }
+  return '';
+}
+
+// Short, local, and never a bare ISO string on a card.
+function _ssShortWhen(iso) {
+  const at = Date.parse(iso || '');
+  if (!Number.isFinite(at)) return '';
+  return new Date(at).toLocaleString(undefined,
+    { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+}
+
 function _ssGoogleTabSummary(project) {
   const titles = Object.values(project?.googleLink?.tabs || {})
     .map(tab => tab?.title).filter(Boolean);
@@ -11476,9 +11951,12 @@ function _ssLinkedSheets(project) {
 // overwritten; a genuine clash goes to the same conflicts banner as a two-Mac
 // collision, with both versions, and a person decides.
 function _ssMergeCellFromGoogle(base, remote, local) {
-  const b = String(base ?? '');
-  const r = String(remote?.v ?? '');
-  const l = String(local?.v ?? '');
+  // MB1188-011: compare the whole cell, not just its text. Comparing `.v` alone
+  // meant a fill or checkbox change in Google was indistinguishable from no
+  // change at all.
+  const b = _ssCellSignature(_ssCheckpointCell(base));
+  const r = _ssCellSignature(remote);
+  const l = _ssCellSignature(local);
   if (r === b) return { take: 'local', cell: local ?? null };
   if (l === b) return { take: 'remote', cell: remote ?? null };
   if (l === r) return { take: 'local', cell: local ?? null };
@@ -11524,9 +12002,60 @@ async function ssPullFromGoogle(projectId, options) {
     const readRows = link.rows;
     const readColumns = link.columns;
 
+    // MB1188-012: ask Google what its tabs are called NOW, before reading any.
+    //
+    // The link used to store titles only, and read by title. Renaming a tab in
+    // Google therefore broke the link silently — the read failed, the
+    // background sync swallowed it, and the project simply stopped updating
+    // with nothing on screen to say so. Tabs are identified by Google's own
+    // sheetId here, and the stored title is corrected from it.
+    //
+    // The same call reports each tab's current size, so a sheet that grew past
+    // the window recorded at import is now read at its real extent instead of
+    // being permanently truncated to it, and names any tab added since the
+    // import rather than ignoring it forever.
+    let currentTabs = null;
+    try {
+      const described = await _googleSheets().describe({ url: spreadsheetId });
+      if (described?.ok && Array.isArray(described.tabs)) currentTabs = described.tabs;
+    } catch (error) {
+      // Not fatal: fall through and read by the stored titles, which is what
+      // every earlier build did. Recorded so a persistent failure is visible.
+      console.warn('[google] tab list unavailable:', error?.message || error);
+    }
+    const bySheetId = new Map();
+    const byTitle = new Map();
+    for (const tab of currentTabs || []) {
+      if (Number.isSafeInteger(tab?.sheetId)) bySheetId.set(tab.sheetId, tab);
+      if (tab?.title) byTitle.set(tab.title, tab);
+    }
+    let renamed = 0;
+    let missing = 0;
+
     for (const { sheetId, tab } of plan) {
+      // Resolve by id first, title second — and adopt the id when a link
+      // written before this change only has a title, so the next sync is
+      // rename-proof even if nobody re-imports.
+      const remoteTab = (Number.isSafeInteger(tab.sheetId) ? bySheetId.get(tab.sheetId) : null)
+        || byTitle.get(tab.title)
+        || null;
+      if (currentTabs && !remoteTab) {
+        // The tab is genuinely gone from Google. Skipping is right; doing it
+        // silently is not.
+        missing += 1;
+        continue;
+      }
+      const readTitle = remoteTab?.title || tab.title;
+      if (remoteTab && readTitle !== tab.title) renamed += 1;
+      // Grow the read window to the tab's real size, still inside the app's
+      // own ceilings. Google reports thousands of empty default rows, so this
+      // is a ceiling on what CAN be read, not a demand for all of it.
+      const wantReadRows = Math.max(readRows, Math.min(remoteTab?.rows || 0, MAX_SPREADSHEET_ROWS));
+      const wantReadColumns = Math.max(readColumns,
+        Math.min(remoteTab?.columns || 0, MAX_SPREADSHEET_COLS));
+
       const remote = await _googleSheets().read({
-        spreadsheetId, title: tab.title, rows: readRows, columns: readColumns,
+        spreadsheetId, title: readTitle, rows: wantReadRows, columns: wantReadColumns,
       });
 
       // Re-acquired AFTER the read, because the read is an await as well.
@@ -11603,7 +12132,7 @@ async function ssPullFromGoogle(projectId, options) {
               id: _ssConflictId(['google', link.spreadsheetId, tab.title, key,
                 String(checkpoint[key] ?? ''), String(local?.v ?? ''), String(incomingCell?.v ?? '')]),
               kind: 'cell', projectId: project.id, sheetId: target.id, target: key,
-              base: checkpoint[key] ? { v: String(checkpoint[key]), bg: '', tc: '', b: false } : null,
+              base: _ssCheckpointCell(checkpoint[key]),
               local: local ? { ...local } : null,
               remote: incomingCell ? { ...incomingCell } : null,
               at: new Date().toISOString(),
@@ -11626,12 +12155,23 @@ async function ssPullFromGoogle(projectId, options) {
       if (Array.isArray(target.colWidths)) {
         while (target.colWidths.length < colsThatFit) target.colWidths.push(100);
         target.colWidths.length = colsThatFit;
+        // MB1188-012: column widths were read on every sync and applied only at
+        // import, so a column widened in Google after the fact never moved
+        // here. A width of 0 is Google's way of saying "hidden" and is left
+        // alone rather than collapsing the column.
+        (remote.columnWidths || []).forEach((width, index) => {
+          if (index < colsThatFit && Number.isFinite(width) && width > 0) {
+            target.colWidths[index] = width;
+          }
+        });
       }
       target.cells = cells;
 
       // The checkpoint describes exactly the extent the app kept, never what
       // Google sent, so a row that did not fit cannot later read as "deleted".
       const kept = (remote.rows || []).slice(0, rowsThatFit).map(row => row.slice(0, colsThatFit));
+      const keptFormats = (remote.formats || []).slice(0, rowsThatFit)
+        .map(row => (row || []).slice(0, colsThatFit));
       changed += tabChanged;
 
       // Cells, checkpoint, link and any conflict this tab produced are written
@@ -11641,7 +12181,18 @@ async function ssPullFromGoogle(projectId, options) {
       live.googleLink = {
         ...liveLink,
         pulledAt: new Date().toISOString(),
-        tabs: { ...liveLink.tabs, [sheetId]: { ...tab, checkpoint: _ssGoogleCheckpoint(kept), mergeSig } },
+        tabs: {
+          ...liveLink.tabs,
+          [sheetId]: {
+            ...tab,
+            // The title Google uses now, and its id, so a rename cannot break
+            // this link again and a legacy title-only link becomes durable.
+            title: readTitle,
+            ...(Number.isSafeInteger(remoteTab?.sheetId) ? { sheetId: remoteTab.sheetId } : {}),
+            checkpoint: _ssGoogleCheckpoint(kept, keptFormats),
+            mergeSig,
+          },
+        },
       };
       if (newConflicts.length) {
         _ssData._conflicts = [
@@ -11664,22 +12215,66 @@ async function ssPullFromGoogle(projectId, options) {
       await saving;
     }
 
+    // MB1188-012: a tab added in Google after the import used to be invisible
+    // forever. Recorded on the link so the project card can say so, rather
+    // than only appearing in a toast nobody was watching for.
+    const finalProject = (_ssData?.projects || []).find(entry => entry.id === projectId);
+    if (finalProject?.googleLink) {
+      const linkedTitles = new Set(
+        Object.values(finalProject.googleLink.tabs || {}).map(entry => entry?.title).filter(Boolean));
+      const discovered = currentTabs
+        ? (currentTabs.map(tab => tab.title).filter(title => title && !linkedTitles.has(title)))
+        : (finalProject.googleLink.newTabs || []);
+      const nextLink = { ...finalProject.googleLink };
+      if (discovered.length) nextLink.newTabs = discovered.slice(0, 25);
+      else delete nextLink.newTabs;
+      // A completed sync clears any error the last one left behind.
+      delete nextLink.lastError;
+      delete nextLink.lastErrorAt;
+      finalProject.googleLink = nextLink;
+      _ssMirroringFromGoogle = true;
+      const savingState = ssSave();
+      _ssMirroringFromGoogle = false;
+      await savingState;
+    }
+
     ssRender();
     ssRenderHomeView();
     // Silent when nothing moved: this runs on a timer, and a toast every few
     // minutes saying "nothing happened" is how people learn to ignore toasts.
-    if (changed || clashes || dropped || !silent) {
+    if (changed || clashes || dropped || renamed || missing || !silent) {
       const parts = [];
       if (changed) parts.push(`${changed.toLocaleString()} cell${changed === 1 ? '' : 's'} updated from Google`);
       if (clashes) parts.push(`${clashes} also changed here — kept yours, see conflicts`);
       if (dropped) parts.push(`${dropped} tab${dropped === 1 ? '' : 's'} larger than this app can hold`);
+      if (renamed) parts.push(`${renamed} tab${renamed === 1 ? ' was' : 's were'} renamed in Google — still linked`);
+      if (missing) parts.push(`${missing} linked tab${missing === 1 ? ' is' : 's are'} no longer in Google`);
       showToast(parts.length ? parts.join('. ') + '.' : 'Already up to date with Google.',
-        clashes || dropped ? 'warning' : 'success');
+        clashes || dropped || missing ? 'warning' : 'success');
     }
     return true;
   } catch (error) {
     // A background attempt that fails is not worth interrupting anybody over —
     // it will try again. A sync somebody asked for is.
+    //
+    // MB1188-012: but it must leave a durable trace either way. A silent
+    // background failure used to be indistinguishable from a link with nothing
+    // to report, so a link that had stopped working could go unnoticed
+    // indefinitely.
+    try {
+      const failed = (_ssData?.projects || []).find(entry => entry.id === projectId);
+      if (failed?.googleLink) {
+        failed.googleLink = {
+          ...failed.googleLink,
+          lastError: String(error?.message || error).slice(0, 300),
+          lastErrorAt: new Date().toISOString(),
+        };
+        _ssMirroringFromGoogle = true;
+        const savingError = ssSave();
+        _ssMirroringFromGoogle = false;
+        await savingError;
+      }
+    } catch (_) {}
     if (!silent) showToast(`Sync from Google failed: ${error?.message || error}`, 'danger');
     return false;
   } finally {
@@ -11722,12 +12317,77 @@ async function ssAutoSyncTick(force) {
 
 // What Google held at the moment of the last pull. A push compares against
 // this to tell "the app changed it" from "Google changed it".
-function _ssGoogleCheckpoint(rows) {
+// MB1188-011: the checkpoint is what "unchanged in Google" means, so it has to
+// describe the whole cell.
+//
+// It used to record text only. A cell whose text stayed the same but whose
+// fill, text colour, bold or checkbox state changed in Google therefore looked
+// identical to its checkpoint, was classified "take local", and the change
+// disappeared — with no conflict, because as far as the merge could see
+// nothing had happened.
+//
+// A cell with no formatting is still stored as a bare string: that is both the
+// shape every checkpoint written before this change uses, and much smaller
+// across a full sheet. Only a formatted cell costs an object.
+function _ssCheckpointEntry(cell) {
+  if (!cell) return null;
+  const v = String(cell.v ?? '');
+  const bg = String(cell.bg ?? '');
+  const tc = String(cell.tc ?? '');
+  const bold = cell.b === true;
+  const checkbox = cell.cb === true;
+  if (!v && !bg && !tc && !bold && !checkbox) return null;
+  if (!bg && !tc && !bold && !checkbox) return v;
+  const entry = { v };
+  if (bg) entry.bg = bg;
+  if (tc) entry.tc = tc;
+  if (bold) entry.b = true;
+  if (checkbox) entry.cb = true;
+  return entry;
+}
+
+// Reads either shape back as a cell.
+function _ssCheckpointCell(entry) {
+  if (entry === undefined || entry === null) return null;
+  if (typeof entry === 'string') return entry === '' ? null : { v: entry, bg: '', tc: '', b: false };
+  if (typeof entry !== 'object' || Array.isArray(entry)) return null;
+  const cell = {
+    v: String(entry.v ?? ''),
+    bg: String(entry.bg ?? ''),
+    tc: String(entry.tc ?? ''),
+    b: entry.b === true,
+  };
+  if (entry.cb === true) cell.cb = true;
+  return cell;
+}
+
+// Canonical comparison for "is this the same cell". Absent, blank and
+// blank-with-no-formatting all collapse to the same signature so a cell that
+// was never there does not read as a change.
+function _ssCellSignature(cell) {
+  if (!cell) return '';
+  const v = String(cell.v ?? '');
+  const bg = String(cell.bg ?? '');
+  const tc = String(cell.tc ?? '');
+  const bold = cell.b === true;
+  const checkbox = cell.cb === true;
+  if (!v && !bg && !tc && !bold && !checkbox) return '';
+  return JSON.stringify([v, bg, tc, bold, checkbox]);
+}
+
+function _ssGoogleCheckpoint(rows, formats) {
   const checkpoint = {};
   (rows || []).forEach((row, r) => {
     (row || []).forEach((value, c) => {
-      const text = String(value ?? '');
-      if (text !== '') checkpoint[r + ',' + c] = text;
+      const format = formats?.[r]?.[c];
+      const entry = _ssCheckpointEntry({
+        v: String(value ?? ''),
+        bg: _ssImportColor(format?.bg),
+        tc: _ssImportColor(format?.tc),
+        b: format?.b === true,
+        cb: format?.cb === true,
+      });
+      if (entry !== null) checkpoint[r + ',' + c] = entry;
     });
   });
   return checkpoint;
@@ -16350,11 +17010,27 @@ async function loadFromiCloud() {
     if (_timestampMs(lastLoaded) && _timestampMs(cloudTs) <= _timestampMs(lastLoaded)) return false;
     const decodedResult = await _decodeCloudEnvelope(cloud);
     let changed = 0;
+    // MB1188-018: keys deferred because this Mac still has an unsent change.
+    // Counted, because whether ANY key was deferred decides whether this
+    // envelope may be marked consumed.
+    const deferred = [];
     for (const [name, entry] of decodedResult.decoded) {
       await _serializeKeyReconcile(name, async () => {
         const localKeyTs = localStorage.getItem('tmb_' + name + '_local_ts') || '';
         const localRevision = _localSyncRevision(name);
-        if (_readPendingSyncRecord(name)) return;
+        if (_readPendingSyncRecord(name)) {
+          // Correct to skip — the local change has not been sent yet, and this
+          // is not the place to merge it. What was NOT correct was letting an
+          // unrelated key from the same envelope mark the whole envelope
+          // consumed, which retired this one without it ever being looked at.
+          deferred.push(name);
+          try {
+            localStorage.setItem('tmb_' + name + '_cloud_deferred',
+              JSON.stringify({ at: new Date().toISOString(), envelope: cloudTs || '' }));
+          } catch (_) {}
+          return;
+        }
+        try { localStorage.removeItem('tmb_' + name + '_cloud_deferred'); } catch (_) {}
         if (localRevision > entry.revision) return;
         if (localRevision === entry.revision &&
             _timestampMs(localKeyTs) > _timestampMs(entry.updated || cloudTs)) return;
@@ -16365,8 +17041,21 @@ async function loadFromiCloud() {
         changed++;
       });
     }
-    if (changed) {
+    // MB1188-018: the watermark is a claim that this whole envelope has been
+    // dealt with, so it may only advance when that is true.
+    //
+    // It used to advance as soon as one key applied. A different key skipped in
+    // the same pass — because this Mac had an unsent change for it — was then
+    // never revisited: the next login compared the envelope against the
+    // advanced watermark and skipped all of it. A newer backup of that dataset
+    // could stay permanently unapplied, with nothing on screen to say so.
+    if (deferred.length === 0) {
       localStorage.setItem('tmb__cloud_last_loaded', cloudTs || new Date().toISOString());
+    } else {
+      console.info('[icloud] envelope kept for another pass; still unsent here:',
+        deferred.join(', '));
+    }
+    if (changed) {
       showToast(`Restored ${changed} newer encrypted data set(s) from iCloud.`, 'info');
     }
     if (decodedResult.rejected.length) {
@@ -16957,7 +17646,7 @@ function openNewNoteModal() {
 // TO-DO LIST
 // ─────────────────────────────────────────────────────────────
 function getTodos() { return STORE.get('todo_items', []); }
-function saveTodos(items) { return STORE.replace('todo_items', items, { authoritative: 'todo list save (pending mutate conversion)' }); }
+function saveTodos(items) { return _persistRecordList('todo_items', items, { reason: 'to-do list save' }); }
 
 async function persistTodos(items, failureLabel = 'To-do change') {
   try {
@@ -17021,7 +17710,7 @@ async function addTodoItem() {
   const text = inp ? inp.value.trim() : '';
   if (!text) { showToast('Enter an item first.', 'warning'); return; }
   const todos = getTodos();
-  todos.push({ id: Date.now(), text, done: false, addedBy: user, addedDate: new Date().toISOString() });
+  todos.push({ id: _newRecordId(), text, done: false, addedBy: user, addedDate: new Date().toISOString() });
   if (await persistTodos(todos, 'To-do item')) {
     if (inp) inp.value = '';
   }
@@ -17051,7 +17740,7 @@ async function generateTodoFromLog(logBody) {
   let added = 0;
   lines.forEach(text => {
     if (!existing.has(text.toLowerCase())) {
-      todos.push({ id: Date.now() + Math.random(), text, done: false, addedDate: new Date().toISOString() });
+      todos.push({ id: _newRecordId(), text, done: false, addedDate: new Date().toISOString() });
       added++;
     }
   });
@@ -17125,7 +17814,7 @@ async function addDashboardTodoItem() {
   const text = inp ? inp.value.trim() : '';
   if (!text) { showToast('Enter an item first.', 'warning'); return; }
   const todos = getTodos();
-  todos.push({ id: Date.now(), text, done: false, addedBy: user, addedDate: new Date().toISOString() });
+  todos.push({ id: _newRecordId(), text, done: false, addedBy: user, addedDate: new Date().toISOString() });
   if (await persistTodos(todos, 'To-do item')) {
     if (inp) inp.value = '';
     document.getElementById('dashboard-todo-add-form').style.display = 'none';
@@ -17182,7 +17871,7 @@ async function dashDeleteTodo(id) {
 
 // ─── Assigned (profile-specific) tasks ────
 function getAssignedTasks() { return STORE.get('assigned_tasks', []); }
-function saveAssignedTasks(items) { return STORE.replace('assigned_tasks', items, { authoritative: 'task list save (pending mutate conversion)' }); }
+function saveAssignedTasks(items) { return _persistRecordList('assigned_tasks', items, { reason: 'assigned task save' }); }
 
 async function persistAssignedTasks(items, failureLabel = 'Task change') {
   try {
@@ -17757,7 +18446,7 @@ async function saveAssignedTask() {
     showToast('Task updated!', 'success');
   } else {
     // Create new task
-    tasks.push({ id: Date.now(), assignee: profile, assignedBy: currentUser(), text, done: false, createdAt: new Date().toISOString() });
+    tasks.push({ id: _newRecordId(), assignee: profile, assignedBy: currentUser(), text, done: false, createdAt: new Date().toISOString() });
     if (!await persistAssignedTasks(tasks, 'Task')) return false;
     const label = profile === 'Team' ? 'Team task added!' : 'Task assigned to ' + profile + '!';
     showToast(label, 'success');
@@ -17829,7 +18518,7 @@ function saveStepUpReceipts(receipts) {
     rejected.catch(() => {});
     return rejected;
   }
-  return STORE.replace('step_up_receipts', receipts, { authoritative: 'receipt list save (pending mutate conversion)' });
+  return _persistRecordList('step_up_receipts', receipts, { reason: 'Step Up receipt save' });
 }
 
 function renderStepUp() {
@@ -18547,7 +19236,7 @@ async function stepUpDeleteReceipt(id) {
 // ═══════════════════════════════════════════════════════════════════
 
 function getPolicies()       { return STORE.get('policies', []); }
-function savePolicies(arr)   { return STORE.replace('policies', arr, { authoritative: 'policy list save (pending mutate conversion)' }); }
+function savePolicies(arr)   { return _persistRecordList('policies', arr, { reason: 'policy list save' }); }
 
 function loadPoliciesPage() { renderPoliciesList(); }
 
@@ -18642,7 +19331,7 @@ async function saveImportedPolicy() {
     return false;
   }
   const policies = getPolicies();
-  policies.unshift({ id: 'pol_' + Date.now(), name, content, dateAdded: new Date().toISOString() });
+  policies.unshift({ id: 'pol_' + _newRecordId(), name, content, dateAdded: new Date().toISOString() });
   try {
     await savePolicies(policies);
     closeImportPolicyModal();
@@ -18925,6 +19614,8 @@ async function runPostLoginMaintenance() {
     ['retention cleanup', pruneOldLogs],
     ['AI to-do v2 migration', migrateAiTodos],
     ['AI to-do v3 migration', migrateAiTodosV3],
+    // MB1188-008: settles profiles added from the signed-out login screen.
+    ['staff directory publication', flushPendingDirectoryPublication],
   ];
   const failures = [];
   for (const [label, job] of jobs) {

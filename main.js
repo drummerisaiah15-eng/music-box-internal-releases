@@ -3298,6 +3298,17 @@ const MAX_SNAPSHOTS_PER_DEVICE = 5;
 const MAX_TOTAL_SNAPSHOTS = 40;
 const SNAPSHOT_NAME_PATTERN =
   /^sync-([a-z0-9]{4,32})-(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z)\.json$/;
+// MB1188-014: the same name with a monotonic per-device sequence in front of
+// the timestamp. Ordering a device's own snapshots by wall clock is wrong
+// whenever that clock moves — daylight saving, an NTP correction, or a Mac
+// whose date is simply set wrong — and the old name had nothing else to sort
+// by. The sequence only ever increases, so a device's own history stays in
+// order no matter what its clock does. Files written by earlier builds still
+// match the pattern above and are read as sequence 0.
+const SNAPSHOT_SEQ_NAME_PATTERN =
+  /^sync-([a-z0-9]{4,32})-s(\d{9})-(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z)\.json$/;
+const SNAPSHOT_SEQ_FILE = 'icloud-snapshot-seq.json';
+const MAX_SNAPSHOT_SEQ = 999999999;
 
 function _backupDeviceId() {
   // Stable per-Mac, derived from the machine's own identifiers. Not a secret —
@@ -3306,9 +3317,30 @@ function _backupDeviceId() {
   return crypto.createHash('sha256').update(seed).digest('hex').slice(0, 12);
 }
 
-function _snapshotFileName(deviceId, when = new Date()) {
+function _snapshotFileName(deviceId, sequence, when = new Date()) {
   const stamp = when.toISOString().replace(/[:.]/g, '-');
-  return `${ICLOUD_SNAPSHOT_PREFIX}${deviceId}-${stamp}${ICLOUD_SNAPSHOT_SUFFIX}`;
+  const seq = String(Math.min(Math.max(Number(sequence) || 0, 0), MAX_SNAPSHOT_SEQ)).padStart(9, '0');
+  return `${ICLOUD_SNAPSHOT_PREFIX}${deviceId}-s${seq}-${stamp}${ICLOUD_SNAPSHOT_SUFFIX}`;
+}
+
+// Monotonic, and recoverable if the counter file is lost: the snapshots already
+// in the folder are themselves the record of how far this device has got.
+async function _nextSnapshotSequence(deviceId, existing) {
+  const counterPath = path.join(app.getPath('userData'), SNAPSHOT_SEQ_FILE);
+  let stored = 0;
+  try {
+    const parsed = JSON.parse(await fs.promises.readFile(counterPath, 'utf8'));
+    if (Number.isSafeInteger(parsed?.sequence) && parsed.sequence >= 0) stored = parsed.sequence;
+  } catch (_) { /* first run, or the counter was lost — rebuilt below */ }
+  let highestOnDisk = 0;
+  for (const snapshot of existing || []) {
+    if (snapshot.deviceId === deviceId) highestOnDisk = Math.max(highestOnDisk, snapshot.sequence || 0);
+  }
+  const next = Math.max(stored, highestOnDisk) + 1;
+  try {
+    await _atomicWriteFile(counterPath, JSON.stringify({ sequence: next }), 0o600);
+  } catch (_) { /* the name still carries it, so a failure here costs nothing */ }
+  return next;
 }
 
 async function _listBackupSnapshots() {
@@ -3320,19 +3352,34 @@ async function _listBackupSnapshots() {
   }
   return names
     .map(name => {
-      const match = SNAPSHOT_NAME_PATTERN.exec(name);
+      const seqMatch = SNAPSHOT_SEQ_NAME_PATTERN.exec(name);
+      const match = seqMatch || SNAPSHOT_NAME_PATTERN.exec(name);
       if (!match) return null;
+      const stamp = seqMatch ? match[3] : match[2];
       // Recover the ISO instant from the filesystem-safe stamp.
-      const iso = match[2].replace(
+      const iso = stamp.replace(
         /^(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z$/,
         '$1T$2:$3:$4.$5Z'
       );
       const at = Date.parse(iso);
       if (!Number.isFinite(at)) return null;
-      return { name, deviceId: match[1], at };
+      return {
+        name,
+        deviceId: match[1],
+        at,
+        sequence: seqMatch ? Number(match[2]) : 0,
+      };
     })
     .filter(Boolean)
-    .sort((a, b) => b.at - a.at || (a.name < b.name ? 1 : -1));
+    // MB1188-014: within one device, the sequence decides — it cannot go
+    // backwards, and its clock can. Across devices there is no shared clock to
+    // appeal to, so the timestamp is still used, and the reader treats it as a
+    // hint rather than as truth (see _pruneBackupSnapshots and the per-key
+    // revision checks the renderer applies to whatever is read).
+    .sort((a, b) => {
+      if (a.deviceId === b.deviceId) return b.sequence - a.sequence || b.at - a.at;
+      return b.at - a.at || (a.name < b.name ? 1 : -1);
+    });
 }
 
 // Retention is bounded per device AND overall, so one Mac cannot crowd another's
@@ -3346,7 +3393,32 @@ async function _pruneBackupSnapshots(snapshots) {
     else perDevice.set(snapshot.deviceId, kept + 1);
   }
   const survivors = snapshots.filter(s => !doomed.includes(s));
-  for (const extra of survivors.slice(MAX_TOTAL_SNAPSHOTS)) doomed.push(extra);
+
+  // MB1188-014: the overall cap is applied round-robin across devices, newest
+  // of each first, rather than by timestamp order.
+  //
+  // Sorted purely by time, one Mac whose clock is far ahead occupies the whole
+  // front of the list, and every other Mac's recovery points are the ones
+  // pruned away — the failure is silent and only discovered when a restore is
+  // actually needed. Taking one per device in turn means a wrong clock costs
+  // that device nothing and costs the others nothing either.
+  const byDevice = new Map();
+  for (const snapshot of survivors) {
+    if (!byDevice.has(snapshot.deviceId)) byDevice.set(snapshot.deviceId, []);
+    byDevice.get(snapshot.deviceId).push(snapshot);
+  }
+  const queues = [...byDevice.values()];
+  const keep = new Set();
+  let round = 0;
+  while (keep.size < MAX_TOTAL_SNAPSHOTS && queues.some(queue => round < queue.length)) {
+    for (const queue of queues) {
+      if (round >= queue.length) continue;
+      if (keep.size >= MAX_TOTAL_SNAPSHOTS) break;
+      keep.add(queue[round]);
+    }
+    round += 1;
+  }
+  for (const extra of survivors) if (!keep.has(extra)) doomed.push(extra);
   for (const snapshot of doomed) {
     try { await fs.promises.unlink(path.join(ICLOUD_DIR, snapshot.name)); }
     catch (_) { /* a peer may have pruned it already */ }
@@ -3437,7 +3509,8 @@ _secureHandle('write-sync-file', async (_, data) => {
       // immutable snapshot so a concurrent backup on another Mac cannot destroy
       // this recovery point (and vice versa).
       const deviceId = _backupDeviceId();
-      const name = _snapshotFileName(deviceId);
+      const existing = await _listBackupSnapshots().catch(() => []);
+      const name = _snapshotFileName(deviceId, await _nextSnapshotSequence(deviceId, existing));
       await _atomicWriteFile(path.join(ICLOUD_DIR, name), serialized, 0o600);
       let pruned = 0;
       try { pruned = await _pruneBackupSnapshots(await _listBackupSnapshots()); }
