@@ -1303,11 +1303,76 @@ test('MB161-014: the read-only promise is stated where somebody will read it', (
     'and the import dialog says it too');
 });
 
-test('MB161-014: the renderer offers no way to write to Google', () => {
+test('MB161-016: the renderer still cannot reach Google directly', () => {
+  // Two-way now, but the renderer composes a request and hands it to main; it
+  // never speaks the Sheets API itself. That is what keeps the access token out
+  // of the renderer and the CSP unwidened.
   const script = inlineScript(source);
   for (const forbidden of ['batchUpdate', 'valueInputOption', 'USER_ENTERED', 'batchClear']) {
     assert.equal(script.includes(forbidden), false,
       `the renderer must not contain ${forbidden}`);
   }
-  assert.doesNotMatch(script, /electronGoogleSheets\.(write|update|append|clear|push)/);
+  for (const fn of ['ssPushToGoogle', 'ssPullFromGoogle']) {
+    const body = namedFunctionSource(fn);
+    assert.doesNotMatch(body, /\bfetch\s*\(/, `${fn} must not call Google itself`);
+  }
+});
+
+test('MB161-016: a push sends only what changed since the last pull', () => {
+  const push = namedFunctionSource('ssPushToGoogle');
+  assert.match(push, /if \(cell\.value === was\) continue;/,
+    'an unchanged cell is not pushed — otherwise every push rewrites the sheet');
+  assert.match(push, /expected: was/,
+    'each cell carries what Google last held, which is what lets main detect a change');
+  assert.match(push, /for \(const \[key, was\] of Object\.entries\(checkpoint\)\)/,
+    'a cell cleared in the app is pushed as a clear, not forgotten');
+  assert.match(push, /confirm\(/, 'and the person is told how many cells before it happens');
+});
+
+test('MB161-016: a refused cell becomes a real conflict, not a warning', () => {
+  const push = namedFunctionSource('ssPushToGoogle');
+  assert.match(push, /result\.skipped\.length/);
+  assert.match(push, /_ssData\._conflicts = conflicts/,
+    'refused cells land in the same conflict list as a Mac-vs-Mac collision');
+  assert.match(push, /remote: miss\.googleValue/, 'carrying what Google actually held');
+  assert.match(push, /local: miss\.appValue/, 'and what the app wanted');
+  assert.match(push, /base: miss\.expected/, 'and what they diverged from');
+});
+
+test('MB161-016: A1 and row,column notation round-trip', () => {
+  const context = vm.createContext({ String, Number, RegExp });
+  vm.runInContext(`
+    ${namedFunctionSource('_ssCellKeyFromA1')}
+    function ssColLabel(c) {
+      let label = '', n = c;
+      while (n >= 0) { label = String.fromCharCode(65 + (n % 26)) + label; n = Math.floor(n / 26) - 1; }
+      return label;
+    }
+    ${namedFunctionSource('_ssA1')}
+    globalThis.api = { toKey: a => _ssCellKeyFromA1(a), toA1: (r, c) => _ssA1(r, c) };
+  `, context);
+  for (const [row, column, a1] of [[0,0,'A1'], [0,25,'Z1'], [0,26,'AA1'], [4,2,'C5'], [199,29,'AD200']]) {
+    assert.equal(context.api.toA1(row, column), a1, `${row},${column} -> ${a1}`);
+    assert.equal(context.api.toKey(a1), `${row},${column}`, `${a1} -> ${row},${column}`);
+  }
+  // Junk must not silently become A1 and write to the wrong cell.
+  assert.equal(context.api.toKey('not-a-cell'), '0,0');
+});
+
+test('MB161-016: a pull keeps formatting Google never had', () => {
+  const pull = namedFunctionSource('ssPullFromGoogle');
+  assert.match(pull, /if \(cell\?\.bg \|\| cell\?\.tc \|\| cell\?\.b\) next\[key\] = \{ \.\.\.cell, v: '' \}/,
+    'colour blocks added in the app survive a pull — Google sent no formatting, '
+    + 'so treating its silence as "delete the colours" would destroy real work');
+  assert.match(pull, /checkpoint: _ssGoogleCheckpoint\(sheet\.rows\)/,
+    'and the checkpoint advances, or the next push would re-send everything');
+});
+
+test('MB161-016: a linked project is tagged and offers pull and push', () => {
+  assert.match(source, /class="ss-google-tag"/);
+  assert.match(source, /p\.googleLink \?/, 'the tag only appears on linked projects');
+  assert.match(source, /onclick="ssPullFromGoogle/);
+  assert.match(source, /onclick="ssPushToGoogle/);
+  assert.match(source, /event\.stopPropagation\(\)/,
+    'the buttons must not also open the project');
 });

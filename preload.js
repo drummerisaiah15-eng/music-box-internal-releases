@@ -90,6 +90,9 @@ contextBridge.exposeInMainWorld('electronGoogleSheets', {
   disconnect:     () => ipcRenderer.invoke('google-disconnect'),
   describe:       (request) => ipcRenderer.invoke('google-sheet-describe', request),
   read:           (request) => ipcRenderer.invoke('google-sheet-read', request),
+  // MB161-016: writes only cells that still hold what the app last saw, and
+  // returns what it replaced so nothing is lost without a record.
+  push:           (request) => ipcRenderer.invoke('google-sheet-push', request),
   onCode:         (cb) => subscribe('google-auth-code', cb),
   onError:        (cb) => subscribe('google-auth-error', cb),
 });

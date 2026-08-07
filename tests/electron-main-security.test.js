@@ -1301,36 +1301,60 @@ function googleHelpers() {
   return context.api;
 }
 
-test('MB161-014: the requested Google scope is read-only', () => {
-  assert.match(main, /const GOOGLE_SCOPE = 'https:\/\/www\.googleapis\.com\/auth\/spreadsheets\.readonly'/,
-    'the narrow scope is what makes a write impossible at the API, not just absent from the code');
-  // The broad scope would permit writing every spreadsheet the account can see.
-  assert.doesNotMatch(main, /auth\/spreadsheets'/, 'the read-write scope is never requested');
-  assert.doesNotMatch(main, /auth\/drive'/, 'and neither is Drive');
+test('MB161-016: the Google scope is spreadsheets, and nothing wider', () => {
+  // Two-way sync needs write access, so the readonly scope is gone. What must
+  // NOT creep back is anything broader — Drive would hand over every file in
+  // the account, not just the sheets somebody chose to link.
+  assert.match(main, /const GOOGLE_SCOPE = 'https:\/\/www\.googleapis\.com\/auth\/spreadsheets'/);
+  assert.doesNotMatch(main, /auth\/drive/, 'Drive scope is never requested');
+  assert.doesNotMatch(main, /auth\/spreadsheets\.readonly/,
+    'and the old readonly scope is gone, so a stale grant cannot silently persist');
+  // The scope Google GRANTED is still verified, not the one asked for.
+  const complete = main.slice(main.indexOf("_secureHandle('google-oauth-complete'"));
+  assert.match(complete, /granted\.split\(\/\\s\+\/\)\.includes\(GOOGLE_SCOPE\)/);
 });
 
-test('MB161-014: there is no Google write path anywhere', () => {
-  for (const forbidden of [
-    'values:batchUpdate', 'values/batchUpdate', ':batchUpdate',
-    'batchClear', 'valueInputOption', 'USER_ENTERED',
-  ]) {
-    assert.equal(main.includes(forbidden), false,
-      `main.js must not contain ${forbidden} while the integration is read-only`);
-  }
-  assert.doesNotMatch(main, /method: '(POST|PUT|PATCH)'[\s\S]{0,200}sheets\.googleapis\.com/,
-    'the only Sheets calls are GETs');
+test('MB161-016: a push re-reads its targets and refuses anything that moved', () => {
+  const push = main.slice(main.indexOf("_secureHandle('google-sheet-push'"),
+                          main.indexOf('function _columnLetters'));
+  // The whole safety argument lives in this ordering: read, compare, then
+  // write only what still matches.
+  assert.ok(push.indexOf('values:batchGet') < push.indexOf('values:batchUpdate'),
+    'the current values are fetched BEFORE anything is written');
+  assert.match(push, /if \(now !== cell\.expected\)/,
+    'a cell that changed in Google since the app last looked is not written');
+  assert.match(push, /skipped\.push\(/, 'it is reported instead, so it can become a conflict');
+  assert.match(push, /replaced\.push\(\{ a1: cell\.a1, previous: now, next: cell\.value \}\)/,
+    'and every value actually overwritten is returned, so a copy survives');
+  assert.match(push, /valueInputOption: 'RAW'/,
+    'RAW: Google stores text as given rather than reinterpreting it');
+  assert.match(push, /if \(!toWrite\.length\) return/,
+    'nothing to write means no request at all');
 });
 
-test('MB161-014: the preload bridge exposes no write method', () => {
+test('MB161-016: the push is bounded and validates every target cell', () => {
+  const push = main.slice(main.indexOf("_secureHandle('google-sheet-push'"),
+                          main.indexOf('function _columnLetters'));
+  assert.match(push, /request\.cells\.length > 5000/, 'a runaway push is refused');
+  assert.match(push, /\^\[A-Z\]\{1,3\}\[1-9\]\[0-9\]\{0,3\}\$/,
+    'every A1 reference is validated rather than interpolated into a range');
+  assert.match(push, /_requireAppRole\(COMMUNICATION_ROLES\)/);
+  // batchUpdate must appear exactly once: the push handler and nowhere else.
+  assert.equal(main.split('values:batchUpdate').length - 1, 1,
+    'there is exactly one place in main.js that writes to Google');
+});
+
+test('MB161-016: the preload bridge exposes read and push, and no more', () => {
   const start = preload.indexOf("exposeInMainWorld('electronGoogleSheets'");
-  assert.notEqual(start, -1, 'the bridge exists');
+  assert.notEqual(start, -1);
   const bridge = preload.slice(start, preload.indexOf('});', start));
-  for (const method of ['write', 'update', 'push', 'set', 'append', 'clear']) {
+  assert.match(bridge, /read:\s*\(request\)/);
+  assert.match(bridge, /push:\s*\(request\)/);
+  for (const method of ['delete', 'clear', 'append', 'createSheet', 'format']) {
     assert.doesNotMatch(bridge, new RegExp(`\\b${method}\\s*:`),
       `the bridge must not offer ${method}`);
   }
-  assert.match(bridge, /read:\s*\(request\)/, 'reading is all it does');
-  // Tokens must never cross into the renderer, same rule as Microsoft.
+  // Tokens still never cross into the renderer.
   assert.doesNotMatch(bridge, /token|refresh|secret/i);
 });
 

@@ -1217,7 +1217,16 @@ _secureHandle('keychain-decrypt', async (_, b64) => {
 // ─────────────────────────────────────────────────────────────
 
 const GOOGLE_VAULT_KEY = 'app_google_sheets_v1';
-const GOOGLE_SCOPE = 'https://www.googleapis.com/auth/spreadsheets.readonly';
+// MB161-016: two-way sync needs write access, so the narrow readonly scope is
+// gone — and with it the guarantee that Google would refuse a write on our
+// behalf regardless of what this code did. Safety now has to come from this
+// file instead, which is why every push re-reads its target cells immediately
+// beforehand and returns whatever it replaced so the caller can preserve it.
+//
+// Anyone connected under the old scope must reconnect. Google does not
+// silently upgrade an existing grant, and google-oauth-complete verifies the
+// scope actually granted rather than the one requested.
+const GOOGLE_SCOPE = 'https://www.googleapis.com/auth/spreadsheets';
 const GOOGLE_AUTH_ENDPOINT = 'https://accounts.google.com/o/oauth2/v2/auth';
 const GOOGLE_TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
 let pendingGoogleOAuth = null;
@@ -2319,6 +2328,128 @@ _secureHandle('google-sheet-read', async (_, request) => {
     return line;
   });
   return { ok: true, spreadsheetId, title, range, rows: grid, filledCells: cells };
+});
+
+// MB161-016: push cells to Google, refusing to destroy anything unannounced.
+//
+// Google has no conditional write — no "set this cell only if it still holds
+// what I last read". So this does the next best thing, in order:
+//
+//   1. Re-read the exact target cells RIGHT NOW.
+//   2. Compare each against `expected` — what the app last saw in Google.
+//      Anything that differs was changed in Google since, and is NOT written.
+//   3. Write only the cells that still match.
+//   4. Return the previous value of every cell written, so the caller keeps a
+//      recoverable copy of what it replaced.
+//
+// The race is not eliminated — a Google edit landing between step 1 and step 3
+// is still lost — but it shrinks from minutes of drift to one round trip, and
+// step 4 means even that leaves a copy behind rather than a silent hole.
+_secureHandle('google-sheet-push', async (_, request) => {
+  _requireAppRole(COMMUNICATION_ROLES);
+  if (!_isPlainObject(request)) throw new Error('Invalid spreadsheet push request.');
+  const spreadsheetId = _googleSpreadsheetId(request.spreadsheetId);
+  const title = String(request.title || '').trim();
+  if (!spreadsheetId) throw new Error('That spreadsheet link is not valid.');
+  if (!title || title.length > 200) throw new Error('Which tab should be written?');
+  if (!Array.isArray(request.cells) || !request.cells.length) {
+    return { ok: true, written: [], skipped: [], replaced: [] };
+  }
+  if (request.cells.length > 5000) {
+    throw new Error('Too many cells in one push. Pull first, then try again.');
+  }
+
+  const wanted = new Map();
+  for (const entry of request.cells) {
+    if (!_isPlainObject(entry)) continue;
+    const a1 = String(entry.a1 || '');
+    if (!/^[A-Z]{1,3}[1-9][0-9]{0,3}$/.test(a1)) {
+      throw new Error(`"${a1.slice(0, 20)}" is not a cell this app will write to.`);
+    }
+    wanted.set(a1, {
+      a1,
+      value: String(entry.value ?? '').slice(0, 50000),
+      expected: String(entry.expected ?? ''),
+    });
+  }
+  if (!wanted.size) return { ok: true, written: [], skipped: [], replaced: [] };
+
+  const token = await _googleAccessTokenFor();
+  const ranges = [...wanted.keys()]
+    .map(a1 => `ranges=${encodeURIComponent(`${title}!${a1}`)}`).join('&');
+  let current;
+  try {
+    current = await _googleApiGet('sheets.googleapis.com',
+      `/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}/values:batchGet` +
+      `?${ranges}&valueRenderOption=FORMATTED_VALUE&dateTimeRenderOption=FORMATTED_STRING`,
+      token);
+  } catch (error) {
+    throw new Error(_googleReadFailure(error));
+  }
+
+  // Map each returned range back to its cell. Google echoes the range it read,
+  // which is how a response is matched to a request rather than by position.
+  const live = new Map();
+  for (const entry of (Array.isArray(current.valueRanges) ? current.valueRanges : [])) {
+    const range = String(entry?.range || '');
+    const a1 = range.includes('!') ? range.split('!').pop().replace(/\$/g, '') : range;
+    const rows = Array.isArray(entry?.values) ? entry.values : [];
+    live.set(a1, String(rows[0]?.[0] ?? ''));
+  }
+
+  const toWrite = [];
+  const skipped = [];
+  const replaced = [];
+  for (const cell of wanted.values()) {
+    const now = live.has(cell.a1) ? live.get(cell.a1) : '';
+    if (now !== cell.expected) {
+      // Changed in Google since the app last looked. Refused, and reported so
+      // the caller can raise it as a conflict rather than silently dropping it.
+      skipped.push({ a1: cell.a1, googleValue: now, appValue: cell.value, expected: cell.expected });
+      continue;
+    }
+    if (now === cell.value) continue;   // already identical; nothing to do
+    toWrite.push(cell);
+    replaced.push({ a1: cell.a1, previous: now, next: cell.value });
+  }
+  if (!toWrite.length) return { ok: true, written: [], skipped, replaced: [] };
+
+  const payload = JSON.stringify({
+    // RAW: Google stores what it is given without reparsing it. The app's cell
+    // model is text, so anything else would silently reinterpret it.
+    valueInputOption: 'RAW',
+    data: toWrite.map(cell => ({ range: `${title}!${cell.a1}`, values: [[cell.value]] })),
+  });
+
+  await new Promise((resolve, reject) => {
+    const req = https.request({
+      method: 'POST',
+      hostname: 'sheets.googleapis.com',
+      path: `/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}/values:batchUpdate`,
+      timeout: 30000,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload),
+      },
+    }, response => {
+      let raw = '';
+      response.on('data', chunk => { if (raw.length < 262144) raw += chunk; });
+      response.on('end', () => {
+        if (response.statusCode === 200) { resolve(); return; }
+        let parsed = null;
+        try { parsed = JSON.parse(raw); } catch (_) { parsed = null; }
+        const error = new Error(parsed?.error?.message || `HTTP ${response.statusCode}`);
+        error.statusCode = response.statusCode;
+        reject(new Error(_googleReadFailure(error)));
+      });
+    });
+    req.on('timeout', () => req.destroy(new Error('Google did not respond in time.')));
+    req.on('error', reject);
+    req.end(payload);
+  });
+
+  return { ok: true, written: toWrite.map(c => c.a1), skipped, replaced };
 });
 
 function _columnLetters(count) {
