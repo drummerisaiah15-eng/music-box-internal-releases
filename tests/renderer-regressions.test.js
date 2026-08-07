@@ -1385,7 +1385,7 @@ test('MB161-018: the checkpoint is measured before the import, not after', () =>
   assert.match(before, /const checkpoints = read\.map\(sheet => _ssGoogleCheckpoint/,
     'checkpoints are built before the import');
   assert.match(before, /const linkBytes = new TextEncoder\(\)/);
-  assert.match(importPath, /\}\)\), linkBytes\);/, 'and passed into the capacity estimate');
+  assert.match(importPath, /\}\)\), linkBytes, /, 'and passed into the capacity estimate');
   assert.match(namedFunctionSource('ssImportBuildProject'),
     /if \(typeof extraBytes === 'number' && extraBytes > 0\) incoming\.bytes \+= extraBytes/);
 });
@@ -1598,4 +1598,39 @@ test('MB161-025: both deletions are async, or the await does nothing', () => {
   assert.match(script, /async function ssDeleteProject\(/);
   assert.match(script, /async function ssDeleteSheet\(/);
   assert.match(script, /async function _ssPersistDeletion\(/);
+});
+
+test('MB161-026: the Google link is written by the import, not by a second save', () => {
+  // The dialog sat on "Saving…" because the import saved twice: once to create
+  // the project, then again after mutating it to attach the link. With split
+  // storage that is every project document encrypted and synchronised a second
+  // time — fourteen writes for a seven-tab import — to store one small piece of
+  // metadata.
+  const build = namedFunctionSource('ssImportBuildProject');
+  assert.match(build, /ssImportBuildProject\(name, sheets, extraBytes, linkFor\)/);
+  assert.match(build, /const link = linkFor\(builtSheets\)/,
+    'the link is built from the sheets that were actually stored');
+  assert.match(build, /if \(link\) record\.googleLink = link/);
+
+  const importPath = namedFunctionSource('_ssGoogleImport');
+  assert.match(importPath, /\}\)\), linkBytes, \(builtSheets\) => \{/,
+    'the Google importer supplies it rather than attaching it afterwards');
+  // The second save is gone. This is the assertion that would catch it coming
+  // back, since the symptom is only visible on a slow machine.
+  const afterBuild = importPath.slice(importPath.indexOf("if (created && typeof created === 'object')"));
+  assert.doesNotMatch(afterBuild, /await ssSave\(\)/,
+    'nothing saves again once the import has committed');
+  assert.doesNotMatch(afterBuild, /created\.googleLink =/,
+    'and the created project is not mutated after the fact');
+});
+
+test('MB161-026: an import is one commit, so it cannot half-exist', () => {
+  // Between the two saves the project existed with no link at all. Quitting in
+  // that window left an imported project that would never sync with the sheet
+  // it came from, and nothing in the UI would have explained why.
+  const build = namedFunctionSource('ssImportBuildProject');
+  const push = build.indexOf('next.projects.push(record)');
+  const store = build.indexOf("STORE.replace('spreadsheets'");
+  assert.ok(push > -1 && store > push,
+    'the link is part of the record before the single write that stores it');
 });

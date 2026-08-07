@@ -11047,21 +11047,19 @@ async function _ssGoogleImport(titles) {
     // `sheetName`, not `name` — that is the field the importer reads, and
     // passing the wrong one silently lands the tab as "Sheet 1".
     await _ssGoogleStatus(el, 'Saving…');
+    const windows = wanted.map(_ssTabWindow);
     const created = await ssImportBuildProject(name, read.map((sheet, i) => ({
       sheetName: wanted[i],
       rows: sheet.rows,
       formats: sheet.formats,
       merges: sheet.merges,
-    })), linkBytes);
-
-    if (created && typeof created === 'object') {
+    })), linkBytes, (builtSheets) => {
       const tabs = {};
-      (created.sheets || []).forEach((sheet, i) => {
+      builtSheets.forEach((sheet, i) => {
         if (!read[i]) return;
         tabs[sheet.id] = { title: wanted[i], checkpoint: checkpoints[i] };
       });
-      const windows = wanted.map(_ssTabWindow);
-      created.googleLink = {
+      return {
         spreadsheetId: _ssGoogleLookup.spreadsheetId,
         // The widest tab imported, so a later sync reads enough for all of them
         // without going back to asking for the maximum allowed.
@@ -11070,7 +11068,9 @@ async function _ssGoogleImport(titles) {
         pulledAt: new Date().toISOString(),
         tabs,
       };
-      await ssSave();
+    });
+
+    if (created && typeof created === 'object') {
       ssCloseGoogleImport();
       const total = read.reduce((sum, sheet) => sum + (sheet.filledCells || 0), 0);
       showToast(
@@ -11480,7 +11480,7 @@ function _ssApplyImportedMerges(cells, merges, storedRows, storedCols) {
   }
 }
 
-async function ssImportBuildProject(name, sheets, extraBytes) {
+async function ssImportBuildProject(name, sheets, extraBytes, linkFor) {
   if (_ssBlockedWorkbook || _ssAwaitingAuthority || !_ssData) return false;
   if (!Array.isArray(sheets) || !sheets.length || sheets.length > MAX_SPREADSHEET_SHEETS) {
     showToast('That spreadsheet did not contain a safe number of sheets.', 'warning');
@@ -11590,12 +11590,27 @@ async function ssImportBuildProject(name, sheets, extraBytes) {
 
     await _flushSpreadsheetSave();
     const next = _cloneJson(normalizeSpreadsheetWorkbook(_ssData));
-    next.projects.push({
+    // MB161-026: the Google link is attached HERE, inside the one commit that
+    // creates the project, rather than by mutating it afterwards and saving
+    // again. The second save rewrote every project document a second time —
+    // for a seven-tab import that is fourteen encrypted documents and fourteen
+    // synchronised writes to store one small piece of metadata, which is what
+    // left the dialog sitting on "Saving…".
+    //
+    // It also closes a real gap: between the two saves the project existed with
+    // no link at all, so quitting in that window produced an imported project
+    // that would never sync with the sheet it came from.
+    const record = {
       id: pid,
       name: projectName,
       activeId: builtSheets[0].id,
       sheets: builtSheets,
-    });
+    };
+    if (typeof linkFor === 'function') {
+      const link = linkFor(builtSheets);
+      if (link) record.googleLink = link;
+    }
+    next.projects.push(record);
     const normalized = normalizeSpreadsheetWorkbook(next);
     await STORE.replace('spreadsheets', normalized, { authoritative: 'confirmed workbook import' });
     _ssData = normalized;
