@@ -1563,3 +1563,39 @@ test('MB161-024: an import that cannot fit is refused before it is built', () =>
   assert.ok(early > -1 && early < build, 'the cheap check comes first');
   assert.match(importPath, /read\.reduce\(\(sum, sheet\) => sum \+ \(sheet\.filledCells \|\| 0\), 0\)/);
 });
+
+test('MB161-025: a deletion is flushed to disk, not fired and forgotten', () => {
+  // Diagnosed from a screenshot of the "Some recent changes may still be
+  // waiting to save" prompt. A project's document is deliberately never
+  // removed — so a delete cannot destroy content another Mac has not synced
+  // yet — which makes the index tombstone the ONLY record that the deletion
+  // happened. Deleting called ssSave() and moved on, so if the app was closed
+  // with that save still pending and somebody chose "Quit Without Saving", the
+  // tombstone was lost, the document was still there, and the project came
+  // back on the next launch.
+  for (const fn of ['ssDeleteProject', 'ssDeleteSheet']) {
+    const body = namedFunctionSource(fn);
+    assert.match(body, /_ssPersistDeletion\(/, `${fn} waits for the write`);
+    assert.doesNotMatch(body, /(?<!_)\bssSave\(\);/,
+      `${fn} must not fire a save and move on`);
+  }
+
+  const persist = namedFunctionSource('_ssPersistDeletion');
+  assert.match(persist, /await _flushSpreadsheetSave\(\)/,
+    'the index tombstone is pushed all the way to the store');
+  // And if it cannot be written, that is said rather than left to be found out
+  // when the project reappears.
+  assert.match(persist, /could not be saved yet/);
+  assert.match(persist, /may come back when the app restarts/,
+    'named precisely, because that is the symptom somebody would otherwise report');
+});
+
+test('MB161-025: both deletions are async, or the await does nothing', () => {
+  // An `await` inside a function nobody awaits still returns control to the
+  // caller immediately. These are called from onclick handlers, so what matters
+  // is that the flush is started and completed before the function resolves.
+  const script = inlineScript(source);
+  assert.match(script, /async function ssDeleteProject\(/);
+  assert.match(script, /async function ssDeleteSheet\(/);
+  assert.match(script, /async function _ssPersistDeletion\(/);
+});

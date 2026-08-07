@@ -10619,7 +10619,7 @@ function ssRenameCurrentProject() {
   });
 }
 
-function ssDeleteProject(id) {
+async function ssDeleteProject(id) {
   const targetId = id || _ssData.activeProject;
   const proj = _ssData.projects.find(p=>p.id===targetId);
   if (!proj) return;
@@ -10629,8 +10629,39 @@ function ssDeleteProject(id) {
   _ssData.projects.splice(idx, 1);
   _ssData.activeProject = _ssData.projects[Math.max(0,idx-1)].id;
   _ssSelR=0;_ssSelC=0;_ssSelR2=0;_ssSelC2=0;_ssEditCell=null;
-  ssSave();
   ssGoHome();
+  return _ssPersistDeletion(`"${proj.name}"`);
+}
+
+// MB161-025: a deletion has to reach disk before anybody can act on having
+// made it.
+//
+// Deleting used to call ssSave() and move on without waiting. That looks fine —
+// the card disappears — but the tombstone is the ONLY record that the deletion
+// happened: a project's document is deliberately never removed, so that a
+// delete cannot destroy content another Mac has not synced yet. The index entry
+// is what marks it gone.
+//
+// So if the app is closed while that save is still pending and somebody picks
+// "Quit Without Saving" at the prompt — a reasonable thing to pick, especially
+// if the app looks stuck — the tombstone is lost, the document is still there,
+// and the project comes back on the next launch. Reported exactly that way,
+// and diagnosed from a screenshot of that prompt.
+//
+// Waiting for the flush means the pending-changes prompt does not appear for a
+// deletion at all. If it cannot be written, that is said plainly rather than
+// left to be discovered later.
+async function _ssPersistDeletion(what) {
+  try {
+    await _flushSpreadsheetSave();
+    return true;
+  } catch (error) {
+    showToast(
+      `${what} was removed here, but the change could not be saved yet. ` +
+      `It may come back when the app restarts. Try Save All.`,
+      'danger');
+    return false;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -11616,15 +11647,18 @@ function ssRenameSheet(id) {
   });
 }
 
-function ssDeleteSheet() {
+async function ssDeleteSheet() {
   const proj = ssActiveProject();
   if (proj.sheets.length <= 1) { showToast('Cannot delete the only sheet.','warning'); return; }
-  if (!confirm(`Delete sheet "${ssActiveSheet().name}"?`)) return;
+  const name = ssActiveSheet().name;
+  if (!confirm(`Delete sheet "${name}"?`)) return;
   const idx = proj.sheets.findIndex(s=>s.id===proj.activeId);
   proj.sheets.splice(idx, 1);
   proj.activeId = proj.sheets[Math.max(0,idx-1)].id;
   _ssSelR=0;_ssSelC=0;_ssSelR2=0;_ssSelC2=0;_ssEditCell=null;
-  ssSave(); ssRender();
+  ssRender();
+  // Same reasoning as deleting a project: the removal only exists once written.
+  return _ssPersistDeletion(`Sheet "${name}"`);
 }
 
 let _ssLastCellMouseDown = { r: -1, c: -1, at: 0 };
