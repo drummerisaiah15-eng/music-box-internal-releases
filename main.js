@@ -1202,14 +1202,21 @@ _secureHandle('keychain-decrypt', async (_, b64) => {
 });
 
 // ─────────────────────────────────────────────────────────────
-// MB161-014: Google Sheets, read-only.
+// MB161-014/016: Google Sheets, two-way.
 //
-// Phase 1 of GOOGLE_SHEETS_SYNC_PLAN.md. Google -> app only. There is no
-// write path here, and there deliberately cannot be one: the scope requested
-// is `spreadsheets.readonly`, so even a bug in this file cannot modify
-// anybody's sheet. Google itself refuses the write. That is a stronger
-// guarantee than "we did not write the code", and it is why read-only could be
-// built before the write-safety contract in the plan is decided.
+// This started read-only, and the scope `spreadsheets.readonly` meant Google
+// itself refused writes — a guarantee that did not depend on this file being
+// correct. Phase 2 gave up that guarantee to allow pushes, so the restraint now
+// has to live here, and it is worth being explicit about what replaced it:
+//
+//   - exactly one write handler, `google-sheet-push`, reachable only from an
+//     explicit button in the UI;
+//   - it re-reads the range and writes only cells that still hold the value the
+//     app last saw, so a cell changed in Google since the last pull is skipped
+//     rather than clobbered;
+//   - it returns what it replaced, so an overwrite is recoverable.
+//
+// That is weaker than "Google refuses it" and the UI no longer claims otherwise.
 //
 // Same loopback-plus-PKCE shape as the Microsoft flow above, with the three
 // differences Google requires: `access_type=offline` and `prompt=consent` to
