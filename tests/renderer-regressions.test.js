@@ -1926,3 +1926,37 @@ test('MB161-041: the AI is told to read completed versus pending', () => {
   assert.match(run, /keeps reappearing as pending across entries/,
     'a repeatedly deferred item is the signal worth surfacing');
 });
+
+test('MB161-046: the figures refresh themselves, the AI summary does not', () => {
+  // The counts are arithmetic over data already in memory — no network, no
+  // model, no cost — so nobody should have to press a button to find out
+  // whether they are looking at something stale. The written summary is the
+  // opposite: it spends against a shared monthly budget, so it stays deliberate.
+  assert.match(script, /function ssRenderWorkloadCharts\(\)/);
+  const opened = namedFunctionSource('ssWorkloadPageOpened');
+  assert.match(opened, /ssRenderWorkloadCharts\(\)/, 'current on arrival');
+  assert.match(opened, /setInterval/);
+  assert.match(opened, /page-workload'\)\?\.classList\.contains\('active'\)/,
+    'and only while somebody is actually looking at it');
+
+  // The timer is stopped on leaving, or it keeps recomputing forever.
+  assert.match(namedFunctionSource('navigate'), /ssWorkloadPageClosed\(\)/);
+  assert.match(namedFunctionSource('ssWorkloadPageClosed'), /clearInterval/);
+
+  // A change to any of the four sources redraws them, whichever Mac made it.
+  assert.match(script, /key === 'logs' \|\| key === 'todo_items' \|\| key === 'assigned_tasks' \|\|\s*\n?\s*key === 'spreadsheets' \|\| _ssIsProjectSyncKey\(key\)/);
+  assert.match(script, /try \{ ssWorkloadDataChanged\(\); \} catch \(_\) \{\}/);
+
+  // And the expensive half is NOT on the timer. namedFunctionSource stops at
+  // the next `\nfunction `, and the neighbour here is `async function`, so the
+  // slice overruns — bound it to the function's own body.
+  const bodyOf = name => {
+    const whole = namedFunctionSource(name);
+    const end = whole.indexOf('\n}\n');
+    return end === -1 ? whole : whole.slice(0, end);
+  };
+  assert.doesNotMatch(bodyOf('ssWorkloadPageOpened'), /_sendAiMessage|ssRunStaffWorkload/,
+    'refreshing the charts must never trigger a paid request');
+  assert.doesNotMatch(bodyOf('ssWorkloadDataChanged'), /_sendAiMessage|ssRunStaffWorkload/);
+  assert.doesNotMatch(bodyOf('ssRenderWorkloadCharts'), /_sendAiMessage/);
+});

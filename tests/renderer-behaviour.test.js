@@ -1753,8 +1753,10 @@ test('MB161-039: the charts do not depend on the AI answering', () => {
   // The counts are arithmetic on data already present. Drawing them only after
   // a successful AI call would mean a spent budget or a network failure left
   // the page blank, when the numbers were available the whole time.
+  // MB161-046: the drawing moved into ssRenderWorkloadCharts so a timer can
+  // call it too; the ordering rule is unchanged.
   const run = declaration('ssRunStaffWorkload');
-  const charts = run.indexOf('_ssWorkloadChartHtml(stats)');
+  const charts = run.indexOf('ssRenderWorkloadCharts()');
   const send = run.indexOf('_sendAiMessage(');
   assert.ok(charts > -1 && send > -1 && charts < send,
     'the charts are rendered before the request is made');

@@ -1471,7 +1471,10 @@
           <h2>Staff Workload</h2>
           <div class="page-sub">What each profile has been carrying, over the last 30 days</div>
         </div>
-        <button class="btn btn-primary" id="workload-run-btn" onclick="ssRunStaffWorkload()">Analyse last 30 days</button>
+        <div style="display:flex;align-items:center;gap:14px">
+          <span id="workload-updated" style="font-size:11.5px;color:var(--text-muted)"></span>
+          <button class="btn btn-primary" id="workload-run-btn" onclick="ssRunStaffWorkload()">Analyse last 30 days</button>
+        </div>
       </div>
 
       <div class="card mb-5">
@@ -1491,7 +1494,7 @@
 
       <div class="card" id="workload-card">
         <div id="workload-counts" style="font-size:13px;color:var(--text-secondary);margin-bottom:14px"></div>
-        <div id="workload-result" style="font-size:13.5px;line-height:1.65;color:var(--text-primary);white-space:pre-wrap">Press <b>Analyse last 30 days</b> to build a summary.</div>
+        <div id="workload-result" style="font-size:13.5px;line-height:1.65;color:var(--text-primary);white-space:pre-wrap">The figures above stay current on their own. Press <b>Analyse last 30 days</b> for a written summary — that part uses the AI budget, so it only runs when you ask.</div>
       </div>
     </div>
 
@@ -6254,6 +6257,11 @@ function _refreshForSyncKey(key, value) {
     try { renderDashboardTodo(); } catch {}
     try { renderBriefingTodo(); } catch {}
   }
+  // MB161-046: the four sources the workload charts are built from.
+  if (key === 'logs' || key === 'todo_items' || key === 'assigned_tasks' ||
+      key === 'spreadsheets' || _ssIsProjectSyncKey(key)) {
+    try { ssWorkloadDataChanged(); } catch (_) {}
+  }
   if (key === 'assigned_tasks') {
     try { renderAssignedTasks(); } catch {}
     try { renderBriefingAssignedTasks(); } catch {}
@@ -7580,6 +7588,10 @@ function navigate(page) {
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
   document.getElementById('page-' + page).classList.add('active');
+  // MB161-046: the workload figures are cheap, so they are current on arrival
+  // rather than showing whatever was last computed.
+  if (page === 'workload') { try { ssWorkloadPageOpened(); } catch (_) {} }
+  else { try { ssWorkloadPageClosed(); } catch (_) {} }
   document.querySelector(`.nav-item[data-page="${page}"]`)?.classList.add('active');
   document.getElementById('topbar-title').textContent = PAGE_TITLES[page] || page;
   // Always scroll to top when switching pages
@@ -17258,6 +17270,55 @@ function _ssWorkloadChartHtml(stats) {
     </div>${departed}`;
 }
 
+// MB161-046: keep the charts current on their own.
+//
+// The numbers are arithmetic over data already in memory — no network, no
+// model, no cost — so there is no reason to make somebody press a button to
+// find out whether they are looking at something stale. They are redrawn when
+// the page opens, whenever any of the four sources changes, and on a slow timer
+// while the page is in front of somebody.
+//
+// The written summary is NOT refreshed with them: that one costs money against
+// a shared monthly budget, so it stays a deliberate act.
+function ssRenderWorkloadCharts() {
+  const stats = _ssWorkloadStats(Date.now() - 30 * 24 * 60 * 60 * 1000);
+  const card = document.getElementById('workload-charts-card');
+  const el = document.getElementById('workload-charts');
+  const html = _ssWorkloadChartHtml(stats);
+  if (el) el.innerHTML = html;
+  if (card) card.style.display = html ? '' : 'none';
+  const stamp = document.getElementById('workload-updated');
+  if (stamp) {
+    stamp.textContent = 'Figures current as of ' +
+      new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  }
+  return stats;
+}
+
+const SS_WORKLOAD_REFRESH_MS = 60 * 1000;
+let _ssWorkloadTimer = null;
+
+function ssWorkloadPageOpened() {
+  ssRenderWorkloadCharts();
+  if (_ssWorkloadTimer) clearInterval(_ssWorkloadTimer);
+  _ssWorkloadTimer = setInterval(() => {
+    // Only while the page is actually in front of somebody. Recomputing for a
+    // page nobody is looking at is work for nothing.
+    if (!document.getElementById('page-workload')?.classList.contains('active')) return;
+    ssRenderWorkloadCharts();
+  }, SS_WORKLOAD_REFRESH_MS);
+}
+
+function ssWorkloadPageClosed() {
+  if (_ssWorkloadTimer) { clearInterval(_ssWorkloadTimer); _ssWorkloadTimer = null; }
+}
+
+// Redraw when one of the four sources changes, whichever Mac changed it.
+function ssWorkloadDataChanged() {
+  if (!document.getElementById('page-workload')?.classList.contains('active')) return;
+  try { ssRenderWorkloadCharts(); } catch (_) {}
+}
+
 async function ssRunStaffWorkload() {
   if (!canManageStudio()) return;
   const out = document.getElementById('workload-result');
@@ -17285,12 +17346,7 @@ async function ssRunStaffWorkload() {
     // MB161-039: the counts are arithmetic on data already here, so they are
     // drawn straight away rather than waiting on the AI — and they are still
     // there if the AI call fails or the month's budget is spent.
-    const stats = _ssWorkloadStats(sinceMs);
-    const chartsCard = document.getElementById('workload-charts-card');
-    const chartsEl = document.getElementById('workload-charts');
-    const chartHtml = _ssWorkloadChartHtml(stats);
-    if (chartsEl) chartsEl.innerHTML = chartHtml;
-    if (chartsCard) chartsCard.style.display = chartHtml ? '' : 'none';
+    const stats = ssRenderWorkloadCharts();
 
     // ── What people wrote down ──
     const entries = (STORE.get('logs', []) || [])
