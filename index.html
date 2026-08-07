@@ -1019,20 +1019,18 @@
     /* MB161-039: workload charts. Plain divs rather than a charting library —
        the CSP forbids remote scripts, and a stacked bar is a width. */
     .wl-row { display:flex;align-items:center;gap:12px;padding:7px 0; }
-    .wl-name { width:150px;flex-shrink:0;font-size:13px;font-weight:600;color:var(--text-primary);
+    .wl-name { width:118px;flex-shrink:0;font-size:13px;font-weight:600;color:var(--text-primary);
                overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
     .wl-track { flex:1;display:flex;height:20px;border-radius:5px;overflow:hidden;background:var(--surface-2);min-width:60px; }
     .wl-seg { height:100%; }
-    .wl-total { width:104px;flex-shrink:0;text-align:right;font-size:12px;color:var(--text-secondary);font-variant-numeric:tabular-nums; }
-    .wl-legend { display:flex;gap:16px;flex-wrap:wrap;margin:2px 0 14px;font-size:11.5px;color:var(--text-secondary); }
-    .wl-key { display:inline-flex;align-items:center;gap:6px; }
+    .wl-total { width:40px;flex-shrink:0;text-align:right;font-size:12px;color:var(--text-secondary);font-variant-numeric:tabular-nums; }
     .wl-dot { width:10px;height:10px;border-radius:3px;display:inline-block; }
-    .wl-weeks { display:flex;align-items:flex-end;gap:10px;height:96px;padding:6px 0 0; }
-    .wl-week { flex:1;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;gap:5px; }
-    .wl-bar { width:100%;max-width:56px;border-radius:4px 4px 0 0;background:var(--sidebar-accent, #c4922a);min-height:2px; }
-    .wl-week-label { font-size:10.5px;color:var(--text-muted);white-space:nowrap; }
-    .wl-heading { font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;
-                  color:var(--text-muted);margin:0 0 10px; }
+    .wl-cols { display:flex;gap:26px;flex-wrap:wrap; }
+    .wl-col { flex:1 1 260px;min-width:240px; }
+    .wl-none { font-size:11.5px;color:var(--text-muted);padding:4px 0; }
+    .wl-heading { display:flex;align-items:center;gap:7px;font-size:12px;font-weight:700;
+                  letter-spacing:.04em;text-transform:uppercase;color:var(--text-muted);
+                  margin:0 0 10px;padding-bottom:7px;border-bottom:1px solid var(--divider); }
     .ss-cell-input {
       position:absolute;inset:0;border:none;outline:none;
       padding:3px 6px;font-size:13px;font-family:inherit;
@@ -7672,10 +7670,34 @@ function _normalizeSpreadsheetAttribution(source, cells) {
     entries.push([cellKey, { by: entry.by, at: entry.at }]);
   }
   if (!entries.length) return null;
+
+  // MB161-042: drop the stamps an import left behind.
+  //
+  // Imports stopped being attributed in MB161-030, but the stamps written by
+  // earlier builds are still in the data — which is why one import still reads
+  // as "179 changes" by whoever pressed the button, drowning the handful of
+  // real edits the panel exists to show.
+  //
+  // An import writes every cell in one go, so its stamps share an author AND a
+  // timestamp to the second, in numbers no one achieves by typing. Forty in the
+  // same second is the line. A large paste would also be caught, and that is
+  // fine: a paste is one action, and crediting it as two hundred separate edits
+  // is the same distortion.
+  const burst = new Map();
+  for (const [, entry] of entries) {
+    const key = entry.by + '@' + entry.at.slice(0, 19);
+    burst.set(key, (burst.get(key) || 0) + 1);
+  }
+  const bulk = new Set([...burst.entries()].filter(([, n]) => n >= 40).map(([key]) => key));
+  const typed = bulk.size
+    ? entries.filter(([, entry]) => !bulk.has(entry.by + '@' + entry.at.slice(0, 19)))
+    : entries;
+  if (!typed.length) return null;
+
   // Keep the most recent when over the cap: old stamps are the ones nobody is
   // still asking about.
-  entries.sort((a, b) => Date.parse(a[1].at) - Date.parse(b[1].at));
-  return Object.fromEntries(entries.slice(-MAX_SPREADSHEET_ATTRIBUTIONS));
+  typed.sort((a, b) => Date.parse(a[1].at) - Date.parse(b[1].at));
+  return Object.fromEntries(typed.slice(-MAX_SPREADSHEET_ATTRIBUTIONS));
 }
 
 // MB161-030: true while cells are arriving from Google rather than from a person.
@@ -8097,6 +8119,32 @@ function _ssStorageMode(stored = STORE.get('spreadsheets', null)) {
 // Tracked so the UI can say "still loading" rather than showing a short list
 // that looks like data went missing.
 let _ssPendingProjectIds = [];
+
+// MB161-040: the last durably-saved WORKBOOK, whatever storage mode is in use.
+//
+// Under split storage the durable snapshot for 'spreadsheets' is the INDEX — a
+// list of project ids and versions — not a workbook. Two places treated it as
+// one:
+//
+//   - the merge base captured when editing begins. _ssProjectAsDoc found no
+//     project in a list of ids, so the base came out null, _mergeSpreadsheetEdits
+//     short-circuited, and no operations were ever derived. Operations are what
+//     carry attribution, which is why ordinary edits stopped appearing in the
+//     activity sidebar while an old import's stamps stayed visible.
+//
+//   - the recovery path after a failed write, where it would have replaced the
+//     whole workbook with a manifest.
+//
+// Assembling from the project documents costs a little more than reading a
+// snapshot, and it is the only thing that is actually a workbook.
+function _ssDurableWorkbook() {
+  try {
+    const assembled = _ssReadStoredWorkbook();
+    return assembled ? _cloneJson(assembled) : null;
+  } catch (_) {
+    return null;
+  }
+}
 
 function _ssReadStoredWorkbook() {
   const stored = STORE.get('spreadsheets', null);
@@ -9445,9 +9493,12 @@ function _beginSpreadsheetSaveStage() {
   }).catch(error => {
     _storeWriteErrors.set('spreadsheets', error);
     if (_ssDirtyWorkbook) {
-      const durable = _durableStoreSnapshots.get('spreadsheets');
+      // MB161-040: must be the assembled WORKBOOK. Under split storage the
+      // durable 'spreadsheets' snapshot is the index — a list of project ids —
+      // so assigning it here replaced the entire workbook with a manifest.
+      const durable = _ssDurableWorkbook();
       if (durable) {
-        _ssData = _cloneJson(durable);
+        _ssData = durable;
         _ssDirtyWorkbook = null;
         _ssDirtyBase = null;
       }
@@ -9478,9 +9529,7 @@ function _stageDirtySpreadsheetSave(delayMs) {
   // commit can tell "the user changed this cell" from "this cell just came
   // back from the cloud".
   if (!_ssDirtyWorkbook) {
-    _ssDirtyBase = _durableStoreSnapshots.has('spreadsheets')
-      ? _cloneJson(_durableStoreSnapshots.get('spreadsheets'))
-      : _cloneJson(_ssData);
+    _ssDirtyBase = _ssDurableWorkbook() || _cloneJson(_ssData);
   }
   _ssDirtyWorkbook = _ssData;
   _ssDirtyGeneration += 1;
@@ -11435,8 +11484,15 @@ async function ssPullFromGoogle(projectId, options) {
       // would re-apply changes it has already taken.
       if (clashes) _ssData._conflicts = conflicts;
       project.googleLink = { ...link, pulledAt: new Date().toISOString(), tabs };
+      // MB161-040: the flag is set and cleared around the save with nothing
+      // awaited in between. Holding it ACROSS an await would suppress the
+      // attribution of anything a person typed while a background sync happened
+      // to be in flight — a rare, silent, and very confusing way to lose credit
+      // for your own edit.
       _ssMirroringFromGoogle = true;
-      try { await ssSave(); } finally { _ssMirroringFromGoogle = false; }
+      const saving = ssSave();
+      _ssMirroringFromGoogle = false;
+      await saving;
     }
 
     ssRender();
@@ -16992,8 +17048,22 @@ function _ssWorkloadStats(sinceMs) {
   const sinceDay = new Date(sinceMs).toISOString().slice(0, 10);
   const people = new Map();
   const weeks = [0, 0, 0, 0];
+
+  // MB161-041: the roster is whoever has a profile RIGHT NOW.
+  //
+  // Counting by whatever name appears in the records meant a deleted profile
+  // ("Test") kept showing up, while anybody who happened to log nothing was
+  // absent entirely — which is the opposite of useful, since a person with no
+  // recorded activity is exactly who a workload review should surface. So
+  // every current profile starts at zero and appears, and a name belonging to
+  // nobody current is counted as departed rather than listed as staff.
+  const roster = new Set((_loginProfiles || []).map(profile => profile.name));
+  for (const name of roster) people.set(name, _wlEmpty());
+  let departed = 0;
+
   const of = name => {
     const who = String(name || 'Unknown').slice(0, 80);
+    if (!roster.has(who)) { departed += 1; return null; }
     if (!people.has(who)) people.set(who, _wlEmpty());
     return people.get(who);
   };
@@ -17007,7 +17077,9 @@ function _ssWorkloadStats(sinceMs) {
 
   for (const entry of STORE.get('logs', []) || []) {
     if (String(entry?.date || '') < sinceDay) continue;
-    of(entry.author).logs += 1;
+    const who = of(entry.author);
+    if (!who) continue;
+    who.logs += 1;
     weeks[weekIndex(_timestampMs(entry.created) || Date.parse(entry.date) || Date.now())] += 1;
   }
 
@@ -17018,7 +17090,9 @@ function _ssWorkloadStats(sinceMs) {
     // Completions before MB161-032 carry no name. Counted separately rather
     // than assigned to somebody who may not have done it.
     if (!item.doneBy) { unattributed += 1; return; }
-    of(item.doneBy).todos += 1;
+    const who = of(item.doneBy);
+    if (!who) return;
+    who.todos += 1;
     weeks[weekIndex(at || Date.now())] += 1;
   };
   (STORE.get('todo_items', []) || []).forEach(countTick);
@@ -17031,13 +17105,15 @@ function _ssWorkloadStats(sinceMs) {
       for (const stamp of Object.values(sheet.editedBy || {})) {
         const at = _timestampMs(stamp?.at);
         if (!stamp?.by || at < sinceMs) continue;
-        of(stamp.by).cells += 1;
+        const who = of(stamp.by);
+        if (!who) continue;
+        who.cells += 1;
         weeks[weekIndex(at)] += 1;
       }
     }
   }
 
-  return { people, weeks, unattributed };
+  return { people, weeks, unattributed, departed };
 }
 
 // A stacked bar per person, and a four-week trend. Widths are shares of the
@@ -17046,49 +17122,58 @@ function _ssWorkloadStats(sinceMs) {
 function _ssWorkloadChartHtml(stats) {
   const rows = [...stats.people.entries()]
     .map(([name, counts]) => ({ name, counts, total: counts.logs + counts.todos + counts.cells }))
-    .filter(row => row.total > 0)
-    .sort((a, b) => b.total - a.total);
+    .sort((a, b) => b.total - a.total || a.name.localeCompare(b.name));
   if (!rows.length) return '';
-  const busiest = rows[0].total || 1;
 
-  const legend = `<div class="wl-legend">
-    <span class="wl-key"><span class="wl-dot" style="background:${WL_COLOURS.logs}"></span>Log entries</span>
-    <span class="wl-key"><span class="wl-dot" style="background:${WL_COLOURS.todos}"></span>To-dos ticked off</span>
-    <span class="wl-key"><span class="wl-dot" style="background:${WL_COLOURS.cells}"></span>Spreadsheet cells edited</span>
-  </div>`;
+  // MB161-041: one chart per measure, not one bar with three meanings.
+  //
+  // The stacked bar was unreadable: a segment's length depended on the row's
+  // total, so the same number of log entries drew a different width on every
+  // row, and a person with only log entries got a bar of solid gold that looked
+  // like a single unexplained quantity. And the weekly chart underneath used
+  // the same colour for a completely different thing.
+  //
+  // Three small charts instead. Within each, every bar is measured against the
+  // same maximum, so lengths are comparable down the column and only down the
+  // column — which is the only comparison the data actually supports.
+  const measures = [
+    { key: 'logs',  label: 'Log entries',              colour: WL_COLOURS.logs },
+    { key: 'todos', label: 'To-dos ticked off',        colour: WL_COLOURS.todos },
+    { key: 'cells', label: 'Spreadsheet cells edited', colour: WL_COLOURS.cells },
+  ];
 
-  const bars = rows.map(row => {
-    const share = row.total / busiest;
-    const seg = (value, colour, label) => value > 0
-      ? `<div class="wl-seg" style="width:${((value / row.total) * 100).toFixed(2)}%;background:${colour}" title="${escAttr(label)}"></div>`
-      : '';
-    return `<div class="wl-row">
-      <div class="wl-name" title="${escAttr(row.name)}">${escHtml(row.name)}</div>
-      <div class="wl-track" style="max-width:${(share * 100).toFixed(2)}%">
-        ${seg(row.counts.logs,  WL_COLOURS.logs,  `${row.counts.logs} log entries`)}
-        ${seg(row.counts.todos, WL_COLOURS.todos, `${row.counts.todos} to-dos`)}
-        ${seg(row.counts.cells, WL_COLOURS.cells, `${row.counts.cells} cells`)}
-      </div>
-      <div class="wl-total">${row.counts.logs} · ${row.counts.todos} · ${row.counts.cells}</div>
+  const columns = measures.map(measure => {
+    const peak = Math.max(...rows.map(row => row.counts[measure.key]), 0);
+    const bars = rows.map(row => {
+      const value = row.counts[measure.key];
+      const width = peak > 0 ? (value / peak) * 100 : 0;
+      return `<div class="wl-row">
+        <div class="wl-name" title="${escAttr(row.name)}">${escHtml(row.name)}</div>
+        <div class="wl-track">
+          ${value > 0 ? `<div class="wl-seg" style="width:${width.toFixed(2)}%;background:${measure.colour}"></div>` : ''}
+        </div>
+        <div class="wl-total">${value}</div>
+      </div>`;
+    }).join('');
+    return `<div class="wl-col">
+      <div class="wl-heading"><span class="wl-dot" style="background:${measure.colour}"></span>${escHtml(measure.label)}</div>
+      ${bars}
+      ${peak === 0 ? '<div class="wl-none">Nothing recorded in this period.</div>' : ''}
     </div>`;
   }).join('');
 
-  const peak = Math.max(...stats.weeks, 1);
-  const weekLabels = ['This week', '1 week ago', '2 weeks ago', '3 weeks ago'];
-  const trend = stats.weeks.map((count, i) => `<div class="wl-week">
-      <div class="wl-week-label">${count}</div>
-      <div class="wl-bar" style="height:${Math.round((count / peak) * 62)}px"></div>
-      <div class="wl-week-label">${escHtml(weekLabels[i])}</div>
-    </div>`).reverse().join('');
+  const departed = stats.departed
+    ? `<div class="wl-none" style="margin-top:14px">${stats.departed} record${stats.departed === 1 ? '' : 's'}
+       belong to a name with no current profile, and are not shown.</div>`
+    : '';
 
-  return `<div class="wl-heading">Recorded activity by profile</div>${legend}${bars}
-    <div class="wl-heading" style="margin-top:22px">Everything recorded, by week</div>
-    <div class="wl-weeks">${trend}</div>
-    <div style="font-size:11.5px;color:var(--text-muted);margin-top:10px">
-      Bars are relative to the busiest profile. The three figures are log entries,
-      to-dos ticked off and spreadsheet cells edited — kept separate because they
-      measure different things and do not add up into a score.
-    </div>`;
+  return `<div class="wl-cols">${columns}</div>
+    <div style="font-size:11.5px;color:var(--text-muted);margin-top:16px;line-height:1.5">
+      Every profile is listed, including anyone with nothing recorded. Within each
+      chart, bars are measured against the busiest person in that chart — so they
+      compare down a column, never across. The three are deliberately not added
+      together: they measure different things, and a longer bar is not a better one.
+    </div>${departed}`;
 }
 
 async function ssRunStaffWorkload() {
@@ -17136,7 +17221,9 @@ async function ssRunStaffWorkload() {
     // rather than quietly assigned to somebody. Saying "we do not know" is the
     // only honest option when the record was never kept.
     const unattributed = stats.unattributed;
-    if (!stats.people.size) {
+    const anyActivity = [...stats.people.values()]
+      .some(c => c.logs > 0 || c.todos > 0 || c.cells > 0);
+    if (!stats.people.size || !anyActivity) {
       out.textContent = 'Nothing logged, ticked off or edited in the last 30 days.';
       return;
     }
@@ -17153,6 +17240,8 @@ async function ssRunStaffWorkload() {
       }
     }
 
+    // Everyone with a profile, including anyone at zero — a person with nothing
+    // recorded is exactly who a workload review should be asked about.
     const everyone = [...stats.people.keys()].sort();
     const counts = everyone.map(name => {
       const c = stats.people.get(name);
@@ -17188,6 +17277,15 @@ async function ssRunStaffWorkload() {
         'how consistently they log and close out to-dos, and anything they appear ' +
         'to be carrying alone. Then give a short "worth a conversation" list of ' +
         'workload imbalances or gaps in coverage.\n\n' +
+        'MANY ENTRIES ARE STRUCTURED. People write headings like "Completed:", ' +
+        '"Done:", "Finished", "Pending:", "Follow-up:", "To do", "Waiting on" or ' +
+        '"Passed on". Read them. What sits under a completed heading was finished ' +
+        'by that person; what sits under a pending heading was handed on or is ' +
+        'still open, and must NOT be described as work they completed. Where a ' +
+        'person consistently logs more pending than completed, or the same item ' +
+        'keeps reappearing as pending across entries, say so — that is a genuine ' +
+        'signal about workload and it is the whole reason for reading the text ' +
+        'rather than just counting entries.\n\n' +
         'You are given three counts per person: log entries, to-dos ticked off, ' +
         'and spreadsheet cells edited. They measure different things and are NOT ' +
         'interchangeable — editing three hundred cells is not thirty times the ' +

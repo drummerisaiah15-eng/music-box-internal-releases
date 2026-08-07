@@ -362,6 +362,11 @@ test('spreadsheet typing in A1 preserves an unrelated remote edit in B1', async 
     ${declaration('_mergeSpreadsheetEdits')}
     ${declaration('_releaseSpreadsheetSaveGate')}
     ${declaration('_beginSpreadsheetSaveStage')}
+    // MB161-040: the base is now the assembled WORKBOOK, not the raw
+    // 'spreadsheets' snapshot — which under split storage is the index.
+    var _ssDurableWorkbook = () => (_durableStoreSnapshots.has('spreadsheets')
+      ? JSON.parse(JSON.stringify(_durableStoreSnapshots.get('spreadsheets')))
+      : null);
     ${declaration('_stageDirtySpreadsheetSave')}
     ${declaration('_scheduleSpreadsheetSave')}
     ${declaration('_flushSpreadsheetSave')}
@@ -1783,6 +1788,11 @@ function authorityEditorContext(authority, { stored = null } = {}) {
     ${declaration('_ssReadStoredWorkbook')}
     async function _ssMigrateToSplitStorage() { return false; }
     ${declaration('ssLoad')}
+    // MB161-040: the base is now the assembled WORKBOOK, not the raw
+    // 'spreadsheets' snapshot — which under split storage is the index.
+    var _ssDurableWorkbook = () => (_durableStoreSnapshots.has('spreadsheets')
+      ? JSON.parse(JSON.stringify(_durableStoreSnapshots.get('spreadsheets')))
+      : null);
     ${declaration('_stageDirtySpreadsheetSave')}
     globalThis.editorApi = {
       load: () => { ssLoad(); return _countSaves(); },

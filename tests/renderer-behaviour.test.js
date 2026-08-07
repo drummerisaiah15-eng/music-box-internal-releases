@@ -1671,17 +1671,20 @@ function workloadApi(now = Date.parse('2026-08-07T12:00:00Z')) {
     var _store = {};
     var STORE = { get: (k, d) => (k in _store ? _store[k] : d) };
     var _ssData = { projects: [] };
+    var _loginProfiles = [];
     var _timestampMs = v => (typeof v === 'string' ? (Date.parse(v) || 0) : 0);
     ${declaration('_wlEmpty')}
     ${declaration('_ssWorkloadStats')}
     globalThis.api = {
-      seed: (logs, todos, tasks, sheets) => {
+      seed: (logs, todos, tasks, sheets, roster) => {
         _store.logs = logs; _store.todo_items = todos; _store.assigned_tasks = tasks;
         _ssData = { projects: [{ sheets }] };
+        _loginProfiles = (roster || ['Emma', 'Carrie', 'Ana']).map(name => ({ name }));
       },
       stats: since => {
         const s = _ssWorkloadStats(since);
-        return { people: [...s.people.entries()], weeks: s.weeks, unattributed: s.unattributed };
+        return { people: [...s.people.entries()], weeks: s.weeks,
+                 unattributed: s.unattributed, departed: s.departed };
       },
     };
   `, context);
@@ -1712,8 +1715,12 @@ test('MB161-039: spreadsheet edits count towards a profile, imports do not', () 
   assert.equal(people.get('Carrie').cells, 1);
   assert.equal(people.get('Emma').logs, 1);
   assert.equal(people.get('Emma').todos, 1);
-  // An unattributed stamp creates no phantom profile.
+  // An unattributed stamp creates no phantom profile, and a name with no
+  // current profile is not listed as staff.
   assert.ok(!people.has('undefined') && !people.has(''));
+  // Every current profile appears, including one with nothing recorded.
+  assert.ok(people.has('Ana'));
+  assert.equal(people.get('Ana').logs + people.get('Ana').todos + people.get('Ana').cells, 0);
 });
 
 test('MB161-039: the three counts are never merged into one number', () => {
@@ -1724,7 +1731,7 @@ test('MB161-039: the three counts are never merged into one number', () => {
   const now = Date.now();
   const at = new Date(now - 1000).toISOString();
   api.seed([], [], [], [{ editedBy: Object.fromEntries(
-    Array.from({ length: 300 }, (_, i) => [`0,${i}`, { by: 'Ana', at }])) }]);
+    Array.from({ length: 300 }, (_, i) => [`0,${i}`, { by: 'Ana', at }])) }], ['Ana']);
   const counts = new Map(api.stats(now - 30 * 24 * 60 * 60 * 1000).people).get('Ana');
   assert.equal(counts.cells, 300);
   assert.equal(counts.logs, 0);
@@ -1746,4 +1753,78 @@ test('MB161-039: the charts do not depend on the AI answering', () => {
   const send = run.indexOf('_sendAiMessage(');
   assert.ok(charts > -1 && send > -1 && charts < send,
     'the charts are rendered before the request is made');
+});
+
+test('MB161-041: the roster is who has a profile now, at zero or otherwise', () => {
+  // A deleted profile ("Test") kept appearing because counting was driven by
+  // whatever name was in the records, while anybody who logged nothing was
+  // absent — the opposite of useful, since a person with no recorded activity
+  // is exactly who a workload review should surface.
+  const now = Date.now();
+  const at = new Date(now - 1000).toISOString();
+  const api = workloadApi();
+  api.seed(
+    [{ author: 'Test', date: new Date(now).toISOString().slice(0, 10), created: at },
+     { author: 'Emma', date: new Date(now).toISOString().slice(0, 10), created: at }],
+    [], [], [], ['Emma', 'Kylie', 'Ana'],
+  );
+  const stats = api.stats(now - 30 * 24 * 60 * 60 * 1000);
+  const people = new Map(stats.people);
+  assert.deepEqual([...people.keys()].sort(), ['Ana', 'Emma', 'Kylie']);
+  assert.equal(people.get('Emma').logs, 1);
+  assert.equal(people.get('Kylie').logs, 0, 'listed, with nothing recorded');
+  assert.ok(!people.has('Test'), 'a name with no current profile is not staff');
+  assert.equal(stats.departed, 1, 'but its records are counted and reported');
+});
+
+test('MB161-042: an import’s stamps are not shown as somebody’s edits', () => {
+  // Imports stopped being attributed in MB161-030, but stamps written by
+  // earlier builds are still in the data — which is why one import still read
+  // as "179 changes" by whoever pressed the button.
+  const context = vm.createContext({ Object, Array, Number, String, Date, Math });
+  vm.runInContext(`
+    var MAX_SPREADSHEET_ATTRIBUTIONS = 200;
+    var MAX_SPREADSHEET_ATTRIBUTION_NAME = 80;
+    ${declaration('_normalizeSpreadsheetAttribution')}
+    globalThis.norm = (source, cells) => _normalizeSpreadsheetAttribution(source, cells);
+  `, context);
+
+  const cells = {};
+  const bulk = {};
+  // 179 cells stamped in the same second: an import.
+  for (let i = 0; i < 179; i += 1) {
+    cells[`0,${i}`] = { v: 'x' };
+    bulk[`0,${i}`] = { by: 'Elizabeth Chaves', at: '2026-08-07T14:26:03.100Z' };
+  }
+  // Three cells somebody actually typed, at different moments.
+  for (let i = 0; i < 3; i += 1) {
+    cells[`1,${i}`] = { v: 'y' };
+    bulk[`1,${i}`] = { by: 'Carrie Gass', at: `2026-08-07T15:0${i}:11.000Z` };
+  }
+  const kept = context.norm(bulk, cells);
+  const names = Object.values(kept).map(entry => entry.by);
+  assert.equal(names.filter(n => n === 'Carrie Gass').length, 3, 'real edits survive');
+  assert.equal(names.filter(n => n === 'Elizabeth Chaves').length, 0,
+    'the import burst is dropped');
+});
+
+test('MB161-042: ordinary fast typing is never mistaken for an import', () => {
+  // The rule is forty stamps sharing an author AND a second. Somebody working
+  // quickly does not produce that, and treating them as an import would erase
+  // the very edits the panel exists to show.
+  const context = vm.createContext({ Object, Array, Number, String, Date, Math });
+  vm.runInContext(`
+    var MAX_SPREADSHEET_ATTRIBUTIONS = 200;
+    var MAX_SPREADSHEET_ATTRIBUTION_NAME = 80;
+    ${declaration('_normalizeSpreadsheetAttribution')}
+    globalThis.norm = (source, cells) => _normalizeSpreadsheetAttribution(source, cells);
+  `, context);
+  const cells = {};
+  const stamps = {};
+  for (let i = 0; i < 39; i += 1) {
+    cells[`0,${i}`] = { v: 'x' };
+    stamps[`0,${i}`] = { by: 'Ana Chaves', at: '2026-08-07T14:26:03.100Z' };
+  }
+  assert.equal(Object.keys(context.norm(stamps, cells)).length, 39,
+    'thirty-nine in one second is still credited');
 });

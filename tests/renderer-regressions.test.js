@@ -1721,9 +1721,12 @@ test('MB161-030: the mirroring flag is always cleared, on every path', () => {
   assert.match(build, /catch \(error\) \{\s*_ssMirroringFromGoogle = false;/,
     'and on the failure path before the write');
 
+  // MB161-040: the sync save sets and clears the flag with nothing awaited in
+  // between. Holding it across an await would suppress the attribution of
+  // anything somebody typed while a background sync happened to be in flight.
   const pull = namedFunctionSource('ssPullFromGoogle');
-  assert.match(pull, /try \{ await ssSave\(\); \} finally \{ _ssMirroringFromGoogle = false; \}/,
-    'and around the sync save');
+  assert.match(pull, /_ssMirroringFromGoogle = true;\s*\n\s*const saving = ssSave\(\);\s*\n\s*_ssMirroringFromGoogle = false;\s*\n\s*await saving;/,
+    'the flag is cleared before the await, not after it');
 
   // It has to be held across the write, not just the build: the attribution is
   // stamped by the operations derived during the commit.
@@ -1872,4 +1875,52 @@ test('MB161-038: a task you gave yourself can be ticked off and removed', () => 
   // And they can see it: a self-assigned task matches on both counts.
   const render = namedFunctionSource('renderMyTasks');
   assert.match(render, /t\.assignee === user \|\|\s*\n?\s*t\.assignedBy === user/);
+});
+
+test('MB161-040: the merge base is a workbook, never the index', () => {
+  // Under split storage the durable 'spreadsheets' snapshot is the INDEX — a
+  // list of project ids. Two places treated it as a workbook.
+  //
+  // As the merge base it made _ssProjectAsDoc return null, so
+  // _mergeSpreadsheetEdits short-circuited and no operations were derived.
+  // Operations carry attribution, which is why ordinary edits stopped showing
+  // in the activity sidebar while an old import's stamps stayed visible.
+  const stage = namedFunctionSource('_stageDirtySpreadsheetSave');
+  assert.match(stage, /_ssDirtyBase = _ssDurableWorkbook\(\) \|\| _cloneJson\(_ssData\)/);
+  assert.doesNotMatch(stage, /_durableStoreSnapshots\.get\('spreadsheets'\)/,
+    'the raw snapshot is not a workbook and must not be used as one');
+
+  // And the recovery path after a failed write, where it would have replaced
+  // the entire workbook with a manifest.
+  assert.match(script, /const durable = _ssDurableWorkbook\(\);\s*\n\s*if \(durable\) \{\s*\n\s*_ssData = durable;/);
+
+  const helper = namedFunctionSource('_ssDurableWorkbook');
+  assert.match(helper, /_ssReadStoredWorkbook\(\)/, 'it assembles rather than reading a snapshot');
+  assert.match(helper, /catch \(_\) \{\s*\n?\s*return null;/,
+    'and a workbook that will not assemble is "no base", not an exception');
+});
+
+test('MB161-041: three charts, each comparable only down its own column', () => {
+  // The stacked bar was unreadable: a segment's width depended on the row's
+  // total, so the same number of log entries drew a different length on every
+  // row, and somebody with only log entries got a solid block that looked like
+  // one unexplained quantity. The weekly chart below then reused that colour
+  // for something else entirely.
+  const chart = namedFunctionSource('_ssWorkloadChartHtml');
+  assert.match(chart, /const measures = \[/);
+  assert.match(chart, /const peak = Math\.max\(\.\.\.rows\.map\(row => row\.counts\[measure\.key\]\), 0\)/,
+    'each chart is scaled to its own busiest value');
+  assert.match(chart, /compare down a column, never across/);
+  // The confusing weekly chart is gone rather than relabelled.
+  assert.ok(!script.includes('wl-weeks') && !script.includes('Everything recorded, by week'));
+  // Every profile is drawn, including the ones at zero.
+  assert.doesNotMatch(chart, /\.filter\(row => row\.total > 0\)/);
+});
+
+test('MB161-041: the AI is told to read completed versus pending', () => {
+  const run = namedFunctionSource('ssRunStaffWorkload');
+  assert.match(run, /MANY ENTRIES ARE STRUCTURED/);
+  assert.match(run, /must NOT be described as work they completed/);
+  assert.match(run, /keeps reappearing as pending across entries/,
+    'a repeatedly deferred item is the signal worth surfacing');
 });
