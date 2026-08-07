@@ -5054,6 +5054,8 @@ const SYNC_BASE_KEYS = Object.freeze([
   // V159-005: owner-published staff directory so profile adds, removals and
   // role changes reach every Mac.
   'staff_directory',
+  // MB161-034: the studio's shared AI spend estimate for the current month.
+  'ai_spend',
 ]);
 
 // Lesson check-out was a MindBody feature. MindBody is retired, so nothing
@@ -12453,10 +12455,21 @@ function setMBMode() {} // MindBody removed
 function saveMindBodySettings() {} // MindBody removed
 async function mbGetToken() { return null; } // MindBody removed
 
-// ── Per-device AI use estimate ────────────────────────────────
-// This is a local convenience pause, not an account-wide Anthropic spending
-// limit. Actual provider billing can differ from this estimate.
-const AI_DEVICE_MONTHLY_PAUSE_USD = 15.00;
+// ── Shared AI use estimate ────────────────────────────────────
+//
+// MB161-034: one budget for the studio, not one per Mac.
+//
+// This used to be $15 per device held in a local key, which meant two Macs
+// could spend $30 between them and neither would notice — the number somebody
+// actually cares about was the one nothing tracked. It is now a single synced
+// record: each Mac keeps its own subtotal so two of them writing at once cannot
+// clobber each other's figure, and the cap applies to the sum.
+//
+// Still an estimate derived from token counts, and still a local pause rather
+// than an account-wide limit at Anthropic. Actual billing can differ.
+const AI_TEAM_MONTHLY_CAP_USD = 20.00;
+// Kept as the old name so nothing that displays it has to change meaning.
+const AI_DEVICE_MONTHLY_PAUSE_USD = AI_TEAM_MONTHLY_CAP_USD;
 const AI_MODEL_COSTS = {
   'claude-opus-4-5':           { input:  5.00, output: 25.00 }, // USD per 1M tokens
   'claude-sonnet-4-6':         { input:  3.00, output: 15.00 },
@@ -12521,7 +12534,21 @@ async function _sendAiMessage(payload) {
   return result.data;
 }
 
-// Route by complexity: simple FAQ → haiku (~5-20x cheaper), complex → sonnet
+// MB161-034: cheapest by default; escalate only with a reason.
+//
+// Haiku is the default for everything. Sonnet costs three times as much on
+// input and three times on output, and the studio now shares one $20 monthly
+// budget, so reaching for it should be a decision rather than a habit.
+//
+// It is worth naming what actually justifies the more expensive model, because
+// "this feels important" does not: multi-step reasoning, or an answer that has
+// to hold a lot of context together at once. Summarising, extracting fields,
+// classifying and rewriting are all things Haiku does well, and those are most
+// of what this app asks for.
+const AI_CHEAPEST_MODEL = 'claude-haiku-4-5-20251001';
+const AI_CAPABLE_MODEL = 'claude-sonnet-4-6';
+
+// Route by complexity: most questions → haiku, genuinely open-ended → sonnet
 function selectAiModel(query) {
   const q = (query || '').toLowerCase().trim();
   const SIMPLE = [
@@ -12535,33 +12562,57 @@ function selectAiModel(query) {
     /^(what|which) (instruments?|lessons?|classes?) (do|does|are|can)/,
     /^(what|who) (are|is) (your )?(staff|teachers?|instructors?)/,
   ];
-  if (q.length < 90 && SIMPLE.some(p => p.test(q))) return 'claude-haiku-4-5-20251001';
-  return 'claude-sonnet-4-6';
+  if (q.length < 90 && SIMPLE.some(p => p.test(q))) return AI_CHEAPEST_MODEL;
+  // Anything short and not obviously multi-part is still a lookup, whatever
+  // words it happens to start with. Only a long or explicitly reasoning-shaped
+  // question earns the expensive model.
+  const NEEDS_REASONING = /\b(compare|why|explain|recommend|analy[sz]e|draft|summar|plan|should we|trade-?off)\b/;
+  if (q.length < 160 && !NEEDS_REASONING.test(q)) return AI_CHEAPEST_MODEL;
+  return AI_CAPABLE_MODEL;
 }
 
-function _aiSpendKey() {
+// One synced record rather than a key per month. A monthly key would grow a new
+// document every month forever; this one carries the month it describes and is
+// reset the first time anybody spends in a new one.
+const AI_SPEND_KEY = 'ai_spend';
+
+function _aiSpendMonth() {
   const d = new Date();
-  return `ai_spend_${d.getFullYear()}_${d.getMonth() + 1}`;
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
 }
 
+// Per-device subtotals. Two Macs writing a single shared total would each
+// overwrite the other's figure; writing only your own entry means the sum is
+// right whichever order the writes land in.
+function _aiSpendRecord() {
+  const stored = STORE.get(AI_SPEND_KEY, null);
+  if (!stored || typeof stored !== 'object' || Array.isArray(stored)) return { month: _aiSpendMonth(), devices: {} };
+  if (stored.month !== _aiSpendMonth()) return { month: _aiSpendMonth(), devices: {} };
+  const devices = {};
+  for (const [device, amount] of Object.entries(stored.devices || {})) {
+    const value = Number(amount);
+    if (Number.isFinite(value) && value > 0) devices[String(device).slice(0, 80)] = value;
+  }
+  return { month: stored.month, devices };
+}
+
+// The whole studio's estimate for this month.
 function getAiSpendThisMonth() {
-  return STORE.get(_aiSpendKey(), 0);
+  return Object.values(_aiSpendRecord().devices).reduce((sum, amount) => sum + amount, 0);
 }
 
 function addAiSpend(model, inputTokens, outputTokens) {
   const rates = AI_MODEL_COSTS[model] || AI_MODEL_COSTS['claude-opus-4-5'];
   const cost = (inputTokens / 1_000_000) * rates.input + (outputTokens / 1_000_000) * rates.output;
-  const current = getAiSpendThisMonth();
-  persistInBackground(
-    _aiSpendKey(),
-    Math.round((current + cost) * 100000) / 100000,
-    'AI usage estimate'
-  );
-  return current + cost;
+  const record = _aiSpendRecord();
+  const device = _deviceId();
+  record.devices[device] = Math.round(((record.devices[device] || 0) + cost) * 100000) / 100000;
+  persistInBackground(AI_SPEND_KEY, record, 'AI usage estimate');
+  return Object.values(record.devices).reduce((sum, amount) => sum + amount, 0);
 }
 
 function aiAtSpendLimit() {
-  return getAiSpendThisMonth() >= AI_DEVICE_MONTHLY_PAUSE_USD;
+  return getAiSpendThisMonth() >= AI_TEAM_MONTHLY_CAP_USD;
 }
 
 async function mbGet() { return null; } // MindBody removed
@@ -16878,8 +16929,8 @@ async function ssRunStaffWorkload() {
   // those are the point of having a pause at all.
   if (aiAtSpendLimit()) {
     out.textContent =
-      `This Mac's estimated AI-use pause of $${AI_DEVICE_MONTHLY_PAUSE_USD} has been reached ` +
-      `for this month. It resets at the start of next month.`;
+      `The studio's estimated AI-use pause of $${AI_TEAM_MONTHLY_CAP_USD} has been reached ` +
+      `for this month, across all Macs. It resets at the start of next month.`;
     return;
   }
   if (button) button.disabled = true;
@@ -16951,7 +17002,9 @@ async function ssRunStaffWorkload() {
 
     out.textContent = `Analysing ${everyone.length} profiles…`;
     const data = await _sendAiMessage({
-      model: 'claude-sonnet-4-6',
+      // Summarising and grouping written notes — squarely Haiku's job, and the
+      // input here is large, which is exactly where the price difference bites.
+      model: AI_CHEAPEST_MODEL,
       max_tokens: 1600,
       system:
         'You are reviewing a small music studio\'s internal Daily Log and to-do ' +
@@ -16979,13 +17032,13 @@ async function ssRunStaffWorkload() {
           `\nThe log entries:\n\n${digest}`,
       }],
     });
-    const spent = addAiSpend('claude-sonnet-4-6',
+    const spent = addAiSpend(AI_CHEAPEST_MODEL,
       data?.usage?.input_tokens || 0, data?.usage?.output_tokens || 0);
     const text = (data?.content || []).map(part => part?.text || '').join('').trim();
     out.textContent = text || 'The analysis came back empty.';
     if (countsEl) {
-      countsEl.textContent += ` · this Mac's AI estimate: $${spent.toFixed(2)} of ` +
-        `$${AI_DEVICE_MONTHLY_PAUSE_USD} this month`;
+      countsEl.textContent += ` · studio AI estimate: $${spent.toFixed(2)} of ` +
+        `$${AI_TEAM_MONTHLY_CAP_USD} this month, all Macs`;
     }
   } catch (error) {
     out.textContent = `Could not analyse the records: ${error?.message || error}`;
@@ -17518,8 +17571,8 @@ Return ONLY the JSON with no explanation or markdown.`;
 
   if (aiAtSpendLimit()) {
     showToast(
-      `This Mac's estimated AI-use pause of $${AI_DEVICE_MONTHLY_PAUSE_USD} has been reached. ` +
-      'The local estimate resets next month; Anthropic billing may differ.',
+      `The studio's estimated AI-use pause of $${AI_TEAM_MONTHLY_CAP_USD} has been reached. ` +
+      'The estimate covers every Mac and resets next month; Anthropic billing may differ.',
       'warning'
     );
     if (statusEl) statusEl.textContent = '';
@@ -17527,7 +17580,7 @@ Return ONLY the JSON with no explanation or markdown.`;
   }
 
   try {
-    const _suModel = 'claude-haiku-4-5-20251001';
+    const _suModel = AI_CHEAPEST_MODEL;   // field extraction from a receipt
     const data = await _sendAiMessage({
       model: _suModel,
       max_tokens: 2048,
@@ -18157,8 +18210,8 @@ ${fullContext}`;
     const spent = getAiSpendThisMonth().toFixed(2);
     if (answerText) {
       answerText.textContent =
-        `⛔ This Mac's estimated AI-use pause of $${AI_DEVICE_MONTHLY_PAUSE_USD} has been reached ` +
-        `($${spent} estimated locally). It resets next month; Anthropic billing may differ.`;
+        `⛔ The studio's estimated AI-use pause of $${AI_TEAM_MONTHLY_CAP_USD} has been reached ` +
+        `($${spent} estimated across all Macs). It resets next month; Anthropic billing may differ.`;
     }
     if (answerSrc) answerSrc.textContent = '';
     if (btn) { btn.disabled = false; btn.textContent = 'Ask AI'; }
@@ -18184,7 +18237,7 @@ ${fullContext}`;
     if (logContext)              srcParts.push('App logs');
     if (websiteText)             srcParts.push('themusicboxinc.com (live)');
     const spendNote = totalSpent >= AI_DEVICE_MONTHLY_PAUSE_USD * 0.8
-      ? ` ⚠️ This Mac estimate: $${totalSpent.toFixed(2)}/$${AI_DEVICE_MONTHLY_PAUSE_USD}`
+      ? ` ⚠️ Studio estimate: $${totalSpent.toFixed(2)}/$${AI_TEAM_MONTHLY_CAP_USD}`
       : '';
     if (answerSrc) answerSrc.textContent = (srcParts.length ? `Sources checked: ${srcParts.join(' · ')}` : 'No sources') + ` · ${modelLabel}` + spendNote;
     if (input) { input.value = ''; input.style.height = 'auto'; }
@@ -19554,7 +19607,7 @@ async function commAnalyzeAndAddTodos() {
   if (aiAtSpendLimit()) return; // silent skip — background task, no toast needed
 
   try {
-    const _commModel = 'claude-haiku-4-5-20251001';
+    const _commModel = AI_CHEAPEST_MODEL; // classifying a message
     const data = await _sendAiMessage({
       model: _commModel,
       max_tokens: 800,

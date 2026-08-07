@@ -249,13 +249,21 @@ test('receipt images are format-limited, resized, and compressed before AI submi
   assert.doesNotMatch(script, /data:image\\\/\(\?:[\s\S]*?heic/);
 });
 
-test('AI spend control is labeled as a per-device estimate with current model rates', () => {
-  assert.match(script, /AI_DEVICE_MONTHLY_PAUSE_USD = 15\.00/);
+test('MB161-034: the AI pause is one shared studio estimate, and says so', () => {
+  assert.match(script, /AI_TEAM_MONTHLY_CAP_USD = 20\.00/);
   assert.match(script, /'claude-opus-4-5':\s*\{ input:\s*5\.00, output:\s*25\.00 \}/);
   assert.match(script, /'claude-haiku-4-5-20251001':\s*\{ input:\s*1\.00, output:\s*5\.00 \}/);
-  assert.match(source, /This Mac's estimated AI-use pause/);
-  assert.match(source, /Anthropic billing may differ/);
+  // The wording matters as much as the number: told it was "this Mac's" pause,
+  // somebody would reasonably assume the other Mac had its own to spend.
+  assert.match(source, /The studio's estimated AI-use pause/);
+  assert.doesNotMatch(source, /This Mac's estimated AI-use pause/);
+  assert.doesNotMatch(source, /This Mac estimate/);
+  assert.match(source, /Anthropic billing may differ/,
+    'it is still an estimate, and still not an account-wide limit');
   assert.doesNotMatch(source, /AI monthly budget/);
+  // Shared means synced. A local key would leave the cap per-Mac in fact while
+  // claiming otherwise in the copy.
+  assert.match(script, /'ai_spend',/);
 });
 
 test('auto-refresh registration is idempotent and resume work is single-flight', () => {

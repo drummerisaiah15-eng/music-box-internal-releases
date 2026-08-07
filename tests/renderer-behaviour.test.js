@@ -1525,3 +1525,100 @@ test('MB161-030: importing and syncing are not credited as edits', () => {
   context.api.mirroring(false);
   assert.equal(context.api.actor(), 'Elizabeth Chaves', 'and it is only suppressed while mirroring');
 });
+
+// ── MB161-034: one shared AI budget, and the cheap model by default ─────────
+
+function spendApi() {
+  const context = vm.createContext({ Object, Number, Math, String, Array, Date, JSON });
+  vm.runInContext(`
+    var _store = {};
+    var STORE = { get: (k, d) => (k in _store ? _store[k] : d) };
+    var _device = 'mac-a';
+    var _deviceId = () => _device;
+    var AI_TEAM_MONTHLY_CAP_USD = 20;
+    var AI_SPEND_KEY = 'ai_spend';
+    var AI_MODEL_COSTS = {
+      'claude-sonnet-4-6':         { input: 3, output: 15 },
+      'claude-haiku-4-5-20251001': { input: 1, output: 5 },
+    };
+    var persistInBackground = (k, v) => { _store[k] = JSON.parse(JSON.stringify(v)); };
+    ${declaration('_aiSpendMonth')}
+    ${declaration('_aiSpendRecord')}
+    ${declaration('getAiSpendThisMonth')}
+    ${declaration('addAiSpend')}
+    ${declaration('aiAtSpendLimit')}
+    globalThis.api = {
+      spend: (m, i, o) => addAiSpend(m, i, o),
+      total: () => getAiSpendThisMonth(),
+      capped: () => aiAtSpendLimit(),
+      asDevice: id => { _device = id; },
+      raw: () => _store.ai_spend,
+      seed: v => { _store.ai_spend = v; },
+    };
+  `, context);
+  return context.api;
+}
+
+test('MB161-034: the cap is the whole studio, not one Mac each', () => {
+  // Two Macs at $15 apiece could spend $30 and neither would notice, because
+  // the number anybody actually cares about was the one nothing tracked.
+  const api = spendApi();
+  api.asDevice('mac-a');
+  api.spend('claude-sonnet-4-6', 1_000_000, 0);   // $3
+  api.asDevice('mac-b');
+  api.spend('claude-sonnet-4-6', 1_000_000, 0);   // $3
+  assert.equal(Math.round(api.total() * 100) / 100, 6, 'both Macs count towards one total');
+  assert.equal(api.capped(), false);
+
+  api.spend('claude-sonnet-4-6', 5_000_000, 0);   // +$15 => $21
+  assert.equal(api.capped(), true, 'and the cap is reached collectively');
+});
+
+test('MB161-034: one Mac writing cannot erase the other Mac’s figure', () => {
+  // The reason for per-device subtotals rather than a single shared number:
+  // two Macs writing a total would each overwrite the other.
+  const api = spendApi();
+  api.asDevice('mac-a');
+  api.spend('claude-haiku-4-5-20251001', 1_000_000, 0);  // $1
+  api.asDevice('mac-b');
+  api.spend('claude-haiku-4-5-20251001', 2_000_000, 0);  // $2
+  const record = api.raw();
+  assert.deepEqual(Object.keys(record.devices).sort(), ['mac-a', 'mac-b']);
+  assert.equal(record.devices['mac-a'], 1);
+  assert.equal(record.devices['mac-b'], 2);
+});
+
+test('MB161-034: last month’s spend does not count against this month', () => {
+  const api = spendApi();
+  api.seed({ month: '2019-01', devices: { 'mac-a': 19.5 } });
+  assert.equal(api.total(), 0, 'a stale month reads as nothing spent');
+  assert.equal(api.capped(), false);
+  // And junk cannot make the studio look either broke or free.
+  for (const junk of [null, 'nope', [], { month: '2019-01' }, { devices: { a: 'lots' } }]) {
+    api.seed(junk);
+    assert.equal(api.total(), 0);
+  }
+});
+
+test('MB161-034: the cheap model is the default, not the fallback', () => {
+  const context = vm.createContext({ String });
+  vm.runInContext(`
+    var AI_CHEAPEST_MODEL = 'haiku';
+    var AI_CAPABLE_MODEL = 'sonnet';
+    ${declaration('selectAiModel')}
+    globalThis.pick = q => selectAiModel(q);
+  `, context);
+  // Lookups, however they are phrased.
+  for (const q of [
+    'what time do you open', 'who teaches drums', 'how much is a lesson',
+    'is guitar available on tuesday', 'do we have a room free at 4',
+    'has Ana logged anything today',
+  ]) assert.equal(context.pick(q), 'haiku', `"${q}" is a lookup`);
+
+  // Only genuinely open-ended work earns the expensive model.
+  for (const q of [
+    'compare our lesson pricing to what similar studios charge and recommend a change',
+    'why did attendance drop in July and what should we do about it',
+    'draft an email to parents explaining the new schedule',
+  ]) assert.equal(context.pick(q), 'sonnet', `"${q}" needs reasoning`);
+});

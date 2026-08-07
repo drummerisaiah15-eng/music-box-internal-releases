@@ -59,7 +59,8 @@ service cloud.firestore {
         'policies',
         'staff_dir_overrides',
         'removed_staff_dir',
-        'staff_directory'
+        'staff_directory',
+        'ai_spend'
       ];
     }
 
