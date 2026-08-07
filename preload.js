@@ -78,10 +78,12 @@ contextBridge.exposeInMainWorld('electronSpreadsheet', {
   importFile:     () => ipcRenderer.invoke('import-spreadsheet'),
 });
 
-// MB161-014: Google Sheets, READ ONLY. There is no write method on this bridge
-// and there is no write handler behind it. The OAuth scope requested is
-// spreadsheets.readonly, so Google itself refuses a write even if something
-// here were wrong. Tokens never cross the bridge; the renderer gets values.
+// MB161-014/016: Google Sheets, two-way. The scope is now spreadsheets rather
+// than spreadsheets.readonly, so Google no longer refuses writes for us and the
+// restraint has to live in our own code: push is the ONLY write method here, it
+// is reachable only from an explicit button, and main re-reads before writing so
+// a cell somebody else changed is skipped rather than clobbered.
+// Tokens never cross the bridge; the renderer gets values.
 contextBridge.exposeInMainWorld('electronGoogleSheets', {
   status:         () => ipcRenderer.invoke('google-status'),
   setCredentials: (request) => ipcRenderer.invoke('google-set-credentials', request),

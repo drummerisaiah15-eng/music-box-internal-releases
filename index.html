@@ -1554,8 +1554,9 @@
           </div>
           <div class="modal-body">
             <div style="font-size:12.5px;color:var(--text-secondary);margin-bottom:14px">
-              Read-only. Music Box copies the values it can see into a new project.
-              Your Google sheet is never modified.
+              Music Box copies the values it can see into a new project, and keeps
+              a link back to the Google sheet so you can pull changes down or push
+              yours up. Nothing is written to Google until you press Push.
             </div>
             <div class="form-group">
               <label class="form-label">Google Sheets link</label>
@@ -1980,20 +1981,26 @@
         </div>
       </div>
 
-      <!-- MB161-014: Google Sheets, read-only -->
+      <!-- MB161-014/016: Google Sheets, two-way -->
       <div class="settings-section owner-settings-section" id="owner-google-settings">
         <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
-          <div class="settings-section-title" style="margin-bottom:0">📊 Google Sheets (read-only)</div>
+          <div class="settings-section-title" style="margin-bottom:0">📊 Google Sheets</div>
           <div class="api-status" id="google-sheets-badge">
             <div class="api-status-dot"></div>
             <span>Not connected</span>
           </div>
         </div>
         <div class="settings-section-desc">
-          Import a Google Sheet into Spreadsheets, and pull it again when it changes in Google.
-          <b>This connection can only read.</b> The access Music Box asks Google for is
-          <span style="font-family:Consolas,monospace;font-size:11px">spreadsheets.readonly</span>,
-          so nothing in this app can alter a Google sheet &mdash; Google refuses the write.
+          Import a Google Sheet into Spreadsheets, then <b>Pull</b> to bring Google's changes
+          down or <b>Push</b> to send yours up. This connection can read and write, so the
+          access Music Box asks Google for is
+          <span style="font-family:Consolas,monospace;font-size:11px">spreadsheets</span>.
+          It only ever touches sheets you have imported, and only when you press a button
+          &mdash; nothing syncs on its own.
+          <br /><br />
+          A push writes only the cells that still hold what Music Box last saw. If somebody
+          changed a cell in Google since your last pull, that cell is left alone and reported
+          back to you instead of being overwritten.
           <br /><br />
           Set up at <a href="https://console.cloud.google.com" target="_blank" style="color:var(--accent)">console.cloud.google.com</a>:
           enable the Google Sheets API, then create an OAuth client ID of type <b>Desktop app</b>.
@@ -10467,15 +10474,20 @@ function ssDeleteProject(id) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// MB161-014: Google Sheets, read-only.
-//
-// Phase 1: Google to app, nothing back. The OAuth scope requested is
-// spreadsheets.readonly, so Google refuses a write even if something here were
-// wrong — the guarantee does not depend on this file being correct.
+// MB161-014/016: Google Sheets, two-way.
 //
 // An import creates a NEW project and records where it came from, so it can be
 // pulled again. Pulling again REPLACES that project's sheet, which is the
 // honest meaning of a mirror and is why it asks first.
+//
+// Pushing goes the other way, and this is where the care is. Google's values
+// API has no etag, no revision precondition, no If-Match — a write always wins,
+// unconditionally. So it cannot be made atomic and must not pretend to be. Instead
+// the push re-reads the range first and only writes cells that still hold what
+// the app last saw at import or pull time (_ssGoogleCheckpoint). A cell that
+// somebody else changed in the meantime is skipped and reported, and the value
+// a push does replace is kept, so an overwrite is recoverable rather than
+// silent. That is the same standard as the rest of the app's sync.
 // ─────────────────────────────────────────────────────────────
 
 let _ssGoogleLookup = null;
@@ -10512,7 +10524,7 @@ async function refreshGoogleSheetsStatus() {
     el.textContent = !status.configured
       ? 'No client ID saved yet.'
       : status.connected
-        ? `Connected as ${status.account || 'a Google account'} — read-only access.`
+        ? `Connected as ${status.account || 'a Google account'}.`
         : 'Client ID saved. Connect a Google account to finish.';
     if (!status.connected && _googleLastError) {
       el.textContent += `  Last attempt failed: ${_googleLastError}`;
@@ -10566,7 +10578,7 @@ async function connectGoogleSheets() {
     showToast('Finish signing in to Google in your browser…', 'info');
     const result = await done;
     _googleLastError = null;
-    showToast(`Google connected as ${result.account || 'your account'} (read-only).`, 'success');
+    showToast(`Google connected as ${result.account || 'your account'}.`, 'success');
     refreshGoogleSheetsStatus();
   } catch (error) {
     // Recorded, not just toasted: the person is usually still in their browser

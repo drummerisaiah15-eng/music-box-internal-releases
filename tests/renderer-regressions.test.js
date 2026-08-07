@@ -1295,12 +1295,29 @@ test('MB161-014: an imported tab goes through the existing validated importer', 
     'the Google path must not write to storage on its own');
 });
 
-test('MB161-014: the read-only promise is stated where somebody will read it', () => {
-  assert.match(source, /spreadsheets\.readonly/,
-    'Settings names the exact scope rather than asking for trust');
-  assert.match(source, /Google refuses the write/);
-  assert.match(source, /Your Google sheet is never modified/,
-    'and the import dialog says it too');
+test('MB161-016: the UI no longer promises read-only, because it is not true', () => {
+  // This connection used to be read-only and Settings said so in bold. When the
+  // scope widened to allow pushes, that sentence became a lie in the one place
+  // somebody would go to check. A stale safety promise is worse than none: it
+  // is the reason a person stops checking. So the old copy has to be gone, not
+  // merely supplemented.
+  assert.doesNotMatch(source, /spreadsheets\.readonly/,
+    'Settings must not name the readonly scope it no longer requests');
+  assert.doesNotMatch(source, /Google refuses the write/,
+    'Google does not refuse our writes any more');
+  assert.doesNotMatch(source, /Your Google sheet is never modified/,
+    'the import dialog cannot claim that either');
+  assert.doesNotMatch(source, /read-only access/,
+    'and the connected status line must not say it');
+
+  // What replaces it has to be specific about the two things a person actually
+  // needs to know: when we write, and what happens to a cell somebody else
+  // touched.
+  assert.match(source, /only when you press a button/);
+  assert.match(source, /nothing syncs on its own/);
+  assert.match(source, /that cell is left alone and reported/);
+  assert.match(source, /Nothing is written to Google until you press Push/,
+    'the import dialog states it too, where the decision is being made');
 });
 
 test('MB161-016: the renderer still cannot reach Google directly', () => {
