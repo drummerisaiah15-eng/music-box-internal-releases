@@ -1516,7 +1516,33 @@ const APP_PROFILE_ROLES = Object.freeze({
   'Ana Chaves': 'Front Desk',
   'Emma Minnetto': 'Front Desk',
 });
-const COMMUNICATION_ROLES = new Set(['Owner', 'Operations & Events', 'Front Desk']);
+const COMMUNICATION_ROLES = new Set(['Owner', 'Operations Manager', 'Operations & Events', 'Front Desk']);
+
+// MB161-031: Operations Manager — a senior role below Owner.
+//
+// It can do the administrative work that used to require the owner: managing
+// staff profiles, and connecting Google. What it deliberately CANNOT do is
+// anything that touches the Owner: it cannot grant the Owner role (that is
+// proved by the owner passcode, not assigned), it cannot remove or demote an
+// Owner profile, and it has no access to the owner passcode, Firebase
+// configuration, or the encrypted credential vault.
+//
+// Those exclusions are enforced here, in main, not in the renderer — the
+// renderer can be wrong or worked around; this cannot.
+const OPERATIONS_MANAGER_ROLES = new Set(['Owner', 'Operations Manager']);
+
+// A profile the Owner may hand out. Owner is absent on purpose: it is proved by
+// the owner passcode rather than assigned, so granting it would create a
+// profile that cannot actually sign in.
+function _requireNotOwnerTarget(target, action) {
+  if (target?.role === 'Owner' && !_appSessionHasRole(new Set(['Owner']))) {
+    throw new Error(`Only an Owner can ${action} an Owner profile.`);
+  }
+}
+
+function _appSessionHasRole(allowed) {
+  try { return !!appSession && allowed.has(appSession.role); } catch (_) { return false; }
+}
 const OWNER_AUTH_VAULT_KEY = 'app_owner_auth_v1';
 const STAFF_PROFILES_VAULT_KEY = 'app_staff_profiles_v1';
 const OWNER_AUTH_ITERATIONS = 310000;
@@ -1580,7 +1606,7 @@ function _removedCustomProfiles(vault) {
 // owner passcode, and app-session-authenticate-owner resolves to the built-in
 // owner identity. Granting Owner to another name would create a profile that
 // cannot actually sign in.
-const ASSIGNABLE_PROFILE_ROLES = Object.freeze(['Operations & Events', 'Front Desk']);
+const ASSIGNABLE_PROFILE_ROLES = Object.freeze(['Operations Manager', 'Operations & Events', 'Front Desk']);
 
 function _profileRoleOverrides(vault) {
   const stored = vault[PROFILE_ROLE_OVERRIDES_VAULT_KEY];
@@ -1838,7 +1864,7 @@ _secureHandle('app-session-add-staff-profile', async (_, requestedName) => {
 //  - task history is NOT touched. Assigned tasks reference a display name, and
 //    deleting the records would destroy studio history rather than a login.
 _secureHandle('app-session-remove-staff-profile', async (_, requestedName) => {
-  _requireAppRole(new Set(['Owner']));
+  _requireAppRole(OPERATIONS_MANAGER_ROLES);
   const name = _normalizeStaffProfileName(requestedName);
   if (appSession && appSession.name === name) {
     throw new Error('You cannot remove the profile that is currently signed in.');
@@ -1848,6 +1874,8 @@ _secureHandle('app-session-remove-staff-profile', async (_, requestedName) => {
   // else (duplicate detection on add uses the same folding).
   const target = _findProfileByFoldedName(existing, name);
   if (!target) throw new Error('That user was not found on this Mac.');
+  // MB161-031: an Operations Manager administers everyone except the Owner.
+  _requireNotOwnerTarget(target, 'remove');
   // Removing the last Owner would leave nobody able to administer the app.
   if (target.role === 'Owner' && _ownerProfileCount(existing) <= 1) {
     throw new Error('The last Owner profile cannot be removed.');
@@ -2077,7 +2105,7 @@ _secureHandle('app-session-import-directory', async (_, directory) => {
 // way, and gating the read would just mean staff see stale cells.
 
 _secureHandle('google-set-credentials', async (_, request) => {
-  _requireAppRole(new Set(['Owner']));
+  _requireAppRole(OPERATIONS_MANAGER_ROLES);
   if (!_isPlainObject(request)) throw new Error('Invalid Google credentials.');
   const clientId = String(request.clientId || '').trim();
   const clientSecret = String(request.clientSecret || '').trim();
@@ -2117,7 +2145,7 @@ _secureHandle('google-status', async () => {
 });
 
 _secureHandle('google-oauth-begin', async (_, request) => {
-  _requireAppRole(new Set(['Owner']));
+  _requireAppRole(OPERATIONS_MANAGER_ROLES);
   if (!_isPlainObject(request)) throw new Error('Invalid Google sign-in request.');
   const vault = _googleVault();
   if (!_validGoogleClientId(vault.clientId || '')) {
@@ -2130,7 +2158,7 @@ _secureHandle('google-oauth-begin', async (_, request) => {
 });
 
 _secureHandle('google-oauth-complete', async (_, request) => {
-  _requireAppRole(new Set(['Owner']));
+  _requireAppRole(OPERATIONS_MANAGER_ROLES);
   if (!_isPlainObject(request)) throw new Error('Invalid Google sign-in completion.');
   const attempt = pendingGoogleOAuth;
   const { state, codeVerifier } = request;
@@ -2194,7 +2222,7 @@ _secureHandle('google-oauth-complete', async (_, request) => {
 });
 
 _secureHandle('google-disconnect', async () => {
-  _requireAppRole(new Set(['Owner']));
+  _requireAppRole(OPERATIONS_MANAGER_ROLES);
   const vault = _googleVault();
   // Keep the client configuration; drop only the account grant.
   _saveGoogleVault({
@@ -2467,7 +2495,7 @@ function _googleReadFailure(error) {
 // between the assignable roles — so Operations & Events is not limited to one
 // person. Owner is not assignable; see ASSIGNABLE_PROFILE_ROLES.
 _secureHandle('app-session-set-profile-role', async (_, request) => {
-  _requireAppRole(new Set(['Owner']));
+  _requireAppRole(OPERATIONS_MANAGER_ROLES);
   if (!_isPlainObject(request)) throw new Error('Invalid role change request.');
   const name = _normalizeStaffProfileName(request.name);
   const role = request.role;
@@ -2481,6 +2509,8 @@ _secureHandle('app-session-set-profile-role', async (_, request) => {
   const target = _findProfileByFoldedName(existing, name);
   if (!target) throw new Error('That user was not found on this Mac.');
   if (target.role === role) return { ok: true, name: target.name, role, unchanged: true };
+  // MB161-031: and cannot demote one either.
+  _requireNotOwnerTarget(target, 'change the role of');
   if (target.role === 'Owner' && _ownerProfileCount(existing) <= 1) {
     throw new Error('The last Owner profile cannot be demoted.');
   }

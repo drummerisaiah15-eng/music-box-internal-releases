@@ -538,7 +538,12 @@ function removalHarness({ role = 'Owner', signedInAs = 'Elizabeth Chaves', vault
     }
     const PROFILE_ROLE_OVERRIDES_VAULT_KEY = 'app_profile_roles_v1';
     const REMOVED_BUILTIN_PROFILES_VAULT_KEY = 'app_removed_builtins_v1';
-    const ASSIGNABLE_PROFILE_ROLES = Object.freeze(['Operations & Events', 'Front Desk']);
+    const ASSIGNABLE_PROFILE_ROLES = Object.freeze(['Operations Manager', 'Operations & Events', 'Front Desk']);
+    // MB161-031: the harness runs the real handler bodies, so it needs the real
+    // role set and the real Owner guard rather than stubs of them.
+    const OPERATIONS_MANAGER_ROLES = new Set(['Owner', 'Operations Manager']);
+    const _appSessionHasRole = allowed => !!appSession && allowed.has(appSession.role);
+    ${sliceFunction(main, '_requireNotOwnerTarget')}
     ${sliceFunction(main, '_normalizeStaffProfileName')}
     ${sliceFunction(main, '_customStaffProfilesFromVault')}
     ${sliceFunction(main, '_profileRoleOverrides')}
@@ -1367,15 +1372,22 @@ test('MB161-021: the preload bridge exposes reads, and no writer', () => {
   }
 });
 
-test('MB161-014: connecting and configuring are Owner-only', () => {
+test('MB161-031: connecting Google needs Owner or Operations Manager, not staff', () => {
+  // Was Owner-only. Connecting a Google account is running the studio rather
+  // than owning it, so an Operations Manager can do it too — but it is still a
+  // privileged act and Front Desk must never reach it.
   for (const channel of ['google-set-credentials', 'google-oauth-begin',
                          'google-oauth-complete', 'google-disconnect']) {
     const start = main.indexOf(`_secureHandle('${channel}'`);
     assert.notEqual(start, -1, `${channel} is handled`);
     const body = main.slice(start, start + 400);
-    assert.match(body, /_requireAppRole\(new Set\(\['Owner'\]\)\)/,
-      `${channel} must be Owner-only — linking a Google account is a privileged act`);
+    assert.match(body, /_requireAppRole\(OPERATIONS_MANAGER_ROLES\)/,
+      `${channel} is limited to Owner and Operations Manager`);
+    assert.doesNotMatch(body, /COMMUNICATION_ROLES/,
+      `${channel} must not be open to every signed-in profile`);
   }
+  assert.match(main, /OPERATIONS_MANAGER_ROLES = new Set\(\['Owner', 'Operations Manager'\]\)/,
+    'and that set is exactly those two roles');
   // Reading is not: staff who can see spreadsheets can see the linked values.
   const read = main.slice(main.indexOf("_secureHandle('google-sheet-read'"));
   assert.match(read.slice(0, 300), /_requireAppRole\(COMMUNICATION_ROLES\)/);
@@ -1628,4 +1640,57 @@ test('MB161-028: column widths are requested and bounded', () => {
   // width should not be able to make one column the entire grid.
   assert.match(read, /Math\.min\(Math\.max\(Math\.round\(pixels\), 24\), 600\)/);
   assert.match(read, /columnWidths,/, 'and they are returned to the renderer');
+});
+
+test('MB161-031: Operations Manager is assignable, and can never reach the Owner', () => {
+  // A senior role below Owner. What it can do is administrative; what it must
+  // never do is anything touching ownership — enforced in main, because the
+  // renderer can be wrong or worked around and this cannot.
+  assert.match(main, /ASSIGNABLE_PROFILE_ROLES = Object\.freeze\(\['Operations Manager', 'Operations & Events', 'Front Desk'\]\)/);
+  assert.match(main, /OPERATIONS_MANAGER_ROLES = new Set\(\['Owner', 'Operations Manager'\]\)/);
+  // Owner is absent from the assignable list, so it cannot be granted at all.
+  assert.ok(!/ASSIGNABLE_PROFILE_ROLES = Object\.freeze\(\[[^\]]*'Owner'/.test(main));
+
+  // Removing or demoting an Owner profile requires actually being an Owner.
+  assert.match(main, /function _requireNotOwnerTarget\(target, action\)/);
+  assert.match(main, /if \(target\?\.role === 'Owner' && !_appSessionHasRole\(new Set\(\['Owner'\]\)\)\)/);
+  for (const handler of ["app-session-remove-staff-profile", "app-session-set-profile-role"]) {
+    const start = main.indexOf(`_secureHandle('${handler}'`);
+    const body = main.slice(start, start + 3000);
+    assert.match(body, /_requireNotOwnerTarget\(target,/, `${handler} protects Owner profiles`);
+  }
+});
+
+test('MB161-031: the owner keeps everything that is about ownership or secrets', () => {
+  // The line is "running the studio" versus "owning it". Profile management and
+  // the Google connection moved; the owner passcode, the Firebase configuration
+  // and the credential vault did not, because those are how ownership is proved
+  // and where the secrets live.
+  for (const handler of [
+    'app-session-stage-owner-pin', 'app-session-commit-owner-pin',
+    'app-session-cancel-owner-pin', 'firebase-configure', 'firebase-clear',
+    // Publishing the directory to every Mac stays an owner act.
+    'app-session-export-directory',
+  ]) {
+    const start = main.indexOf(`_secureHandle('${handler}'`);
+    assert.notEqual(start, -1, `${handler} exists`);
+    const body = main.slice(start, start + 600);
+    assert.match(body, /_requireAppRole\(new Set\(\['Owner'\]\)\)/,
+      `${handler} stays Owner-only`);
+  }
+  // And the ones that moved really did move.
+  // app-session-add-staff-profile is deliberately absent: it never had a role
+  // guard of its own, and adding one here would silently restrict who can add a
+  // profile, which nobody asked for. It defaults every new profile to Front Desk
+  // regardless of who creates it.
+  for (const handler of [
+    'app-session-remove-staff-profile', 'app-session-set-profile-role',
+    'google-set-credentials', 'google-oauth-begin', 'google-oauth-complete',
+    'google-disconnect',
+  ]) {
+    const start = main.indexOf(`_secureHandle('${handler}'`);
+    const body = main.slice(start, start + 600);
+    assert.match(body, /_requireAppRole\(OPERATIONS_MANAGER_ROLES\)/,
+      `${handler} is available to an Operations Manager`);
+  }
 });

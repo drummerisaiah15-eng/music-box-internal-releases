@@ -1179,6 +1179,11 @@
     <svg class="nav-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3h10a2 2 0 012 2v12a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2z"/><path d="M7 8h6M7 11h6M7 14h4"/></svg>
     Daily Log
   </div>
+  <!-- MB161-032: Owner and Operations Manager only. -->
+  <div class="nav-item" id="nav-workload" data-page="workload" style="display:none">
+    <svg class="nav-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 17V9M8 17V4M13 17v-6M18 17v-9"/></svg>
+    Staff Workload
+  </div>
   <div class="nav-item" data-page="policies">
     <svg class="nav-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M5 2h7l4 4v12a1 1 0 01-1 1H5a1 1 0 01-1-1V3a1 1 0 011-1z"/><polyline points="12 2 12 6 16 6"/><line x1="7" y1="9" x2="13" y2="9"/><line x1="7" y1="12" x2="13" y2="12"/><line x1="7" y1="15" x2="10" y2="15"/></svg>
     Musicbox Agent
@@ -1445,13 +1450,43 @@
     <!-- ─────────────────────────────────────────── -->
     <!-- PAGE: DAILY LOG -->
     <!-- ─────────────────────────────────────────── -->
+    <div id="page-workload" class="page">
+      <div class="page-header">
+        <div>
+          <h2>Staff Workload</h2>
+          <div class="page-sub">What each profile has been carrying, over the last 30 days</div>
+        </div>
+        <button class="btn btn-primary" id="workload-run-btn" onclick="ssRunStaffWorkload()">Analyse last 30 days</button>
+      </div>
+
+      <div class="card mb-5">
+        <div style="font-size:12.5px;color:var(--text-secondary);line-height:1.55">
+          This reads the Daily Log and the to-do lists. It shows what each person
+          <b>wrote down and ticked off</b>, which is not the same as what they did — quiet,
+          uneventful work often goes unlogged, and one person's shift may simply be busier
+          than another's. Useful for spotting workload imbalance and who is carrying what.
+          <b>Not a performance score</b>, and not sound grounds on its own for a decision
+          about someone's job.
+        </div>
+      </div>
+
+      <div class="card" id="workload-card">
+        <div id="workload-counts" style="font-size:13px;color:var(--text-secondary);margin-bottom:14px"></div>
+        <div id="workload-result" style="font-size:13.5px;line-height:1.65;color:var(--text-primary);white-space:pre-wrap">Press <b>Analyse last 30 days</b> to build a summary.</div>
+      </div>
+    </div>
+
     <div id="page-log" class="page">
       <div class="page-header">
         <div>
           <h2>Daily Log</h2>
           <div class="page-sub">Operator notes referenced by the whole team each day</div>
         </div>
-        <button class="btn btn-primary" onclick="openNewLogModal()">+ New Entry</button>
+        <div style="display:flex;gap:8px;align-items:center">
+          <button class="btn btn-primary" onclick="openNewLogModal()">+ New Entry</button>
+        </div>
+      </div>
+
       </div>
 
       <!-- Log form (inline) -->
@@ -2024,7 +2059,7 @@
       </div>
 
       <!-- MB161-014/016: Google Sheets, two-way -->
-      <div class="settings-section owner-settings-section" id="owner-google-settings">
+      <div class="settings-section manager-settings-section" id="owner-google-settings">
         <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
           <div class="settings-section-title" style="margin-bottom:0">📊 Google Sheets</div>
           <div class="api-status" id="google-sheets-badge">
@@ -3288,6 +3323,15 @@ function applyRolePermissions() {
   // Step Up Receipts nav: Carrie only
   const navStepup = document.getElementById('nav-stepup');
   if (navStepup) navStepup.style.display = canAccessStepUp() ? '' : 'none';
+  // MB161-032: reviewing the whole team's workload is an operations job.
+  const navWorkload = document.getElementById('nav-workload');
+  if (navWorkload) navWorkload.style.display = canManageStudio() ? '' : 'none';
+  // MB161-031: connecting Google is running the studio, not owning it, so an
+  // Operations Manager can do it. The owner sections either hold secrets (the
+  // credential vault, Firebase) or control ownership itself, and stay closed.
+  document.querySelectorAll('.manager-settings-section').forEach(section => {
+    section.style.display = canManageStudio() ? '' : 'none';
+  });
   document.querySelectorAll('.owner-settings-section').forEach(section => {
     section.style.display = liz ? '' : 'none';
   });
@@ -7475,6 +7519,7 @@ const PAGE_TITLES = {
   email: 'Email Hub',
   imessage: 'Messages Hub',
   log: 'Daily Log',
+  workload: 'Staff Workload',
   spreadsheets: 'Spreadsheets',
   stepup: 'Step Up Receipts',
   policies: 'Musicbox Agent',
@@ -7483,12 +7528,17 @@ const PAGE_TITLES = {
 
 function canAccessPage(page) {
   if (page === 'stepup') return canAccessStepUp();
+  // MB161-032: hiding the nav item is presentation; this is the check that
+  // decides. A page reachable by any other route must still be refused.
+  if (page === 'workload') return canManageStudio();
   return true;
 }
 
 function navigate(page) {
   if (!canAccessPage(page)) {
-    showToast('This profile does not have access to Step Up Receipts.', 'warning');
+    showToast(page === 'workload'
+      ? 'Staff Workload is available to the owner and an Operations Manager.'
+      : 'This profile does not have access to Step Up Receipts.', 'warning');
     page = 'dashboard';
   }
   // Commit any in-progress spreadsheet cell edit before switching away
@@ -16756,8 +16806,19 @@ async function dashSaveTodoEdit(id) {
   );
 }
 
+// MB161-032: record WHO ticked something off, and when.
+//
+// `done` was a bare boolean, so the app knew a to-do was finished but not by
+// whom — there was nothing to analyse and nothing to credit anybody for.
+// Cleared again when something is un-ticked, so a stale name cannot linger on
+// a task that is open again.
+function _markDone(item, done) {
+  if (!done) { const { doneBy, doneAt, ...rest } = item; return { ...rest, done: false }; }
+  return { ...item, done: true, doneBy: currentUser() || 'Unknown', doneAt: new Date().toISOString() };
+}
+
 async function dashToggleTodo(id, done) {
-  await persistTodos(getTodos().map(t => String(t.id) === String(id) ? { ...t, done } : t));
+  await persistTodos(getTodos().map(t => String(t.id) === String(id) ? _markDone(t, done) : t));
 }
 
 async function dashDeleteTodo(id) {
@@ -16792,6 +16853,143 @@ function hasOperationsRole() {
   return getUserRole(currentUser()) === 'Operations & Events';
 }
 
+// ── MB161-032: staff workload review ────────────────────────────────────────
+//
+// Reads the Daily Log for the last 30 days, groups it by author, and asks the
+// AI to describe what each person has been carrying.
+//
+// It is called Workload rather than Efficiency on purpose. The only thing this
+// can actually see is what somebody WROTE DOWN. A quiet shift handled well
+// produces almost no log entries; a chaotic one produces many. Presenting that
+// as a productivity ranking would be measuring diligence at note-taking and
+// calling it work — and it would be read as a verdict on a person, which is a
+// serious thing to get wrong. So the prompt is told to describe and compare
+// workload, to say when the log is too thin to support a conclusion, and not to
+// rank anybody, and the modal says the same in plain sight above the result.
+async function ssRunStaffWorkload() {
+  if (!canManageStudio()) return;
+  const out = document.getElementById('workload-result');
+  const countsEl = document.getElementById('workload-counts');
+  const button = document.getElementById('workload-run-btn');
+  if (!out) return;
+  if (button) button.disabled = true;
+  out.textContent = 'Reading the last 30 days…';
+  if (countsEl) countsEl.textContent = '';
+
+  try {
+    const sinceMs = Date.now() - 30 * 24 * 60 * 60 * 1000;
+    const sinceDay = new Date(sinceMs).toISOString().slice(0, 10);
+
+    // ── What people wrote down ──
+    const entries = (STORE.get('logs', []) || [])
+      .filter(entry => String(entry?.date || '') >= sinceDay);
+
+    // ── What people ticked off ──
+    //
+    // Completion attribution (doneBy/doneAt) only started being recorded in
+    // MB161-032, so anything finished before this build is counted as unknown
+    // rather than quietly assigned to somebody. Saying "we do not know" is the
+    // only honest option when the record was never kept.
+    const ticks = new Map();
+    let unattributed = 0;
+    const countTick = (item, kind) => {
+      if (!item?.done) return;
+      const at = _timestampMs(item.doneAt);
+      if (item.doneAt && at < sinceMs) return;
+      if (!item.doneBy) { unattributed += 1; return; }
+      const who = String(item.doneBy).slice(0, 80);
+      if (!ticks.has(who)) ticks.set(who, { team: 0, personal: 0 });
+      ticks.get(who)[kind] += 1;
+    };
+    (STORE.get('todo_items', []) || []).forEach(item => countTick(item, 'team'));
+    (STORE.get('assigned_tasks', []) || []).forEach(item => countTick(item, 'personal'));
+
+    if (!entries.length && !ticks.size) {
+      out.textContent = 'Nothing logged or ticked off in the last 30 days.';
+      return;
+    }
+
+    // Grouped and bounded before it leaves the app: the request has a size
+    // limit, and a studio that logs heavily would otherwise blow past it.
+    const byAuthor = new Map();
+    for (const entry of entries.sort(_compareSyncRecords)) {
+      const author = String(entry.author || 'Unknown').slice(0, 80);
+      if (!byAuthor.has(author)) byAuthor.set(author, []);
+      const bucket = byAuthor.get(author);
+      if (bucket.length < 120) {
+        bucket.push(`${entry.date}: ${String(entry.body || '').replace(/\s+/g, ' ').slice(0, 400)}`);
+      }
+    }
+
+    const everyone = [...new Set([...byAuthor.keys(), ...ticks.keys()])].sort();
+    const counts = everyone.map(name => {
+      const tick = ticks.get(name) || { team: 0, personal: 0 };
+      return `${name}: ${(byAuthor.get(name) || []).length} log entries, ` +
+             `${tick.personal} personal to-dos and ${tick.team} team to-dos ticked off`;
+    }).join('\n');
+
+    if (countsEl) {
+      countsEl.textContent =
+        `${entries.length} log entries and ${[...ticks.values()].reduce((n, t) => n + t.team + t.personal, 0)} ` +
+        `completed to-dos across ${everyone.length} profiles` +
+        (unattributed ? ` · ${unattributed} to-dos completed before this build have no name recorded` : '');
+    }
+
+    const digest = [...byAuthor.entries()]
+      .map(([author, list]) => `### ${author}\n${list.join('\n')}`).join('\n\n')
+      .slice(0, 60000);
+
+    out.textContent = `Analysing ${everyone.length} profiles…`;
+    const data = await _sendAiMessage({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 1600,
+      system:
+        'You are reviewing a small music studio\'s internal Daily Log and to-do ' +
+        'lists to help an operations manager understand how work is distributed ' +
+        'across her team.\n\n' +
+        'For each person, describe in 2-4 sentences: what kinds of work they log, ' +
+        'how consistently they log and close out to-dos, and anything they appear ' +
+        'to be carrying alone. Then give a short "worth a conversation" list of ' +
+        'workload imbalances or gaps in coverage.\n\n' +
+        'Rules you must follow:\n' +
+        '- Do NOT rank people, score them, or say who is most or least productive.\n' +
+        '- These records show what somebody wrote down and ticked off, not what ' +
+        'they did. A quiet shift handled well may produce almost nothing, and ' +
+        'plenty of real work never becomes a to-do. Say so when the records are ' +
+        'too thin to support any conclusion about a person.\n' +
+        '- Different roles log and close different amounts; never compare across ' +
+        'roles as though it were the same job.\n' +
+        '- Describe patterns, never judge character or attitude.\n' +
+        '- Plain text, no markdown headers.',
+      messages: [{
+        role: 'user',
+        content:
+          `Activity over the last 30 days:\n${counts}\n` +
+          (unattributed ? `\nNote: ${unattributed} to-dos were completed before the app began recording who completed them. They are not attributed to anyone.\n` : '') +
+          `\nThe log entries:\n\n${digest}`,
+      }],
+    });
+    const text = (data?.content || []).map(part => part?.text || '').join('').trim();
+    out.textContent = text || 'The analysis came back empty.';
+  } catch (error) {
+    out.textContent = `Could not analyse the records: ${error?.message || error}`;
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+// MB161-031: Operations Manager — senior to Operations & Events, below Owner.
+// Everything it can do is administrative; nothing it can do touches the Owner.
+function isOperationsManager() {
+  return getUserRole(currentUser()) === 'Operations Manager';
+}
+
+// The people who can run the studio day to day. Used for capabilities that are
+// about running things rather than owning them.
+function canManageStudio() {
+  return isElizabeth() || isOperationsManager();
+}
+
 // Retained as the historical name used across the UI; role-based since profile
 // roles became owner-assignable.
 function isCarrie() {
@@ -16799,10 +16997,13 @@ function isCarrie() {
 }
 // Everyone can add tasks (at minimum Team tasks); Eliz/Carrie can also assign to individuals
 function canAddTasks()   { return !!currentUser(); }
-function canAssignTasks(){ return isElizabeth() || isCarrie(); } // kept for compat; personal-assign only
+function canAssignTasks(){ return isElizabeth() || isOperationsManager() || isCarrie(); }
 function getAssignableStaff() {
   // My Tasks is person-specific only — Team To-Do is the separate shared section
-  if (isElizabeth()) {
+  // MB161-031: an Operations Manager delegates to everyone except the Owner —
+  // the same reach the Owner has, minus the Owner. Deliberately not "everyone
+  // except herself": she can give herself a task like anybody else.
+  if (isElizabeth() || isOperationsManager()) {
     return _loginProfiles
       .filter(profile => profile.role !== 'Owner')
       .map(profile => profile.name);
@@ -16825,7 +17026,7 @@ function renderMyTasks() {
 
   // My Tasks add button: only Elizabeth and Carrie assign person-specific tasks
   const assignBtn = document.getElementById('dashboard-assign-task-btn');
-  if (assignBtn) assignBtn.style.display = (isElizabeth() || isCarrie()) ? '' : 'none';
+  if (assignBtn) assignBtn.style.display = canAssignTasks() ? '' : 'none';
 
   // Visibility: Elizabeth sees all. Others see: Team tasks + their own + tasks they created.
   let tasks;
@@ -16953,7 +17154,7 @@ async function toggleAssignedTask(id, done) {
   if (!task || (!isElizabeth() && task.assignee !== 'Team' &&
       task.assignee !== user && task.assignedBy !== user)) return false;
   return persistAssignedTasks(
-    tasks.map(item => String(item.id) === String(id) ? { ...item, done } : item)
+    tasks.map(item => String(item.id) === String(id) ? _markDone(item, done) : item)
   );
 }
 

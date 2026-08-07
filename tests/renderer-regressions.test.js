@@ -396,6 +396,7 @@ test('task dropdown behavior includes added users at the intended authority leve
       _loginProfiles: profiles,
       isElizabeth: () => current === 'Elizabeth Chaves',
       isCarrie: () => current === 'Carrie Gass',
+      isOperationsManager: () => (profiles.find(p => p.name === current) || {}).role === 'Operations Manager',
     };
     vm.runInNewContext(`${namedFunctionSource('getAssignableStaff')}; this.result = getAssignableStaff();`, sandbox);
     return JSON.parse(JSON.stringify(sandbox.result));
@@ -404,6 +405,15 @@ test('task dropdown behavior includes added users at the intended authority leve
   assert.deepEqual(evaluateFor('Carrie Gass'), ['Ana Chaves', "Quinn O'Neil"]);
   assert.deepEqual(evaluateFor('Ana Chaves'), []);
   assert.deepEqual(evaluateFor("Quinn O'Neil"), []);
+
+  // MB161-031: an Operations Manager delegates to everyone except the Owner —
+  // the Owner's reach minus the Owner. Including herself: she can take a task
+  // like anybody else.
+  profiles.push({ name: 'Dana Reid', role: 'Operations Manager' });
+  assert.deepEqual(evaluateFor('Dana Reid'),
+    ['Carrie Gass', 'Ana Chaves', "Quinn O'Neil", 'Dana Reid']);
+  assert.ok(!evaluateFor('Dana Reid').includes('Elizabeth Chaves'),
+    'and never the Owner');
 });
 
 test('CSV export neutralizes formula-like text without changing ordinary values', () => {
@@ -1698,4 +1708,42 @@ test('MB161-030: the mirroring flag is always cleared, on every path', () => {
   const set = build.indexOf('_ssMirroringFromGoogle = true');
   const replace = build.indexOf("STORE.replace('spreadsheets'");
   assert.ok(set > -1 && replace > set, 'set before the write that carries the cells');
+});
+
+test('MB161-032: Staff Workload is refused by the router, not just hidden', () => {
+  // Hiding a nav item is presentation. The check that decides has to be in the
+  // router, or the page is reachable by any other route.
+  const access = namedFunctionSource('canAccessPage');
+  assert.match(access, /if \(page === 'workload'\) return canManageStudio\(\);/);
+  assert.match(namedFunctionSource('navigate'), /Staff Workload is available to the owner/);
+  assert.match(source, /id="nav-workload"[^>]*style="display:none"/,
+    'and it starts hidden rather than flashing for everyone on load');
+});
+
+test('MB161-032: the workload review is framed as workload, not as a score', () => {
+  // The only thing this can see is what somebody wrote down and ticked off. A
+  // quiet shift handled well produces almost nothing. Presenting that as a
+  // productivity ranking would measure diligence at note-taking and call it
+  // work — and it would be read as a verdict on a person.
+  const run = namedFunctionSource('ssRunStaffWorkload');
+  assert.match(run, /Do NOT rank people, score them/);
+  assert.match(run, /too thin to support any conclusion about a person/);
+  assert.match(run, /never compare across \s*'?\s*\+?\s*'?roles as though it were the same job/);
+  // And the caveat is in front of the person reading it, not only in the prompt.
+  assert.match(source, /Not a performance score<\/b>, and not sound grounds/);
+});
+
+test('MB161-032: completions record who, and unknown ones stay unknown', () => {
+  // `done` was a bare boolean, so there was nothing to analyse. Attribution
+  // starts now, which means everything finished earlier has no name — and
+  // guessing at those would be worse than counting them separately.
+  const mark = namedFunctionSource('_markDone');
+  assert.match(mark, /doneBy: currentUser\(\) \|\| 'Unknown'/);
+  assert.match(mark, /doneAt: new Date\(\)\.toISOString\(\)/);
+  assert.match(mark, /const \{ doneBy, doneAt, \.\.\.rest \} = item/,
+    'un-ticking clears the name, so it cannot linger on a task that is open again');
+
+  const run = namedFunctionSource('ssRunStaffWorkload');
+  assert.match(run, /if \(!item\.doneBy\) \{ unattributed \+= 1; return; \}/);
+  assert.match(run, /have no name recorded/, 'and the count is shown rather than hidden');
 });
