@@ -960,9 +960,17 @@
       z-index:6;outline:2.5px solid #1a73e8;outline-offset:-2px;
       box-shadow:0 0 0 3px rgba(26,115,232,0.18);
     }
+    /* MB161-019: the editor keeps the cell's own fill and text colour.
+       This used to force background:#fff, so opening a black blocked-out cell
+       turned it white while you typed — the block appeared to vanish, and on a
+       cell with white text set you were typing white on white. `background` and
+       `color` are already `inherit` on .ss-cell-input, so simply not overriding
+       them here makes editing look like the cell it is editing. The blue
+       outline stays as the "this is open" signal, which is what the white was
+       standing in for. */
     #ss-grid td.ss-editing .ss-cell-input {
       white-space:pre;overflow-x:auto;overflow-y:hidden;
-      height:100%;min-height:0;line-height:24px;background:#fff;
+      height:100%;min-height:0;line-height:24px;
       outline:2px solid #1a73e8;
     }
     #ss-grid td.ss-in-range { background-color:rgba(26,115,232,.08) !important; }
@@ -1650,6 +1658,11 @@
             <button class="ss-toolbar-btn" id="ss-unmerge-btn" onclick="ssUnmergeCells()" style="display:none;color:#c44">Unmerge</button>
             <div class="ss-sep"></div>
             <button class="ss-toolbar-btn" id="ss-key-btn" onclick="ssToggleColorKey()">+ Color Key</button>
+            <div class="ss-sep"></div>
+            <!-- MB161-019: pinch-to-zoom has no affordance of its own, so the
+                 readout doubles as the discovery hint and the way back to 100%. -->
+            <button class="ss-toolbar-btn" id="ss-zoom-btn" onclick="ssResetZoom()"
+              title="Zoom — pinch the trackpad, or ⌘− and ⌘+. Click to reset to 100%.">100%</button>
           </div>
           <!-- Cells clip rather than grow, so the whole value of the selected
                cell is read here. Full width and on its own row, directly under
@@ -9761,6 +9774,11 @@ function ssRenderGrid() {
   const sheet = ssActiveSheet();
   const table = document.getElementById('ss-grid');
   if (!sheet || !table) return;
+  // MB161-019: bind on first render rather than at startup. The grid lives on a
+  // page that is not in the DOM until Spreadsheets is opened, so a listener
+  // attached at boot would have nothing to attach to. Guarded, so this is a
+  // no-op on every render after the first.
+  _ssBindZoom();
   const { rows, cols, colWidths = [], cells = {} } = sheet;
   const r1 = Math.min(_ssSelR,_ssSelR2), r2 = Math.max(_ssSelR,_ssSelR2);
   const c1 = Math.min(_ssSelC,_ssSelC2), c2 = Math.max(_ssSelC,_ssSelC2);
@@ -11794,8 +11812,86 @@ document.addEventListener('mouseup',    () => { _ssIsSelecting = false; _ssDragO
 document.addEventListener('pointerup',  () => { _ssIsSelecting = false; _ssDragOrigin = null; });
 document.addEventListener('pointercancel', () => { _ssIsSelecting = false; _ssDragOrigin = null; });
 
+// ── MB161-019: zoom the grid ────────────────────────────────────────────────
+//
+// A schedule is six columns of names against a column of times, and the whole
+// point of reading one is seeing the shape of the day at once. At 100% that is
+// two screens of scrolling.
+//
+// A trackpad pinch arrives as a wheel event with ctrlKey set — that is how the
+// gesture is delivered, not a modifier anybody is holding — so it has to be
+// taken before the browser reads it as page zoom, which would scale the sidebar
+// and the toolbar along with the grid.
+//
+// CSS `zoom` rather than `transform: scale()`: zoom reflows, so the scroll
+// extents and the sticky-ish header row stay honest and a click still lands on
+// the cell under the pointer. A transform leaves the layout at its old size and
+// the scrollbars start lying.
+const SS_ZOOM_MIN = 0.5;
+const SS_ZOOM_MAX = 2;
+const SS_ZOOM_KEY = 'mb_ss_zoom';
+let _ssZoom = 1;
+
+function _ssClampZoom(value) {
+  const zoom = Number(value);
+  // `<= 0` as well as non-finite: Number(null) is 0, which is perfectly finite
+  // and would clamp to the 50% floor rather than falling back to 100%. A zoom of
+  // zero is not a small zoom, it is a missing one.
+  if (!Number.isFinite(zoom) || zoom <= 0) return 1;
+  return Math.min(SS_ZOOM_MAX, Math.max(SS_ZOOM_MIN, zoom));
+}
+
+function ssApplyZoom() {
+  const grid = document.getElementById('ss-grid');
+  if (grid) grid.style.zoom = _ssZoom === 1 ? '' : String(_ssZoom);
+  const btn = document.getElementById('ss-zoom-btn');
+  if (btn) {
+    btn.textContent = Math.round(_ssZoom * 100) + '%';
+    btn.classList.toggle('ss-active', _ssZoom !== 1);
+  }
+}
+
+// View state, not workbook data: it belongs to whoever is sitting at this Mac,
+// so it is kept locally and deliberately NOT synced. Pushing one person's zoom
+// onto the other machine would be a change nobody asked for.
+function ssSetZoom(next) {
+  _ssZoom = _ssClampZoom(next);
+  try { localStorage.setItem(SS_ZOOM_KEY, String(_ssZoom)); } catch (_) {}
+  ssApplyZoom();
+}
+
+function ssResetZoom() { ssSetZoom(1); }
+
+function ssLoadZoom() {
+  let stored = 1;
+  try { stored = parseFloat(localStorage.getItem(SS_ZOOM_KEY)); } catch (_) {}
+  _ssZoom = _ssClampZoom(stored);
+  ssApplyZoom();
+}
+
+function _ssBindZoom() {
+  const wrap = document.getElementById('ss-grid-wrap');
+  if (!wrap || wrap._ssZoomBound) return;
+  wrap._ssZoomBound = true;
+  wrap.addEventListener('wheel', (e) => {
+    if (!e.ctrlKey) return;             // an ordinary two-finger scroll
+    e.preventDefault();                  // requires passive:false, below
+    // deltaY is roughly proportional to the pinch, so scaling multiplicatively
+    // keeps the gesture feeling the same at 50% as at 200%.
+    ssSetZoom(_ssZoom * Math.exp(-e.deltaY / 180));
+  }, { passive: false });
+  ssLoadZoom();
+}
+
 document.addEventListener('keydown', function(e) {
   if (!document.getElementById('page-spreadsheets')?.classList.contains('active')) return;
+  // Zoom keys work while a cell is open too: reaching for ⌘− should not depend
+  // on whether something happens to be being edited.
+  if (e.metaKey || e.ctrlKey) {
+    if (e.key === '=' || e.key === '+') { e.preventDefault(); ssSetZoom(_ssZoom + 0.1); return; }
+    if (e.key === '-' || e.key === '_') { e.preventDefault(); ssSetZoom(_ssZoom - 0.1); return; }
+    if (e.key === '0')                  { e.preventDefault(); ssResetZoom(); return; }
+  }
   if (_ssEditCell) return;
   if (e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA') return;
   const s=ssActiveSheet(); if(!s) return;

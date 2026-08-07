@@ -1551,3 +1551,61 @@ test('MB161-018: the import trim measures against the stored width', () => {
   assert.match(importPath, /Math\.max\(cols, 6\)/);
   assert.doesNotMatch(importPath, /Math\.max\(cols, 1\)/);
 });
+
+// ── MB161-019: reading the grid ─────────────────────────────────────────────
+
+test('MB161-019: a pinch zooms the grid and nothing else', () => {
+  const bind = namedFunctionSource('_ssBindZoom');
+  // A trackpad pinch arrives as a wheel event with ctrlKey set. That is how the
+  // gesture is delivered, not a key anybody is holding, so reading it as a
+  // modifier combination would be wrong.
+  assert.match(bind, /if \(!e\.ctrlKey\) return;/, 'an ordinary two-finger scroll is left alone');
+  assert.match(bind, /e\.preventDefault\(\)/,
+    'taken before Chromium reads it as page zoom, which would scale the sidebar too');
+  assert.match(bind, /\{ passive: false \}/,
+    'preventDefault on wheel does nothing without this');
+  // Bound on first render, not at boot: the grid is not in the DOM until
+  // Spreadsheets is opened, so a boot-time listener has nothing to attach to.
+  assert.match(bind, /wrap\._ssZoomBound/, 'and bound exactly once');
+  assert.match(namedFunctionSource('ssRenderGrid'), /_ssBindZoom\(\)/);
+});
+
+test('MB161-019: zoom is clamped, and is not workbook data', () => {
+  const context = vm.createContext({ Number, Math, JSON });
+  vm.runInContext(`
+    var SS_ZOOM_MIN = 0.5, SS_ZOOM_MAX = 2;
+    ${namedFunctionSource('_ssClampZoom')}
+    globalThis.clamp = value => _ssClampZoom(value);
+  `, context);
+  assert.equal(context.clamp(1), 1);
+  assert.equal(context.clamp(5), 2, 'clamped up top');
+  assert.equal(context.clamp(0.01), 0.5, 'and at the bottom');
+  // A stored value that has been corrupted must not make the grid disappear.
+  for (const junk of [NaN, Infinity, -Infinity, 'huge', null, undefined]) {
+    assert.equal(context.clamp(junk), 1, `${String(junk)} falls back to 100%`);
+  }
+
+  // Zoom belongs to whoever is at this Mac. Putting it in the workbook would
+  // push one person's zoom onto the other machine as a synced change.
+  const set = namedFunctionSource('ssSetZoom');
+  assert.match(set, /localStorage\.setItem\(SS_ZOOM_KEY/);
+  assert.doesNotMatch(set, /STORE\.|ssSave\(/, 'view state is never synced');
+});
+
+test('MB161-019: an open cell keeps the fill it is being edited in', () => {
+  // The editor forced background:#fff, so opening a black blocked-out cell
+  // turned it white while you typed — the block appeared to vanish, and on a
+  // cell carrying white text you were typing white on white.
+  const editing = source.slice(source.indexOf('#ss-grid td.ss-editing .ss-cell-input'));
+  const rule = editing.slice(0, editing.indexOf('}'));
+  assert.doesNotMatch(rule, /background/,
+    'the editor must not override the cell background');
+  assert.doesNotMatch(rule, /(^|[^-])color:/,
+    'nor its text colour');
+  assert.match(rule, /outline:2px solid #1a73e8/,
+    'the blue outline is what says "open", which the white was standing in for');
+
+  // Those two only inherit because the base rule says so, so that has to hold.
+  const base = source.slice(source.indexOf('    .ss-cell-input {'));
+  assert.match(base.slice(0, base.indexOf('}')), /background:inherit;color:inherit/);
+});
