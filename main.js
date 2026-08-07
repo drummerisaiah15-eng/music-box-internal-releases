@@ -1202,21 +1202,21 @@ _secureHandle('keychain-decrypt', async (_, b64) => {
 });
 
 // ─────────────────────────────────────────────────────────────
-// MB161-014/016: Google Sheets, two-way.
+// MB161-014/021: Google Sheets, one direction — Google to the app.
 //
-// This started read-only, and the scope `spreadsheets.readonly` meant Google
-// itself refused writes — a guarantee that did not depend on this file being
-// correct. Phase 2 gave up that guarantee to allow pushes, so the restraint now
-// has to live here, and it is worth being explicit about what replaced it:
+// This was read-only, then briefly two-way, and is read-only again. The round
+// trip is worth recording, because the second version was not broken:
 //
-//   - exactly one write handler, `google-sheet-push`, reachable only from an
-//     explicit button in the UI;
-//   - it re-reads the range and writes only cells that still hold the value the
-//     app last saw, so a cell changed in Google since the last pull is skipped
-//     rather than clobbered;
-//   - it returns what it replaced, so an overwrite is recoverable.
+// Pushing meant widening the scope to `spreadsheets`, splitting writes across
+// two input options, reconciling the cells Google refused, and keeping a
+// checkpoint accurate enough to write from. All of that worked. But its failure
+// mode was somebody's real spreadsheet being overwritten, and the studio does
+// not actually need it — they edit in the app, and Google only has to be able
+// to feed changes in.
 //
-// That is weaker than "Google refuses it" and the UI no longer claims otherwise.
+// So the scope is `spreadsheets.readonly` again and there is no write handler.
+// Google itself refuses a write, which is a guarantee that holds even if
+// everything in this file is wrong. That is worth more than the feature was.
 //
 // Same loopback-plus-PKCE shape as the Microsoft flow above, with the three
 // differences Google requires: `access_type=offline` and `prompt=consent` to
@@ -1233,7 +1233,7 @@ const GOOGLE_VAULT_KEY = 'app_google_sheets_v1';
 // Anyone connected under the old scope must reconnect. Google does not
 // silently upgrade an existing grant, and google-oauth-complete verifies the
 // scope actually granted rather than the one requested.
-const GOOGLE_SCOPE = 'https://www.googleapis.com/auth/spreadsheets';
+const GOOGLE_SCOPE = 'https://www.googleapis.com/auth/spreadsheets.readonly';
 const GOOGLE_AUTH_ENDPOINT = 'https://accounts.google.com/o/oauth2/v2/auth';
 const GOOGLE_TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
 let pendingGoogleOAuth = null;
@@ -2358,7 +2358,7 @@ _secureHandle('google-sheet-read', async (_, request) => {
     // string TRUE or FALSE — which is why an imported checkbox column arrived as
     // a column reading "FALSE". The box itself is the validation rule, so
     // without this the tick is simply not in the response.
-    'data(rowData(values(formattedValue,dataValidation(condition(type)),effectiveFormat(backgroundColor,textFormat(bold,foregroundColor))))))',
+    'data(rowData(values(formattedValue,dataValidation(condition(type)),effectiveFormat(backgroundColor,backgroundColorStyle,textFormat(bold,foregroundColor,foregroundColorStyle))))))',
   ].join(',');
   let payload;
   try {
@@ -2395,8 +2395,9 @@ _secureHandle('google-sheet-read', async (_, request) => {
       // White is what Google reports for an unformatted cell, so treating it as
       // "no fill" is what keeps a blank sheet from importing as 50,000 white
       // cells. The app's own background is white, so nothing looks different.
-      const bg = _googleColorHex(effective.backgroundColor, '#ffffff');
-      const tc = _googleColorHex(effective.textFormat?.foregroundColor, '#000000');
+      const bg = _googleColorHex(effective.backgroundColorStyle, effective.backgroundColor, '#ffffff');
+      const tc = _googleColorHex(effective.textFormat?.foregroundColorStyle,
+                                 effective.textFormat?.foregroundColor, '#000000');
       const bold = effective.textFormat?.bold === true;
       const checkbox = cell.dataValidation?.condition?.type === 'BOOLEAN';
       textLine.push(text);
@@ -2443,11 +2444,24 @@ _secureHandle('google-sheet-read', async (_, request) => {
   };
 });
 
-// Google gives colour as floats 0..1, with missing channels meaning zero, and
-// may report it under either the old `backgroundColor` or a newer colour style.
+// Google gives colour as floats 0..1, with missing channels meaning zero.
+//
+// MB161-022: it reports the SAME colour two ways. `backgroundColor` is
+// deprecated; `backgroundColorStyle` supersedes it and, per Google's reference,
+// "takes precedence" when both are set. Reading only the deprecated field is
+// how a sheet whose colours come from conditional formatting or the document
+// theme imported as plain white — the value was in the field we never asked
+// for. So the style wins, and the deprecated field is the fallback.
+//
+// A ColorStyle is a union: either `rgbColor` or a named `themeColor` that
+// cannot be resolved to hex without the spreadsheet's palette. In the theme
+// case there is no rgbColor to read, and the deprecated field — which Google
+// still fills in with the resolved colour — is exactly the right fallback.
+//
 // Anything that resolves to `treatAsBlank` comes back as '' — the app's "no
 // colour" — rather than as an explicit hex, so a default sheet imports clean.
-function _googleColorHex(color, treatAsBlank) {
+function _googleColorHex(style, legacy, treatAsBlank) {
+  const color = _isPlainObject(style?.rgbColor) ? style.rgbColor : legacy;
   if (!_isPlainObject(color)) return '';
   const channel = value => {
     const number = Number(value);
@@ -2459,146 +2473,17 @@ function _googleColorHex(color, treatAsBlank) {
   return hex === treatAsBlank ? '' : hex;
 }
 
-// MB161-016: push cells to Google, refusing to destroy anything unannounced.
+// MB161-021: there is no write path to Google, by construction.
 //
-// Google has no conditional write — no "set this cell only if it still holds
-// what I last read". So this does the next best thing, in order:
-//
-//   1. Re-read the exact target cells RIGHT NOW.
-//   2. Compare each against `expected` — what the app last saw in Google.
-//      Anything that differs was changed in Google since, and is NOT written.
-//   3. Write only the cells that still match.
-//   4. Return the previous value of every cell written, so the caller keeps a
-//      recoverable copy of what it replaced.
-//
-// The race is not eliminated — a Google edit landing between step 1 and step 3
-// is still lost — but it shrinks from minutes of drift to one round trip, and
-// step 4 means even that leaves a copy behind rather than a silent hole.
-_secureHandle('google-sheet-push', async (_, request) => {
-  _requireAppRole(COMMUNICATION_ROLES);
-  if (!_isPlainObject(request)) throw new Error('Invalid spreadsheet push request.');
-  const spreadsheetId = _googleSpreadsheetId(request.spreadsheetId);
-  const title = String(request.title || '').trim();
-  if (!spreadsheetId) throw new Error('That spreadsheet link is not valid.');
-  if (!title || title.length > 200) throw new Error('Which tab should be written?');
-  if (!Array.isArray(request.cells) || !request.cells.length) {
-    return { ok: true, written: [], skipped: [], replaced: [] };
-  }
-  if (request.cells.length > 5000) {
-    throw new Error('Too many cells in one push. Pull first, then try again.');
-  }
+// Two-way sync was built and then deliberately taken back out. Pushing meant
+// widening the OAuth scope, splitting writes across input options, reconciling
+// what Google refused, and keeping a checkpoint honest enough to write from —
+// a lot of machinery whose failure mode is somebody's real spreadsheet being
+// overwritten. The studio edits in the app; Google only has to be able to feed
+// changes IN. So the scope went back to spreadsheets.readonly and Google itself
+// refuses a write again, which is a guarantee that does not depend on this file
+// staying correct.
 
-  const wanted = new Map();
-  for (const entry of request.cells) {
-    if (!_isPlainObject(entry)) continue;
-    const a1 = String(entry.a1 || '');
-    if (!/^[A-Z]{1,3}[1-9][0-9]{0,3}$/.test(a1)) {
-      throw new Error(`"${a1.slice(0, 20)}" is not a cell this app will write to.`);
-    }
-    wanted.set(a1, {
-      a1,
-      // Strictly boolean: a truthy value here would let the renderer opt any
-      // cell out of RAW, which is the guard against `=` becoming a formula.
-      checkbox: entry.checkbox === true,
-      value: String(entry.value ?? '').slice(0, 50000),
-      expected: String(entry.expected ?? ''),
-    });
-  }
-  if (!wanted.size) return { ok: true, written: [], skipped: [], replaced: [] };
-
-  const token = await _googleAccessTokenFor();
-  const ranges = [...wanted.keys()]
-    .map(a1 => `ranges=${encodeURIComponent(_googleRange(title, a1))}`).join('&');
-  let current;
-  try {
-    current = await _googleApiGet('sheets.googleapis.com',
-      `/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}/values:batchGet` +
-      `?${ranges}&valueRenderOption=FORMATTED_VALUE&dateTimeRenderOption=FORMATTED_STRING`,
-      token);
-  } catch (error) {
-    throw new Error(_googleReadFailure(error));
-  }
-
-  // Map each returned range back to its cell. Google echoes the range it read,
-  // which is how a response is matched to a request rather than by position.
-  const live = new Map();
-  for (const entry of (Array.isArray(current.valueRanges) ? current.valueRanges : [])) {
-    const range = String(entry?.range || '');
-    const a1 = range.includes('!') ? range.split('!').pop().replace(/\$/g, '') : range;
-    const rows = Array.isArray(entry?.values) ? entry.values : [];
-    live.set(a1, String(rows[0]?.[0] ?? ''));
-  }
-
-  const toWrite = [];
-  const skipped = [];
-  const replaced = [];
-  for (const cell of wanted.values()) {
-    const now = live.has(cell.a1) ? live.get(cell.a1) : '';
-    if (now !== cell.expected) {
-      // Changed in Google since the app last looked. Refused, and reported so
-      // the caller can raise it as a conflict rather than silently dropping it.
-      skipped.push({ a1: cell.a1, googleValue: now, appValue: cell.value, expected: cell.expected });
-      continue;
-    }
-    if (now === cell.value) continue;   // already identical; nothing to do
-    toWrite.push(cell);
-    replaced.push({ a1: cell.a1, previous: now, next: cell.value });
-  }
-  if (!toWrite.length) return { ok: true, written: [], skipped, replaced: [] };
-
-  // A cell the caller marked as a checkbox. Only ever TRUE or FALSE reaches
-  // this branch; anything else is treated as ordinary text so a stray flag
-  // cannot smuggle a value past RAW into formula parsing.
-  const isBox = cell => cell.checkbox === true &&
-    ['TRUE', 'FALSE'].includes(String(cell.value).trim().toUpperCase());
-  const boxes = toWrite.filter(isBox);
-  const plain = toWrite.filter(cell => !isBox(cell));
-
-  const payload = JSON.stringify({
-    // RAW: Google stores what it is given without reparsing it. The app's cell
-    // model is text, so anything else would silently reinterpret it.
-    valueInputOption: 'RAW',
-    data: plain.map(cell => ({ range: _googleRange(title, cell.a1), values: [[cell.value]] })),
-  });
-
-  // MB161-020: checkboxes are the one exception to RAW, and they have to be.
-  //
-  // RAW stores exactly what it is given, so a ticked box would arrive as the
-  // STRING "TRUE" in a cell whose validation expects the boolean — Google shows
-  // that as invalid, and the app would be corrupting the sheet it is meant to
-  // mirror. USER_ENTERED parses "TRUE" to the boolean, which is what the
-  // checkbox reads.
-  //
-  // Sent as a separate request because valueInputOption applies to the whole
-  // batch. Everything else stays RAW: that is what stops a cell beginning with
-  // `=` or `+` being reinterpreted as a formula, which is a much worse failure
-  // than a mis-typed tick.
-  const batches = [];
-  if (plain.length) batches.push(payload);
-  if (boxes.length) batches.push(JSON.stringify({
-    valueInputOption: 'USER_ENTERED',
-    data: boxes.map(cell => ({ range: _googleRange(title, cell.a1), values: [[cell.value]] })),
-  }));
-
-  for (const body of batches) {
-    const write = await _googleHttp({
-      method: 'POST',
-      url: `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}/values:batchUpdate`,
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body,
-      limit: 256 * 1024,
-    });
-    if (write.statusCode !== 200) {
-      let parsed = null;
-      try { parsed = JSON.parse(write.text); } catch (_) { parsed = null; }
-      const error = new Error(parsed?.error?.message || `HTTP ${write.statusCode}`);
-      error.statusCode = write.statusCode;
-      throw new Error(_googleReadFailure(error));
-    }
-  }
-
-  return { ok: true, written: toWrite.map(c => c.a1), skipped, replaced };
-});
 
 // MB161-018: an A1 range naming a tab.
 //

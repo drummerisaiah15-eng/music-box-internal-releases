@@ -78,12 +78,13 @@ contextBridge.exposeInMainWorld('electronSpreadsheet', {
   importFile:     () => ipcRenderer.invoke('import-spreadsheet'),
 });
 
-// MB161-014/016: Google Sheets, two-way. The scope is now spreadsheets rather
-// than spreadsheets.readonly, so Google no longer refuses writes for us and the
-// restraint has to live in our own code: push is the ONLY write method here, it
-// is reachable only from an explicit button, and main re-reads before writing so
-// a cell somebody else changed is skipped rather than clobbered.
-// Tokens never cross the bridge; the renderer gets values.
+// MB161-014/021: Google Sheets, READ ONLY. There is no write method on this
+// bridge and no write handler behind it. The scope requested is
+// spreadsheets.readonly, so Google itself refuses a write even if something
+// here were wrong — a guarantee that does not depend on this file, or the
+// renderer, being correct. Tokens never cross the bridge; the renderer gets
+// values. (Two-way sync existed briefly and was removed on purpose: see the
+// note above the Google section in main.js.)
 contextBridge.exposeInMainWorld('electronGoogleSheets', {
   status:         () => ipcRenderer.invoke('google-status'),
   setCredentials: (request) => ipcRenderer.invoke('google-set-credentials', request),
@@ -92,9 +93,6 @@ contextBridge.exposeInMainWorld('electronGoogleSheets', {
   disconnect:     () => ipcRenderer.invoke('google-disconnect'),
   describe:       (request) => ipcRenderer.invoke('google-sheet-describe', request),
   read:           (request) => ipcRenderer.invoke('google-sheet-read', request),
-  // MB161-016: writes only cells that still hold what the app last saw, and
-  // returns what it replaced so nothing is lost without a record.
-  push:           (request) => ipcRenderer.invoke('google-sheet-push', request),
   onCode:         (cb) => subscribe('google-auth-code', cb),
   onError:        (cb) => subscribe('google-auth-error', cb),
 });

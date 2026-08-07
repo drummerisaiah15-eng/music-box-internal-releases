@@ -1362,3 +1362,66 @@ test('MB161-020: a non-boolean checkbox flag is refused, not coerced', () => {
       `${JSON.stringify(junk)} is refused`);
   }
 });
+
+// ── MB161-021: Google's changes arrive without discarding work done here ────
+
+function mergeApi() {
+  const context = vm.createContext({ String });
+  vm.runInContext(`
+    ${declaration('_ssMergeCellFromGoogle')}
+    globalThis.api = (base, remote, local) => _ssMergeCellFromGoogle(base, remote, local);
+  `, context);
+  const cell = v => (v === null ? null : { v, bg: '', tc: '', b: false });
+  return (base, remote, local) => context.api(base, cell(remote), cell(local));
+}
+
+test('MB161-021: a cell Google has not touched keeps whatever the app has', () => {
+  // The whole reason for the merge. The studio edits in the app now, so a sync
+  // that took Google's copy wholesale would throw away the primary version
+  // every few minutes.
+  const merge = mergeApi();
+  assert.equal(merge('Zachary P', 'Zachary P', 'Zachary Pine').take, 'local');
+  assert.equal(merge('Zachary P', 'Zachary P', 'Zachary Pine').cell.v, 'Zachary Pine');
+  // Including a cell the app cleared.
+  assert.equal(merge('Zachary P', 'Zachary P', null).take, 'local');
+  assert.equal(merge('Zachary P', 'Zachary P', null).cell, null);
+});
+
+test('MB161-021: a cell only Google changed comes across', () => {
+  const merge = mergeApi();
+  assert.equal(merge('Zachary P', 'Zachary Pine', 'Zachary P').take, 'remote');
+  assert.equal(merge('Zachary P', 'Zachary Pine', 'Zachary P').cell.v, 'Zachary Pine');
+  // New in Google: no base, nothing locally.
+  assert.equal(merge(undefined, 'Mia Gemma', null).take, 'remote');
+  // Deleted in Google, untouched here: the deletion is real and comes across.
+  const deleted = merge('Zachary P', null, 'Zachary P');
+  assert.equal(deleted.take, 'remote');
+  assert.equal(deleted.cell, null);
+});
+
+test('MB161-021: when both changed, the app wins and it is flagged', () => {
+  // Never silently overwritten. This is the answer to "what if two people
+  // edited the same cell", and it matches what the two-Mac sync already does.
+  const merge = mergeApi();
+  const clash = merge('Zachary P', 'Zachary Pine', 'Zach Pine');
+  assert.equal(clash.take, 'conflict');
+  assert.equal(clash.cell.v, 'Zach Pine', "the app's value is what stays on screen");
+
+  // Agreeing by coincidence is not a conflict.
+  assert.equal(merge('Zachary P', 'Zach P', 'Zach P').take, 'local');
+  // Deleted in Google, edited here: still a clash, and the app's text survives.
+  const both = merge('Zachary P', null, 'Zach Pine');
+  assert.equal(both.take, 'conflict');
+  assert.equal(both.cell.v, 'Zach Pine');
+});
+
+test('MB161-021: an absent base is treated as empty, not as "changed"', () => {
+  // A cell that has never been seen by a sync has no checkpoint entry. Reading
+  // that as "the base was undefined, so everything differs from it" would make
+  // every untouched empty cell a conflict on the first run.
+  const merge = mergeApi();
+  assert.equal(merge(undefined, null, null).take, 'local');
+  assert.equal(merge(undefined, null, 'typed here').take, 'local',
+    'a cell only the app has is left alone');
+  assert.equal(merge('', null, 'typed here').take, 'local');
+});

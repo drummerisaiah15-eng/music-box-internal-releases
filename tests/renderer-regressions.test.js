@@ -1339,86 +1339,18 @@ test('MB161-018: imported fills, bold and merges survive the build', () => {
   assert.match(build, /Array\.isArray\(s\.formats\) \? s\.formats : null/);
 });
 
-test('MB161-016: the UI no longer promises read-only, because it is not true', () => {
-  // This connection used to be read-only and Settings said so in bold. When the
-  // scope widened to allow pushes, that sentence became a lie in the one place
-  // somebody would go to check. A stale safety promise is worse than none: it
-  // is the reason a person stops checking. So the old copy has to be gone, not
-  // merely supplemented.
-  assert.doesNotMatch(source, /spreadsheets\.readonly/,
-    'Settings must not name the readonly scope it no longer requests');
-  assert.doesNotMatch(source, /Google refuses the write/,
-    'Google does not refuse our writes any more');
-  assert.doesNotMatch(source, /Your Google sheet is never modified/,
-    'the import dialog cannot claim that either');
-  assert.doesNotMatch(source, /read-only access/,
-    'and the connected status line must not say it');
-
-  // What replaces it has to be specific about the two things a person actually
-  // needs to know: when we write, and what happens to a cell somebody else
-  // touched.
-  assert.match(source, /only when you press a button/);
-  assert.match(source, /nothing syncs on its own/);
-  assert.match(source, /that cell is left alone and reported/);
-  assert.match(source, /Nothing is written to Google until you press Push/,
-    'the import dialog states it too, where the decision is being made');
-});
-
-test('MB161-016: the renderer still cannot reach Google directly', () => {
-  // Two-way now, but the renderer composes a request and hands it to main; it
-  // never speaks the Sheets API itself. That is what keeps the access token out
-  // of the renderer and the CSP unwidened.
+test('MB161-021: the renderer cannot reach Google, and cannot write to it', () => {
+  // The renderer composes a request and hands it to main; it never speaks the
+  // Sheets API itself. That is what keeps the access token out of the renderer
+  // and the CSP unwidened.
   const script = inlineScript(source);
-  for (const forbidden of ['batchUpdate', 'valueInputOption', 'USER_ENTERED', 'batchClear']) {
+  for (const forbidden of ['batchUpdate', 'valueInputOption', 'USER_ENTERED', 'batchClear',
+                           'ssPushToGoogle', '_ssPendingPush', 'google-sheet-push']) {
     assert.equal(script.includes(forbidden), false,
       `the renderer must not contain ${forbidden}`);
   }
-  for (const fn of ['ssPushToGoogle', 'ssPullFromGoogle']) {
-    const body = namedFunctionSource(fn);
-    assert.doesNotMatch(body, /\bfetch\s*\(/, `${fn} must not call Google itself`);
-  }
-});
-
-test('MB161-016: a push sends only what changed since the last pull', () => {
-  // The diff itself moved into _ssPendingPush when a project gained the ability
-  // to mirror several tabs, but the rules it encodes did not change.
-  const pending = namedFunctionSource('_ssPendingPush');
-  assert.match(pending, /if \(cell\.value === was\) continue;/,
-    'an unchanged cell is not pushed — otherwise every push rewrites the sheet');
-  assert.match(pending, /expected: was/,
-    'each cell carries what Google last held, which is what lets main detect a change');
-  assert.match(pending, /for \(const \[key, was\] of Object\.entries\(checkpoint\)\)/,
-    'a cell cleared in the app is pushed as a clear, not forgotten');
-
-  const push = namedFunctionSource('ssPushToGoogle');
-  assert.match(push, /confirm\(/, 'and the person is told how many cells before it happens');
-  // MB161-018: the count in that prompt has to be the total across every tab.
-  // Confirming six times, or confirming once against one tab's count and then
-  // writing five more, are both ways of getting consent for the wrong thing.
-  assert.match(push, /const total = work\.reduce\(/);
-  assert.match(push, /Push \$\{total\} cell/);
-  const beforeConfirm = push.slice(0, push.indexOf('confirm('));
-  assert.doesNotMatch(beforeConfirm, /_googleSheets\(\)\.push/,
-    'nothing is sent before the person answers');
-});
-
-test('MB161-018: a push says plainly that it does not carry formatting', () => {
-  // Import and pull both bring colours and merges across, so it is reasonable to
-  // assume a push sends them back. It does not — the values API has no way to.
-  // Saying so in the prompt is the difference between a known limit and a
-  // person believing their colour changes reached Google.
-  const push = namedFunctionSource('ssPushToGoogle');
-  assert.match(push, /Colours and merged cells are not pushed/);
-});
-
-test('MB161-016: a refused cell becomes a real conflict, not a warning', () => {
-  const push = namedFunctionSource('ssPushToGoogle');
-  assert.match(push, /result\.skipped\.length/);
-  assert.match(push, /_ssData\._conflicts = conflicts/,
-    'refused cells land in the same conflict list as a Mac-vs-Mac collision');
-  assert.match(push, /remote: miss\.googleValue/, 'carrying what Google actually held');
-  assert.match(push, /local: miss\.appValue/, 'and what the app wanted');
-  assert.match(push, /base: miss\.expected/, 'and what they diverged from');
+  assert.doesNotMatch(namedFunctionSource('ssPullFromGoogle'), /\bfetch\s*\(/,
+    'the sync must not call Google itself');
 });
 
 test('MB161-016: A1 and row,column notation round-trip', () => {
@@ -1439,59 +1371,6 @@ test('MB161-016: A1 and row,column notation round-trip', () => {
   }
   // Junk must not silently become A1 and write to the wrong cell.
   assert.equal(context.api.toKey('not-a-cell'), '0,0');
-});
-
-test('MB161-018: a pull now takes formatting from Google, and asks first', () => {
-  // This reverses MB161-016 deliberately. Back then a pull preserved fills the
-  // app had added, because Google sent no formatting at all and treating its
-  // silence as "delete the colours" would have destroyed real work. Now the
-  // read carries fills, bold and merges, so silence is no longer silence: a
-  // cell with no fill in Google means no fill. Keeping the app's version would
-  // make every pull drift further from the sheet it claims to mirror.
-  //
-  // It is still a real overwrite of anything restyled in the app, so unlike the
-  // old pull it is confirmed rather than assumed.
-  const pull = namedFunctionSource('ssPullFromGoogle');
-  assert.match(pull, /confirm\(/, 'a destructive pull asks');
-  assert.match(pull, /in the app since the last pull and not pushed will be lost/,
-    'and says what it costs, in those words');
-  const beforeConfirm = pull.slice(0, pull.indexOf('confirm('));
-  assert.doesNotMatch(beforeConfirm, /target\.cells =/, 'and nothing is replaced before the answer');
-
-  assert.match(pull, /const bg = _ssImportColor\(format\?\.bg\)/,
-    'fills come from Google');
-  assert.match(pull, /_ssApplyImportedMerges\(cells, remote\.merges, rowsThatFit, colsThatFit\)/,
-    'and so do merges \u2014 bounded by what the sheet can actually hold');
-
-  // A tab that grew in Google returns more rows than the sheet has. Writing
-  // them anyway makes an out-of-range cell, which the validator refuses: the
-  // pull would look fine and quarantine the project at the next save.
-  assert.match(pull, /if \(r >= rowsThatFit\) return;/);
-  assert.match(pull, /if \(c >= colsThatFit\) return;/);
-  assert.match(pull, /target\.rows = rowsThatFit/, 'the sheet grows where it can');
-  assert.match(pull, /checkpoint: _ssGoogleCheckpoint\(kept\)/,
-    'and the checkpoint advances, or the next push would re-send everything');
-});
-
-test('MB161-018: pull and push walk every linked tab, not just the first sheet', () => {
-  // Both used to read project.sheets[0] and link.title, which was correct while
-  // a project could only ever mirror one tab. With all-tabs import that shape
-  // silently syncs Monday and quietly ignores the other five.
-  for (const name of ['ssPullFromGoogle', 'ssPushToGoogle']) {
-    const fn = namedFunctionSource(name);
-    assert.match(fn, /_ssLinkedSheets\(project\)/, `${name} works from the tab map`);
-    assert.doesNotMatch(fn, /project\.sheets\[0\]/, `${name} must not assume one sheet`);
-    assert.doesNotMatch(fn, /link\.title/, `${name} must not assume one tab name`);
-  }
-});
-
-test('MB161-016: a linked project is tagged and offers pull and push', () => {
-  assert.match(source, /class="ss-google-tag"/);
-  assert.match(source, /p\.googleLink \?/, 'the tag only appears on linked projects');
-  assert.match(source, /onclick="ssPullFromGoogle/);
-  assert.match(source, /onclick="ssPushToGoogle/);
-  assert.match(source, /event\.stopPropagation\(\)/,
-    'the buttons must not also open the project');
 });
 
 test('MB161-018: the checkpoint is measured before the import, not after', () => {
@@ -1539,22 +1418,6 @@ test('MB161-018: a trimmed pull cannot delete the rows it trimmed', () => {
     'the checkpoint describes what was kept, never what was sent');
   assert.doesNotMatch(pull, /_ssGoogleCheckpoint\(remote\.rows\)/,
     'the untrimmed grid must not be the checkpoint');
-});
-
-test('MB161-018: pull and push persist each tab before starting the next', () => {
-  // Six tabs is six round trips and the fourth can fail. Saving once at the end
-  // means the first three are already written in Google (push) or replaced in
-  // memory (pull) while their checkpoints are still the old ones — so the next
-  // push re-sends cells Google already has, Google refuses them, and the app
-  // reports its own writes as somebody else's edits.
-  for (const name of ['ssPullFromGoogle', 'ssPushToGoogle']) {
-    const fn = namedFunctionSource(name);
-    const loopStart = fn.indexOf('for (const');
-    const loopEnd = fn.lastIndexOf('    }');
-    const loop = fn.slice(loopStart, loopEnd);
-    assert.match(loop, /project\.googleLink = \{ \.\.\.link,/, `${name} updates the link inside the loop`);
-    assert.match(loop, /await ssSave\(\)/, `${name} saves inside the loop`);
-  }
 });
 
 test('MB161-018: the import trim measures against the stored width', () => {

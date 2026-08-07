@@ -1585,9 +1585,9 @@
           </div>
           <div class="modal-body">
             <div style="font-size:12.5px;color:var(--text-secondary);margin-bottom:14px">
-              Music Box copies the values it can see into a new project, and keeps
-              a link back to the Google sheet so you can pull changes down or push
-              yours up. Nothing is written to Google until you press Push.
+              Music Box copies the values it can see into a new project and keeps a link
+              back to the Google sheet, so later changes made in Google come across on
+              their own. Nothing is ever written back to Google.
             </div>
             <div class="form-group">
               <label class="form-label">Google Sheets link</label>
@@ -2030,16 +2030,17 @@
           </div>
         </div>
         <div class="settings-section-desc">
-          Import a Google Sheet into Spreadsheets, then <b>Pull</b> to bring Google's changes
-          down or <b>Push</b> to send yours up. This connection can read and write, so the
-          access Music Box asks Google for is
-          <span style="font-family:Consolas,monospace;font-size:11px">spreadsheets</span>.
-          It only ever touches sheets you have imported, and only when you press a button
-          &mdash; nothing syncs on its own.
+          Import a Google Sheet into Spreadsheets and carry on working here. Music Box
+          checks the sheets you imported every few minutes and brings any changes made in
+          Google across on its own.
           <br /><br />
-          A push writes only the cells that still hold what Music Box last saw. If somebody
-          changed a cell in Google since your last pull, that cell is left alone and reported
-          back to you instead of being overwritten.
+          <b>This connection can only read.</b> The access Music Box asks Google for is
+          <span style="font-family:Consolas,monospace;font-size:11px">spreadsheets.readonly</span>,
+          so nothing in this app can alter a Google sheet &mdash; Google refuses the write.
+          Your edits here stay here.
+          <br /><br />
+          If the same cell was changed in both places, yours is kept and the clash is listed
+          in Spreadsheets for you to settle. Nothing you type is overwritten by a sync.
           <br /><br />
           Set up at <a href="https://console.cloud.google.com" target="_blank" style="color:var(--accent)">console.cloud.google.com</a>:
           enable the Google Sheets API, then create an OAuth client ID of type <b>Desktop app</b>.
@@ -8530,11 +8531,14 @@ function normalizeSpreadsheetWorkbook(value) {
           if (!tab || typeof tab !== 'object' || Array.isArray(tab)) {
             throw new Error('spreadsheets has an invalid Google tab');
           }
-          if (!Object.keys(tab).every(key => ['title', 'sheetId', 'checkpoint'].includes(key))) {
+          if (!Object.keys(tab).every(key => ['title', 'sheetId', 'checkpoint', 'mergeSig'].includes(key))) {
             throw new Error('spreadsheets has an invalid Google tab');
           }
           const entry = { title: checkedString(tab.title, 'Google tab name', 200) };
           if (Number.isSafeInteger(tab.sheetId)) entry.sheetId = tab.sheetId;
+          // MB161-021: a digest of Google's merged regions at the last sync, so
+          // structure is only restated when Google's own structure has moved.
+          if (typeof tab.mergeSig === 'string' && tab.mergeSig.length <= 32) entry.mergeSig = tab.mergeSig;
           const checkpoint = readCheckpoint(tab.checkpoint);
           if (checkpoint) entry.checkpoint = checkpoint;
           tabs[sheetKey] = entry;
@@ -9399,6 +9403,9 @@ function initSpreadsheet() {
 }
 
 function ssGoHome() {
+  // MB161-021: nothing to keep current once no project is open. Leaving the
+  // timer running would keep polling Google from the Dashboard.
+  ssStopAutoSync();
   document.getElementById('ss-home-view').style.display = '';
   document.getElementById('ss-editor-view').style.display = 'none';
   document.getElementById('ss-page-title').textContent = 'Spreadsheets';
@@ -9783,8 +9790,7 @@ function ssRenderHomeView() {
         <span class="ss-google-dot"></span>Google Sheets
       </div>
       <div class="ss-google-actions" onclick="event.stopPropagation()">
-        <button onclick="ssPullFromGoogle(${jsArg(p.id)})" title="Replace this project's cells with what Google has now">↓ Pull</button>
-        <button onclick="ssPushToGoogle(${jsArg(p.id)})" title="Send this project's changes to Google">↑ Push</button>
+        <button onclick="ssPullFromGoogle(${jsArg(p.id)})" title="Check Google now. Edits made in Google come in; your work here is kept.">↓ Sync now</button>
       </div>` : ''}
     </div>`
   ).join('') +
@@ -10558,6 +10564,10 @@ function ssSwitchProject(id) {
   _ssSelR=0;_ssSelC=0;_ssSelR2=0;_ssSelC2=0;_ssEditCell=null;
   // MB-008: Switching projects is view-state navigation; no workbook sync write.
   ssRender();
+  // MB161-021: opening a linked project is the moment somebody most wants it to
+  // be current, so check then rather than waiting out the interval.
+  ssStartAutoSync();
+  ssAutoSyncTick(true);
 }
 
 let _ssProjNameCallback = null;
@@ -10818,8 +10828,8 @@ async function ssGoogleLookup() {
             onclick="ssGoogleImportTab(${jsArg(tab.title)})">Import</button>
         </div>`).join('') +
       `<div style="font-size:11.5px;color:var(--text-muted);margin-top:10px">` +
-      `Up to 500 rows × 100 columns are read. Fills, text colour, bold and merged cells ` +
-      `come across; formulas import as their result, and column widths do not.</div>`;
+      `Up to 500 rows × 100 columns are read. Fills, text colour, bold, checkboxes and ` +
+      `merged cells come across; formulas import as their result, and column widths do not.</div>`;
   } catch (error) {
     el.textContent = error?.message || String(error);
     el.style.color = '#c0392b';
@@ -10991,40 +11001,65 @@ function _ssLinkedSheets(project) {
     .map(sheet => ({ sheet, tab: tabs[sheet.id] }));
 }
 
-async function ssPullFromGoogle(projectId) {
+// MB161-021: bring Google's changes in WITHOUT discarding work done here.
+//
+// This used to replace the sheet outright, which was right while Google was the
+// only place anybody edited. Now the studio edits in the app and Google is the
+// occasional second author, so replacing would throw away the primary copy.
+//
+// So it is a three-way merge, using the checkpoint — what Google held at the
+// last sync — as the base, exactly as the Mac-to-Mac merge uses its base:
+//
+//   Google unchanged since the base      -> keep whatever the app has
+//   Google changed, app did not          -> take Google's
+//   both changed to the same thing       -> agree, nothing to do
+//   both changed differently             -> KEEP THE APP'S, and raise a conflict
+//
+// The last line is the important one. The app's copy is never silently
+// overwritten; a genuine clash goes to the same conflicts banner as a two-Mac
+// collision, with both versions, and a person decides.
+function _ssMergeCellFromGoogle(base, remote, local) {
+  const b = String(base ?? '');
+  const r = String(remote?.v ?? '');
+  const l = String(local?.v ?? '');
+  if (r === b) return { take: 'local', cell: local ?? null };
+  if (l === b) return { take: 'remote', cell: remote ?? null };
+  if (l === r) return { take: 'local', cell: local ?? null };
+  return { take: 'conflict', cell: local ?? null };
+}
+
+async function ssPullFromGoogle(projectId, options) {
+  const silent = options?.silent === true;
   const project = (_ssData?.projects || []).find(p => p.id === projectId);
   const link = project?.googleLink;
   if (!link || !_googleSheets() || _ssGoogleBusy) return false;
   const linked = _ssLinkedSheets(project);
-  if (!linked.length) { showToast('No sheet in this project is linked to a Google tab.', 'warning'); return false; }
-
-  // MB161-018: a pull now replaces fills, text colour, bold and merges as well
-  // as values, because the import brings all of those across and leaving them
-  // behind would make a pulled sheet drift further from Google every time. That
-  // is a real overwrite of anything restyled in the app, so it is asked about
-  // rather than assumed.
-  if (!confirm(
-    `Replace ${linked.length === 1 ? `"${linked[0].tab.title}"` : `${linked.length} sheets`} ` +
-    `with what Google has now?\n\n` +
-    `Values, colours and merged cells are taken from Google. Anything changed ` +
-    `in the app since the last pull and not pushed will be lost.`)) return false;
+  if (!linked.length) {
+    if (!silent) showToast('No sheet in this project is linked to a Google tab.', 'warning');
+    return false;
+  }
+  // Merging under a live editor would rebuild the grid and throw the caret
+  // away mid-word. Nothing is lost by waiting for the next round.
+  if (_ssEditCell) return false;
 
   _ssGoogleBusy = true;
   try {
-    let pulled = 0;
+    let changed = 0;
     let dropped = 0;
+    let clashes = 0;
     const tabs = { ...link.tabs };
+    const conflicts = Array.isArray(_ssData._conflicts) ? [..._ssData._conflicts] : [];
+
     for (const { sheet: target, tab } of linked) {
       const remote = await _googleSheets().read({
         spreadsheetId: link.spreadsheetId, title: tab.title,
         rows: link.rows, columns: link.columns,
       });
-      // A tab that grew in Google since the import returns more rows than the
-      // sheet has. Writing them anyway produces an out-of-range cell, which the
-      // workbook validator refuses outright — the pull would appear to work and
-      // then quarantine the project on the next save. So the sheet grows to fit
-      // where the limits allow, and where they do not the surplus is dropped
-      // and said out loud rather than silently.
+      // A tab that grew in Google returns more rows than the sheet has. Writing
+      // them anyway produces an out-of-range cell, which the workbook validator
+      // refuses outright — the sync would appear to work and then quarantine the
+      // project on the next save. So the sheet grows where the limits allow, and
+      // where they do not the surplus is dropped and said out loud.
       const wantRows = Math.max(target.rows, (remote.rows || []).length);
       const wantCols = Math.max(target.cols,
         (remote.rows || []).reduce((mx, row) => Math.max(mx, row.length), 0));
@@ -11038,7 +11073,8 @@ async function ssPullFromGoogle(projectId) {
       }
       if (rowsThatFit < wantRows || colsThatFit < wantCols) dropped += 1;
 
-      const cells = {};
+      // What Google sends now, in the app's cell shape.
+      const incoming = new Map();
       (remote.rows || []).forEach((row, r) => {
         if (r >= rowsThatFit) return;
         row.forEach((value, c) => {
@@ -11052,10 +11088,57 @@ async function ssPullFromGoogle(projectId) {
           if (text === '' && !bg && !tc && !bold && !checkbox) return;
           const built = { v: text, bg, tc, b: bold };
           if (checkbox) built.cb = true;
-          cells[r + ',' + c] = built;
+          incoming.set(r + ',' + c, built);
         });
       });
-      _ssApplyImportedMerges(cells, remote.merges, rowsThatFit, colsThatFit);
+
+      const checkpoint = tab.checkpoint || {};
+      const existing = target.cells || {};
+      const cells = {};
+      const keys = new Set([
+        ...Object.keys(existing), ...incoming.keys(), ...Object.keys(checkpoint),
+      ]);
+      let tabChanged = 0;
+      for (const key of keys) {
+        const [row, column] = key.split(',').map(Number);
+        // Outside the window we read, so Google has said nothing about it.
+        // Dropping it here would delete app-only cells beyond the read extent.
+        if (!(row < rowsThatFit && column < colsThatFit)) {
+          if (existing[key]) cells[key] = existing[key];
+          continue;
+        }
+        const local = existing[key] || null;
+        const incomingCell = incoming.get(key) || null;
+        const outcome = _ssMergeCellFromGoogle(checkpoint[key], incomingCell, local);
+        if (outcome.take === 'remote') {
+          if (incomingCell) cells[key] = incomingCell;
+          tabChanged += 1;
+        } else {
+          if (outcome.cell) cells[key] = outcome.cell;
+          if (outcome.take === 'conflict') {
+            clashes += 1;
+            conflicts.push({
+              id: _ssConflictId(['google', link.spreadsheetId, tab.title, key,
+                String(checkpoint[key] ?? ''), String(local?.v ?? ''), String(incomingCell?.v ?? '')]),
+              kind: 'cell', projectId: project.id, sheetId: target.id, target: key,
+              base: checkpoint[key] ? { v: String(checkpoint[key]), bg: '', tc: '', b: false } : null,
+              local: local ? { ...local } : null,
+              remote: incomingCell ? { ...incomingCell } : null,
+              at: new Date().toISOString(),
+            });
+          }
+        }
+      }
+
+      // Merged regions are structure, not content, so they are only restated
+      // when Google's own structure has actually moved. Re-applying them every
+      // sync would undo a merge somebody made here for no reason.
+      const mergeSig = _ssDigest(JSON.stringify(remote.merges || []));
+      _ssApplyImportedMerges(
+        cells,
+        mergeSig === tab.mergeSig ? _ssMergesOf(existing) : remote.merges,
+        rowsThatFit, colsThatFit);
+
       target.rows = rowsThatFit;
       target.cols = colsThatFit;
       if (Array.isArray(target.colWidths)) {
@@ -11063,37 +11146,71 @@ async function ssPullFromGoogle(projectId) {
         target.colWidths.length = colsThatFit;
       }
       target.cells = cells;
-      // The checkpoint has to describe exactly what the app kept, NOT what
-      // Google sent. If a row was dropped above, leaving it in the checkpoint
-      // makes the next push see "present at the last pull, absent now" and push
-      // an empty value over it — the app would delete rows in Google that it
-      // had merely declined to display. Same extent as the cells, always.
-      const kept = (remote.rows || []).slice(0, rowsThatFit).map(row => row.slice(0, colsThatFit));
-      tabs[target.id] = { ...tab, checkpoint: _ssGoogleCheckpoint(kept) };
-      pulled += remote.filledCells || 0;
 
-      // Persisted per tab rather than once at the end. A failure on the fourth
-      // tab used to leave the first three pulled in memory with their old
-      // checkpoints, and every cell they had just pulled would look like a local
-      // edit on the next push.
+      // The checkpoint describes exactly the extent the app kept, never what
+      // Google sent, so a row that did not fit cannot later read as "deleted".
+      const kept = (remote.rows || []).slice(0, rowsThatFit).map(row => row.slice(0, colsThatFit));
+      tabs[target.id] = { ...tab, checkpoint: _ssGoogleCheckpoint(kept), mergeSig };
+      changed += tabChanged;
+
+      // Persisted per tab. A failure on the fourth tab must not leave the first
+      // three merged in memory against their old checkpoints, or the next sync
+      // would re-apply changes it has already taken.
+      if (clashes) _ssData._conflicts = conflicts;
       project.googleLink = { ...link, pulledAt: new Date().toISOString(), tabs };
       await ssSave();
     }
+
     ssRender();
     ssRenderHomeView();
-    showToast(
-      `Pulled ${pulled.toLocaleString()} cells from Google` +
-      (linked.length > 1 ? ` across ${linked.length} tabs` : '') +
-      (dropped ? `. ${dropped} tab${dropped === 1 ? ' was' : 's were'} larger than this app can hold, ` +
-        `so the far rows or columns were not pulled.` : '.'),
-      dropped ? 'warning' : 'success');
+    // Silent when nothing moved: this runs on a timer, and a toast every few
+    // minutes saying "nothing happened" is how people learn to ignore toasts.
+    if (changed || clashes || dropped || !silent) {
+      const parts = [];
+      if (changed) parts.push(`${changed.toLocaleString()} cell${changed === 1 ? '' : 's'} updated from Google`);
+      if (clashes) parts.push(`${clashes} also changed here — kept yours, see conflicts`);
+      if (dropped) parts.push(`${dropped} tab${dropped === 1 ? '' : 's'} larger than this app can hold`);
+      showToast(parts.length ? parts.join('. ') + '.' : 'Already up to date with Google.',
+        clashes || dropped ? 'warning' : 'success');
+    }
     return true;
   } catch (error) {
-    showToast(`Pull from Google failed: ${error?.message || error}`, 'danger');
+    // A background attempt that fails is not worth interrupting anybody over —
+    // it will try again. A sync somebody asked for is.
+    if (!silent) showToast(`Sync from Google failed: ${error?.message || error}`, 'danger');
     return false;
   } finally {
     _ssGoogleBusy = false;
   }
+}
+
+// ── Automatic checking ──────────────────────────────────────────────────────
+//
+// The studio should not have to remember a button. This checks the open
+// project's linked tabs on a timer and when the project is opened, and does
+// nothing at all when there is no link, no connection, or an edit in progress.
+const SS_AUTO_SYNC_MS = 3 * 60 * 1000;
+const SS_AUTO_SYNC_MIN_GAP_MS = 45 * 1000;
+let _ssAutoSyncTimer = null;
+let _ssAutoSyncLastAt = 0;
+
+function ssStopAutoSync() {
+  if (_ssAutoSyncTimer) { clearInterval(_ssAutoSyncTimer); _ssAutoSyncTimer = null; }
+}
+
+function ssStartAutoSync() {
+  ssStopAutoSync();
+  _ssAutoSyncTimer = setInterval(() => { ssAutoSyncTick(); }, SS_AUTO_SYNC_MS);
+}
+
+async function ssAutoSyncTick(force) {
+  const project = (_ssData?.projects || []).find(p => p.id === _ssData?.activeProject);
+  if (!project?.googleLink || !_googleSheets() || _ssGoogleBusy || _ssEditCell) return;
+  if (_ssBlockedWorkbook || _ssAwaitingAuthority) return;
+  const now = Date.now();
+  if (!force && now - _ssAutoSyncLastAt < SS_AUTO_SYNC_MIN_GAP_MS) return;
+  _ssAutoSyncLastAt = now;
+  await ssPullFromGoogle(project.id, { silent: true });
 }
 
 // What Google held at the moment of the last pull. A push compares against
@@ -11107,124 +11224,6 @@ function _ssGoogleCheckpoint(rows) {
     });
   });
   return checkpoint;
-}
-
-// The cells of one sheet that differ from what Google last held.
-function _ssPendingPush(sheet, tab, link) {
-  const checkpoint = tab.checkpoint || {};
-  const cells = [];
-  const seen = new Set();
-  for (const [key, cell] of _ssSheetCellText(sheet)) {
-    seen.add(key);
-    if (cell.row >= link.rows || cell.column >= link.columns) continue;
-    const was = checkpoint[key] ?? '';
-    if (cell.value === was) continue;               // unchanged since the pull
-    cells.push({
-      a1: _ssA1(cell.row, cell.column), value: cell.value, expected: was,
-      // MB161-020: main needs to know, because a ticked box written verbatim
-      // lands in Google as the text "TRUE" and fails the checkbox's own
-      // validation. How it compensates is main's business, not the renderer's.
-      checkbox: sheet.cells?.[key]?.cb === true,
-    });
-  }
-  // Cleared in the app: present at the last pull, gone now.
-  for (const [key, was] of Object.entries(checkpoint)) {
-    if (seen.has(key)) continue;
-    const [row, column] = key.split(',').map(Number);
-    if (row >= link.rows || column >= link.columns) continue;
-    cells.push({ a1: _ssA1(row, column), value: '', expected: was });
-  }
-  return cells;
-}
-
-async function ssPushToGoogle(projectId) {
-  const project = (_ssData?.projects || []).find(p => p.id === projectId);
-  const link = project?.googleLink;
-  if (!link || !_googleSheets() || _ssGoogleBusy) return false;
-  const linked = _ssLinkedSheets(project);
-  if (!linked.length) { showToast('No sheet in this project is linked to a Google tab.', 'warning'); return false; }
-
-  // Everything is worked out before anything is sent, so the confirmation can
-  // state the real total rather than a per-tab count the person then has to
-  // answer six times.
-  const work = linked
-    .map(({ sheet, tab }) => ({ sheet, tab, cells: _ssPendingPush(sheet, tab, link) }))
-    .filter(entry => entry.cells.length);
-  const total = work.reduce((sum, entry) => sum + entry.cells.length, 0);
-  if (!total) { showToast('Nothing to push — Google already matches.', 'info'); return true; }
-
-  const where = work.length === 1
-    ? `"${work[0].tab.title}"`
-    : `${work.length} tabs`;
-  if (!confirm(
-    `Push ${total} cell${total === 1 ? '' : 's'} to ${where} in Google?\n\n` +
-    `Any cell somebody changed in Google since your last pull will be left alone ` +
-    `and reported, not overwritten.\n\n` +
-    `Colours and merged cells are not pushed — only values.`)) return false;
-
-  _ssGoogleBusy = true;
-  try {
-    const conflicts = Array.isArray(_ssData._conflicts) ? [..._ssData._conflicts] : [];
-    const tabs = { ...link.tabs };
-    let written = 0;
-    let skipped = 0;
-
-    for (const { sheet, tab, cells } of work) {
-      const result = await _googleSheets().push({
-        spreadsheetId: link.spreadsheetId, title: tab.title, cells,
-      });
-
-      // Anything Google refused because it had moved on becomes a real conflict,
-      // in the same list and with the same UI as a Mac-vs-Mac collision.
-      for (const miss of result.skipped) {
-        conflicts.push({
-          id: _ssConflictId(['google', link.spreadsheetId, tab.title, miss.a1,
-            miss.expected, miss.appValue, miss.googleValue]),
-          kind: 'cell', projectId: project.id, sheetId: sheet.id,
-          target: _ssCellKeyFromA1(miss.a1),
-          base: miss.expected ? { v: miss.expected, bg: '', tc: '', b: false } : null,
-          local: miss.appValue ? { v: miss.appValue, bg: '', tc: '', b: false } : null,
-          remote: miss.googleValue ? { v: miss.googleValue, bg: '', tc: '', b: false } : null,
-          at: new Date().toISOString(),
-        });
-      }
-      // Advance the checkpoint for everything that did land, so the next push
-      // does not try to write it again.
-      const nextCheckpoint = { ...(tab.checkpoint || {}) };
-      for (const change of result.replaced) {
-        nextCheckpoint[_ssCellKeyFromA1(change.a1)] = change.next;
-      }
-      tabs[sheet.id] = { ...tab, checkpoint: nextCheckpoint };
-      written += result.written.length;
-      skipped += result.skipped.length;
-
-      // Saved per tab, for the same reason the pull is. Google has already been
-      // written by the time this line runs, so if a later tab throws and the
-      // advanced checkpoint were lost, the next push would re-send those cells
-      // with a stale `expected`, Google would refuse them, and the app would
-      // report its own writes as somebody else's edits.
-      if (conflicts.length !== (_ssData._conflicts || []).length) _ssData._conflicts = conflicts;
-      project.googleLink = { ...link, tabs };
-      await ssSave();
-    }
-
-    ssRender();
-
-    if (skipped) {
-      showToast(
-        `Pushed ${written} cell${written === 1 ? '' : 's'}. ` +
-        `${skipped} changed in Google since your last pull and were kept — ` +
-        `review them in the conflicts banner.`, 'warning');
-    } else {
-      showToast(`Pushed ${written} cell${written === 1 ? '' : 's'} to Google.`, 'success');
-    }
-    return true;
-  } catch (error) {
-    showToast(`Push to Google failed: ${error?.message || error}`, 'danger');
-    return false;
-  } finally {
-    _ssGoogleBusy = false;
-  }
 }
 
 function _ssCellKeyFromA1(a1) {
@@ -11271,6 +11270,22 @@ function _ssImportColor(input) {
 // collide with one already applied is dropped rather than written, and every
 // covered cell is deleted after the anchor absorbs it. Getting this wrong does
 // not draw badly — it throws on save and quarantines the project.
+// MB161-021: the merged regions a sheet already has, in the same shape the
+// importer produces. A sync that restated Google's merges every time would undo
+// a merge somebody made here, so when Google's own structure has not moved the
+// app's is fed back through the same applier instead — one code path, already
+// tested for overlap, clipping and clearing the cells underneath.
+function _ssMergesOf(cells) {
+  const out = [];
+  for (const [key, cell] of Object.entries(cells || {})) {
+    if (!(cell?.rs > 1) && !(cell?.cs > 1)) continue;
+    const [row, column] = key.split(',').map(Number);
+    if (!Number.isSafeInteger(row) || !Number.isSafeInteger(column)) continue;
+    out.push({ row, column, rowSpan: cell.rs || 1, colSpan: cell.cs || 1 });
+  }
+  return out;
+}
+
 function _ssApplyImportedMerges(cells, merges, storedRows, storedCols) {
   if (!Array.isArray(merges) || !merges.length) return;
   const claimed = new Set();

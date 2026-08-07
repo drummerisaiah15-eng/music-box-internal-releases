@@ -1301,61 +1301,58 @@ function googleHelpers() {
   return context.api;
 }
 
-test('MB161-016: the Google scope is spreadsheets, and nothing wider', () => {
-  // Two-way sync needs write access, so the readonly scope is gone. What must
-  // NOT creep back is anything broader — Drive would hand over every file in
-  // the account, not just the sheets somebody chose to link.
-  assert.match(main, /const GOOGLE_SCOPE = 'https:\/\/www\.googleapis\.com\/auth\/spreadsheets'/);
+test('MB161-021: the Google scope is readonly, and nothing wider', () => {
+  // Two-way sync existed and was removed. Narrowing the scope back is the whole
+  // point of having removed it: Google now refuses a write regardless of what
+  // this codebase does, which is a guarantee no amount of care in main.js can
+  // match. Widening it again should have to be a deliberate, visible act.
+  assert.match(main, /const GOOGLE_SCOPE = 'https:\/\/www\.googleapis\.com\/auth\/spreadsheets\.readonly'/);
   assert.doesNotMatch(main, /auth\/drive/, 'Drive scope is never requested');
-  assert.doesNotMatch(main, /auth\/spreadsheets\.readonly/,
-    'and the old readonly scope is gone, so a stale grant cannot silently persist');
   // The scope Google GRANTED is still verified, not the one asked for.
   const complete = main.slice(main.indexOf("_secureHandle('google-oauth-complete'"));
   assert.match(complete, /granted\.split\(\/\\s\+\/\)\.includes\(GOOGLE_SCOPE\)/);
 });
 
-test('MB161-016: a push re-reads its targets and refuses anything that moved', () => {
-  const push = main.slice(main.indexOf("_secureHandle('google-sheet-push'"),
-                          main.indexOf('function _columnLetters'));
-  // The whole safety argument lives in this ordering: read, compare, then
-  // write only what still matches.
-  assert.ok(push.indexOf('values:batchGet') < push.indexOf('values:batchUpdate'),
-    'the current values are fetched BEFORE anything is written');
-  assert.match(push, /if \(now !== cell\.expected\)/,
-    'a cell that changed in Google since the app last looked is not written');
-  assert.match(push, /skipped\.push\(/, 'it is reported instead, so it can become a conflict');
-  assert.match(push, /replaced\.push\(\{ a1: cell\.a1, previous: now, next: cell\.value \}\)/,
-    'and every value actually overwritten is returned, so a copy survives');
-  assert.match(push, /valueInputOption: 'RAW'/,
-    'RAW: Google stores text as given rather than reinterpreting it');
-  assert.match(push, /if \(!toWrite\.length\) return/,
-    'nothing to write means no request at all');
+test('MB161-021: there is no write path to Google at all', () => {
+  // Stated as absence rather than as "the write is careful", because absence is
+  // the property that cannot regress quietly. Anything here reappearing means
+  // the app can modify somebody's spreadsheet again.
+  for (const writer of [
+    'values:batchUpdate', 'values:append', 'values:clear',
+    'batchUpdate', 'valueInputOption', 'USER_ENTERED',
+    'google-sheet-push',
+  ]) {
+    assert.ok(!main.includes(writer),
+      `main.js must not contain ${writer} — that is a write to somebody's sheet`);
+  }
+  // And nothing anywhere in main POSTs to the Sheets API. Checked against the
+  // host rather than by slicing out "the Google section", because that slice
+  // ran on into Microsoft and RingCentral and counted their POSTs — a test that
+  // fails for the wrong reason teaches people to edit the test.
+  const sheetsRequests = [...main.matchAll(/sheets\.googleapis\.com[^`'"]*/g)].map(m => m[0]);
+  assert.ok(sheetsRequests.length, 'the Sheets API is still used for reads');
+  for (const url of sheetsRequests) {
+    assert.doesNotMatch(url, /:(batchUpdate|append|clear)/, `${url} is not a read`);
+  }
+  // The only POST to Google at all is the token exchange, and it goes to the
+  // OAuth endpoint rather than to anybody's spreadsheet.
+  for (const [, target] of main.matchAll(/method: 'POST',[\s\S]{0,200}?url: ([^,\n]+)/g)) {
+    assert.doesNotMatch(target, /sheets\.googleapis\.com/, 'nothing POSTs to the Sheets API');
+  }
+  assert.match(main, /GOOGLE_TOKEN_ENDPOINT = 'https:\/\/oauth2\.googleapis\.com\/token'/,
+    'the token exchange still points where it should');
 });
 
-test('MB161-016: the push is bounded and validates every target cell', () => {
-  const push = main.slice(main.indexOf("_secureHandle('google-sheet-push'"),
-                          main.indexOf('function _columnLetters'));
-  assert.match(push, /request\.cells\.length > 5000/, 'a runaway push is refused');
-  assert.match(push, /\^\[A-Z\]\{1,3\}\[1-9\]\[0-9\]\{0,3\}\$/,
-    'every A1 reference is validated rather than interpolated into a range');
-  assert.match(push, /_requireAppRole\(COMMUNICATION_ROLES\)/);
-  // batchUpdate must appear exactly once: the push handler and nowhere else.
-  assert.equal(main.split('values:batchUpdate').length - 1, 1,
-    'there is exactly one place in main.js that writes to Google');
-});
-
-test('MB161-016: the preload bridge exposes read and push, and no more', () => {
+test('MB161-021: the preload bridge exposes reads, and no writer', () => {
   const start = preload.indexOf("exposeInMainWorld('electronGoogleSheets'");
   assert.notEqual(start, -1);
   const bridge = preload.slice(start, preload.indexOf('});', start));
   assert.match(bridge, /read:\s*\(request\)/);
-  assert.match(bridge, /push:\s*\(request\)/);
-  for (const method of ['delete', 'clear', 'append', 'createSheet', 'format']) {
+  assert.match(bridge, /describe:\s*\(request\)/);
+  for (const method of ['push', 'write', 'delete', 'clear', 'append', 'createSheet', 'format']) {
     assert.doesNotMatch(bridge, new RegExp(`\\b${method}\\s*:`),
       `the bridge must not offer ${method}`);
   }
-  // Tokens still never cross into the renderer.
-  assert.doesNotMatch(bridge, /token|refresh|secret/i);
 });
 
 test('MB161-014: connecting and configuring are Owner-only', () => {
@@ -1473,10 +1470,13 @@ test('MB161-017: every Google call uses Electron net, not Node https', () => {
     const body = main.slice(start, main.indexOf(endMarker, start + 1));
     assert.doesNotMatch(body, /https\.request/, `${name} must not use Node https`);
   }
-  const push = main.slice(main.indexOf("_secureHandle('google-sheet-push'"),
-                          main.indexOf('function _columnLetters'));
-  assert.doesNotMatch(push, /https\.request/, 'the push must not use Node https either');
-  assert.match(push, /_googleHttp\(\{/, 'it goes through the shared helper');
+  // The push that used to be checked here is gone (MB161-021). What remains is
+  // that no Google-facing code anywhere reaches for Node https.
+  const googleFns = ['_googleTokenRequest', '_googleApiGet', '_googleAccountEmail'];
+  for (const name of googleFns) {
+    assert.ok(main.includes(name), `${name} still exists`);
+  }
+  assert.match(main, /_googleHttp\(\{/, 'everything goes through the shared helper');
 
   // The helper still bounds size and time; swapping transports must not have
   // dropped either.
@@ -1500,11 +1500,9 @@ test('MB161-018: a tab name is quoted into the A1 range, everywhere', () => {
   // No range may be built by interpolating a bare title again.
   assert.doesNotMatch(main, /`\$\{title\}!/,
     'every range goes through the helper');
-  for (const built of [
-    /const range = _googleRange\(title, `A1:\$\{_columnLetters\(columns\)\}\$\{rows\}`\)/,
-    /_googleRange\(title, a1\)/,
-    /range: _googleRange\(title, cell\.a1\)/,
-  ]) assert.match(main, built);
+  // Only the read builds a range now that the write path is gone.
+  assert.match(main,
+    /const range = _googleRange\(title, `A1:\$\{_columnLetters\(columns\)\}\$\{rows\}`\)/);
 });
 
 test('MB161-018: the formatted read stays bounded and trims to what is used', () => {
@@ -1532,9 +1530,9 @@ test('MB161-018: white and black map to "no colour", not to a fill', () => {
   vm.runInNewContext(
     `${extractFunction(main, '_isPlainObject')}
      ${extractFunction(main, '_googleColorHex')}
-     this.api = (color, blank) => _googleColorHex(color, blank);`, context);
-  const bg = color => context.api(color, '#ffffff');
-  const fg = color => context.api(color, '#000000');
+     this.api = (style, legacy, blank) => _googleColorHex(style, legacy, blank);`, context);
+  const bg = color => context.api(null, color, '#ffffff');
+  const fg = color => context.api(null, color, '#000000');
 
   assert.equal(bg({ red: 1, green: 1, blue: 1 }), '', 'white background is no fill');
   assert.equal(fg({}), '', 'a missing channel is zero, so {} is black text: no colour');
@@ -1547,24 +1545,16 @@ test('MB161-018: white and black map to "no colour", not to a fill', () => {
   assert.equal(bg({ red: 2, green: -1, blue: 0.5 }), '#ff0080');
 });
 
-test('MB161-020: a checkbox is written as USER_ENTERED, everything else RAW', () => {
-  const push = main.slice(main.indexOf("_secureHandle('google-sheet-push'"),
-                          main.indexOf('function _googleRange'));
-  // RAW stores exactly what it is given, so a ticked box would arrive as the
-  // string "TRUE" in a cell whose validation expects the boolean, and Google
-  // would mark it invalid — the app corrupting the sheet it mirrors.
-  assert.match(push, /valueInputOption: 'USER_ENTERED'/);
-  assert.match(push, /valueInputOption: 'RAW'/);
-  assert.match(push, /data: plain\.map/, 'the RAW batch carries only non-checkboxes');
-  assert.match(push, /data: boxes\.map/, 'and the parsed batch only checkboxes');
-
-  // The opt-out of RAW is the dangerous part: RAW is what stops a cell starting
-  // with `=` or `+` being reinterpreted as a formula. So it is not enough for
-  // the caller to claim a cell is a checkbox — the value must actually be one.
-  assert.match(push, /cell\.checkbox === true &&/);
-  assert.match(push, /\['TRUE', 'FALSE'\]\.includes\(String\(cell\.value\)\.trim\(\)\.toUpperCase\(\)\)/);
-  assert.match(push, /checkbox: entry\.checkbox === true/,
-    'and the flag is taken strictly, never for truthiness');
+test('MB161-021: removing the write path took its RAW/USER_ENTERED split with it', () => {
+  // While the app could write, a ticked checkbox had to go out as USER_ENTERED
+  // (RAW would have stored the string "TRUE" and failed Google's own boolean
+  // validation) while everything else stayed RAW so a leading `=` could not
+  // become a formula. That whole balancing act is gone with the writes, and
+  // must not come back without the scope change that would justify it.
+  assert.ok(!main.includes('USER_ENTERED'));
+  assert.ok(!main.includes('valueInputOption'));
+  // Checkboxes are still READ, which is the half that survived.
+  assert.match(main, /cell\.dataValidation\?\.condition\?\.type === 'BOOLEAN'/);
 });
 
 test('MB161-020: the read asks Google for the validation that draws the box', () => {
@@ -1579,4 +1569,39 @@ test('MB161-020: the read asks Google for the validation that draws the box', ()
   // An unticked box is content, so it has to count towards the used extent or
   // an empty checkbox column would be trimmed away entirely.
   assert.match(read, /bg \|\| tc \|\| bold \|\| checkbox/);
+});
+
+test('MB161-022: the newer colourStyle wins over the deprecated colour field', () => {
+  // Google reports the same colour two ways. `backgroundColor` is deprecated and
+  // `backgroundColorStyle` "takes precedence" per the reference. Reading only
+  // the deprecated one is how a sheet coloured by conditional formatting or by
+  // the document theme could import as plain white.
+  const context = { Object, Array, Number, String, Math };
+  vm.runInNewContext(
+    `${extractFunction(main, '_isPlainObject')}
+     ${extractFunction(main, '_googleColorHex')}
+     this.api = (style, legacy) => _googleColorHex(style, legacy, '#ffffff');`, context);
+
+  // Both present and disagreeing: the style is the truth.
+  assert.equal(
+    context.api({ rgbColor: { red: 1, green: 0, blue: 0 } }, { red: 0, green: 0, blue: 1 }),
+    '#ff0000');
+  // Style present but naming a theme colour, which has no rgb to read. The
+  // deprecated field is where Google puts the resolved colour, so it is used.
+  assert.equal(context.api({ themeColor: 'ACCENT1' }, { red: 0, green: 0, blue: 1 }), '#0000ff');
+  // Only the deprecated field, which is the common case for a plain fill.
+  assert.equal(context.api(undefined, { red: 0, green: 1, blue: 0 }), '#00ff00');
+  // Neither.
+  assert.equal(context.api(undefined, undefined), '');
+  // White is still "no fill" whichever field carried it.
+  assert.equal(context.api({ rgbColor: { red: 1, green: 1, blue: 1 } }, undefined), '');
+});
+
+test('MB161-022: both colour representations are actually requested', () => {
+  // The precedence logic is worthless if the field mask never asks for the
+  // field that wins.
+  const read = main.slice(main.indexOf("_secureHandle('google-sheet-read'"),
+                          main.indexOf('function _googleColorHex'));
+  assert.match(read, /backgroundColor,backgroundColorStyle/);
+  assert.match(read, /foregroundColor,foregroundColorStyle/);
 });
