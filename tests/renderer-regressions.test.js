@@ -1801,3 +1801,44 @@ test('MB161-035: every page container is balanced and contains only itself', () 
     }
   }
 });
+
+test('MB161-037: the renderer and main agree on which roles exist', () => {
+  // Adding Operations Manager to main.js left two hand-written lists in the
+  // renderer behind. The dropdown simply never offered it. The validator was
+  // worse: it REJECTS a profile carrying an unlisted role, so the whole profile
+  // list would have been thrown out the moment anybody was given the new role.
+  assert.match(script, /const ASSIGNABLE_ROLES = Object\.freeze\(\['Operations Manager', 'Operations & Events', 'Front Desk'\]\)/);
+  assert.match(script, /const ALL_PROFILE_ROLES = Object\.freeze\(\['Owner', \.\.\.ASSIGNABLE_ROLES\]\)/);
+
+  // Both consumers use the shared list rather than repeating it.
+  assert.match(script, /\$\{ASSIGNABLE_ROLES\.map\(r =>/, 'the Manage Users dropdown');
+  assert.match(script, /!ALL_PROFILE_ROLES\.includes\(role\)/, 'the profile-list validator');
+  assert.ok(!/\['Owner', 'Operations & Events', 'Front Desk'\]/.test(script),
+    'no hand-written copy of the role list survives');
+  assert.ok(!/\['Operations & Events', 'Front Desk'\]/.test(script));
+
+  // And the renderer's list matches what main will actually accept.
+  const mainList = mainSource.match(/ASSIGNABLE_PROFILE_ROLES = Object\.freeze\(\[([^\]]*)\]\)/);
+  assert.ok(mainList, 'main declares the assignable roles');
+  const rendererList = script.match(/ASSIGNABLE_ROLES = Object\.freeze\(\[([^\]]*)\]\)/);
+  assert.equal(rendererList[1].trim(), mainList[1].trim(),
+    'a role the renderer offers but main refuses is a dropdown that throws');
+});
+
+test('MB161-037: a synced key must declare its shape, or every write is refused', () => {
+  // `ai_spend` is { month, devices } — an object. _expectedSyncType defaults to
+  // 'array', so adding the key without listing it here made every write throw
+  // "ai_spend expected array data", including on the login screen.
+  const expected = namedFunctionSource('_expectedSyncType');
+  assert.match(expected, /'ai_spend'\]\.includes\(key\)\) return 'object'/);
+
+  // Every synced key is either declared as an object or genuinely a list. This
+  // is the check that would have caught it.
+  const keys = script.match(/const SYNC_BASE_KEYS = Object\.freeze\(\[([\s\S]*?)\]\)/)[1]
+    .match(/'([a-z_]+)'/g).map(k => k.replace(/'/g, ''));
+  const objectKeys = expected.match(/\[([^\]]*)\]\.includes\(key\)/)[1]
+    .match(/'([a-z_]+)'/g).map(k => k.replace(/'/g, ''));
+  assert.ok(keys.includes('ai_spend'));
+  assert.ok(objectKeys.includes('ai_spend'),
+    'ai_spend is synced, so its shape has to be declared');
+});

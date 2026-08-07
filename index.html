@@ -2673,7 +2673,7 @@ async function refreshLoginProfiles() {
     const role = profile?.role;
     const folded = name.toLocaleLowerCase('en-US');
     if (!name || name.length > 80 || seen.has(folded) ||
-        !['Owner', 'Operations & Events', 'Front Desk'].includes(role) ||
+        !ALL_PROFILE_ROLES.includes(role) ||
         (role === 'Owner' && name !== 'Elizabeth Chaves')) {
       throw new Error('The protected user-profile list is invalid.');
     }
@@ -2719,7 +2719,7 @@ function renderManageProfiles() {
     const roleCell = roleEditable
       ? `<select class="form-select" style="width:190px;font-size:12.5px"
             onchange="setProfileRole(${jsArg(profile.name)}, this.value)">
-           ${['Operations & Events', 'Front Desk'].map(r =>
+           ${ASSIGNABLE_ROLES.map(r =>
              `<option value="${escAttr(r)}" ${r === profile.role ? 'selected' : ''}>${escHtml(r)}</option>`
            ).join('')}
          </select>`
@@ -5671,9 +5671,26 @@ function _estimateJsonBytes(value) {
   return new TextEncoder().encode(JSON.stringify(value)).byteLength;
 }
 
+// MB161-037: the roles somebody may be given, in one place.
+//
+// This was written out by hand in two places — the Manage Users dropdown and
+// the profile-list validator — and adding a role to main.js left both behind.
+// The dropdown simply never offered it; the validator was worse, since it
+// REJECTS a profile carrying an unlisted role, which would have thrown out the
+// whole profile list the moment anybody was made an Operations Manager.
+//
+// Must stay in step with ASSIGNABLE_PROFILE_ROLES in main.js, which is the one
+// that actually enforces anything.
+const ASSIGNABLE_ROLES = Object.freeze(['Operations Manager', 'Operations & Events', 'Front Desk']);
+const ALL_PROFILE_ROLES = Object.freeze(['Owner', ...ASSIGNABLE_ROLES]);
+
 function _expectedSyncType(key) {
   if (_ssIsProjectSyncKey(key)) return 'object';
-  if (['room_overrides', 'room_by_instructor', 'room_time_rules', 'spreadsheets'].includes(key)) return 'object';
+  // MB161-037: `ai_spend` is { month, devices } — an object, not a list. Adding
+  // a synced key without declaring its shape here means it falls through to the
+  // default of 'array' and every write is refused, which is what happened.
+  if (['room_overrides', 'room_by_instructor', 'room_time_rules', 'spreadsheets',
+       'ai_spend'].includes(key)) return 'object';
   return 'array';
 }
 
