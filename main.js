@@ -2354,7 +2354,11 @@ _secureHandle('google-sheet-read', async (_, request) => {
   const fields = [
     'sheets(properties(sheetId,title)',
     'merges',
-    'data(rowData(values(formattedValue,effectiveFormat(backgroundColor,textFormat(bold,foregroundColor))))))',
+    // dataValidation is how Google carries a checkbox. The cell's VALUE is the
+    // string TRUE or FALSE — which is why an imported checkbox column arrived as
+    // a column reading "FALSE". The box itself is the validation rule, so
+    // without this the tick is simply not in the response.
+    'data(rowData(values(formattedValue,dataValidation(condition(type)),effectiveFormat(backgroundColor,textFormat(bold,foregroundColor))))))',
   ].join(',');
   let payload;
   try {
@@ -2394,12 +2398,13 @@ _secureHandle('google-sheet-read', async (_, request) => {
       const bg = _googleColorHex(effective.backgroundColor, '#ffffff');
       const tc = _googleColorHex(effective.textFormat?.foregroundColor, '#000000');
       const bold = effective.textFormat?.bold === true;
+      const checkbox = cell.dataValidation?.condition?.type === 'BOOLEAN';
       textLine.push(text);
-      formatLine.push({ bg, tc, b: bold });
+      formatLine.push({ bg, tc, b: bold, cb: checkbox });
       if (text !== '') { cells += 1; lastCol = Math.max(lastCol, c); lastRow = Math.max(lastRow, r); }
       // A fill with no text is meaningful on its own — that is exactly how a
       // blocked-out slot is drawn — so it counts towards the used extent.
-      else if (bg || tc || bold) { lastCol = Math.max(lastCol, c); lastRow = Math.max(lastRow, r); }
+      else if (bg || tc || bold || checkbox) { lastCol = Math.max(lastCol, c); lastRow = Math.max(lastRow, r); }
     }
     grid.push(textLine);
     formats.push(formatLine);
@@ -2492,6 +2497,9 @@ _secureHandle('google-sheet-push', async (_, request) => {
     }
     wanted.set(a1, {
       a1,
+      // Strictly boolean: a truthy value here would let the renderer opt any
+      // cell out of RAW, which is the guard against `=` becoming a formula.
+      checkbox: entry.checkbox === true,
       value: String(entry.value ?? '').slice(0, 50000),
       expected: String(entry.expected ?? ''),
     });
@@ -2538,26 +2546,55 @@ _secureHandle('google-sheet-push', async (_, request) => {
   }
   if (!toWrite.length) return { ok: true, written: [], skipped, replaced: [] };
 
+  // A cell the caller marked as a checkbox. Only ever TRUE or FALSE reaches
+  // this branch; anything else is treated as ordinary text so a stray flag
+  // cannot smuggle a value past RAW into formula parsing.
+  const isBox = cell => cell.checkbox === true &&
+    ['TRUE', 'FALSE'].includes(String(cell.value).trim().toUpperCase());
+  const boxes = toWrite.filter(isBox);
+  const plain = toWrite.filter(cell => !isBox(cell));
+
   const payload = JSON.stringify({
     // RAW: Google stores what it is given without reparsing it. The app's cell
     // model is text, so anything else would silently reinterpret it.
     valueInputOption: 'RAW',
-    data: toWrite.map(cell => ({ range: _googleRange(title, cell.a1), values: [[cell.value]] })),
+    data: plain.map(cell => ({ range: _googleRange(title, cell.a1), values: [[cell.value]] })),
   });
 
-  const write = await _googleHttp({
-    method: 'POST',
-    url: `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}/values:batchUpdate`,
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-    body: payload,
-    limit: 256 * 1024,
-  });
-  if (write.statusCode !== 200) {
-    let parsed = null;
-    try { parsed = JSON.parse(write.text); } catch (_) { parsed = null; }
-    const error = new Error(parsed?.error?.message || `HTTP ${write.statusCode}`);
-    error.statusCode = write.statusCode;
-    throw new Error(_googleReadFailure(error));
+  // MB161-020: checkboxes are the one exception to RAW, and they have to be.
+  //
+  // RAW stores exactly what it is given, so a ticked box would arrive as the
+  // STRING "TRUE" in a cell whose validation expects the boolean — Google shows
+  // that as invalid, and the app would be corrupting the sheet it is meant to
+  // mirror. USER_ENTERED parses "TRUE" to the boolean, which is what the
+  // checkbox reads.
+  //
+  // Sent as a separate request because valueInputOption applies to the whole
+  // batch. Everything else stays RAW: that is what stops a cell beginning with
+  // `=` or `+` being reinterpreted as a formula, which is a much worse failure
+  // than a mis-typed tick.
+  const batches = [];
+  if (plain.length) batches.push(payload);
+  if (boxes.length) batches.push(JSON.stringify({
+    valueInputOption: 'USER_ENTERED',
+    data: boxes.map(cell => ({ range: _googleRange(title, cell.a1), values: [[cell.value]] })),
+  }));
+
+  for (const body of batches) {
+    const write = await _googleHttp({
+      method: 'POST',
+      url: `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}/values:batchUpdate`,
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body,
+      limit: 256 * 1024,
+    });
+    if (write.statusCode !== 200) {
+      let parsed = null;
+      try { parsed = JSON.parse(write.text); } catch (_) { parsed = null; }
+      const error = new Error(parsed?.error?.message || `HTTP ${write.statusCode}`);
+      error.statusCode = write.statusCode;
+      throw new Error(_googleReadFailure(error));
+    }
   }
 
   return { ok: true, written: toWrite.map(c => c.a1), skipped, replaced };

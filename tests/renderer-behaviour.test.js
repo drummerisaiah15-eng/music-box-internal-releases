@@ -1315,3 +1315,50 @@ test('MB161-018: a link naming no reachable tab is dropped entirely', () => {
   });
   assert.equal(out.projects[0].googleLink, undefined);
 });
+
+// ── MB161-020: checkboxes ───────────────────────────────────────────────────
+
+test('MB161-020: a checkbox is TRUE/FALSE text, so a push needs no special case', () => {
+  const context = vm.createContext({ String });
+  vm.runInContext(`
+    ${declaration('_ssIsChecked')}
+    globalThis.checked = value => _ssIsChecked(value);
+  `, context);
+  // Google writes the literal strings, and case/whitespace vary by locale and
+  // by how the value got there.
+  assert.equal(context.checked('TRUE'), true);
+  assert.equal(context.checked('true'), true);
+  assert.equal(context.checked(' TRUE '), true);
+  assert.equal(context.checked('FALSE'), false);
+  assert.equal(context.checked(''), false);
+  assert.equal(context.checked(undefined), false);
+  // Not a truthiness test: any other text is an unticked box, not a ticked one.
+  assert.equal(context.checked('yes'), false);
+  assert.equal(context.checked('1'), false);
+});
+
+test('MB161-020: the checkbox flag survives normalization, and only when set', () => {
+  const api = roundTripApi();
+  const out = api.norm(book({
+    '0,0': { v: 'TRUE', bg: '', tc: '', b: false, cb: true },
+    '0,1': { v: 'plain', bg: '', tc: '', b: false },
+  }));
+  const cells = out.projects[0].sheets[0].cells;
+  assert.equal(cells['0,0'].cb, true);
+  assert.equal(cells['0,0'].v, 'TRUE', 'the value is still the text Google stores');
+  // Absent rather than false on ordinary cells: a field per cell across a full
+  // workbook is real weight against the 600 KB budget.
+  assert.ok(!('cb' in cells['0,1']));
+});
+
+test('MB161-020: a non-boolean checkbox flag is refused, not coerced', () => {
+  // The flag decides whether a cell is interactive, so a junk value must not
+  // quietly become `true` via truthiness.
+  const api = roundTripApi();
+  for (const junk of ['true', 1, {}, []]) {
+    assert.throws(
+      () => api.norm(book({ '0,0': { v: 'x', bg: '', tc: '', b: false, cb: junk } })),
+      /invalid checkbox flag/,
+      `${JSON.stringify(junk)} is refused`);
+  }
+});

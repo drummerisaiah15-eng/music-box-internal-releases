@@ -1174,9 +1174,23 @@ test('double-clicking a cell enters edit mode even though selecting rebuilds the
 
   // Order matters: the detection must happen before the selection rebuild,
   // which is the very thing that destroys the browser's dblclick pairing.
+  // Aim at the MAIN path's selection specifically. Probing for the first
+  // `_ssSelR=r;_ssSelC=c;` anywhere in the function is too loose: the checkbox
+  // branch added later sets the selection too, and it legitimately runs before
+  // the detection, which made this read as a regression when nothing had
+  // regressed. The line that matters is the one the rebuild follows.
   const detectAt = down.indexOf('const secondClick');
-  const selectAt = down.indexOf('_ssSelR=r;_ssSelC=c;');
-  assert.ok(detectAt > -1 && selectAt > -1 && detectAt < selectAt);
+  const selectAt = down.indexOf('_ssSelR=r;_ssSelC=c;_ssSelR2=r;_ssSelC2=c;\n  _ssIsSelecting=false;');
+  assert.ok(detectAt > -1, 'the detection exists');
+  assert.ok(selectAt > -1, 'and so does the selection rebuild it must precede');
+  assert.ok(detectAt < selectAt, 'detection comes first');
+
+  // MB161-020: ticking a box is handled before the double-click detection, so a
+  // second click ticks it back rather than opening a text editor over the word
+  // TRUE. That is what Google does, and it is why the probe above had to be
+  // made specific rather than this branch moved.
+  const checkAt = down.indexOf("e.target.dataset?.cb === '1'");
+  assert.ok(checkAt > -1 && checkAt < detectAt);
 
   // The fallback path must not restart an edit already begun, or it throws away
   // the caret that was just positioned.
@@ -1318,8 +1332,8 @@ test('MB161-018: imported fills, bold and merges survive the build', () => {
   // A blocked-out slot on a schedule is an empty cell with a black fill. The
   // first version of this kept cells only when `val !== ''`, which is exactly
   // the test that throws those away.
-  assert.match(build, /if \(val !== '' \|\| bg \|\| tc \|\| bold\)/,
-    'a cell worth keeping for its fill alone must be kept');
+  assert.match(build, /if \(val !== '' \|\| bg \|\| tc \|\| bold \|\| checkbox\)/,
+    'a cell worth keeping for its fill \u2014 or its checkbox \u2014 alone must be kept');
   assert.match(build, /_ssApplyImportedMerges\(cells, s\.merges, storedRows, storedCols\)/);
   // Optional, because CSV and .xlsx imports carry no formatting at all.
   assert.match(build, /Array\.isArray\(s\.formats\) \? s\.formats : null/);

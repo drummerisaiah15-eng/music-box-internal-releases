@@ -1001,6 +1001,18 @@
       overflow:hidden;text-overflow:ellipsis;
       height:auto;max-height:36px;line-height:18px;
     }
+    /* MB161-020: a checkbox cell. Centred like Google's, and sized so it still
+       fits a 26px row without changing it. */
+    .ss-cell-inner.ss-cell-check {
+      display:flex;align-items:center;justify-content:center;padding:0;
+    }
+    .ss-check {
+      width:14px;height:14px;border:1.5px solid #9aa0a6;border-radius:2px;
+      display:inline-flex;align-items:center;justify-content:center;
+      font-size:11px;line-height:1;color:transparent;background:#fff;
+      cursor:pointer;user-select:none;
+    }
+    .ss-check.ss-check-on { background:#1a73e8;border-color:#1a73e8;color:#fff; }
     .ss-cell-input {
       position:absolute;inset:0;border:none;outline:none;
       padding:3px 6px;font-size:13px;font-family:inherit;
@@ -1664,6 +1676,9 @@
             <button class="ss-toolbar-btn" onclick="ssDeleteCol()" style="color:#c44">− Col</button>
             <div class="ss-sep"></div>
             <button class="ss-toolbar-btn" onclick="ssExportCSV()">Export CSV</button>
+            <div class="ss-sep"></div>
+            <button class="ss-toolbar-btn" id="ss-check-btn" onclick="ssToggleCheckboxCells()"
+              title="Turn the selected cells into checkboxes, or back into plain cells">☑ Checkbox</button>
             <div class="ss-sep"></div>
             <button class="ss-toolbar-btn" id="ss-merge-btn" onclick="ssMergeCells()">Merge</button>
             <button class="ss-toolbar-btn" id="ss-unmerge-btn" onclick="ssUnmergeCells()" style="display:none;color:#c44">Unmerge</button>
@@ -8375,7 +8390,11 @@ function normalizeSpreadsheetWorkbook(value) {
       for (const [cellKey, cell] of cellEntries) {
         const match = /^(0|[1-9]\d*),(0|[1-9]\d*)$/.exec(cellKey);
         if (!match || !cell || typeof cell !== 'object' || Array.isArray(cell) ||
-            !Object.keys(cell).every(key => ['v', 'bg', 'tc', 'b', 'rs', 'cs'].includes(key))) {
+            // MB161-020: `cb` marks a checkbox. It has to be listed here as well
+            // as constructed below — the whitelist is checked against the INPUT,
+            // so a cell carrying a key this does not name is refused outright
+            // and the project quarantines on save.
+            !Object.keys(cell).every(key => ['v', 'bg', 'tc', 'b', 'rs', 'cs', 'cb'].includes(key))) {
           throw new Error('spreadsheets contains an invalid cell');
         }
         const row = Number(match[1]);
@@ -8406,12 +8425,18 @@ function normalizeSpreadsheetWorkbook(value) {
             row + rowSpan > rows || col + colSpan > cols) {
           throw new Error('spreadsheets contains an invalid merged-cell span');
         }
+        if (cell.cb !== undefined && typeof cell.cb !== 'boolean') {
+          throw new Error('spreadsheets contains an invalid checkbox flag');
+        }
         const normalizedCell = {
           v: text,
           bg: optionalColor(cell.bg, 'cell background'),
           tc: optionalColor(cell.tc, 'cell text color'),
           b: !!cell.b,
         };
+        // MB161-020: only stored when set, so a workbook full of ordinary cells
+        // does not grow by a field per cell against the 600 KB budget.
+        if (cell.cb) normalizedCell.cb = true;
         if (rowSpan > 1) normalizedCell.rs = rowSpan;
         if (colSpan > 1) normalizedCell.cs = colSpan;
         cells[cellKey] = normalizedCell;
@@ -9839,6 +9864,12 @@ function ssRenderGrid() {
       if (editing) {
         const iv = _ssEditInitChar!==null ? _ssEditInitChar : (cell.v||'');
         html += `<div class="ss-cell-input" id="ss-inp" contenteditable="true" spellcheck="false" onkeydown="ssCellKey(event)" oninput="ssCellInput(event)" onblur="ssCommitEdit()" onmousedown="event.stopPropagation()" ondblclick="event.stopPropagation()" onpaste="(function(e){e.preventDefault();var el=e.currentTarget;var t=(e.clipboardData||window.clipboardData).getData('text/plain');var s=window.getSelection();var selected=s&&el.contains(s.anchorNode)&&el.contains(s.focusNode)?s.toString().length:0;var room=Math.max(0,MAX_SPREADSHEET_CELL_CHARS-(el.textContent.length-selected));if(t.length>room){showToast('Paste was not inserted. A spreadsheet cell can contain up to 50,000 characters.','warning');return;}document.execCommand('insertText',false,t);})(event)">${escHtml(iv)}</div>`;
+      } else if (cell.cb) {
+        // MB161-020: the value is still the string TRUE or FALSE — that is what
+        // Google stores and what a push sends back. Only the drawing changes.
+        html += `<div class="ss-cell-inner ss-cell-check"><span class="ss-check${
+          _ssIsChecked(cell.v) ? ' ss-check-on' : ''}" data-cb="1">${
+          _ssIsChecked(cell.v) ? '&#10003;' : ''}</span></div>`;
       } else {
         html += `<div class="ss-cell-inner">${escHtml(cell.v||'')}</div>`;
       }
@@ -9910,6 +9941,7 @@ function ssUpdateToolbar() {
   const fb = document.getElementById('ss-formula-bar');
   if (fb && document.activeElement !== fb) fb.value = cell.v || '';
   document.getElementById('ss-btn-bold')?.classList.toggle('ss-active', !!cell.b);
+  document.getElementById('ss-check-btn')?.classList.toggle('ss-active', !!cell.cb);
   // Show Merge always; show Unmerge when on a merged cell
   const isMerged = (cell.rs > 1 || cell.cs > 1);
   const mergeBtn = document.getElementById('ss-merge-btn');
@@ -10421,6 +10453,56 @@ function ssRenderActivityBar() {
 
   bar.style.display = 'flex';
   _ssApplyActivityPanelState();
+}
+
+// ── MB161-020: checkboxes ───────────────────────────────────────────────────
+//
+// A Google checkbox is a validation rule, not a value: the cell holds the
+// string TRUE or FALSE and Google draws a box over it. That is why an imported
+// checkbox column arrived reading "FALSE" all the way down.
+//
+// The app keeps the same arrangement rather than inventing a boolean cell type.
+// The value stays TRUE/FALSE text, so a push needs no special case, CSV export
+// stays meaningful, and a cell that loses its checkbox is still readable.
+function _ssIsChecked(value) {
+  return String(value ?? '').trim().toUpperCase() === 'TRUE';
+}
+
+function ssToggleCheckbox(r, c) {
+  const sheet = ssActiveSheet(); if (!sheet) return;
+  const key = ssKey(r, c);
+  const cell = sheet.cells[key];
+  if (!cell?.cb) return;
+  ssPushUndo();
+  sheet.cells[key] = { ...cell, v: _ssIsChecked(cell.v) ? 'FALSE' : 'TRUE' };
+  ssSave(); ssRenderGrid(); ssUpdateToolbar();
+}
+
+// Turn the selection into checkboxes, or back into ordinary cells. Anything
+// that was not already TRUE/FALSE starts unticked rather than being guessed at.
+function ssToggleCheckboxCells() {
+  const sheet = ssActiveSheet(); if (!sheet) return;
+  const r1=Math.min(_ssSelR,_ssSelR2), r2=Math.max(_ssSelR,_ssSelR2);
+  const c1=Math.min(_ssSelC,_ssSelC2), c2=Math.max(_ssSelC,_ssSelC2);
+  let anyPlain = false;
+  for (let r=r1;r<=r2;r++) for (let c=c1;c<=c2;c++) {
+    if (!sheet.cells[ssKey(r,c)]?.cb) anyPlain = true;
+  }
+  ssPushUndo();
+  for (let r=r1;r<=r2;r++) for (let c=c1;c<=c2;c++) {
+    const key = ssKey(r,c);
+    const cell = sheet.cells[key] || { v:'', bg:'', tc:'', b:false };
+    if (anyPlain) {
+      const value = _ssIsChecked(cell.v) ? 'TRUE' : 'FALSE';
+      sheet.cells[key] = { ...cell, v: value, cb: true };
+    } else {
+      // Leaving TRUE/FALSE behind is the honest inverse: the value was never
+      // anything else, and clearing it would silently drop what was ticked.
+      const { cb, ...rest } = cell;
+      sheet.cells[key] = rest;
+    }
+  }
+  ssSave(); ssRenderGrid(); ssUpdateToolbar();
 }
 
 function ssMergeCells() {
@@ -10965,9 +11047,12 @@ async function ssPullFromGoogle(projectId) {
           const bg = _ssImportColor(format?.bg);
           const tc = _ssImportColor(format?.tc);
           const bold = format?.b === true;
+          const checkbox = format?.cb === true;
           const text = String(value ?? '');
-          if (text === '' && !bg && !tc && !bold) return;
-          cells[r + ',' + c] = { v: text, bg, tc, b: bold };
+          if (text === '' && !bg && !tc && !bold && !checkbox) return;
+          const built = { v: text, bg, tc, b: bold };
+          if (checkbox) built.cb = true;
+          cells[r + ',' + c] = built;
         });
       });
       _ssApplyImportedMerges(cells, remote.merges, rowsThatFit, colsThatFit);
@@ -11034,7 +11119,13 @@ function _ssPendingPush(sheet, tab, link) {
     if (cell.row >= link.rows || cell.column >= link.columns) continue;
     const was = checkpoint[key] ?? '';
     if (cell.value === was) continue;               // unchanged since the pull
-    cells.push({ a1: _ssA1(cell.row, cell.column), value: cell.value, expected: was });
+    cells.push({
+      a1: _ssA1(cell.row, cell.column), value: cell.value, expected: was,
+      // MB161-020: main needs to know, because a ticked box written verbatim
+      // lands in Google as the text "TRUE" and fails the checkbox's own
+      // validation. How it compensates is main's business, not the renderer's.
+      checkbox: sheet.cells?.[key]?.cb === true,
+    });
   }
   // Cleared in the app: present at the last pull, gone now.
   for (const [key, was] of Object.entries(checkpoint)) {
@@ -11282,8 +11373,11 @@ async function ssImportBuildProject(name, sheets, extraBytes) {
         const bg = _ssImportColor(format?.bg);
         const tc = _ssImportColor(format?.tc);
         const bold = format?.b === true;
-        if (val !== '' || bg || tc || bold) {
-          cells[ri + ',' + ci] = { v: val, bg, tc, b: bold };
+        const checkbox = format?.cb === true;
+        if (val !== '' || bg || tc || bold || checkbox) {
+          const built = { v: val, bg, tc, b: bold };
+          if (checkbox) built.cb = true;
+          cells[ri + ',' + ci] = built;
         }
       });
     });
@@ -11419,6 +11513,16 @@ function ssGridMouseDown(e) {
   if (_ssEditCell && _ssEditCell.r===r && _ssEditCell.c===c) return;
   // Leaving a different cell — commit it first
   if (_ssEditCell) ssCommitEdit();
+
+  // MB161-020: a click on the box itself ticks it, the way it does in Google.
+  // Checked against the box rather than the cell so there is still somewhere to
+  // click to select a checkbox cell without changing it.
+  if (e.target.dataset?.cb === '1') {
+    _ssSelR=r;_ssSelC=c;_ssSelR2=r;_ssSelC2=c;
+    ssToggleCheckbox(r, c);
+    e.preventDefault();
+    return;
+  }
 
   // Detect the double-click here rather than relying on the browser's dblclick
   // event. Selecting a cell rebuilds the whole table, so the two clicks of a
@@ -11910,6 +12014,11 @@ document.addEventListener('keydown', function(e) {
   else if (e.key==='ArrowDown')  _ssSelR=Math.min(s.rows-1,_ssSelR+1);
   else if (e.key==='ArrowLeft')  _ssSelC=Math.max(0,_ssSelC-1);
   else if (e.key==='ArrowRight') _ssSelC=Math.min(s.cols-1,_ssSelC+1);
+  // MB161-020: on a checkbox cell, Enter and Space tick it rather than opening
+  // a text editor over the word TRUE. Space is what Google uses.
+  else if ((e.key==='Enter'||e.key===' ') && s.cells[ssKey(_ssSelR,_ssSelC)]?.cb) {
+    e.preventDefault(); ssToggleCheckbox(_ssSelR,_ssSelC); return;
+  }
   else if (e.key==='Enter'||e.key==='F2') { ssStartEdit(_ssSelR,_ssSelC,null); return; }
   else if (e.key==='Delete'||e.key==='Backspace') {
     ssPushUndo();

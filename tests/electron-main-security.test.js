@@ -1546,3 +1546,37 @@ test('MB161-018: white and black map to "no colour", not to a fill', () => {
   // Out-of-range floats are clamped rather than producing '#1ff00-8'.
   assert.equal(bg({ red: 2, green: -1, blue: 0.5 }), '#ff0080');
 });
+
+test('MB161-020: a checkbox is written as USER_ENTERED, everything else RAW', () => {
+  const push = main.slice(main.indexOf("_secureHandle('google-sheet-push'"),
+                          main.indexOf('function _googleRange'));
+  // RAW stores exactly what it is given, so a ticked box would arrive as the
+  // string "TRUE" in a cell whose validation expects the boolean, and Google
+  // would mark it invalid — the app corrupting the sheet it mirrors.
+  assert.match(push, /valueInputOption: 'USER_ENTERED'/);
+  assert.match(push, /valueInputOption: 'RAW'/);
+  assert.match(push, /data: plain\.map/, 'the RAW batch carries only non-checkboxes');
+  assert.match(push, /data: boxes\.map/, 'and the parsed batch only checkboxes');
+
+  // The opt-out of RAW is the dangerous part: RAW is what stops a cell starting
+  // with `=` or `+` being reinterpreted as a formula. So it is not enough for
+  // the caller to claim a cell is a checkbox — the value must actually be one.
+  assert.match(push, /cell\.checkbox === true &&/);
+  assert.match(push, /\['TRUE', 'FALSE'\]\.includes\(String\(cell\.value\)\.trim\(\)\.toUpperCase\(\)\)/);
+  assert.match(push, /checkbox: entry\.checkbox === true/,
+    'and the flag is taken strictly, never for truthiness');
+});
+
+test('MB161-020: the read asks Google for the validation that draws the box', () => {
+  const read = main.slice(main.indexOf("_secureHandle('google-sheet-read'"),
+                          main.indexOf('function _googleColorHex'));
+  // A Google checkbox is a validation rule; the cell value is just TRUE/FALSE.
+  // Without this in the mask the tick is simply absent from the response, which
+  // is why an imported checkbox column arrived reading "FALSE" all the way down.
+  assert.match(read, /dataValidation\(condition\(type\)\)/);
+  assert.match(read, /cell\.dataValidation\?\.condition\?\.type === 'BOOLEAN'/);
+  assert.match(read, /formatLine\.push\(\{ bg, tc, b: bold, cb: checkbox \}\)/);
+  // An unticked box is content, so it has to count towards the used extent or
+  // an empty checkbox column would be trimmed away entirely.
+  assert.match(read, /bg \|\| tc \|\| bold \|\| checkbox/);
+});
