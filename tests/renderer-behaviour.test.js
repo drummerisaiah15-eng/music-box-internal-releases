@@ -1477,3 +1477,28 @@ test('MB161-023: background work yields, and never queues behind a person', asyn
   assert.equal(await context.acquire(0), false, 'a zero wait gives up immediately');
   assert.ok(Date.now() - started < 100, 'and does not sleep first');
 });
+
+test('MB161-028: removing a checkbox does not leave "FALSE" behind', () => {
+  const context = vm.createContext({ Object, String });
+  vm.runInContext(`
+    ${declaration('_ssIsChecked')}
+    // The removal branch of ssToggleCheckboxCells, isolated.
+    globalThis.remove = cell => {
+      const { cb, ...rest } = cell;
+      return _ssIsChecked(cell.v) ? rest : { ...rest, v: '' };
+    };
+  `, context);
+
+  // Unticked: the word FALSE is litter somebody then deletes by hand.
+  const off = context.remove({ v: 'FALSE', bg: '', tc: '', b: false, cb: true });
+  assert.equal(off.v, '');
+  assert.equal(off.cb, undefined);
+  // Ticked: that genuinely means something, so it survives losing its box.
+  const on = context.remove({ v: 'TRUE', bg: '', tc: '', b: false, cb: true });
+  assert.equal(on.v, 'TRUE');
+  assert.equal(on.cb, undefined);
+  // Formatting is never collateral damage either way.
+  const styled = context.remove({ v: 'FALSE', bg: '#cccccc', tc: '', b: true, cb: true });
+  assert.equal(styled.bg, '#cccccc');
+  assert.equal(styled.b, true);
+});

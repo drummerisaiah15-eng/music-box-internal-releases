@@ -922,8 +922,11 @@
       border-collapse:collapse;table-layout:fixed;
       font-size:13px;font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text',sans-serif;
     }
+    /* MB161-028: the same weight of gridline Google draws. #d4d4d4 all but
+       disappeared against the pale fills a schedule is made of, so rows were
+       hard to follow across. */
     #ss-grid th, #ss-grid td {
-      border:1px solid #d4d4d4;padding:0;position:relative;overflow:hidden;
+      border:1px solid #bdc1c6;padding:0;position:relative;overflow:hidden;
     }
     #ss-grid th { white-space:nowrap;height:26px; }
     /* A schedule is read by scanning rows and columns. Letting one long note
@@ -10527,10 +10530,13 @@ function ssToggleCheckboxCells() {
       const value = _ssIsChecked(cell.v) ? 'TRUE' : 'FALSE';
       sheet.cells[key] = { ...cell, v: value, cb: true };
     } else {
-      // Leaving TRUE/FALSE behind is the honest inverse: the value was never
-      // anything else, and clearing it would silently drop what was ticked.
+      // MB161-028: removing a checkbox must not leave "FALSE" sitting in the
+      // cell. I originally kept the text on the grounds that it was the honest
+      // inverse, but an unticked box carries no information — the word FALSE in
+      // a schedule is just litter somebody then has to delete by hand. A TICKED
+      // box does mean something, so that value is kept.
       const { cb, ...rest } = cell;
-      sheet.cells[key] = rest;
+      sheet.cells[key] = _ssIsChecked(cell.v) ? rest : { ...rest, v: '' };
     }
   }
   ssSave(); ssRenderGrid(); ssUpdateToolbar();
@@ -11081,6 +11087,7 @@ async function _ssGoogleImport(titles) {
       rows: sheet.rows,
       formats: sheet.formats,
       merges: sheet.merges,
+      colWidths: sheet.columnWidths,
     })), linkBytes, (builtSheets) => {
       const tabs = {};
       builtSheets.forEach((sheet, i) => {
@@ -11566,9 +11573,17 @@ async function ssImportBuildProject(name, sheets, extraBytes, linkFor) {
       });
     });
     _ssApplyImportedMerges(cells, s.merges, storedRows, storedCols);
-    // Compute column widths: estimate based on longest content per column
+    // MB161-028: use the real column widths when they came with the sheet.
+    //
+    // Estimating from the longest value is a reasonable guess and wrong every
+    // time — one long note in a column made that column far wider than the
+    // sheet it was copied from, so an import never lined up with the original.
+    // A CSV genuinely has no widths, so the estimate stays as the fallback.
+    const givenWidths = Array.isArray(s.colWidths) ? s.colWidths : null;
     const colWidths = [];
     for (let c = 0; c < numCols; c++) {
+      const given = Number(givenWidths?.[c]);
+      if (Number.isFinite(given) && given > 0) { colWidths.push(Math.min(600, Math.max(24, Math.round(given)))); continue; }
       let maxLen = 4;
       rows2d.forEach(r => { if (r[c]) maxLen = Math.max(maxLen, String(r[c]).length); });
       colWidths.push(Math.min(240, Math.max(70, maxLen * 8)));
@@ -12193,9 +12208,26 @@ function _ssBindZoom() {
   wrap.addEventListener('wheel', (e) => {
     if (!e.ctrlKey) return;             // an ordinary two-finger scroll
     e.preventDefault();                  // requires passive:false, below
+    // MB161-028: keep the point under the pointer where it is.
+    //
+    // Scaling alone anchors everything at the top-left corner, so pinching to
+    // look closely at Thursday afternoon threw Thursday afternoon off-screen
+    // and left you scrolling back to it. The fix is to convert the cursor
+    // position into unscaled content coordinates, apply the zoom, and then
+    // restore the scroll so that same content point sits under the cursor
+    // again — which is what every map and spreadsheet does.
+    const rect = wrap.getBoundingClientRect();
+    const pointerX = e.clientX - rect.left;
+    const pointerY = e.clientY - rect.top;
+    const before = _ssZoom;
     // deltaY is roughly proportional to the pinch, so scaling multiplicatively
     // keeps the gesture feeling the same at 50% as at 200%.
     ssSetZoom(_ssZoom * Math.exp(-e.deltaY / 180));
+    if (_ssZoom === before) return;      // clamped at a limit: nothing moved
+    const contentX = (wrap.scrollLeft + pointerX) / before;
+    const contentY = (wrap.scrollTop + pointerY) / before;
+    wrap.scrollLeft = contentX * _ssZoom - pointerX;
+    wrap.scrollTop = contentY * _ssZoom - pointerY;
   }, { passive: false });
   ssLoadZoom();
 }

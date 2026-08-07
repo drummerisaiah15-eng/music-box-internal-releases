@@ -1655,3 +1655,27 @@ test('MB161-027: a pending deletion is forgotten only once it is buried', () => 
   assert.match(commit, /if \(record\?\._deleted\) _ssDeletedProjectIds\.delete/,
     'and only for ids the written index actually tombstones');
 });
+
+test('MB161-028: zoom keeps the point under the pointer', () => {
+  // Scaling alone anchors at the top-left, so pinching to look closely at
+  // Thursday afternoon threw Thursday afternoon off screen.
+  const bind = namedFunctionSource('_ssBindZoom');
+  assert.match(bind, /const contentX = \(wrap\.scrollLeft \+ pointerX\) \/ before/,
+    'the cursor is converted to unscaled content coordinates first');
+  assert.match(bind, /wrap\.scrollLeft = contentX \* _ssZoom - pointerX/,
+    'and the scroll is restored so that point lands back under the cursor');
+  assert.match(bind, /if \(_ssZoom === before\) return;/,
+    'clamped at a limit nothing moved, so nothing should be scrolled');
+  // Measured from the element, not the window: the grid is not at the origin.
+  assert.match(bind, /wrap\.getBoundingClientRect\(\)/);
+});
+
+test('MB161-028: imported columns use Google’s widths, not a guess', () => {
+  const build = namedFunctionSource('ssImportBuildProject');
+  assert.match(build, /const givenWidths = Array\.isArray\(s\.colWidths\) \? s\.colWidths : null/);
+  assert.match(build, /if \(Number\.isFinite\(given\) && given > 0\)/,
+    'a real width wins');
+  // A CSV has no widths at all, so the estimate has to survive as the fallback.
+  assert.match(build, /maxLen \* 8/);
+  assert.match(namedFunctionSource('_ssGoogleImport'), /colWidths: sheet\.columnWidths/);
+});

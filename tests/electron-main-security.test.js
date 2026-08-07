@@ -1605,3 +1605,15 @@ test('MB161-022: both colour representations are actually requested', () => {
   assert.match(read, /backgroundColor,backgroundColorStyle/);
   assert.match(read, /foregroundColor,foregroundColorStyle/);
 });
+
+test('MB161-028: column widths are requested and bounded', () => {
+  const read = main.slice(main.indexOf("_secureHandle('google-sheet-read'"),
+                          main.indexOf('function _googleColorHex'));
+  assert.match(read, /columnMetadata\(pixelSize\)/, 'the mask asks for the real widths');
+  assert.match(read, /columnMetadata\.slice\(0, usedCols\)/,
+    'and only for the columns actually kept');
+  // A hidden column is 0 pixels in Google and would vanish here; a pathological
+  // width should not be able to make one column the entire grid.
+  assert.match(read, /Math\.min\(Math\.max\(Math\.round\(pixels\), 24\), 600\)/);
+  assert.match(read, /columnWidths,/, 'and they are returned to the renderer');
+});

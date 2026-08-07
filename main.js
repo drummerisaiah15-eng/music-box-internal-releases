@@ -2358,7 +2358,7 @@ _secureHandle('google-sheet-read', async (_, request) => {
     // string TRUE or FALSE — which is why an imported checkbox column arrived as
     // a column reading "FALSE". The box itself is the validation rule, so
     // without this the tick is simply not in the response.
-    'data(rowData(values(formattedValue,dataValidation(condition(type)),effectiveFormat(backgroundColor,backgroundColorStyle,textFormat(bold,foregroundColor,foregroundColorStyle))))))',
+    'data(rowData(values(formattedValue,dataValidation(condition(type)),effectiveFormat(backgroundColor,backgroundColorStyle,textFormat(bold,foregroundColor,foregroundColorStyle)))),columnMetadata(pixelSize)))',
   ].join(',');
   let payload;
   try {
@@ -2437,9 +2437,26 @@ _secureHandle('google-sheet-read', async (_, request) => {
     if (merges.length >= 5000) break;
   }
 
+  // MB161-028: Google's actual column widths, in pixels.
+  //
+  // The importer used to guess a width from the longest value in each column.
+  // That is a reasonable guess and it is wrong every time: it made columns
+  // wider than the sheet they came from wherever one cell held a long note, so
+  // an imported schedule never lined up with the original. Google reports the
+  // real widths, so there is no reason to estimate.
+  const columnMetadata = Array.isArray(sheet?.data?.[0]?.columnMetadata)
+    ? sheet.data[0].columnMetadata
+    : [];
+  const columnWidths = columnMetadata.slice(0, usedCols).map(entry => {
+    const pixels = Number(entry?.pixelSize);
+    // Bounded: a hidden column is 0 in Google and would vanish here, and a
+    // pathological width should not be able to make one column the whole grid.
+    return Number.isFinite(pixels) && pixels > 0 ? Math.min(Math.max(Math.round(pixels), 24), 600) : 0;
+  });
+
   return {
     ok: true, spreadsheetId, title, range,
-    rows: trimmedRows, formats: trimmedFormats, merges,
+    rows: trimmedRows, formats: trimmedFormats, merges, columnWidths,
     filledCells: cells,
   };
 });
