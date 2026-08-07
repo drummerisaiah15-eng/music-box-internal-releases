@@ -88,7 +88,7 @@ function splitApi() {
       normIndex: value => normalizeSpreadsheetIndex(value),
       normProject: doc => normalizeSpreadsheetProject(doc),
       projectAsDoc: (wb, id) => _ssProjectAsDoc(wb, id),
-      indexAfter: (idx, base, next, at) => _ssIndexAfterEdit(idx, base, next, at),
+      indexAfter: (idx, base, next, at, deleted) => _ssIndexAfterEdit(idx, base, next, at, deleted),
     };
   `, context);
   return {
@@ -101,7 +101,7 @@ function splitApi() {
     normIndex: v => JSON.parse(JSON.stringify(context.api.normIndex(v))),
     normProject: d => JSON.parse(JSON.stringify(context.api.normProject(d))),
     projectAsDoc: (wb, id) => JSON.parse(JSON.stringify(context.api.projectAsDoc(wb, id) ?? null)),
-    indexAfter: (idx, base, next, at) => JSON.parse(JSON.stringify(context.api.indexAfter(idx, base, next, at))),
+    indexAfter: (idx, base, next, at, deleted) => JSON.parse(JSON.stringify(context.api.indexAfter(idx, base, next, at, deleted))),
     raw: context.api,
   };
 }
@@ -1355,4 +1355,50 @@ test('MB161-012: capacity is measured per project once storage is split', () => 
   const shared = context.api.level(workbook, 'p1');
   assert.equal(shared.cells.used, 12000, 'the old shape counts every project together');
   assert.equal(shared.fraction, 1);
+});
+
+test('MB161-027: a deletion survives a base that cannot show it', () => {
+  // The exact reported failure. _stageDirtySpreadsheetSave falls back to
+  // cloning the LIVE workbook when there is no durable snapshot, and that clone
+  // is taken after the project has already been spliced out. So the base and
+  // the result are identical, the diff sees no deletion, the index keeps
+  // listing the project, and the next reassemble brings it back — "I delete it
+  // and it returns when I switch tabs".
+  const api = splitApi();
+  const index = api.normIndex({
+    schema: 2, activeProject: 'p1',
+    projects: [{ id: 'p1', version: 1 }, { id: 'p2', version: 1 }],
+  });
+  const after = legacyWorkbook([project('p1', [sheet('s1')])]);
+
+  // Base === result: p2 is already gone from both.
+  const inferred = api.indexAfter(index, after, after, AT);
+  assert.equal(inferred.projects.find(p => p.id === 'p2')._deleted, undefined,
+    'the diff genuinely cannot see it — this is the bug, reproduced');
+
+  // Told explicitly, it is buried regardless of what the base looks like.
+  const explicit = api.indexAfter(index, after, after, AT, ['p2']);
+  const p2 = explicit.projects.find(p => p.id === 'p2');
+  assert.equal(p2._deleted, true);
+  assert.equal(p2._deletedAt, AT);
+  assert.equal(p2.version, 2, 'and advances past the live record so the merge picks it');
+});
+
+test('MB161-027: an explicit deletion never buries a project that still exists', () => {
+  // A stale id in the pending set must not be able to delete a project that has
+  // since been re-created, or the safety net becomes the hazard.
+  const api = splitApi();
+  const index = api.normIndex({ schema: 2, activeProject: 'p1', projects: [{ id: 'p1', version: 1 }] });
+  const live = legacyWorkbook([project('p1', [sheet('s1')])]);
+  const next = api.indexAfter(index, live, live, AT, ['p1']);
+  assert.equal(next.projects.find(p => p.id === 'p1')._deleted, undefined,
+    'present in the result wins over any claim that it was deleted');
+});
+
+test('MB161-027: a junk id in the pending set cannot corrupt the index', () => {
+  const api = splitApi();
+  const index = api.normIndex({ schema: 2, activeProject: 'p1', projects: [{ id: 'p1', version: 1 }] });
+  const after = legacyWorkbook([project('p1', [sheet('s1')])]);
+  const next = api.indexAfter(index, after, after, AT, ['', 'not a valid id!', '../escape']);
+  assert.deepEqual(next.projects.map(p => p.id), ['p1'], 'nothing else was added');
 });

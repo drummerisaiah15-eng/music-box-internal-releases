@@ -7838,7 +7838,22 @@ function _ssProjectAsDoc(workbook, projectId) {
 // finished downloading. Comparing against the base makes a deletion an act
 // somebody performed rather than an inference from absence — the same rule the
 // cell operations already follow.
-function _ssIndexAfterEdit(currentIndex, dirtyBase, dirty, at = new Date().toISOString()) {
+// MB161-027: the ids somebody deleted in this session, remembered until their
+// tombstones are actually written.
+//
+// The comment above says a deletion should be "an act somebody performed rather
+// than an inference from absence", and then the code inferred it — by diffing
+// the result against a base. That works only if the base predates the deletion,
+// and there is a path where it does not: when no durable snapshot exists the
+// base falls back to a clone of the LIVE workbook, which is captured after the
+// project has already been removed. Base equals result, nothing looks deleted,
+// the index keeps listing it, and the next reassemble brings it back — which is
+// exactly what "I delete it and it returns when I switch tabs" is.
+//
+// Holding the ids makes the deletion survive whatever the base happens to be.
+const _ssDeletedProjectIds = new Set();
+
+function _ssIndexAfterEdit(currentIndex, dirtyBase, dirty, at = new Date().toISOString(), explicitlyDeleted = []) {
   const index = currentIndex?.schema === SPREADSHEET_INDEX_SCHEMA
     ? _cloneJson(currentIndex)
     : { schema: SPREADSHEET_INDEX_SCHEMA, projects: [] };
@@ -7865,8 +7880,11 @@ function _ssIndexAfterEdit(currentIndex, dirtyBase, dirty, at = new Date().toISO
     }
   }
 
-  for (const id of baseIds) {
+  // An id deleted on purpose is tombstoned even if the base cannot show it.
+  const goneIds = new Set([...baseIds, ...explicitlyDeleted]);
+  for (const id of goneIds) {
     if (nextIds.has(id)) continue;
+    if (!SPREADSHEET_PROJECT_ID_PATTERN.test(id)) continue;
     // Present when this session began and gone now: somebody deleted it.
     const existing = records.get(id) || { id, version: 1 };
     records.set(id, {
@@ -8054,7 +8072,7 @@ async function _ssCommitSplitWorkbook(dirtyBase, dirty) {
   const currentIndex = _ssStorageMode(storedIndex) === 'split'
     ? normalizeSpreadsheetIndex(storedIndex)
     : null;
-  const nextIndex = _ssIndexAfterEdit(currentIndex, dirtyBase, dirty, at);
+  const nextIndex = _ssIndexAfterEdit(currentIndex, dirtyBase, dirty, at, [..._ssDeletedProjectIds]);
   if (JSON.stringify(nextIndex) !== JSON.stringify(currentIndex)) {
     await _serializeKeyMutation('spreadsheets', async () => {
       await _commitEncryptedSnapshot('spreadsheets', JSON.stringify(nextIndex), nextIndex, {
@@ -8063,6 +8081,13 @@ async function _ssCommitSplitWorkbook(dirtyBase, dirty) {
       });
     });
     written.push('spreadsheets');
+  }
+
+  // Only forget a deletion once its tombstone is in the index that was written.
+  // Clearing on attempt rather than on success is how a failed write turns into
+  // a project quietly coming back.
+  for (const record of nextIndex.projects || []) {
+    if (record?._deleted) _ssDeletedProjectIds.delete(String(record.id));
   }
 
   if (_syncReady && _syncBootstrapComplete) {
@@ -10626,6 +10651,9 @@ async function ssDeleteProject(id) {
   if (_ssData.projects.length <= 1) { showToast('Cannot delete the only project.','warning'); return; }
   if (!confirm(`Delete project "${proj.name}" and all its sheets?`)) return;
   const idx = _ssData.projects.findIndex(p=>p.id===targetId);
+  // Recorded BEFORE the splice, so the deletion never depends on the diff
+  // being able to see it.
+  _ssDeletedProjectIds.add(String(targetId));
   _ssData.projects.splice(idx, 1);
   _ssData.activeProject = _ssData.projects[Math.max(0,idx-1)].id;
   _ssSelR=0;_ssSelC=0;_ssSelR2=0;_ssSelC2=0;_ssEditCell=null;

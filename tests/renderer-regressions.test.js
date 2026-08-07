@@ -1634,3 +1634,24 @@ test('MB161-026: an import is one commit, so it cannot half-exist', () => {
   assert.ok(push > -1 && store > push,
     'the link is part of the record before the single write that stores it');
 });
+
+test('MB161-027: deleting records the id before it removes the project', () => {
+  // Order matters. Recording after the splice would be recording it from the
+  // same state that already cannot see it.
+  const del = namedFunctionSource('ssDeleteProject');
+  const record = del.indexOf('_ssDeletedProjectIds.add');
+  const splice = del.indexOf('projects.splice');
+  assert.ok(record > -1 && splice > -1 && record < splice);
+});
+
+test('MB161-027: a pending deletion is forgotten only once it is buried', () => {
+  // Clearing the set on attempt rather than on success is how a failed index
+  // write turns into a project quietly returning.
+  const commit = namedFunctionSource('_ssCommitSplitWorkbook');
+  assert.match(commit, /_ssIndexAfterEdit\(currentIndex, dirtyBase, dirty, at, \[\.\.\._ssDeletedProjectIds\]\)/);
+  const clear = commit.indexOf('_ssDeletedProjectIds.delete');
+  const write = commit.indexOf("written.push('spreadsheets')");
+  assert.ok(clear > -1 && write > -1 && clear > write, 'cleared after the write, not before');
+  assert.match(commit, /if \(record\?\._deleted\) _ssDeletedProjectIds\.delete/,
+    'and only for ids the written index actually tombstones');
+});
