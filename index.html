@@ -10653,6 +10653,31 @@ function ssDeleteProject(id) {
 let _ssGoogleLookup = null;
 let _ssGoogleBusy = false;
 
+// MB161-023: one Google request at a time, but never a silent no-op.
+//
+// This flag used to be checked with a bare `if (busy) return`, which was fine
+// while the only things that set it were buttons — a person cannot press two at
+// once. Automatic syncing broke that assumption: a background check can hold the
+// flag for as long as the network takes, and during that window pressing "Look
+// up tabs" did nothing and said nothing. Reported as "it worked a few seconds
+// ago and now it doesn't", which is exactly what a silent guard feels like.
+//
+// So an action somebody actually took waits for its turn and says so, and only
+// gives up after a bounded wait. Background work still yields immediately —
+// it has nothing to prove and will run again shortly.
+async function _ssGoogleAcquire(waitMs = 10000) {
+  const started = Date.now();
+  while (_ssGoogleBusy) {
+    // `>=`, not `>`: with a zero wait the elapsed time is also zero on the first
+    // pass, so `>` slept a full tick before giving up — which is precisely what
+    // a caller asking not to wait was asking not to do.
+    if (Date.now() - started >= waitMs) return false;
+    await new Promise(resolve => setTimeout(resolve, 150));
+  }
+  _ssGoogleBusy = true;
+  return true;
+}
+
 function _googleSheets() {
   return window.electronGoogleSheets || null;
 }
@@ -10795,9 +10820,15 @@ function ssCloseGoogleImport() {
 async function ssGoogleLookup() {
   const el = document.getElementById('ss-google-result');
   const url = (document.getElementById('ss-google-url')?.value || '').trim();
-  if (!el || _ssGoogleBusy) return;
-  _ssGoogleBusy = true;
+  if (!el) return;
+  // A previous failure left this red; a new attempt should not look failed.
+  el.style.color = '';
   el.textContent = 'Looking up…';
+  if (!await _ssGoogleAcquire()) {
+    el.textContent = 'Still finishing an earlier check of Google. Try again in a moment.';
+    el.style.color = '#c0392b';
+    return;
+  }
   try {
     const info = await _googleSheets().describe({ url });
     _ssGoogleLookup = info;
@@ -10853,15 +10884,21 @@ function ssGoogleImportAllTabs() {
 // is written, so a failure on the fourth tab leaves no half-built project
 // behind — the same all-or-nothing the file importer already gives.
 async function _ssGoogleImport(titles) {
-  if (!_ssGoogleLookup || _ssGoogleBusy) return;
+  if (!_ssGoogleLookup) return;
   const wanted = (Array.isArray(titles) ? titles : []).filter(Boolean);
   if (!wanted.length) return;
   if (wanted.length > MAX_SPREADSHEET_SHEETS) {
     showToast(`A project can hold ${MAX_SPREADSHEET_SHEETS} sheets. That spreadsheet has ${wanted.length} tabs.`, 'warning');
     return;
   }
-  _ssGoogleBusy = true;
   const el = document.getElementById('ss-google-result');
+  if (!await _ssGoogleAcquire()) {
+    if (el) {
+      el.textContent = 'Still finishing an earlier check of Google. Try again in a moment.';
+      el.style.color = '#c0392b';
+    }
+    return;
+  }
   try {
     const read = [];
     for (const title of wanted) {
@@ -11032,7 +11069,8 @@ async function ssPullFromGoogle(projectId, options) {
   const silent = options?.silent === true;
   const project = (_ssData?.projects || []).find(p => p.id === projectId);
   const link = project?.googleLink;
-  if (!link || !_googleSheets() || _ssGoogleBusy) return false;
+  if (!link || !_googleSheets()) return false;
+  if (silent && _ssGoogleBusy) return false;   // background work never queues
   const linked = _ssLinkedSheets(project);
   if (!linked.length) {
     if (!silent) showToast('No sheet in this project is linked to a Google tab.', 'warning');
@@ -11042,7 +11080,10 @@ async function ssPullFromGoogle(projectId, options) {
   // away mid-word. Nothing is lost by waiting for the next round.
   if (_ssEditCell) return false;
 
-  _ssGoogleBusy = true;
+  if (!await _ssGoogleAcquire(silent ? 0 : 10000)) {
+    if (!silent) showToast('Still finishing an earlier check of Google. Try again in a moment.', 'warning');
+    return false;
+  }
   try {
     let changed = 0;
     let dropped = 0;
@@ -11206,6 +11247,10 @@ function ssStartAutoSync() {
 async function ssAutoSyncTick(force) {
   const project = (_ssData?.projects || []).find(p => p.id === _ssData?.activeProject);
   if (!project?.googleLink || !_googleSheets() || _ssGoogleBusy || _ssEditCell) return;
+  // Not while somebody is in the middle of importing: the modal owns the
+  // connection for as long as it is open, and a background check competing with
+  // it is what made "Look up tabs" feel broken.
+  if (!document.getElementById('ss-google-modal')?.classList.contains('hidden')) return;
   if (_ssBlockedWorkbook || _ssAwaitingAuthority) return;
   const now = Date.now();
   if (!force && now - _ssAutoSyncLastAt < SS_AUTO_SYNC_MIN_GAP_MS) return;

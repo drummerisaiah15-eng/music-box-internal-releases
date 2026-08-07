@@ -1425,3 +1425,55 @@ test('MB161-021: an absent base is treated as empty, not as "changed"', () => {
     'a cell only the app has is left alone');
   assert.equal(merge('', null, 'typed here').take, 'local');
 });
+
+// ── MB161-023: a background sync must not silently disable the buttons ──────
+
+test('MB161-023: a user action waits its turn instead of vanishing', async () => {
+  // Reported as "Look up tabs worked a few seconds ago and now it doesn't."
+  // The flag that serialises Google requests was checked with a bare
+  // `if (busy) return`. That was fine while only buttons set it — a person
+  // cannot press two at once — but an automatic background check can hold it
+  // for as long as the network takes, and during that window the button did
+  // nothing AND said nothing.
+  const context = vm.createContext({ Date, Promise, setTimeout });
+  vm.runInContext(`
+    var _ssGoogleBusy = false;
+    ${declaration('_ssGoogleAcquire')}
+    globalThis.api = {
+      acquire: ms => _ssGoogleAcquire(ms),
+      hold: () => { _ssGoogleBusy = true; },
+      release: () => { _ssGoogleBusy = false; },
+      busy: () => _ssGoogleBusy,
+    };
+  `, context);
+
+  assert.equal(await context.api.acquire(1000), true, 'a free gate is taken at once');
+  assert.equal(context.api.busy(), true, 'and is held');
+
+  // Held by something else and never released: the caller gives up, bounded,
+  // rather than hanging on a promise that will not settle.
+  const started = Date.now();
+  assert.equal(await context.api.acquire(300), false);
+  assert.ok(Date.now() - started >= 250, 'it really waited rather than failing instantly');
+
+  // Released while waiting: the action proceeds, which is the whole point.
+  context.api.release();
+  context.api.hold();
+  setTimeout(() => context.api.release(), 120);
+  assert.equal(await context.api.acquire(3000), true, 'the wait resolves once the gate frees');
+});
+
+test('MB161-023: background work yields, and never queues behind a person', async () => {
+  // A background tick that waited would pile up behind an import and then fire
+  // a burst of reads the moment it finished. It has nothing to prove — it runs
+  // again in a few minutes.
+  const context = vm.createContext({ Date, Promise, setTimeout });
+  vm.runInContext(`
+    var _ssGoogleBusy = true;
+    ${declaration('_ssGoogleAcquire')}
+    globalThis.acquire = ms => _ssGoogleAcquire(ms);
+  `, context);
+  const started = Date.now();
+  assert.equal(await context.acquire(0), false, 'a zero wait gives up immediately');
+  assert.ok(Date.now() - started < 100, 'and does not sleep first');
+});
