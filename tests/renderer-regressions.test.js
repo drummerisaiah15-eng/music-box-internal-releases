@@ -1747,3 +1747,19 @@ test('MB161-032: completions record who, and unknown ones stay unknown', () => {
   assert.match(run, /if \(!item\.doneBy\) \{ unattributed \+= 1; return; \}/);
   assert.match(run, /have no name recorded/, 'and the count is shown rather than hidden');
 });
+
+test('MB161-033: every AI caller respects the monthly pause and records its spend', () => {
+  // The pause is only a pause if nothing can go around it. Staff Workload is
+  // the most expensive single call in the app — Sonnet, with up to 60,000
+  // characters of log behind it — and it shipped checking neither.
+  for (const fn of ['ssRunStaffWorkload']) {
+    const body = namedFunctionSource(fn);
+    assert.match(body, /if \(aiAtSpendLimit\(\)\)/, `${fn} checks the pause first`);
+    assert.match(body, /addAiSpend\(/, `${fn} records what it spent`);
+    const guard = body.indexOf('aiAtSpendLimit()');
+    const send = body.indexOf('_sendAiMessage(');
+    assert.ok(guard > -1 && send > guard, `${fn} checks BEFORE it spends`);
+  }
+  // And the estimate is shown, not just accumulated silently.
+  assert.match(namedFunctionSource('ssRunStaffWorkload'), /AI estimate: \$/);
+});

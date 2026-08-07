@@ -16872,6 +16872,16 @@ async function ssRunStaffWorkload() {
   const countsEl = document.getElementById('workload-counts');
   const button = document.getElementById('workload-run-btn');
   if (!out) return;
+  // MB161-033: this is the most expensive single call in the app — Sonnet, with
+  // up to 60,000 characters of log behind it — and it was the only AI caller
+  // that neither checked the monthly pause nor recorded what it spent. Both of
+  // those are the point of having a pause at all.
+  if (aiAtSpendLimit()) {
+    out.textContent =
+      `This Mac's estimated AI-use pause of $${AI_DEVICE_MONTHLY_PAUSE_USD} has been reached ` +
+      `for this month. It resets at the start of next month.`;
+    return;
+  }
   if (button) button.disabled = true;
   out.textContent = 'Reading the last 30 days…';
   if (countsEl) countsEl.textContent = '';
@@ -16969,8 +16979,14 @@ async function ssRunStaffWorkload() {
           `\nThe log entries:\n\n${digest}`,
       }],
     });
+    const spent = addAiSpend('claude-sonnet-4-6',
+      data?.usage?.input_tokens || 0, data?.usage?.output_tokens || 0);
     const text = (data?.content || []).map(part => part?.text || '').join('').trim();
     out.textContent = text || 'The analysis came back empty.';
+    if (countsEl) {
+      countsEl.textContent += ` · this Mac's AI estimate: $${spent.toFixed(2)} of ` +
+        `$${AI_DEVICE_MONTHLY_PAUSE_USD} this month`;
+    }
   } catch (error) {
     out.textContent = `Could not analyse the records: ${error?.message || error}`;
   } finally {
