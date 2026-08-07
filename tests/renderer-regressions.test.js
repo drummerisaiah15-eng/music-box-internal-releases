@@ -1771,3 +1771,33 @@ test('MB161-033: every AI caller respects the monthly pause and records its spen
   // And the estimate is shown, not just accumulated silently.
   assert.match(namedFunctionSource('ssRunStaffWorkload'), /AI estimate: \$/);
 });
+
+test('MB161-035: every page container is balanced and contains only itself', () => {
+  // The Daily Log form appeared on Settings, Spreadsheets and Staff Workload.
+  // Cause: an orphaned </div> left behind when I removed a modal by slicing on
+  // string indices, which closed `page-log` 376 characters in. Everything after
+  // it sat outside any page, so it rendered on all of them.
+  //
+  // The script parsed fine and every test passed, because nothing here was
+  // checking the HTML. This is that check: each page must close, and it must
+  // not swallow the next page.
+  const pages = [...source.matchAll(/<div id="(page-[a-z]+)" class="page">/g)]
+    .map(match => ({ id: match[1], at: match.index + match[0].length }));
+  assert.ok(pages.length >= 8, 'the page containers were found');
+
+  for (const page of pages) {
+    let depth = 1;
+    let end = -1;
+    for (const token of source.slice(page.at).matchAll(/<div\b|<\/div>/g)) {
+      depth += token[0].startsWith('<div') ? 1 : -1;
+      if (depth === 0) { end = page.at + token.index + token[0].length; break; }
+    }
+    assert.notEqual(end, -1, `${page.id} is never closed`);
+    const body = source.slice(page.at, end);
+    for (const other of pages) {
+      if (other.id === page.id) continue;
+      assert.ok(!body.includes(`<div id="${other.id}" class="page">`),
+        `${page.id} swallows ${other.id} — it is missing a closing tag`);
+    }
+  }
+});
