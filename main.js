@@ -1414,48 +1414,89 @@ async function _beginGoogleOAuth({ clientId, codeChallenge }) {
   return { ok: true };
 }
 
-function _googleTokenRequest(body) {
+// MB161-017: every Google call goes through Electron's `net`, not Node's
+// `https`.
+//
+// Node ships its own CA bundle and ignores the macOS keychain. Any machine
+// running TLS-inspecting software — parental controls, corporate filtering,
+// some antivirus — presents a certificate signed by a root CA that the system
+// trusts and Node does not, and every request dies with "unable to verify the
+// first certificate". Reported from a real Mac running Qustodio.
+//
+// Electron's `net` uses Chromium's network stack, which reads the system trust
+// store, so it succeeds exactly where the OS itself would. It also picks up
+// system proxy settings for free. This is not a workaround and it does not
+// weaken verification: the certificate is still verified, against the store
+// that actually reflects the machine.
+function _googleHttp({ method, url, headers = {}, body = null, limit = 8 * 1024 * 1024 }) {
   return new Promise((resolve, reject) => {
-    const payload = new URLSearchParams(body).toString();
-    const request = https.request({
-      method: 'POST',
-      hostname: 'oauth2.googleapis.com',
-      path: '/token',
-      timeout: 20000,
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Content-Length': Buffer.byteLength(payload),
-        Accept: 'application/json',
-      },
-    }, response => {
+    const { net } = require('electron');
+    const request = net.request({ method, url });
+    for (const [name, value] of Object.entries(headers)) request.setHeader(name, value);
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { request.abort(); } catch (_) {}
+      reject(new Error('Google did not respond in time.'));
+    }, 30000);
+    request.on('response', response => {
       let raw = '';
       let size = 0;
       response.on('data', chunk => {
         size += chunk.length;
-        if (size > 256 * 1024) { request.destroy(new Error('Google token response was too large.')); return; }
+        if (size > limit) {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          try { request.abort(); } catch (_) {}
+          reject(new Error('The Google response was too large to read safely.'));
+          return;
+        }
         raw += chunk;
       });
       response.on('end', () => {
-        let parsed = null;
-        try { parsed = JSON.parse(raw); } catch (_) { parsed = null; }
-        if (!parsed || typeof parsed !== 'object') {
-          reject(new Error('Google returned a response this app could not read.'));
-          return;
-        }
-        if (response.statusCode !== 200) {
-          // Google names the actual problem here; passing it through saves an
-          // hour of guessing which of the six setup steps was missed.
-          const detail = parsed.error_description || parsed.error || `HTTP ${response.statusCode}`;
-          reject(new Error(`Google refused the sign-in: ${String(detail).slice(0, 300)}`));
-          return;
-        }
-        resolve(parsed);
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve({ statusCode: response.statusCode, text: raw });
       });
     });
-    request.on('timeout', () => request.destroy(new Error('Google did not respond in time.')));
-    request.on('error', reject);
-    request.end(payload);
+    request.on('error', error => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(error);
+    });
+    if (body !== null) request.write(body);
+    request.end();
   });
+}
+
+async function _googleTokenRequest(body) {
+  const payload = new URLSearchParams(body).toString();
+  const { statusCode, text } = await _googleHttp({
+    method: 'POST',
+    url: GOOGLE_TOKEN_ENDPOINT,
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      Accept: 'application/json',
+    },
+    body: payload,
+    limit: 256 * 1024,
+  });
+  let parsed = null;
+  try { parsed = JSON.parse(text); } catch (_) { parsed = null; }
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error('Google returned a response this app could not read.');
+  }
+  if (statusCode !== 200) {
+    // Google names the actual problem here; passing it through saves an hour
+    // of guessing which of the six setup steps was missed.
+    const detail = parsed.error_description || parsed.error || `HTTP ${statusCode}`;
+    throw new Error(`Google refused the sign-in: ${String(detail).slice(0, 300)}`);
+  }
+  return parsed;
 }
 
 // Access tokens live in memory only. They expire in an hour, they are not worth
@@ -1482,40 +1523,19 @@ async function _googleAccessTokenFor() {
   return _googleAccessToken.value;
 }
 
-function _googleApiGet(host, requestPath, accessToken) {
-  return new Promise((resolve, reject) => {
-    const request = https.request({
-      method: 'GET',
-      hostname: host,
-      path: requestPath,
-      timeout: 30000,
-      headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' },
-    }, response => {
-      let raw = '';
-      let size = 0;
-      response.on('data', chunk => {
-        size += chunk.length;
-        // A bounded range cannot legitimately produce this much JSON.
-        if (size > 8 * 1024 * 1024) { request.destroy(new Error('The Google response was too large to read safely.')); return; }
-        raw += chunk;
-      });
-      response.on('end', () => {
-        let parsed = null;
-        try { parsed = JSON.parse(raw); } catch (_) { parsed = null; }
-        if (response.statusCode === 200 && parsed && typeof parsed === 'object') {
-          resolve(parsed);
-          return;
-        }
-        const detail = parsed?.error?.message || `HTTP ${response.statusCode}`;
-        const error = new Error(String(detail).slice(0, 300));
-        error.statusCode = response.statusCode;
-        reject(error);
-      });
-    });
-    request.on('timeout', () => request.destroy(new Error('Google did not respond in time.')));
-    request.on('error', reject);
-    request.end();
+async function _googleApiGet(host, requestPath, accessToken) {
+  const { statusCode, text } = await _googleHttp({
+    method: 'GET',
+    url: `https://${host}${requestPath}`,
+    headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' },
   });
+  let parsed = null;
+  try { parsed = JSON.parse(text); } catch (_) { parsed = null; }
+  if (statusCode === 200 && parsed && typeof parsed === 'object') return parsed;
+  const detail = parsed?.error?.message || `HTTP ${statusCode}`;
+  const error = new Error(String(detail).slice(0, 300));
+  error.statusCode = statusCode;
+  throw error;
 }
 
 async function _googleAccountEmail(accessToken) {
@@ -2421,33 +2441,20 @@ _secureHandle('google-sheet-push', async (_, request) => {
     data: toWrite.map(cell => ({ range: `${title}!${cell.a1}`, values: [[cell.value]] })),
   });
 
-  await new Promise((resolve, reject) => {
-    const req = https.request({
-      method: 'POST',
-      hostname: 'sheets.googleapis.com',
-      path: `/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}/values:batchUpdate`,
-      timeout: 30000,
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(payload),
-      },
-    }, response => {
-      let raw = '';
-      response.on('data', chunk => { if (raw.length < 262144) raw += chunk; });
-      response.on('end', () => {
-        if (response.statusCode === 200) { resolve(); return; }
-        let parsed = null;
-        try { parsed = JSON.parse(raw); } catch (_) { parsed = null; }
-        const error = new Error(parsed?.error?.message || `HTTP ${response.statusCode}`);
-        error.statusCode = response.statusCode;
-        reject(new Error(_googleReadFailure(error)));
-      });
-    });
-    req.on('timeout', () => req.destroy(new Error('Google did not respond in time.')));
-    req.on('error', reject);
-    req.end(payload);
+  const write = await _googleHttp({
+    method: 'POST',
+    url: `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}/values:batchUpdate`,
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: payload,
+    limit: 256 * 1024,
   });
+  if (write.statusCode !== 200) {
+    let parsed = null;
+    try { parsed = JSON.parse(write.text); } catch (_) { parsed = null; }
+    const error = new Error(parsed?.error?.message || `HTTP ${write.statusCode}`);
+    error.statusCode = write.statusCode;
+    throw new Error(_googleReadFailure(error));
+  }
 
   return { ok: true, written: toWrite.map(c => c.a1), skipped, replaced };
 });

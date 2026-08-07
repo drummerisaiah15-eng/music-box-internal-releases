@@ -1448,3 +1448,39 @@ test('MB161-014: access tokens are memory-only and errors say what to do', () =>
     assert.match(failure, hint, `HTTP ${code} explains itself`);
   }
 });
+
+test('MB161-017: every Google call uses Electron net, not Node https', () => {
+  // Node ships its own CA bundle and ignores the macOS keychain, so on a Mac
+  // running TLS-inspecting software (Qustodio, corporate filtering, some
+  // antivirus) every Node https request dies with "unable to verify the first
+  // certificate" while the same request from a browser succeeds. Reported from
+  // a real machine. Electron's net uses Chromium's stack, which reads the
+  // system trust store — the certificate is still verified, against the store
+  // that reflects the actual machine.
+  const googleStart = main.indexOf('function _googleHttp');
+  assert.notEqual(googleStart, -1, '_googleHttp exists');
+  const helper = main.slice(googleStart, main.indexOf('async function _googleTokenRequest'));
+  assert.match(helper, /const \{ net \} = require\('electron'\)/);
+  assert.match(helper, /net\.request\(\{ method, url \}\)/);
+
+  // No Google-facing function may fall back to Node https.
+  for (const [name, endMarker] of [
+    ['async function _googleTokenRequest', 'async function _googleApiGet'],
+    ['async function _googleApiGet', 'async function _googleAccountEmail'],
+  ]) {
+    const start = main.indexOf(name);
+    assert.notEqual(start, -1, `${name} exists`);
+    const body = main.slice(start, main.indexOf(endMarker, start + 1));
+    assert.doesNotMatch(body, /https\.request/, `${name} must not use Node https`);
+  }
+  const push = main.slice(main.indexOf("_secureHandle('google-sheet-push'"),
+                          main.indexOf('function _columnLetters'));
+  assert.doesNotMatch(push, /https\.request/, 'the push must not use Node https either');
+  assert.match(push, /_googleHttp\(\{/, 'it goes through the shared helper');
+
+  // The helper still bounds size and time; swapping transports must not have
+  // dropped either.
+  assert.match(helper, /size > limit/);
+  assert.match(helper, /Google did not respond in time/);
+  assert.match(helper, /request\.abort\(\)/);
+});
