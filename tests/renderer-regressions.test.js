@@ -1287,12 +1287,42 @@ test('MB161-014: an imported tab goes through the existing validated importer', 
   // Re-implementing any of that for Google would be a second place to get wrong.
   // namedFunctionSource stops at the next `function`, and the neighbours here
   // are `async function`, so bound the slice to this function's own body.
-  const full = namedFunctionSource('ssGoogleImportTab');
-  const importTab = full.slice(0, full.indexOf('\n// \u2500\u2500 Import'));
-  assert.match(importTab, /await ssImportBuildProject\(name, \[\{ sheetName: title, rows: sheet\.rows \}\]\)/,
+  const importPath = namedFunctionSource('_ssGoogleImport');
+  assert.match(importPath, /await ssImportBuildProject\(name, read\.map\(/,
+    'the Google path builds through the shared importer, not its own writer');
+  assert.match(importPath, /sheetName: wanted\[i\]/,
     'sheetName is the field the importer reads — `name` silently lands the tab as "Sheet 1"');
-  assert.doesNotMatch(importTab, /STORE\.(replace|set|mutate)/,
+  assert.doesNotMatch(importPath, /STORE\.(replace|set|mutate)/,
     'the Google path must not write to storage on its own');
+});
+
+test('MB161-018: every tab is read before any of them is written', () => {
+  // Importing six tabs is six network round trips, and the fourth can fail. If
+  // the project were built tab by tab, that would leave a half-imported project
+  // linked to a spreadsheet it does not match — worse than importing nothing,
+  // because it looks finished. So all reads complete first, then one build.
+  const importPath = namedFunctionSource('_ssGoogleImport');
+  const readLoop = importPath.slice(0, importPath.indexOf('ssImportBuildProject'));
+  assert.match(readLoop, /for \(const title of wanted\)/, 'reads are a loop over the wanted tabs');
+  assert.match(readLoop, /read\.push\(await _googleSheets\(\)\.read\(/,
+    'and they are awaited one at a time — parallel grid reads trip the quota');
+  assert.doesNotMatch(readLoop, /ssImportBuildProject|ssSave\(/,
+    'nothing is written while reads are still outstanding');
+
+  // And the sheet count is refused up front rather than discovered at save.
+  assert.match(importPath, /wanted\.length > MAX_SPREADSHEET_SHEETS/);
+});
+
+test('MB161-018: imported fills, bold and merges survive the build', () => {
+  const build = namedFunctionSource('ssImportBuildProject');
+  // A blocked-out slot on a schedule is an empty cell with a black fill. The
+  // first version of this kept cells only when `val !== ''`, which is exactly
+  // the test that throws those away.
+  assert.match(build, /if \(val !== '' \|\| bg \|\| tc \|\| bold\)/,
+    'a cell worth keeping for its fill alone must be kept');
+  assert.match(build, /_ssApplyImportedMerges\(cells, s\.merges, storedRows, storedCols\)/);
+  // Optional, because CSV and .xlsx imports carry no formatting at all.
+  assert.match(build, /Array\.isArray\(s\.formats\) \? s\.formats : null/);
 });
 
 test('MB161-016: the UI no longer promises read-only, because it is not true', () => {
@@ -1336,14 +1366,35 @@ test('MB161-016: the renderer still cannot reach Google directly', () => {
 });
 
 test('MB161-016: a push sends only what changed since the last pull', () => {
-  const push = namedFunctionSource('ssPushToGoogle');
-  assert.match(push, /if \(cell\.value === was\) continue;/,
+  // The diff itself moved into _ssPendingPush when a project gained the ability
+  // to mirror several tabs, but the rules it encodes did not change.
+  const pending = namedFunctionSource('_ssPendingPush');
+  assert.match(pending, /if \(cell\.value === was\) continue;/,
     'an unchanged cell is not pushed — otherwise every push rewrites the sheet');
-  assert.match(push, /expected: was/,
+  assert.match(pending, /expected: was/,
     'each cell carries what Google last held, which is what lets main detect a change');
-  assert.match(push, /for \(const \[key, was\] of Object\.entries\(checkpoint\)\)/,
+  assert.match(pending, /for \(const \[key, was\] of Object\.entries\(checkpoint\)\)/,
     'a cell cleared in the app is pushed as a clear, not forgotten');
+
+  const push = namedFunctionSource('ssPushToGoogle');
   assert.match(push, /confirm\(/, 'and the person is told how many cells before it happens');
+  // MB161-018: the count in that prompt has to be the total across every tab.
+  // Confirming six times, or confirming once against one tab's count and then
+  // writing five more, are both ways of getting consent for the wrong thing.
+  assert.match(push, /const total = work\.reduce\(/);
+  assert.match(push, /Push \$\{total\} cell/);
+  const beforeConfirm = push.slice(0, push.indexOf('confirm('));
+  assert.doesNotMatch(beforeConfirm, /_googleSheets\(\)\.push/,
+    'nothing is sent before the person answers');
+});
+
+test('MB161-018: a push says plainly that it does not carry formatting', () => {
+  // Import and pull both bring colours and merges across, so it is reasonable to
+  // assume a push sends them back. It does not — the values API has no way to.
+  // Saying so in the prompt is the difference between a known limit and a
+  // person believing their colour changes reached Google.
+  const push = namedFunctionSource('ssPushToGoogle');
+  assert.match(push, /Colours and merged cells are not pushed/);
 });
 
 test('MB161-016: a refused cell becomes a real conflict, not a warning', () => {
@@ -1376,13 +1427,48 @@ test('MB161-016: A1 and row,column notation round-trip', () => {
   assert.equal(context.api.toKey('not-a-cell'), '0,0');
 });
 
-test('MB161-016: a pull keeps formatting Google never had', () => {
+test('MB161-018: a pull now takes formatting from Google, and asks first', () => {
+  // This reverses MB161-016 deliberately. Back then a pull preserved fills the
+  // app had added, because Google sent no formatting at all and treating its
+  // silence as "delete the colours" would have destroyed real work. Now the
+  // read carries fills, bold and merges, so silence is no longer silence: a
+  // cell with no fill in Google means no fill. Keeping the app's version would
+  // make every pull drift further from the sheet it claims to mirror.
+  //
+  // It is still a real overwrite of anything restyled in the app, so unlike the
+  // old pull it is confirmed rather than assumed.
   const pull = namedFunctionSource('ssPullFromGoogle');
-  assert.match(pull, /if \(cell\?\.bg \|\| cell\?\.tc \|\| cell\?\.b\) next\[key\] = \{ \.\.\.cell, v: '' \}/,
-    'colour blocks added in the app survive a pull — Google sent no formatting, '
-    + 'so treating its silence as "delete the colours" would destroy real work');
-  assert.match(pull, /checkpoint: _ssGoogleCheckpoint\(sheet\.rows\)/,
+  assert.match(pull, /confirm\(/, 'a destructive pull asks');
+  assert.match(pull, /in the app since the last pull and not pushed will be lost/,
+    'and says what it costs, in those words');
+  const beforeConfirm = pull.slice(0, pull.indexOf('confirm('));
+  assert.doesNotMatch(beforeConfirm, /target\.cells =/, 'and nothing is replaced before the answer');
+
+  assert.match(pull, /const bg = _ssImportColor\(format\?\.bg\)/,
+    'fills come from Google');
+  assert.match(pull, /_ssApplyImportedMerges\(cells, remote\.merges, rowsThatFit, colsThatFit\)/,
+    'and so do merges \u2014 bounded by what the sheet can actually hold');
+
+  // A tab that grew in Google returns more rows than the sheet has. Writing
+  // them anyway makes an out-of-range cell, which the validator refuses: the
+  // pull would look fine and quarantine the project at the next save.
+  assert.match(pull, /if \(r >= rowsThatFit\) return;/);
+  assert.match(pull, /if \(c >= colsThatFit\) return;/);
+  assert.match(pull, /target\.rows = rowsThatFit/, 'the sheet grows where it can');
+  assert.match(pull, /checkpoint: _ssGoogleCheckpoint\(kept\)/,
     'and the checkpoint advances, or the next push would re-send everything');
+});
+
+test('MB161-018: pull and push walk every linked tab, not just the first sheet', () => {
+  // Both used to read project.sheets[0] and link.title, which was correct while
+  // a project could only ever mirror one tab. With all-tabs import that shape
+  // silently syncs Monday and quietly ignores the other five.
+  for (const name of ['ssPullFromGoogle', 'ssPushToGoogle']) {
+    const fn = namedFunctionSource(name);
+    assert.match(fn, /_ssLinkedSheets\(project\)/, `${name} works from the tab map`);
+    assert.doesNotMatch(fn, /project\.sheets\[0\]/, `${name} must not assume one sheet`);
+    assert.doesNotMatch(fn, /link\.title/, `${name} must not assume one tab name`);
+  }
 });
 
 test('MB161-016: a linked project is tagged and offers pull and push', () => {
@@ -1392,4 +1478,76 @@ test('MB161-016: a linked project is tagged and offers pull and push', () => {
   assert.match(source, /onclick="ssPushToGoogle/);
   assert.match(source, /event\.stopPropagation\(\)/,
     'the buttons must not also open the project');
+});
+
+test('MB161-018: the checkpoint is measured before the import, not after', () => {
+  // A linked project stores a copy of every text value as Google last held it.
+  // That roughly doubles the project, and it is attached AFTER the capacity
+  // check in the caller — so leaving it out of the estimate lets an import pass
+  // the check and then fail to save. The project would exist and be unwritable,
+  // which is worse than a refusal.
+  const importPath = namedFunctionSource('_ssGoogleImport');
+  const build = importPath.indexOf('await ssImportBuildProject');
+  const before = importPath.slice(0, build);
+  assert.match(before, /const checkpoints = read\.map\(sheet => _ssGoogleCheckpoint/,
+    'checkpoints are built before the import');
+  assert.match(before, /const linkBytes = new TextEncoder\(\)/);
+  assert.match(importPath, /\}\)\), linkBytes\);/, 'and passed into the capacity estimate');
+  assert.match(namedFunctionSource('ssImportBuildProject'),
+    /if \(typeof extraBytes === 'number' && extraBytes > 0\) incoming\.bytes \+= extraBytes/);
+});
+
+test('MB161-018: a tab taller than the grid ceiling is trimmed, not refused', () => {
+  // Counting fills towards a tab's used extent made extents much bigger: a
+  // schedule blocks out unavailable slots with black cells far below its last
+  // piece of text. A tab that imported fine when only text counted can now
+  // exceed the per-sheet ceiling. Refusing the whole import over rows nobody
+  // reads is the wrong trade — the top of a schedule is the part that matters.
+  const importPath = namedFunctionSource('_ssGoogleImport');
+  assert.match(importPath, /MAX_SPREADSHEET_GRID_CELLS \/ Math\.max\(cols, 6\)/);
+  assert.match(importPath, /sheet\.rows = sheet\.rows\.slice\(0, maxRows\)/);
+  assert.match(importPath, /sheet\.formats = sheet\.formats\.slice\(0, maxRows\)/,
+    'formats are trimmed with the values, or they would address the wrong rows');
+  // Trimming silently would be the same bug wearing a different hat.
+  assert.match(importPath, /trimmedTabs \+= 1/);
+  assert.match(importPath, /taller than a sheet /, 'and it is said out loud');
+});
+
+test('MB161-018: a trimmed pull cannot delete the rows it trimmed', () => {
+  // The worst bug found in review. A pull that drops rows beyond what the sheet
+  // can hold, but records the untrimmed grid as the checkpoint, leaves those
+  // cells "present at the last pull, absent now" — which is exactly the
+  // condition _ssPendingPush turns into a push of an empty value. The app would
+  // silently delete rows in Google that it had only declined to display.
+  const pull = namedFunctionSource('ssPullFromGoogle');
+  assert.match(pull, /const kept = \(remote\.rows \|\| \[\]\)\.slice\(0, rowsThatFit\)\.map\(row => row\.slice\(0, colsThatFit\)\)/);
+  assert.match(pull, /checkpoint: _ssGoogleCheckpoint\(kept\)/,
+    'the checkpoint describes what was kept, never what was sent');
+  assert.doesNotMatch(pull, /_ssGoogleCheckpoint\(remote\.rows\)/,
+    'the untrimmed grid must not be the checkpoint');
+});
+
+test('MB161-018: pull and push persist each tab before starting the next', () => {
+  // Six tabs is six round trips and the fourth can fail. Saving once at the end
+  // means the first three are already written in Google (push) or replaced in
+  // memory (pull) while their checkpoints are still the old ones — so the next
+  // push re-sends cells Google already has, Google refuses them, and the app
+  // reports its own writes as somebody else's edits.
+  for (const name of ['ssPullFromGoogle', 'ssPushToGoogle']) {
+    const fn = namedFunctionSource(name);
+    const loopStart = fn.indexOf('for (const');
+    const loopEnd = fn.lastIndexOf('    }');
+    const loop = fn.slice(loopStart, loopEnd);
+    assert.match(loop, /project\.googleLink = \{ \.\.\.link,/, `${name} updates the link inside the loop`);
+    assert.match(loop, /await ssSave\(\)/, `${name} saves inside the loop`);
+  }
+});
+
+test('MB161-018: the import trim measures against the stored width', () => {
+  // The importer pads a narrow sheet out to six columns. Computing the row
+  // ceiling from the read width let a one-column tab keep 10,000 rows, which
+  // became 60,000 stored cells and failed the check the trim exists to satisfy.
+  const importPath = namedFunctionSource('_ssGoogleImport');
+  assert.match(importPath, /Math\.max\(cols, 6\)/);
+  assert.doesNotMatch(importPath, /Math\.max\(cols, 1\)/);
 });

@@ -8435,7 +8435,7 @@ function normalizeSpreadsheetWorkbook(value) {
         throw new Error('spreadsheets has an invalid Google link');
       }
       if (!Object.keys(link).every(key =>
-          ['spreadsheetId', 'title', 'sheetId', 'rows', 'columns', 'pulledAt', 'checkpoint'].includes(key))) {
+          ['spreadsheetId', 'title', 'sheetId', 'rows', 'columns', 'pulledAt', 'checkpoint', 'tabs'].includes(key))) {
         throw new Error('spreadsheets has an invalid Google link');
       }
       const spreadsheetId = String(link.spreadsheetId ?? '');
@@ -8444,25 +8444,64 @@ function normalizeSpreadsheetWorkbook(value) {
       }
       googleLink = {
         spreadsheetId,
-        title: checkedString(link.title, 'Google tab name', 200),
         rows: Number.isSafeInteger(link.rows) && link.rows > 0 ? Math.min(link.rows, 500) : 200,
         columns: Number.isSafeInteger(link.columns) && link.columns > 0 ? Math.min(link.columns, 100) : 30,
       };
-      if (Number.isSafeInteger(link.sheetId)) googleLink.sheetId = link.sheetId;
       if (link.pulledAt !== undefined) googleLink.pulledAt = String(link.pulledAt).slice(0, 40);
-      // The values as Google last had them. This is what makes a push able to
-      // tell "I changed this" from "Google changed this".
-      if (link.checkpoint !== undefined) {
-        if (typeof link.checkpoint !== 'object' || Array.isArray(link.checkpoint)) {
+
+      const readCheckpoint = (input) => {
+        if (input === undefined) return undefined;
+        if (typeof input !== 'object' || input === null || Array.isArray(input)) {
           throw new Error('spreadsheets has an invalid Google checkpoint');
         }
         const checkpoint = {};
-        for (const [cellKey, value] of Object.entries(link.checkpoint)) {
+        for (const [cellKey, value] of Object.entries(input)) {
           if (!/^(0|[1-9]\d*),(0|[1-9]\d*)$/.test(cellKey)) continue;
           checkpoint[cellKey] = String(value ?? '').slice(0, MAX_SPREADSHEET_CELL_CHARS);
         }
-        if (Object.keys(checkpoint).length) googleLink.checkpoint = checkpoint;
+        return Object.keys(checkpoint).length ? checkpoint : undefined;
+      };
+
+      // MB161-018: one project can now mirror several tabs of the same
+      // spreadsheet, so the tab name and the checkpoint moved from the link
+      // itself into a map keyed by the sheet they belong to. A link written
+      // before this change has them at the top level and names exactly one tab;
+      // it is read as a one-entry map against the project's first sheet, so an
+      // existing import keeps pulling and pushing without being re-linked.
+      const tabs = {};
+      const sheetIds = new Set(sheets.map(sheet => sheet.id));
+      if (link.tabs !== undefined) {
+        if (typeof link.tabs !== 'object' || link.tabs === null || Array.isArray(link.tabs)) {
+          throw new Error('spreadsheets has an invalid Google tab map');
+        }
+        for (const [sheetKey, tab] of Object.entries(link.tabs)) {
+          // A link to a sheet this project no longer has is dropped, not kept:
+          // it can never be pulled or pushed and would only grow the document.
+          if (!sheetIds.has(sheetKey)) continue;
+          if (!tab || typeof tab !== 'object' || Array.isArray(tab)) {
+            throw new Error('spreadsheets has an invalid Google tab');
+          }
+          if (!Object.keys(tab).every(key => ['title', 'sheetId', 'checkpoint'].includes(key))) {
+            throw new Error('spreadsheets has an invalid Google tab');
+          }
+          const entry = { title: checkedString(tab.title, 'Google tab name', 200) };
+          if (Number.isSafeInteger(tab.sheetId)) entry.sheetId = tab.sheetId;
+          const checkpoint = readCheckpoint(tab.checkpoint);
+          if (checkpoint) entry.checkpoint = checkpoint;
+          tabs[sheetKey] = entry;
+        }
+      } else if (link.title !== undefined && sheets.length) {
+        const entry = { title: checkedString(link.title, 'Google tab name', 200) };
+        if (Number.isSafeInteger(link.sheetId)) entry.sheetId = link.sheetId;
+        const checkpoint = readCheckpoint(link.checkpoint);
+        if (checkpoint) entry.checkpoint = checkpoint;
+        tabs[sheets[0].id] = entry;
       }
+      // A link that names no reachable tab cannot do anything, so it is not a
+      // link. Dropping it is what stops an orphaned badge appearing on a
+      // project whose sheets were all deleted.
+      if (!Object.keys(tabs).length) googleLink = undefined;
+      else googleLink.tabs = tabs;
     }
     const normalizedProject = { id, name, activeId, sheets };
     if (googleLink) normalizedProject.googleLink = googleLink;
@@ -9691,7 +9730,7 @@ function ssRenderHomeView() {
       </div>
       <div class="ss-proj-card-name">${escHtml(p.name)}</div>
       <div class="ss-proj-card-meta">${p.sheets.length} sheet${p.sheets.length!==1?'s':''}</div>
-      ${p.googleLink ? `<div class="ss-google-tag" title="Linked to the Google tab &quot;${escAttr(p.googleLink.title)}&quot;">
+      ${p.googleLink ? `<div class="ss-google-tag" title="Linked to ${escAttr(_ssGoogleTabSummary(p))} in Google Sheets">
         <span class="ss-google-dot"></span>Google Sheets
       </div>
       <div class="ss-google-actions" onclick="event.stopPropagation()">
@@ -10642,8 +10681,22 @@ async function ssGoogleLookup() {
     const info = await _googleSheets().describe({ url });
     _ssGoogleLookup = info;
     if (!info.tabs.length) { el.textContent = 'That spreadsheet has no readable tabs.'; return; }
+    // MB161-018: a workbook whose tabs are Monday..Saturday is one thing, not
+    // six, and importing it a tab at a time produced six unrelated projects
+    // that then had to be pulled and pushed separately. All-tabs is offered
+    // first because for a sheet like that it is almost always what is wanted.
+    const allTabs = info.tabs.length > 1 ? `
+      <div style="display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:2px solid var(--divider)">
+        <div style="flex:1">
+          <div style="font-size:13px;font-weight:700">All ${info.tabs.length} tabs</div>
+          <div style="font-size:11px;color:var(--text-muted)">One project, ${info.tabs.length} sheets</div>
+        </div>
+        <button class="btn btn-primary btn-sm" style="border-radius:7px;padding:4px 11px"
+          onclick="ssGoogleImportAllTabs()">Import all</button>
+      </div>` : '';
     el.innerHTML =
       `<div style="font-weight:600;margin-bottom:8px">${escHtml(info.title)}</div>` +
+      allTabs +
       info.tabs.map(tab => `
         <div style="display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid var(--divider)">
           <div style="flex:1">
@@ -10654,8 +10707,8 @@ async function ssGoogleLookup() {
             onclick="ssGoogleImportTab(${jsArg(tab.title)})">Import</button>
         </div>`).join('') +
       `<div style="font-size:11.5px;color:var(--text-muted);margin-top:10px">` +
-      `Up to 500 rows × 100 columns are read. Values only — formulas import as their result, ` +
-      `and colours and formatting are not imported.</div>`;
+      `Up to 500 rows × 100 columns are read. Fills, text colour, bold and merged cells ` +
+      `come across; formulas import as their result, and column widths do not.</div>`;
   } catch (error) {
     el.textContent = error?.message || String(error);
     el.style.color = '#c0392b';
@@ -10664,44 +10717,120 @@ async function ssGoogleLookup() {
   }
 }
 
-async function ssGoogleImportTab(title) {
+const GOOGLE_IMPORT_ROWS = 500;
+const GOOGLE_IMPORT_COLUMNS = 100;
+
+function ssGoogleImportTab(title) { return _ssGoogleImport([title]); }
+
+function ssGoogleImportAllTabs() {
+  const titles = (_ssGoogleLookup?.tabs || []).map(tab => tab.title);
+  return _ssGoogleImport(titles);
+}
+
+// One import path for "this tab" and "all tabs", because they differ only in
+// how many sheets the project ends up with. Every tab is read BEFORE anything
+// is written, so a failure on the fourth tab leaves no half-built project
+// behind — the same all-or-nothing the file importer already gives.
+async function _ssGoogleImport(titles) {
   if (!_ssGoogleLookup || _ssGoogleBusy) return;
+  const wanted = (Array.isArray(titles) ? titles : []).filter(Boolean);
+  if (!wanted.length) return;
+  if (wanted.length > MAX_SPREADSHEET_SHEETS) {
+    showToast(`A project can hold ${MAX_SPREADSHEET_SHEETS} sheets. That spreadsheet has ${wanted.length} tabs.`, 'warning');
+    return;
+  }
   _ssGoogleBusy = true;
   const el = document.getElementById('ss-google-result');
   try {
-    if (el) el.textContent = `Reading ${title}…`;
-    const sheet = await _googleSheets().read({
-      spreadsheetId: _ssGoogleLookup.spreadsheetId,
-      title,
-      rows: 500,
-      columns: 100,
-    });
-    // The existing importer already validates dimensions, bounds every cell and
-    // — since MB161-011 — refuses before writing anything if it will not fit.
-    const name = `${_ssGoogleLookup.title} — ${title}`.slice(0, 160);
-    // `sheetName`, not `name` — that is the field ssImportBuildProject reads,
-    // and passing the wrong one silently lands the tab as "Sheet 1".
-    const imported = await ssImportBuildProject(name, [{ sheetName: title, rows: sheet.rows }]);
-    if (imported) {
-      // MB161-016: remember where it came from, and what Google held at this
-      // moment. Without the checkpoint a later push cannot tell an app edit
-      // from a Google edit, and would overwrite both.
-      const created = (_ssData.projects || [])[_ssData.projects.length - 1];
-      if (created) {
-        created.googleLink = {
-          spreadsheetId: _ssGoogleLookup.spreadsheetId,
-          title,
-          rows: 500,
-          columns: 100,
-          pulledAt: new Date().toISOString(),
-          checkpoint: _ssGoogleCheckpoint(sheet.rows),
-        };
-        await ssSave();
+    const read = [];
+    for (const title of wanted) {
+      if (el) el.textContent = wanted.length > 1
+        ? `Reading ${title}… (${read.length + 1} of ${wanted.length})`
+        : `Reading ${title}…`;
+      // Sequential on purpose. Six parallel grid reads is the shape that trips
+      // Google's per-minute quota, and the failure it returns then looks like a
+      // permissions problem rather than a rate limit.
+      read.push(await _googleSheets().read({
+        spreadsheetId: _ssGoogleLookup.spreadsheetId,
+        title,
+        rows: GOOGLE_IMPORT_ROWS,
+        columns: GOOGLE_IMPORT_COLUMNS,
+      }));
+    }
+
+    // MB161-018: counting fills towards a tab's used extent made extents much
+    // bigger — a schedule blocks out unavailable slots with black cells far
+    // below its last piece of text. A tab that imported fine when only text
+    // counted can now exceed the per-sheet grid ceiling and be refused. Taking
+    // the rows that fit and naming the ones that did not is more useful than
+    // refusing the whole import, because the top of a schedule is the part
+    // anybody actually wants.
+    let trimmedTabs = 0;
+    for (const sheet of read) {
+      const cols = (sheet.rows || []).reduce((mx, row) => Math.max(mx, row.length), 0);
+      if (cols > MAX_SPREADSHEET_COLS) throw new Error('A tab is wider than this app can hold.');
+      // The importer pads a narrow sheet out to six columns, so the ceiling has
+      // to be computed against the stored width, not the read width. Using the
+      // raw count let a one-column tab keep 10,000 rows that then became 60,000
+      // stored cells and failed the very check this trim exists to satisfy.
+      const maxRows = Math.floor(MAX_SPREADSHEET_GRID_CELLS / Math.max(cols, 6));
+      if ((sheet.rows || []).length > maxRows) {
+        sheet.rows = sheet.rows.slice(0, maxRows);
+        if (Array.isArray(sheet.formats)) sheet.formats = sheet.formats.slice(0, maxRows);
+        trimmedTabs += 1;
       }
+    }
+
+    // The importer validates dimensions, bounds every cell and — since
+    // MB161-011 — refuses before writing anything if it will not fit.
+    const name = (wanted.length === 1
+      ? `${_ssGoogleLookup.title} — ${wanted[0]}`
+      : _ssGoogleLookup.title).slice(0, 160);
+    // MB161-016/018: remember what Google held at this moment. Without the
+    // checkpoint a later push cannot tell an app edit from a Google edit, and
+    // would overwrite both. Built BEFORE the import so its size can be counted
+    // against the project's budget — it is attached afterwards, and an import
+    // that fits only because the checkpoint was ignored cannot be saved.
+    const checkpoints = read.map(sheet => _ssGoogleCheckpoint(sheet.rows));
+    const linkBytes = new TextEncoder().encode(JSON.stringify(checkpoints)).byteLength;
+
+    // `sheetName`, not `name` — that is the field the importer reads, and
+    // passing the wrong one silently lands the tab as "Sheet 1".
+    const created = await ssImportBuildProject(name, read.map((sheet, i) => ({
+      sheetName: wanted[i],
+      rows: sheet.rows,
+      formats: sheet.formats,
+      merges: sheet.merges,
+    })), linkBytes);
+
+    if (created && typeof created === 'object') {
+      const tabs = {};
+      (created.sheets || []).forEach((sheet, i) => {
+        if (!read[i]) return;
+        tabs[sheet.id] = { title: wanted[i], checkpoint: checkpoints[i] };
+      });
+      created.googleLink = {
+        spreadsheetId: _ssGoogleLookup.spreadsheetId,
+        rows: GOOGLE_IMPORT_ROWS,
+        columns: GOOGLE_IMPORT_COLUMNS,
+        pulledAt: new Date().toISOString(),
+        tabs,
+      };
+      await ssSave();
       ssCloseGoogleImport();
-      showToast(`Imported ${sheet.filledCells.toLocaleString()} cells from Google.`, 'success');
+      const total = read.reduce((sum, sheet) => sum + (sheet.filledCells || 0), 0);
+      showToast(
+        `Imported ${total.toLocaleString()} cells from Google` +
+        (wanted.length > 1 ? ` across ${wanted.length} tabs` : '') +
+        (trimmedTabs
+          ? `. ${trimmedTabs} tab${trimmedTabs === 1 ? ' was' : 's were'} taller than a sheet ` +
+            `here can hold, so the last rows were left behind.`
+          : '.'),
+        trimmedTabs ? 'warning' : 'success');
+    } else if (created) {
+      ssCloseGoogleImport();
     } else if (el) {
-      el.textContent = 'That tab was not imported. See the message above.';
+      el.textContent = 'Nothing was imported. See the message above.';
     }
   } catch (error) {
     if (el) { el.textContent = error?.message || String(error); el.style.color = '#c0392b'; }
@@ -10715,6 +10844,17 @@ async function ssGoogleImportTab(title) {
 function _ssGoogleLinkOf(projectId) {
   const project = (_ssData?.projects || []).find(p => p.id === (projectId || _ssData?.activeProject));
   return project?.googleLink || null;
+}
+
+// What the badge says a project is linked to. One tab is named; several are
+// counted, because six tab names do not fit in a tooltip and the count is the
+// part somebody is actually checking.
+function _ssGoogleTabSummary(project) {
+  const titles = Object.values(project?.googleLink?.tabs || {})
+    .map(tab => tab?.title).filter(Boolean);
+  if (!titles.length) return 'a spreadsheet';
+  if (titles.length === 1) return `the tab "${titles[0]}"`;
+  return `${titles.length} tabs`;
 }
 
 // A1 for a zero-based row/column, and back again.
@@ -10732,46 +10872,107 @@ function _ssSheetCellText(sheet) {
   return out;
 }
 
+// The sheets of a project that are linked to a Google tab, in project order.
+function _ssLinkedSheets(project) {
+  const tabs = project?.googleLink?.tabs || {};
+  return (project?.sheets || [])
+    .filter(sheet => tabs[sheet.id]?.title)
+    .map(sheet => ({ sheet, tab: tabs[sheet.id] }));
+}
+
 async function ssPullFromGoogle(projectId) {
   const project = (_ssData?.projects || []).find(p => p.id === projectId);
   const link = project?.googleLink;
   if (!link || !_googleSheets() || _ssGoogleBusy) return false;
+  const linked = _ssLinkedSheets(project);
+  if (!linked.length) { showToast('No sheet in this project is linked to a Google tab.', 'warning'); return false; }
+
+  // MB161-018: a pull now replaces fills, text colour, bold and merges as well
+  // as values, because the import brings all of those across and leaving them
+  // behind would make a pulled sheet drift further from Google every time. That
+  // is a real overwrite of anything restyled in the app, so it is asked about
+  // rather than assumed.
+  if (!confirm(
+    `Replace ${linked.length === 1 ? `"${linked[0].tab.title}"` : `${linked.length} sheets`} ` +
+    `with what Google has now?\n\n` +
+    `Values, colours and merged cells are taken from Google. Anything changed ` +
+    `in the app since the last pull and not pushed will be lost.`)) return false;
+
   _ssGoogleBusy = true;
   try {
-    const sheet = await _googleSheets().read({
-      spreadsheetId: link.spreadsheetId, title: link.title,
-      rows: link.rows, columns: link.columns,
-    });
-    const target = project.sheets[0];
-    if (!target) throw new Error('That project has no sheet to fill.');
-
-    // Google is the source of truth for a linked tab, so its values replace
-    // the cells — but formatting the studio added in the app is kept, because
-    // Google never sent any and wiping it would destroy work Google never had.
-    const next = {};
-    sheet.rows.forEach((row, r) => {
-      row.forEach((value, c) => {
-        const key = r + ',' + c;
-        const existing = target.cells[key] || {};
-        if (String(value ?? '') === '') return;
-        next[key] = { ...existing, v: String(value) };
+    let pulled = 0;
+    let dropped = 0;
+    const tabs = { ...link.tabs };
+    for (const { sheet: target, tab } of linked) {
+      const remote = await _googleSheets().read({
+        spreadsheetId: link.spreadsheetId, title: tab.title,
+        rows: link.rows, columns: link.columns,
       });
-    });
-    // Keep formatting-only cells that Google has nothing to say about.
-    for (const [key, cell] of Object.entries(target.cells || {})) {
-      if (next[key]) continue;
-      if (cell?.bg || cell?.tc || cell?.b) next[key] = { ...cell, v: '' };
+      // A tab that grew in Google since the import returns more rows than the
+      // sheet has. Writing them anyway produces an out-of-range cell, which the
+      // workbook validator refuses outright — the pull would appear to work and
+      // then quarantine the project on the next save. So the sheet grows to fit
+      // where the limits allow, and where they do not the surplus is dropped
+      // and said out loud rather than silently.
+      const wantRows = Math.max(target.rows, (remote.rows || []).length);
+      const wantCols = Math.max(target.cols,
+        (remote.rows || []).reduce((mx, row) => Math.max(mx, row.length), 0));
+      const fitRows = Math.min(wantRows, MAX_SPREADSHEET_ROWS);
+      const fitCols = Math.min(wantCols, MAX_SPREADSHEET_COLS);
+      const rowsThatFit = Math.max(target.rows,
+        Math.min(fitRows, Math.floor(MAX_SPREADSHEET_GRID_CELLS / Math.max(fitCols, 1))));
+      const colsThatFit = Math.max(target.cols, fitCols);
+      if (rowsThatFit * colsThatFit > MAX_SPREADSHEET_GRID_CELLS) {
+        throw new Error(`"${tab.title}" is larger than a sheet in this app can hold.`);
+      }
+      if (rowsThatFit < wantRows || colsThatFit < wantCols) dropped += 1;
+
+      const cells = {};
+      (remote.rows || []).forEach((row, r) => {
+        if (r >= rowsThatFit) return;
+        row.forEach((value, c) => {
+          if (c >= colsThatFit) return;
+          const format = remote.formats?.[r]?.[c];
+          const bg = _ssImportColor(format?.bg);
+          const tc = _ssImportColor(format?.tc);
+          const bold = format?.b === true;
+          const text = String(value ?? '');
+          if (text === '' && !bg && !tc && !bold) return;
+          cells[r + ',' + c] = { v: text, bg, tc, b: bold };
+        });
+      });
+      _ssApplyImportedMerges(cells, remote.merges, rowsThatFit, colsThatFit);
+      target.rows = rowsThatFit;
+      target.cols = colsThatFit;
+      if (Array.isArray(target.colWidths)) {
+        while (target.colWidths.length < colsThatFit) target.colWidths.push(100);
+        target.colWidths.length = colsThatFit;
+      }
+      target.cells = cells;
+      // The checkpoint has to describe exactly what the app kept, NOT what
+      // Google sent. If a row was dropped above, leaving it in the checkpoint
+      // makes the next push see "present at the last pull, absent now" and push
+      // an empty value over it — the app would delete rows in Google that it
+      // had merely declined to display. Same extent as the cells, always.
+      const kept = (remote.rows || []).slice(0, rowsThatFit).map(row => row.slice(0, colsThatFit));
+      tabs[target.id] = { ...tab, checkpoint: _ssGoogleCheckpoint(kept) };
+      pulled += remote.filledCells || 0;
+
+      // Persisted per tab rather than once at the end. A failure on the fourth
+      // tab used to leave the first three pulled in memory with their old
+      // checkpoints, and every cell they had just pulled would look like a local
+      // edit on the next push.
+      project.googleLink = { ...link, pulledAt: new Date().toISOString(), tabs };
+      await ssSave();
     }
-    target.cells = next;
-    project.googleLink = {
-      ...link,
-      pulledAt: new Date().toISOString(),
-      checkpoint: _ssGoogleCheckpoint(sheet.rows),
-    };
-    await ssSave();
     ssRender();
     ssRenderHomeView();
-    showToast(`Pulled ${sheet.filledCells.toLocaleString()} cells from Google.`, 'success');
+    showToast(
+      `Pulled ${pulled.toLocaleString()} cells from Google` +
+      (linked.length > 1 ? ` across ${linked.length} tabs` : '') +
+      (dropped ? `. ${dropped} tab${dropped === 1 ? ' was' : 's were'} larger than this app can hold, ` +
+        `so the far rows or columns were not pulled.` : '.'),
+      dropped ? 'warning' : 'success');
     return true;
   } catch (error) {
     showToast(`Pull from Google failed: ${error?.message || error}`, 'danger');
@@ -10794,14 +10995,9 @@ function _ssGoogleCheckpoint(rows) {
   return checkpoint;
 }
 
-async function ssPushToGoogle(projectId) {
-  const project = (_ssData?.projects || []).find(p => p.id === projectId);
-  const link = project?.googleLink;
-  if (!link || !_googleSheets() || _ssGoogleBusy) return false;
-  const sheet = project.sheets[0];
-  if (!sheet) return false;
-
-  const checkpoint = link.checkpoint || {};
+// The cells of one sheet that differ from what Google last held.
+function _ssPendingPush(sheet, tab, link) {
+  const checkpoint = tab.checkpoint || {};
   const cells = [];
   const seen = new Set();
   for (const [key, cell] of _ssSheetCellText(sheet)) {
@@ -10818,26 +11014,51 @@ async function ssPushToGoogle(projectId) {
     if (row >= link.rows || column >= link.columns) continue;
     cells.push({ a1: _ssA1(row, column), value: '', expected: was });
   }
+  return cells;
+}
 
-  if (!cells.length) { showToast('Nothing to push — Google already matches.', 'info'); return true; }
+async function ssPushToGoogle(projectId) {
+  const project = (_ssData?.projects || []).find(p => p.id === projectId);
+  const link = project?.googleLink;
+  if (!link || !_googleSheets() || _ssGoogleBusy) return false;
+  const linked = _ssLinkedSheets(project);
+  if (!linked.length) { showToast('No sheet in this project is linked to a Google tab.', 'warning'); return false; }
+
+  // Everything is worked out before anything is sent, so the confirmation can
+  // state the real total rather than a per-tab count the person then has to
+  // answer six times.
+  const work = linked
+    .map(({ sheet, tab }) => ({ sheet, tab, cells: _ssPendingPush(sheet, tab, link) }))
+    .filter(entry => entry.cells.length);
+  const total = work.reduce((sum, entry) => sum + entry.cells.length, 0);
+  if (!total) { showToast('Nothing to push — Google already matches.', 'info'); return true; }
+
+  const where = work.length === 1
+    ? `"${work[0].tab.title}"`
+    : `${work.length} tabs`;
   if (!confirm(
-    `Push ${cells.length} cell${cells.length === 1 ? '' : 's'} to "${link.title}" in Google?\n\n` +
+    `Push ${total} cell${total === 1 ? '' : 's'} to ${where} in Google?\n\n` +
     `Any cell somebody changed in Google since your last pull will be left alone ` +
-    `and reported, not overwritten.`)) return false;
+    `and reported, not overwritten.\n\n` +
+    `Colours and merged cells are not pushed — only values.`)) return false;
 
   _ssGoogleBusy = true;
   try {
-    const result = await _googleSheets().push({
-      spreadsheetId: link.spreadsheetId, title: link.title, cells,
-    });
+    const conflicts = Array.isArray(_ssData._conflicts) ? [..._ssData._conflicts] : [];
+    const tabs = { ...link.tabs };
+    let written = 0;
+    let skipped = 0;
 
-    // Anything Google refused because it had moved on becomes a real conflict,
-    // in the same list and with the same UI as a Mac-vs-Mac collision.
-    if (result.skipped.length) {
-      const conflicts = Array.isArray(_ssData._conflicts) ? [..._ssData._conflicts] : [];
+    for (const { sheet, tab, cells } of work) {
+      const result = await _googleSheets().push({
+        spreadsheetId: link.spreadsheetId, title: tab.title, cells,
+      });
+
+      // Anything Google refused because it had moved on becomes a real conflict,
+      // in the same list and with the same UI as a Mac-vs-Mac collision.
       for (const miss of result.skipped) {
         conflicts.push({
-          id: _ssConflictId(['google', link.spreadsheetId, link.title, miss.a1,
+          id: _ssConflictId(['google', link.spreadsheetId, tab.title, miss.a1,
             miss.expected, miss.appValue, miss.googleValue]),
           kind: 'cell', projectId: project.id, sheetId: sheet.id,
           target: _ssCellKeyFromA1(miss.a1),
@@ -10847,25 +11068,35 @@ async function ssPushToGoogle(projectId) {
           at: new Date().toISOString(),
         });
       }
-      _ssData._conflicts = conflicts;
+      // Advance the checkpoint for everything that did land, so the next push
+      // does not try to write it again.
+      const nextCheckpoint = { ...(tab.checkpoint || {}) };
+      for (const change of result.replaced) {
+        nextCheckpoint[_ssCellKeyFromA1(change.a1)] = change.next;
+      }
+      tabs[sheet.id] = { ...tab, checkpoint: nextCheckpoint };
+      written += result.written.length;
+      skipped += result.skipped.length;
+
+      // Saved per tab, for the same reason the pull is. Google has already been
+      // written by the time this line runs, so if a later tab throws and the
+      // advanced checkpoint were lost, the next push would re-send those cells
+      // with a stale `expected`, Google would refuse them, and the app would
+      // report its own writes as somebody else's edits.
+      if (conflicts.length !== (_ssData._conflicts || []).length) _ssData._conflicts = conflicts;
+      project.googleLink = { ...link, tabs };
+      await ssSave();
     }
-    // Advance the checkpoint for everything that did land, so the next push
-    // does not try to write it again.
-    const nextCheckpoint = { ...checkpoint };
-    for (const change of result.replaced) {
-      nextCheckpoint[_ssCellKeyFromA1(change.a1)] = change.next;
-    }
-    project.googleLink = { ...link, checkpoint: nextCheckpoint };
-    await ssSave();
+
     ssRender();
 
-    if (result.skipped.length) {
+    if (skipped) {
       showToast(
-        `Pushed ${result.written.length} cell${result.written.length === 1 ? '' : 's'}. ` +
-        `${result.skipped.length} changed in Google since your last pull and were kept — ` +
+        `Pushed ${written} cell${written === 1 ? '' : 's'}. ` +
+        `${skipped} changed in Google since your last pull and were kept — ` +
         `review them in the conflicts banner.`, 'warning');
     } else {
-      showToast(`Pushed ${result.written.length} cell${result.written.length === 1 ? '' : 's'} to Google.`, 'success');
+      showToast(`Pushed ${written} cell${written === 1 ? '' : 's'} to Google.`, 'success');
     }
     return true;
   } catch (error) {
@@ -10904,7 +11135,76 @@ async function ssImportFile() {
   }
 }
 
-async function ssImportBuildProject(name, sheets) {
+// MB161-018: a fill or text colour arriving from outside the app. Strict on
+// purpose — anything that is not a plain six-digit hex becomes "no colour"
+// rather than being stored and rendered as whatever CSS makes of it.
+function _ssImportColor(input) {
+  return typeof input === 'string' && /^#[0-9a-fA-F]{6}$/.test(input)
+    ? input.toLowerCase()
+    : '';
+}
+
+// Turn Google's merge ranges into the app's anchor-plus-span cells.
+//
+// The workbook validator refuses two things this has to respect: merged regions
+// that overlap, and cells that exist underneath one. So a merge that would
+// collide with one already applied is dropped rather than written, and every
+// covered cell is deleted after the anchor absorbs it. Getting this wrong does
+// not draw badly — it throws on save and quarantines the project.
+function _ssApplyImportedMerges(cells, merges, storedRows, storedCols) {
+  if (!Array.isArray(merges) || !merges.length) return;
+  const claimed = new Set();
+  for (const merge of merges) {
+    if (!merge || typeof merge !== 'object') continue;
+    const row = Number(merge.row);
+    const column = Number(merge.column);
+    if (!Number.isSafeInteger(row) || !Number.isSafeInteger(column) ||
+        row < 0 || column < 0 || row >= storedRows || column >= storedCols) continue;
+    // Validate the spans BEFORE clipping them. `Number(x) || 1` reads as a
+    // harmless default but turns a malformed span into a legitimate-looking
+    // one — a NaN rowSpan alongside a colSpan of 2 becomes a real 1x2 merge,
+    // so a corrupt response would silently restructure the sheet rather than
+    // being ignored. Caught by its own test.
+    const rawRowSpan = Number(merge.rowSpan);
+    const rawColSpan = Number(merge.colSpan);
+    if (!Number.isSafeInteger(rawRowSpan) || !Number.isSafeInteger(rawColSpan)) continue;
+    if (rawRowSpan < 1 || rawColSpan < 1) continue;
+    // Clip rather than reject: a merge running past the imported window is
+    // still meaningful for the part that is inside it.
+    const rowSpan = Math.min(rawRowSpan, storedRows - row);
+    const colSpan = Math.min(rawColSpan, storedCols - column);
+    if (rowSpan < 1 || colSpan < 1 || (rowSpan === 1 && colSpan === 1)) continue;
+
+    let collides = false;
+    for (let r = row; r < row + rowSpan && !collides; r += 1) {
+      for (let c = column; c < column + colSpan; c += 1) {
+        if (claimed.has(r + ',' + c)) { collides = true; break; }
+      }
+    }
+    if (collides) continue;
+
+    const anchorKey = row + ',' + column;
+    const anchor = cells[anchorKey] || { v: '', bg: '', tc: '', b: false };
+    for (let r = row; r < row + rowSpan; r += 1) {
+      for (let c = column; c < column + colSpan; c += 1) {
+        const key = r + ',' + c;
+        claimed.add(key);
+        if (key === anchorKey) continue;
+        // Google puts the value in the top-left of a merge, but the fill is on
+        // every covered cell. If the anchor has no fill of its own, inherit one
+        // from the region so the merged block keeps its colour.
+        const covered = cells[key];
+        if (covered && !anchor.bg && covered.bg) anchor.bg = covered.bg;
+        delete cells[key];
+      }
+    }
+    anchor.rs = rowSpan;
+    anchor.cs = colSpan;
+    cells[anchorKey] = anchor;
+  }
+}
+
+async function ssImportBuildProject(name, sheets, extraBytes) {
   if (_ssBlockedWorkbook || _ssAwaitingAuthority || !_ssData) return false;
   if (!Array.isArray(sheets) || !sheets.length || sheets.length > MAX_SPREADSHEET_SHEETS) {
     showToast('That spreadsheet did not contain a safe number of sheets.', 'warning');
@@ -10941,13 +11241,24 @@ async function ssImportBuildProject(name, sheets) {
       }
     const sid = pid + '_s' + (i + 1);
     const cells = {};
+    // MB161-018: formatting is optional, because CSV and .xlsx imports have
+    // none. When it is present a cell can be worth keeping for its fill alone —
+    // a blocked-out slot on a schedule is an empty cell with a black
+    // background, and dropping it because `val === ''` is what made the first
+    // Google import look nothing like the sheet it came from.
+    const formats = Array.isArray(s.formats) ? s.formats : null;
     rows2d.forEach((row, ri) => {
       row.forEach((val, ci) => {
-        if (val !== '') {
-          cells[ri + ',' + ci] = { v: val, bg: '', tc: '', b: false };
+        const format = formats?.[ri]?.[ci];
+        const bg = _ssImportColor(format?.bg);
+        const tc = _ssImportColor(format?.tc);
+        const bold = format?.b === true;
+        if (val !== '' || bg || tc || bold) {
+          cells[ri + ',' + ci] = { v: val, bg, tc, b: bold };
         }
       });
     });
+    _ssApplyImportedMerges(cells, s.merges, storedRows, storedCols);
     // Compute column widths: estimate based on longest content per column
     const colWidths = [];
     for (let c = 0; c < numCols; c++) {
@@ -10981,6 +11292,12 @@ async function ssImportBuildProject(name, sheets) {
       return totals;
     }, { cells: 0, characters: 0 });
     incoming.bytes = new TextEncoder().encode(JSON.stringify(builtSheets)).byteLength;
+    // MB161-018: a Google import stores a checkpoint too — a copy of every text
+    // value as Google last held it — and it is attached AFTER this check, in the
+    // caller. Leaving it out of the estimate is how an import passes here and
+    // then fails to save, which is the worst of both: the project exists and
+    // cannot be written. It roughly doubles a linked project, so it is counted.
+    if (typeof extraBytes === 'number' && extraBytes > 0) incoming.bytes += extraBytes;
     const refusal = _ssCapacityRefusal(_ssData, incoming);
     if (refusal) {
       showToast(
@@ -11005,7 +11322,10 @@ async function ssImportBuildProject(name, sheets) {
     _ssData = normalized;
     showToast('✅ Imported "' + projectName + '" (' + builtSheets.length + ' sheet' + (builtSheets.length !== 1 ? 's' : '') + ')', 'success');
     ssGoHome();
-    return true;
+    // MB161-018: hand back the project that was actually stored, rather than
+    // `true`. The Google importer used to reach for `projects[length - 1]` to
+    // find it again, which is only correct while nothing else can append.
+    return (_ssData.projects || []).find(project => project.id === pid) || true;
   } catch (error) {
     showToast(`That spreadsheet was not imported: ${error?.message || error}`, 'danger');
     return false;

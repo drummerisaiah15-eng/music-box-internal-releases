@@ -1484,3 +1484,65 @@ test('MB161-017: every Google call uses Electron net, not Node https', () => {
   assert.match(helper, /Google did not respond in time/);
   assert.match(helper, /request\.abort\(\)/);
 });
+
+test('MB161-018: a tab name is quoted into the A1 range, everywhere', () => {
+  // `Monday!A1` parses, which is why this survived testing: every tab in the
+  // sheet under test had a one-word name. A1 requires the sheet name quoted as
+  // soon as it contains a space or punctuation, so "Color Block" or "Week 1"
+  // returned a parse error — and on an all-tabs import one such tab took the
+  // whole batch down with it.
+  assert.match(main, /function _googleRange\(title, cells\)/);
+  const helper = main.slice(main.indexOf('function _googleRange'),
+                            main.indexOf('function _columnLetters'));
+  assert.match(helper, /replace\(\/'\/g, "''"\)/,
+    "an internal quote is escaped by doubling, which is the escape A1 defines");
+
+  // No range may be built by interpolating a bare title again.
+  assert.doesNotMatch(main, /`\$\{title\}!/,
+    'every range goes through the helper');
+  for (const built of [
+    /const range = _googleRange\(title, `A1:\$\{_columnLetters\(columns\)\}\$\{rows\}`\)/,
+    /_googleRange\(title, a1\)/,
+    /range: _googleRange\(title, cell\.a1\)/,
+  ]) assert.match(main, built);
+});
+
+test('MB161-018: the formatted read stays bounded and trims to what is used', () => {
+  const read = main.slice(main.indexOf("_secureHandle('google-sheet-read'"),
+                          main.indexOf('function _googleColorHex'));
+  // A fields mask is not an optimisation here. Without it Google returns every
+  // format property of every cell and a 500x100 window runs to tens of
+  // megabytes, which is a memory problem rather than a slow one.
+  assert.match(read, /includeGridData=true&fields=/);
+  assert.match(read, /48 \* 1024 \* 1024/, 'and the response is still capped');
+
+  // Google reports an effective format for every cell in the requested window
+  // whether or not anybody touched it, so without trimming every import would
+  // arrive as the full 500 rows of nothing.
+  assert.match(read, /const usedRows = lastRow \+ 1/);
+  assert.match(read, /const usedCols = lastCol \+ 1/);
+  assert.match(read, /merges\.length >= 5000/, 'and the merge list is bounded too');
+});
+
+test('MB161-018: white and black map to "no colour", not to a fill', () => {
+  // Google reports white for an unformatted cell and black for default text.
+  // Storing those as explicit colours would turn a blank tab into fifty
+  // thousand white cells and defeat the trimming above.
+  const context = { Object, Array, Number, String, Math };
+  vm.runInNewContext(
+    `${extractFunction(main, '_isPlainObject')}
+     ${extractFunction(main, '_googleColorHex')}
+     this.api = (color, blank) => _googleColorHex(color, blank);`, context);
+  const bg = color => context.api(color, '#ffffff');
+  const fg = color => context.api(color, '#000000');
+
+  assert.equal(bg({ red: 1, green: 1, blue: 1 }), '', 'white background is no fill');
+  assert.equal(fg({}), '', 'a missing channel is zero, so {} is black text: no colour');
+  assert.equal(bg({}), '#000000', 'but {} as a background really is black');
+  assert.equal(bg({ red: 0.8, green: 0.8, blue: 0.8 }), '#cccccc');
+  assert.equal(bg({ red: 1, green: 1, blue: 0 }), '#ffff00');
+  // Junk must not become a colour string that then reaches CSS.
+  for (const junk of [null, undefined, 'red', 42, []]) assert.equal(bg(junk), '');
+  // Out-of-range floats are clamped rather than producing '#1ff00-8'.
+  assert.equal(bg({ red: 2, green: -1, blue: 0.5 }), '#ff0080');
+});

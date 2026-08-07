@@ -1147,3 +1147,171 @@ test('MB161-011: the edit paths ask before they mutate, not after', () => {
   assert.match(importer, /filled cells\. \$\{refusal\}/,
     'and the refusal names the size of the file that was rejected');
 });
+
+// ── MB161-018: importing a Google grid, not just its text ───────────────────
+//
+// A studio schedule keeps most of its meaning in the fills (a black cell is a
+// blocked-out slot) and the merges (one lesson spanning two 15-minute rows).
+// The first import dropped both and produced a grid that was technically the
+// same data and practically unusable. These exercise the real functions.
+
+function importApi() {
+  const context = vm.createContext({ Object, Array, Number, String, JSON, Boolean });
+  vm.runInContext(`
+    ${declaration('_ssImportColor')}
+    ${declaration('_ssApplyImportedMerges')}
+    globalThis.api = {
+      color: value => _ssImportColor(value),
+      merge: (cells, merges, rows, cols) => {
+        _ssApplyImportedMerges(cells, merges, rows, cols);
+        return cells;
+      },
+    };
+  `, context);
+  return context.api;
+}
+
+test('MB161-018: only a real hex is accepted as an imported colour', () => {
+  const api = importApi();
+  assert.equal(api.color('#1A2B3C'), '#1a2b3c', 'normalized to lower case');
+  assert.equal(api.color('#000000'), '#000000', 'black is a colour, not an absence');
+  // Everything else becomes "no colour" rather than being stored and handed to
+  // CSS, which is how `red; background:url(...)` would have got a look-in.
+  for (const junk of ['red', 'rgb(1,2,3)', '#abc', '#12345g', '', null, undefined, 42, {},
+                      '#123456; background:url(x)']) {
+    assert.equal(api.color(junk), '', `${JSON.stringify(junk)} is not a colour`);
+  }
+});
+
+test('MB161-018: a merge claims its region and leaves no cell underneath', () => {
+  const api = importApi();
+  const cells = {
+    '0,0': { v: 'Zachary P', bg: '#cccccc', tc: '', b: false },
+    '1,0': { v: '', bg: '#cccccc', tc: '', b: false },   // covered by the merge
+    '2,0': { v: 'keep me', bg: '', tc: '', b: false },   // outside it
+  };
+  const out = api.merge(cells, [{ row: 0, column: 0, rowSpan: 2, colSpan: 1 }], 10, 5);
+  assert.deepEqual(Object.keys(out).sort(), ['0,0', '2,0']);
+  assert.equal(out['0,0'].rs, 2);
+  assert.equal(out['0,0'].cs, 1);
+  assert.equal(out['0,0'].v, 'Zachary P', 'the anchor keeps its value');
+  // The workbook validator refuses a cell inside a merged region outright, so
+  // "the covered cell is gone" is not tidiness — leaving it quarantines the
+  // project on the next save.
+  assert.equal(out['1,0'], undefined);
+});
+
+test('MB161-018: a merged block inherits a fill its anchor lacks', () => {
+  // Google puts the value in the top-left of a merge but paints every covered
+  // cell. If the anchor happens to carry no fill of its own, taking the region's
+  // is what stops a coloured block importing as a white one.
+  const api = importApi();
+  const out = api.merge({
+    '0,0': { v: 'Music Mix', bg: '', tc: '', b: false },
+    '0,1': { v: '', bg: '#6d8fe0', tc: '', b: false },
+  }, [{ row: 0, column: 0, rowSpan: 1, colSpan: 2 }], 10, 5);
+  assert.equal(out['0,0'].bg, '#6d8fe0');
+});
+
+test('MB161-018: overlapping merges cannot both be applied', () => {
+  // Two merges claiming the same cell is a workbook the validator rejects. A
+  // spreadsheet cannot really produce this, but a corrupt or hostile response
+  // can, and the failure mode is a project that will not save.
+  const api = importApi();
+  const out = api.merge({ '0,0': { v: 'a', bg: '', tc: '', b: false } }, [
+    { row: 0, column: 0, rowSpan: 2, colSpan: 2 },
+    { row: 1, column: 1, rowSpan: 2, colSpan: 2 },   // overlaps the first
+  ], 10, 5);
+  assert.equal(out['0,0'].rs, 2);
+  assert.equal(out['1,1'], undefined, 'the second merge was dropped, not written');
+  const spans = Object.values(out).filter(cell => cell.rs > 1 || cell.cs > 1);
+  assert.equal(spans.length, 1);
+});
+
+test('MB161-018: a merge running past the grid is clipped, not dropped', () => {
+  const api = importApi();
+  const out = api.merge({ '0,0': { v: 'x', bg: '', tc: '', b: false } },
+    [{ row: 0, column: 0, rowSpan: 99, colSpan: 99 }], 4, 3);
+  assert.equal(out['0,0'].rs, 4, 'clipped to the stored row count');
+  assert.equal(out['0,0'].cs, 3, 'and the stored column count');
+});
+
+test('MB161-018: junk merges are ignored rather than throwing', () => {
+  const api = importApi();
+  const out = api.merge({ '0,0': { v: 'x', bg: '', tc: '', b: false } }, [
+    null, 'nope', {}, { row: -1, column: 0, rowSpan: 2, colSpan: 2 },
+    { row: 0, column: 0, rowSpan: 1, colSpan: 1 },        // a 1x1 is not a merge
+    { row: 99, column: 99, rowSpan: 2, colSpan: 2 },      // anchor off the grid
+    { row: 0, column: 0, rowSpan: NaN, colSpan: 2 },
+  ], 10, 5);
+  assert.deepEqual(Object.keys(out), ['0,0']);
+  assert.equal(out['0,0'].rs, undefined, 'none of those was applied');
+});
+
+test('MB161-018: a link written before multi-tab still pulls and pushes', () => {
+  // The tab name and checkpoint moved out of the link and into a map keyed by
+  // sheet. Somebody who imported a tab on the previous build has the old shape
+  // stored and synced. Reading it as a one-entry map is what stops their
+  // project silently losing its link on first launch.
+  const api = roundTripApi();
+  const out = api.norm({
+    activeProject: 'p1',
+    projects: [{
+      id: 'p1', name: 'P', activeId: 's1',
+      sheets: [{ id: 's1', name: 'Monday', rows: 3, cols: 3, colWidths: [], cells: {} }],
+      googleLink: {
+        spreadsheetId: '1zZ4M7ewY7cFBePc2nV-kX2j-YHr0rilPQ6bFvB7WYrg',
+        title: 'Monday', rows: 500, columns: 100,
+        checkpoint: { '0,0': 'TIME' },
+      },
+    }],
+  });
+  const link = out.projects[0].googleLink;
+  assert.equal(link.title, undefined, 'the old top-level field is gone');
+  assert.deepEqual(link.tabs, { s1: { title: 'Monday', checkpoint: { '0,0': 'TIME' } } });
+  assert.equal(link.spreadsheetId, '1zZ4M7ewY7cFBePc2nV-kX2j-YHr0rilPQ6bFvB7WYrg');
+});
+
+test('MB161-018: a tab map survives normalization intact', () => {
+  const api = roundTripApi();
+  const out = api.norm({
+    activeProject: 'p1',
+    projects: [{
+      id: 'p1', name: 'Color Block', activeId: 's1',
+      sheets: [
+        { id: 's1', name: 'Monday',  rows: 3, cols: 3, colWidths: [], cells: {} },
+        { id: 's2', name: 'Tuesday', rows: 3, cols: 3, colWidths: [], cells: {} },
+      ],
+      googleLink: {
+        spreadsheetId: '1zZ4M7ewY7cFBePc2nV-kX2j-YHr0rilPQ6bFvB7WYrg',
+        rows: 500, columns: 100,
+        tabs: {
+          s1: { title: 'Monday',  checkpoint: { '0,0': 'TIME' } },
+          s2: { title: 'Tuesday', checkpoint: { '0,0': 'TIME' } },
+          // A tab pointing at a sheet this project does not have can never be
+          // pulled or pushed; keeping it would only grow the document.
+          s9: { title: 'Ghost', checkpoint: { '0,0': 'x' } },
+        },
+      },
+    }],
+  });
+  assert.deepEqual(Object.keys(out.projects[0].googleLink.tabs).sort(), ['s1', 's2']);
+});
+
+test('MB161-018: a link naming no reachable tab is dropped entirely', () => {
+  // Otherwise the project keeps a Google badge and Pull/Push buttons that
+  // cannot do anything, which reads as "connected" when it is not.
+  const api = roundTripApi();
+  const out = api.norm({
+    activeProject: 'p1',
+    projects: [{
+      id: 'p1', name: 'P', activeId: 's1',
+      sheets: [{ id: 's1', name: 'S', rows: 3, cols: 3, colWidths: [], cells: {} }],
+      googleLink: {
+        spreadsheetId: '1zZ4M7ewY7cFBePc2nV-kX2j-YHr0rilPQ6bFvB7WYrg',
+        rows: 500, columns: 100, tabs: { sGone: { title: 'Monday' } },
+      },
+    }],
+  });
+  assert.equal(out.projects[0].googleLink, undefined);
+});

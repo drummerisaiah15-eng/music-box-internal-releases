@@ -1530,11 +1530,12 @@ async function _googleAccessTokenFor() {
   return _googleAccessToken.value;
 }
 
-async function _googleApiGet(host, requestPath, accessToken) {
+async function _googleApiGet(host, requestPath, accessToken, limit) {
   const { statusCode, text } = await _googleHttp({
     method: 'GET',
     url: `https://${host}${requestPath}`,
     headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' },
+    ...(limit ? { limit } : {}),
   });
   let parsed = null;
   try { parsed = JSON.parse(text); } catch (_) { parsed = null; }
@@ -2336,26 +2337,122 @@ _secureHandle('google-sheet-read', async (_, request) => {
 
   // A bounded A1 range. Never the whole tab: Google tabs carry thousands of
   // empty default rows, and asking for them wastes quota and memory alike.
-  const range = `${title}!A1:${_columnLetters(columns)}${rows}`;
+  const range = _googleRange(title, `A1:${_columnLetters(columns)}${rows}`);
   const token = await _googleAccessTokenFor();
+
+  // MB161-018: read the grid, not just the values.
+  //
+  // The values endpoint returns text and nothing else, which is why the first
+  // import landed as an unstyled grid: a schedule sheet carries most of its
+  // meaning in the fills (blocked-out slots, colour-coded lesson types) and in
+  // the merges (a lesson spanning two 15-minute rows). Dropping those does not
+  // lose decoration, it loses the schedule.
+  //
+  // So this asks for grid data instead, with a strict `fields` mask. The mask
+  // is not an optimisation detail — without it Google returns every format
+  // property of every cell and a 500x100 window runs to tens of megabytes.
+  const fields = [
+    'sheets(properties(sheetId,title)',
+    'merges',
+    'data(rowData(values(formattedValue,effectiveFormat(backgroundColor,textFormat(bold,foregroundColor))))))',
+  ].join(',');
   let payload;
   try {
     payload = await _googleApiGet('sheets.googleapis.com',
-      `/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}/values/${encodeURIComponent(range)}` +
-      `?valueRenderOption=FORMATTED_VALUE&dateTimeRenderOption=FORMATTED_STRING`, token);
+      `/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}` +
+      `?ranges=${encodeURIComponent(range)}&includeGridData=true&fields=${encodeURIComponent(fields)}`,
+      token,
+      // Formatted reads are an order of magnitude larger than value reads.
+      // Still bounded — an unbounded read is how a hostile or corrupt response
+      // becomes a memory problem.
+      48 * 1024 * 1024);
   } catch (error) {
     throw new Error(_googleReadFailure(error));
   }
-  const values = Array.isArray(payload.values) ? payload.values : [];
+
+  const sheet = Array.isArray(payload.sheets) ? payload.sheets[0] : null;
+  const rowData = sheet?.data?.[0]?.rowData;
+  const sourceRows = Array.isArray(rowData) ? rowData : [];
+
+  const grid = [];
+  const formats = [];
   let cells = 0;
-  const grid = values.slice(0, rows).map(row => {
-    const line = (Array.isArray(row) ? row : []).slice(0, columns)
-      .map(value => String(value ?? '').slice(0, 50000));
-    cells += line.filter(value => value !== '').length;
-    return line;
-  });
-  return { ok: true, spreadsheetId, title, range, rows: grid, filledCells: cells };
+  let lastRow = -1;
+  let lastCol = -1;
+
+  for (let r = 0; r < Math.min(sourceRows.length, rows); r += 1) {
+    const values = Array.isArray(sourceRows[r]?.values) ? sourceRows[r].values : [];
+    const textLine = [];
+    const formatLine = [];
+    for (let c = 0; c < Math.min(values.length, columns); c += 1) {
+      const cell = values[c] || {};
+      const text = String(cell.formattedValue ?? '').slice(0, 50000);
+      const effective = cell.effectiveFormat || {};
+      // White is what Google reports for an unformatted cell, so treating it as
+      // "no fill" is what keeps a blank sheet from importing as 50,000 white
+      // cells. The app's own background is white, so nothing looks different.
+      const bg = _googleColorHex(effective.backgroundColor, '#ffffff');
+      const tc = _googleColorHex(effective.textFormat?.foregroundColor, '#000000');
+      const bold = effective.textFormat?.bold === true;
+      textLine.push(text);
+      formatLine.push({ bg, tc, b: bold });
+      if (text !== '') { cells += 1; lastCol = Math.max(lastCol, c); lastRow = Math.max(lastRow, r); }
+      // A fill with no text is meaningful on its own — that is exactly how a
+      // blocked-out slot is drawn — so it counts towards the used extent.
+      else if (bg || tc || bold) { lastCol = Math.max(lastCol, c); lastRow = Math.max(lastRow, r); }
+    }
+    grid.push(textLine);
+    formats.push(formatLine);
+  }
+
+  // Trim to what is actually used. Google reports an effective format for every
+  // cell in the requested window whether or not anybody touched it, so without
+  // this every import would arrive as the full 500 rows.
+  const usedRows = lastRow + 1;
+  const usedCols = lastCol + 1;
+  const trimmedRows = grid.slice(0, usedRows).map(row => row.slice(0, usedCols));
+  const trimmedFormats = formats.slice(0, usedRows).map(row => row.slice(0, usedCols));
+
+  // Merges are reported for the whole tab, so clip them to the window we read.
+  // Half-open in Google (endRowIndex is exclusive), inclusive spans here.
+  const merges = [];
+  for (const merge of Array.isArray(sheet?.merges) ? sheet.merges : []) {
+    const r1 = Number(merge?.startRowIndex ?? 0);
+    const c1 = Number(merge?.startColumnIndex ?? 0);
+    const r2 = Number(merge?.endRowIndex ?? 0);
+    const c2 = Number(merge?.endColumnIndex ?? 0);
+    if (![r1, c1, r2, c2].every(Number.isSafeInteger)) continue;
+    if (r1 < 0 || c1 < 0 || r2 <= r1 || c2 <= c1) continue;
+    if (r1 >= usedRows || c1 >= usedCols) continue;       // anchor outside the window
+    const rowSpan = Math.min(r2, usedRows) - r1;
+    const colSpan = Math.min(c2, usedCols) - c1;
+    if (rowSpan < 1 || colSpan < 1 || (rowSpan === 1 && colSpan === 1)) continue;
+    merges.push({ row: r1, column: c1, rowSpan, colSpan });
+    if (merges.length >= 5000) break;
+  }
+
+  return {
+    ok: true, spreadsheetId, title, range,
+    rows: trimmedRows, formats: trimmedFormats, merges,
+    filledCells: cells,
+  };
 });
+
+// Google gives colour as floats 0..1, with missing channels meaning zero, and
+// may report it under either the old `backgroundColor` or a newer colour style.
+// Anything that resolves to `treatAsBlank` comes back as '' — the app's "no
+// colour" — rather than as an explicit hex, so a default sheet imports clean.
+function _googleColorHex(color, treatAsBlank) {
+  if (!_isPlainObject(color)) return '';
+  const channel = value => {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return 0;
+    return Math.max(0, Math.min(255, Math.round(number * 255)));
+  };
+  const hex = '#' + [color.red, color.green, color.blue]
+    .map(value => channel(value).toString(16).padStart(2, '0')).join('');
+  return hex === treatAsBlank ? '' : hex;
+}
 
 // MB161-016: push cells to Google, refusing to destroy anything unannounced.
 //
@@ -2403,7 +2500,7 @@ _secureHandle('google-sheet-push', async (_, request) => {
 
   const token = await _googleAccessTokenFor();
   const ranges = [...wanted.keys()]
-    .map(a1 => `ranges=${encodeURIComponent(`${title}!${a1}`)}`).join('&');
+    .map(a1 => `ranges=${encodeURIComponent(_googleRange(title, a1))}`).join('&');
   let current;
   try {
     current = await _googleApiGet('sheets.googleapis.com',
@@ -2445,7 +2542,7 @@ _secureHandle('google-sheet-push', async (_, request) => {
     // RAW: Google stores what it is given without reparsing it. The app's cell
     // model is text, so anything else would silently reinterpret it.
     valueInputOption: 'RAW',
-    data: toWrite.map(cell => ({ range: `${title}!${cell.a1}`, values: [[cell.value]] })),
+    data: toWrite.map(cell => ({ range: _googleRange(title, cell.a1), values: [[cell.value]] })),
   });
 
   const write = await _googleHttp({
@@ -2465,6 +2562,18 @@ _secureHandle('google-sheet-push', async (_, request) => {
 
   return { ok: true, written: toWrite.map(c => c.a1), skipped, replaced };
 });
+
+// MB161-018: an A1 range naming a tab.
+//
+// `Monday!A1` happens to work, which is exactly why this was missed: every tab
+// in the sheet that got tested had a one-word name. Google's A1 grammar needs a
+// sheet name quoted the moment it contains a space or punctuation, so a tab
+// called "Color Block" or "Week 1" produced a parse error from the API and, on
+// an all-tabs import, took the whole batch down with it. Internal quotes are
+// escaped by doubling, which is the escape A1 defines.
+function _googleRange(title, cells) {
+  return `'${String(title).replace(/'/g, "''")}'!${cells}`;
+}
 
 function _columnLetters(count) {
   let n = count - 1;
