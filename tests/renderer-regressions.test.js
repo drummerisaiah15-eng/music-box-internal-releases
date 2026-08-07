@@ -1609,3 +1609,33 @@ test('MB161-019: an open cell keeps the fill it is being edited in', () => {
   const base = source.slice(source.indexOf('    .ss-cell-input {'));
   assert.match(base.slice(0, base.indexOf('}')), /background:inherit;color:inherit/);
 });
+
+test('MB161-019: a merged cell wraps but never grows its row', () => {
+  // height:auto here was written when a merge was a rare, deliberate act. An
+  // imported Google schedule is built almost entirely out of rowspan-2 merges,
+  // so the exception became the rule: one long note set the height of its whole
+  // row and 26px rows became 90px ones.
+  const start = source.indexOf('#ss-grid td[rowspan]:not([rowspan="1"]),');
+  assert.notEqual(start, -1);
+  const tdRule = source.slice(start, source.indexOf('}', start));
+  assert.doesNotMatch(tdRule, /height:auto/,
+    'a merged cell takes its room from its rowspan, never from its text');
+  assert.match(tdRule, /height:26px/, 'the same row height as every other cell');
+
+  const innerStart = source.indexOf('#ss-grid td[rowspan]:not([rowspan="1"]) .ss-cell-inner,');
+  assert.notEqual(innerStart, -1);
+  const innerRule = source.slice(innerStart, source.indexOf('}', innerStart));
+  assert.match(innerRule, /-webkit-line-clamp:2/, 'two lines, then it clips');
+  assert.match(innerRule, /max-height:36px/, 'and cannot exceed the two lines it clamps to');
+  assert.match(innerRule, /overflow:hidden/);
+});
+
+test('MB161-019: an ordinary cell is still one clipped line', () => {
+  // The formula bar is what shows the whole value, so no cell needs to.
+  const start = source.indexOf('    .ss-cell-inner {');
+  const rule = source.slice(start, source.indexOf('}', start));
+  assert.match(rule, /white-space:nowrap/);
+  assert.match(rule, /overflow:hidden/);
+  assert.match(rule, /text-overflow:ellipsis/);
+  assert.match(rule, /height:26px/);
+});

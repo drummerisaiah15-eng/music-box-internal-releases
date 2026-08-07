@@ -935,12 +935,17 @@
       white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
       vertical-align:middle;height:26px;
     }
-    /* A merged cell is the deliberate exception: it was given the room, so it
-       may use it. */
+    /* MB161-019: a merged cell may WRAP, but it still may not GROW.
+       `height:auto` here was written when a merge was a rare, deliberate act, so
+       letting one size itself was harmless. An imported Google schedule is built
+       almost entirely out of rowspan-2 merges, which turned the exception into
+       the rule: a single long note in one column set the height of its whole
+       row, and the grid went from 26px rows to 90px ones.
+       The room a merged cell gets comes from its rowspan and nothing else. */
     #ss-grid td[rowspan]:not([rowspan="1"]),
     #ss-grid td[colspan]:not([colspan="1"]) {
       white-space:normal;word-break:break-word;overflow-wrap:break-word;
-      vertical-align:top;height:auto;
+      vertical-align:top;height:26px;
     }
     #ss-grid th {
       background:#f3f3f3;text-align:center;font-weight:500;
@@ -984,11 +989,17 @@
       padding:3px 6px;height:26px;line-height:20px;user-select:none;
       white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
     }
-    /* A merged cell was deliberately given the room, so it may wrap. */
+    /* A merged cell was given the room, so it may wrap — to two lines, then it
+       clips like every other cell. Two rather than one because that is what a
+       rowspan-2 block has space for; more than that and the row has to grow,
+       which is the thing being prevented. The rest of the value is in the
+       formula bar, which is where a spreadsheet puts it. */
     #ss-grid td[rowspan]:not([rowspan="1"]) .ss-cell-inner,
     #ss-grid td[colspan]:not([colspan="1"]) .ss-cell-inner {
+      display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;
       white-space:pre-wrap;word-break:break-word;overflow-wrap:break-word;
-      height:auto;min-height:26px;line-height:1.35;
+      overflow:hidden;text-overflow:ellipsis;
+      height:auto;max-height:36px;line-height:18px;
     }
     .ss-cell-input {
       position:absolute;inset:0;border:none;outline:none;
