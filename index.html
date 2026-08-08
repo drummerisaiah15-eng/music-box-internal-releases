@@ -967,16 +967,19 @@
        disappeared against the pale fills a schedule is made of, so rows were
        hard to follow across.
 
-       The width is a variable because the grid is scaled with CSS `zoom`, and
-       zoom scales border-width along with everything else. At 75% a 1px line
-       is asked to paint 0.75px, which Chromium antialiases into something
-       paler than the fill on either side of it — so the lines faded out
-       exactly when the grid was zoomed out far enough to need them most.
-       Darkening the colour could not fix that, because the problem was the
-       width. ssApplyZoom sets --ss-line to 1/zoom so the painted line is a
-       true device pixel at any zoom level. */
+       The grid is scaled with CSS `zoom`, so at 75% a 1px line is asked to
+       paint 0.75px and Chromium antialiases it paler than the fills on either
+       side — the lines wash out exactly when the grid is zoomed out far enough
+       to need them.
+
+       Compensated with COLOUR, not width. Scaling the width up to counter the
+       zoom did keep the line crisp, but border-width is layout: every step
+       changed the row heights, which changed the total content height, which
+       moved the scroll target the pointer-anchored zoom was aiming at — so
+       zooming juddered up and down instead of gliding. Colour costs no layout
+       at all. */
     #ss-grid th, #ss-grid td {
-      border:var(--ss-line, 1px) solid #83888d;padding:0;position:relative;overflow:hidden;
+      border:1px solid var(--ss-line-color, #83888d);padding:0;position:relative;overflow:hidden;
     }
     #ss-grid th { white-space:nowrap;height:26px; }
     /* A schedule is read by scanning rows and columns. Letting one long note
@@ -13457,14 +13460,26 @@ function _ssClampZoom(value) {
   return Math.min(SS_ZOOM_MAX, Math.max(SS_ZOOM_MIN, zoom));
 }
 
+// A zoomed-out gridline covers less than a pixel, so it paints paler. Darken
+// it by the same proportion to keep it looking like the line it is. Layout is
+// untouched, which is the whole point.
+function _ssGridLineColor(zoom) {
+  const from = [0x83, 0x88, 0x8d];   // at 100% and above
+  const to   = [0x3c, 0x40, 0x43];   // at 50%, the furthest out the grid goes
+  const t = Math.min(Math.max((1 - zoom) / 0.5, 0), 1);
+  return '#' + from
+    .map((channel, index) => Math.round(channel + (to[index] - channel) * t))
+    .map(channel => channel.toString(16).padStart(2, '0'))
+    .join('');
+}
+
 function ssApplyZoom() {
   const grid = document.getElementById('ss-grid');
   if (grid) {
     grid.style.zoom = _ssZoom === 1 ? '' : String(_ssZoom);
-    // Counter the zoom so a gridline is always one real pixel. Without this a
-    // zoomed-out grid draws sub-pixel lines that wash out against the fills.
-    grid.style.setProperty('--ss-line',
-      _ssZoom === 1 ? '1px' : (1 / _ssZoom).toFixed(3) + 'px');
+    // Darker as the grid shrinks, so the thinner painted line reads the same.
+    // Deliberately not a width change: see the note beside the CSS.
+    grid.style.setProperty('--ss-line-color', _ssGridLineColor(_ssZoom));
   }
   const btn = document.getElementById('ss-zoom-btn');
   if (btn) {

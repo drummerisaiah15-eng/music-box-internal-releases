@@ -2266,25 +2266,31 @@ test('the morning briefing has no dead sections', () => {
   }
 });
 
-test('gridlines stay one real pixel at every zoom level', () => {
-  // The grid is scaled with CSS `zoom`, which scales border-width too. At 75%
-  // a 1px border paints 0.75px, and Chromium antialiases that into something
-  // paler than the fill on either side — so the lines faded out exactly when
-  // the grid was zoomed out far enough to need them. Darkening the colour
-  // could not fix a width problem, which is why it had to be done twice.
+test('gridlines darken with zoom without changing layout', () => {
+  // First attempt scaled border-width by 1/zoom. It kept the line crisp and it
+  // broke zooming: border-width is layout, so every step resized the rows,
+  // which resized the content, which moved the scroll target the
+  // pointer-anchored zoom was aiming at. The grid juddered instead of gliding.
+  // Colour is layout-neutral, so it can change on every wheel event for free.
   const source = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
-  assert.match(source, /border:var\(--ss-line, 1px\) solid #83888d/,
-    'the width is a variable, not a literal');
+  assert.match(source, /border:1px solid var\(--ss-line-color, #83888d\)/,
+    'the WIDTH is fixed at 1px');
   const apply = namedFunctionSource('ssApplyZoom');
-  assert.match(apply, /setProperty\('--ss-line',/, 'and zoom sets it');
-  assert.match(apply, /\(1 \/ _ssZoom\)/, 'to the inverse of the zoom');
+  assert.doesNotMatch(apply, /--ss-line'/, 'nothing sets a width variable');
+  assert.match(apply, /setProperty\('--ss-line-color', _ssGridLineColor\(_ssZoom\)\)/);
 
-  // Check the arithmetic rather than trusting the expression.
-  const context = vm.createContext({ Number });
-  vm.runInContext(`globalThis.line = z => z === 1 ? 1 : Number((1 / z).toFixed(3));`, context);
-  for (const zoom of [0.5, 0.67, 0.75, 1, 1.5, 2]) {
-    const painted = context.line(zoom) * zoom;
-    assert.ok(Math.abs(painted - 1) < 0.005,
-      `at ${zoom * 100}% the line paints ${painted.toFixed(3)}px, not 1px`);
+  const context = vm.createContext({ Math, Number, String });
+  vm.runInContext(`${namedFunctionSource('_ssGridLineColor')}
+    globalThis.line = z => _ssGridLineColor(z);`, context);
+  assert.equal(context.line(1), '#83888d', 'unchanged at 100%');
+  assert.equal(context.line(2), '#83888d', 'and no darker when zoomed in');
+  assert.equal(context.line(0.5), '#3c4043', 'darkest at the 50% floor');
+  // Monotonic, so there is no zoom level where the line suddenly jumps.
+  const luminance = hex => parseInt(hex.slice(1, 3), 16);
+  let previous = 0;
+  for (const zoom of [0.5, 0.6, 0.7, 0.8, 0.9, 1]) {
+    const value = luminance(context.line(zoom));
+    assert.ok(value >= previous, `line gets lighter as zoom rises (${zoom})`);
+    previous = value;
   }
 });
