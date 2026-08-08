@@ -1951,3 +1951,28 @@ test('a refused client ID says what was wrong with it', () => {
   assert.doesNotMatch(secretClean.slice(0, 500), /\[\^A-Za-z0-9/,
     'a secret is never rewritten beyond removing invisible characters');
 });
+
+test('a client ID of the wrong length is saved with a warning, not silently', () => {
+  // A truncated client ID still matches the shape check, and Google answers it
+  // with 'Error 401: invalid_client — The OAuth client was not found', which
+  // reads like a project or test-user problem rather than a character missing
+  // from what was pasted. That cost an hour.
+  const source = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  const handler = source.slice(source.indexOf("_secureHandle('google-set-credentials'"));
+  assert.match(handler.slice(0, 2600), /suffix\.length === 32 \? null :/,
+    'the 32-character convention is checked');
+  assert.match(handler.slice(0, 2600), /copied incompletely/);
+  assert.match(handler.slice(0, 4000), /reconnectRequired: !sameClient, lengthWarning/,
+    'and returned to the renderer');
+
+  // A warning, not a refusal — 32 is Google's convention, not a guarantee.
+  const suffixOf = id => /-([A-Za-z0-9_]+)\.apps\.googleusercontent\.com$/.exec(id)?.[1] || '';
+  const short = '235779015004-5m1ddq0k4p1v4mq77lfl6513lcpbe3e.apps.googleusercontent.com';
+  const full = '235779015004-5m1ddq0k4p1v4mq77lfl6513lcpbe3ex.apps.googleusercontent.com';
+  assert.equal(suffixOf(short).length, 31, 'the reported value really is one short');
+  assert.equal(suffixOf(full).length, 32);
+  assert.match(source, /warning, not a refusal/, 'documented as a warning');
+
+  const renderer = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  assert.match(renderer, /result\.lengthWarning/, 'and the operator is shown it');
+});

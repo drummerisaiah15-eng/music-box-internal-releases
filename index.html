@@ -11832,9 +11832,16 @@ async function saveGoogleCredentials() {
     const result = await _googleSheets().setCredentials({ clientId, clientSecret });
     const secretField = document.getElementById('google-client-secret');
     if (secretField) secretField.value = '';
-    showToast(result.reconnectRequired
-      ? 'Google credentials saved. Connect the Google account next.'
-      : 'Google credentials saved.', 'success');
+    if (result.lengthWarning) {
+      // Shown instead of the cheerful message, because the next thing that
+      // happens is a Google error page that names the wrong problem.
+      showToast(`Google credentials saved, but check the client ID: ${result.lengthWarning}`,
+        'warning');
+    } else {
+      showToast(result.reconnectRequired
+        ? 'Google credentials saved. Connect the Google account next.'
+        : 'Google credentials saved.', 'success');
+    }
     refreshGoogleSheetsStatus();
   } catch (error) {
     showToast(`Google credentials were not saved: ${error?.message || error}`, 'danger');

@@ -2178,6 +2178,18 @@ _secureHandle('google-set-credentials', async (_, request) => {
   if (!_validGoogleClientSecret(clientSecret)) {
     throw new Error('That does not look like a Google OAuth client secret.');
   }
+  // A truncated client ID still matches the shape above, and Google answers a
+  // truncated one with 'Error 401: invalid_client — The OAuth client was not
+  // found', which reads like a project or test-user problem rather than a typo.
+  // Every client ID Google issues has a 32-character suffix, so a different
+  // length is worth saying out loud. It is a warning, not a refusal: the length
+  // is Google's convention, not a documented guarantee.
+  const suffix = /-([A-Za-z0-9_]+)\.apps\.googleusercontent\.com$/.exec(clientId)?.[1] || '';
+  const lengthWarning = suffix.length === 32 ? null :
+    `This client ID has ${suffix.length} characters after the dash; Google issues 32. ` +
+    `If Google then says the OAuth client was not found, it was copied incompletely — ` +
+    `use the copy button in the console rather than retyping it.`;
+
   const existing = _googleVault();
   // Changing the client identity invalidates any token issued under the old
   // one, so drop them rather than leaving credentials that cannot work.
@@ -2189,7 +2201,7 @@ _secureHandle('google-set-credentials', async (_, request) => {
     account: sameClient ? existing.account : undefined,
     connectedAt: sameClient ? existing.connectedAt : undefined,
   });
-  return { ok: true, reconnectRequired: !sameClient };
+  return { ok: true, reconnectRequired: !sameClient, lengthWarning };
 });
 
 _secureHandle('google-status', async () => {
