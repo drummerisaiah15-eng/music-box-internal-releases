@@ -2752,11 +2752,13 @@ async function publishStaffDirectory() {
     _setDirectoryPublicationPending(true);
     return false;
   }
-  if (!isElizabeth()) {
-    // Publishing is owner-only. Recording the debt is what makes the message
-    // on the login screen true: before this, "Elizabeth can sign in here to
-    // publish it" described a flow that did not exist, and the new employee
-    // stayed missing from the other Macs indefinitely.
+  // MB1188-029: publishing needs somebody signed in, but no longer needs it to
+  // be the owner. Nobody is signed in at the login screen, which is the only
+  // place a profile can be created, so this defer is still the normal path —
+  // it is just settled by whoever signs in next rather than by Elizabeth
+  // specifically, on that particular Mac. See app-session-export-directory in
+  // main.js for why widening it is safe.
+  if (!currentUser()) {
     _setDirectoryPublicationPending(true);
     return false;
   }
@@ -2775,6 +2777,19 @@ async function publishStaffDirectory() {
       includeSync: cloudRunning,
       requireSync: cloudRunning,
     });
+    // MB1188-028: the marker used to be cleared here unconditionally, and this
+    // returned true, so a write that never left the Mac was announced as
+    // "shared with the other Macs". It also threw away the one affordance for
+    // fixing it: with the marker gone, the Manage Users banner and its "Share
+    // now" button disappear, and nothing ever retries.
+    //
+    // Only the cloud write settles the debt. Without it the directory is
+    // durable locally and still owed to the other Macs, which is exactly what
+    // the marker means.
+    if (!cloudRunning) {
+      _setDirectoryPublicationPending(true);
+      return false;
+    }
     _setDirectoryPublicationPending(false);
     return true;
   } catch (error) {
@@ -2797,9 +2812,10 @@ async function publishStaffDirectory() {
 // add recorded the debt, and nothing ever settled it.
 async function flushPendingDirectoryPublication() {
   if (!_directoryPublicationPending()) return true;
-  // Only the owner can publish. Anyone else signing in leaves the marker alone
-  // so it is still there when Elizabeth does.
-  if (!isElizabeth()) return true;
+  // MB1188-029: anyone signed in can settle this now. It used to wait for
+  // Elizabeth, which meant a profile added on a Mac she never signs into stayed
+  // local forever.
+  if (!currentUser()) return true;
   const published = await publishStaffDirectory();
   if (published) {
     showToast(
@@ -2815,8 +2831,8 @@ async function flushPendingDirectoryPublication() {
 }
 
 async function retryDirectoryPublication() {
-  if (!isElizabeth()) {
-    showToast('Only the owner can share profiles with the other Macs.', 'warning');
+  if (!currentUser()) {
+    showToast('Sign in to share profiles with the other Macs.', 'warning');
     return false;
   }
   const published = await publishStaffDirectory();
@@ -3041,8 +3057,8 @@ async function addLoginUser() {
       showToast(`${result.profile.name} was added with Front Desk access.`, 'success');
     } else {
       showToast(
-        `${result.profile.name} was added on this Mac with Front Desk access, but not yet ` +
-        `shared with the other Macs. Elizabeth can sign in here to publish it.`,
+        `${result.profile.name} was added on this Mac with Front Desk access. ` +
+        `Signing in here will share them with the other Macs.`,
         'warning'
       );
     }
@@ -6385,6 +6401,24 @@ async function _initFirebaseInner() {
     subscribeToSync();
     _syncBootstrapComplete = true;
 
+    // MB1188-028: publish profiles added from the signed-out login screen.
+    //
+    // MB1188-008 put this in runPostLoginMaintenance, which was the right idea
+    // in the wrong place. completeLogin() deliberately starts Firebase only
+    // AFTER maintenance settles — `_postLoginMaintenancePromise.then(initFirebase)`
+    // — so when the flush ran, _syncReady and _syncBootstrapComplete were both
+    // still false and `cloudRunning` was false EVERY time, not occasionally.
+    // The directory was written to this Mac, announced as shared, and never
+    // sent. That is why the staff_directory document in Firestore never
+    // changed while projects synced perfectly: projects are read from the
+    // store, but a profile has to be pushed to the cloud and then applied into
+    // the other Mac's vault over IPC, and the push was never happening.
+    //
+    // Here is the first moment publishing can actually reach the cloud.
+    void flushPendingDirectoryPublication().catch(error => {
+      console.warn('[profiles] pending publication failed:', error?.message || error);
+    });
+
     // Repointed at a different cloud, every stored revision describes a
     // document that is not there, and CAS fails closed on every key forever.
     // Remote presence is authoritative only now that bootstrap has finished,
@@ -7088,54 +7122,88 @@ function subscribeToSync() {
   _syncUnsubs = [];
   _syncKeyUnsubs.clear();
 
-  getSyncKeys().forEach(key => {
-    // V159-009: a quarantined key must not receive live snapshots. Its local and
-    // remote copies stay frozen until an explicit recovery action runs.
-    if (_syncBootstrapFailedKeys.has(key)) return;
-    const unsub = studioRef().collection('data').doc(key)
-      .onSnapshot(snap => {
-        _serializeKeyReconcile(key, async () => {
-          const result = await _reconcileRemoteSnapshot(key, snap);
-          if (result.conflict) {
-            const err = new SyncConflictError(
-              key,
-              _localSyncRevision(key),
-              Number(snap.data()?.revision || 0)
-            );
-            _syncDeliveryErrors.set(key, err);
-            _surfaceSyncDeliveryError(key, err);
-          } else if (result.localPending && _syncBootstrapComplete) {
-            _scheduleSyncDrain(key).catch(() => {});
-          }
-        }).catch(err => {
-          const msg = err?.message || String(err);
-          console.warn('Sync value rejected for', key, msg);
-          // H-05: durably quarantine so a restart or loadSettings() cannot
-          // later report the key as synced. Also surface the recovery panel.
-          _quarantineSyncKey(key, msg);
-          _remoteDocPresence.delete(key);
-          // H-10: stop this key's listener immediately — the key is frozen until
-          // an explicit recovery action runs; continued snapshots are unwanted.
-          _unsubscribeSyncKey(key);
-          setSyncStatus('error');
-          showToast(`Cloud data for ${key} was rejected and local data was preserved.`, 'warning');
-          _updateSyncConflictActions();
-        });
-      }, err => {
-        // H-10: listener-level Firebase errors (permissions, network, SDK bugs)
-        // are durable failures — quarantine the key so recovery controls appear,
-        // and stop the listener to avoid a tight error loop.
+  getSyncKeys().forEach(key => _subscribeSyncKey(key));
+}
+
+// MB1188-015: the set of synchronized keys GROWS while the app is running, and
+// nothing was picking that up.
+//
+// subscribeToSync() runs twice in a session: once at sync bootstrap and once
+// after a quarantine recovery. It subscribes to whatever getSyncKeys() names at
+// that instant. A project created on the other Mac arrives here as a new id in
+// the index — which merges correctly — but its content lives under
+// spreadsheet_<id>, a key this Mac has never subscribed to. The document
+// therefore never arrived, _ssReadStoredWorkbook parked the id in
+// _ssPendingProjectIds as "still loading", and the project stayed invisible on
+// this Mac until the next launch. That is the two-Mac symptom: the documents
+// existed in Firestore all along, written by the other device, with nothing
+// here listening for them.
+//
+// Subscribing only to what is missing, rather than calling subscribeToSync()
+// again, matters: a full re-subscribe tears down every healthy listener and
+// makes Firestore re-deliver every document, which on a large studio workbook
+// is both a stall and a needless burst of reconcile work.
+function _ssEnsureProjectSubscriptions() {
+  if (!_syncReady || !_firestoreDb) return;
+  for (const key of _ssKnownProjectSyncKeys()) {
+    if (_syncKeyUnsubs.has(key)) continue;
+    _subscribeSyncKey(key);
+  }
+}
+
+// One key's listener. Extracted from subscribeToSync so a single key can be
+// subscribed on its own; the behaviour is unchanged.
+function _subscribeSyncKey(key) {
+  // V159-009: a quarantined key must not receive live snapshots. Its local and
+  // remote copies stay frozen until an explicit recovery action runs.
+  if (_syncBootstrapFailedKeys.has(key)) return;
+  const unsub = studioRef().collection('data').doc(key)
+    .onSnapshot(snap => {
+      _serializeKeyReconcile(key, async () => {
+        const result = await _reconcileRemoteSnapshot(key, snap);
+        // MB1188-015: the index may now name a project whose document this Mac
+        // has no listener for. Subscribe before anything reads the workbook,
+        // or the id sits in _ssPendingProjectIds until the next launch.
+        if (key === 'spreadsheets') _ssEnsureProjectSubscriptions();
+        if (result.conflict) {
+          const err = new SyncConflictError(
+            key,
+            _localSyncRevision(key),
+            Number(snap.data()?.revision || 0)
+          );
+          _syncDeliveryErrors.set(key, err);
+          _surfaceSyncDeliveryError(key, err);
+        } else if (result.localPending && _syncBootstrapComplete) {
+          _scheduleSyncDrain(key).catch(() => {});
+        }
+      }).catch(err => {
         const msg = err?.message || String(err);
-        console.warn('Sync listener error for', key, ':', msg);
-        _quarantineSyncKey(key, `listener error: ${msg}`);
+        console.warn('Sync value rejected for', key, msg);
+        // H-05: durably quarantine so a restart or loadSettings() cannot
+        // later report the key as synced. Also surface the recovery panel.
+        _quarantineSyncKey(key, msg);
+        _remoteDocPresence.delete(key);
+        // H-10: stop this key's listener immediately — the key is frozen until
+        // an explicit recovery action runs; continued snapshots are unwanted.
         _unsubscribeSyncKey(key);
         setSyncStatus('error');
-        showToast(`Live sync listener for ${key} failed; local data is preserved.`, 'warning');
+        showToast(`Cloud data for ${key} was rejected and local data was preserved.`, 'warning');
         _updateSyncConflictActions();
       });
-    _syncKeyUnsubs.set(key, unsub);
-    _syncUnsubs.push(unsub);
-  });
+    }, err => {
+      // H-10: listener-level Firebase errors (permissions, network, SDK bugs)
+      // are durable failures — quarantine the key so recovery controls appear,
+      // and stop the listener to avoid a tight error loop.
+      const msg = err?.message || String(err);
+      console.warn('Sync listener error for', key, ':', msg);
+      _quarantineSyncKey(key, `listener error: ${msg}`);
+      _unsubscribeSyncKey(key);
+      setSyncStatus('error');
+      showToast(`Live sync listener for ${key} failed; local data is preserved.`, 'warning');
+      _updateSyncConflictActions();
+    });
+  _syncKeyUnsubs.set(key, unsub);
+  _syncUnsubs.push(unsub);
 }
 
 async function syncRoomData() {
@@ -8828,6 +8896,19 @@ async function _ssCommitSplitWorkbook(dirtyBase, dirty, stagedActor) {
   if (_syncReady && _syncBootstrapComplete) {
     for (const key of written) _scheduleSyncDrain(key).catch(() => {});
   }
+
+  // MB1188-015: a project created HERE needs its own listener too. Without it
+  // this Mac writes the document and then never hears about it again, so edits
+  // the other Mac makes to that project do not arrive until the next launch —
+  // the same invisibility bug in the opposite direction. Not swallowed: a
+  // failure here is why a project would stop receiving changes, and a silent
+  // catch would leave that looking like a sync problem with no cause.
+  try {
+    _ssEnsureProjectSubscriptions();
+  } catch (error) {
+    console.warn('Could not subscribe to new project keys:', error?.message || error);
+  }
+
   return _ssReadStoredWorkbook();
 }
 
@@ -9177,11 +9258,26 @@ function normalizeSpreadsheetWorkbook(value) {
         throw new Error('spreadsheets has unsafe sheet dimensions');
       }
       const rawWidths = sheet.colWidths === undefined ? [] : sheet.colWidths;
-      if (!Array.isArray(rawWidths) || rawWidths.length > cols ||
-          rawWidths.some(width => !Number.isFinite(width) || width < 40 || width > 1000)) {
+      // MB1188-014: a width is decoration, exactly like a colour above, and the
+      // same trade applies — refusing a whole workbook over one is never right.
+      // The producers clamped to 24..600 (main.js reading Google's pixelSize,
+      // the importer mirroring it) while this demanded 40..1000, so a single
+      // narrow column in a Google sheet — a spacer, a checkbox column — failed
+      // the entire import. The sync path could also push such a width into an
+      // already-saved project, after which every save of it threw, silently and
+      // permanently. Producers are aligned now; this coerces so that no future
+      // one can detonate a workbook. Structure still refuses: more widths than
+      // the sheet has columns is wrong, not merely ugly.
+      // Clamped inline rather than via safeFiniteNumber() because fourteen test
+      // harnesses splice this function out on its own.
+      if (!Array.isArray(rawWidths) || rawWidths.length > cols) {
         throw new Error('spreadsheets has invalid column widths');
       }
-      const colWidths = rawWidths.map(width => Number(width));
+      const colWidths = rawWidths.map(width => {
+        const number = Number(width);
+        if (!Number.isFinite(number)) return 100;
+        return Math.round(Math.min(1000, Math.max(40, number)));
+      });
       const rawCells = sheet.cells === undefined ? {} : sheet.cells;
       if (!rawCells || typeof rawCells !== 'object' || Array.isArray(rawCells)) {
         throw new Error('spreadsheets has invalid cells');
@@ -12316,6 +12412,185 @@ function _ssMergeCellFromGoogle(base, remote, local) {
   return { take: 'conflict', cell: local ?? null };
 }
 
+// MB1188-016: rows and columns that MOVED in Google.
+//
+// The merge above is per-cell and keyed by an absolute "row,column". That is
+// right while Google only ever edits in place, and quietly destructive the
+// moment somebody inserts or deletes a row: everything below shifts, so the
+// checkpoint for row 9 now describes whatever sits at row 10.
+//
+// Rows the app has NOT touched survive that on their own — "Google changed,
+// the app did not" takes Google's value, and after a shift Google's value is
+// exactly the shifted content. The rows that break are the ones the studio
+// edited. The stranded local edit stays at its old coordinate, lands on top of
+// whatever moved into that slot and destroys it, while the row the edit
+// belonged to reappears with the edit undone. One conflict is raised and it
+// describes the collision rather than the shift. So the damage is confined to
+// precisely the rows somebody cared about enough to change.
+//
+// Google exposes no structural change feed — the Sheets API has no such events
+// and Drive revisions are whole-file snapshots — so the mapping is recovered by
+// diffing the checkpoint's lines against the incoming lines by content.
+//
+// The trust rule is what keeps this honest: an alignment only has to be right
+// for lines the app has locally modified, because every other line the existing
+// merge already handles correctly. So a line the app edited must match exactly
+// one incoming line and be unique enough on both sides to identify. When it is
+// not — a tab of blank or repeated rows, a row deleted in Google that was
+// edited here, structure moved on both axes at once — this refuses and says so.
+// Guessing is what the original bug did, and guessing is what did the damage.
+function _ssAxisSignatures(count, span, cellAt) {
+  const out = [];
+  for (let i = 0; i < count; i++) {
+    const parts = [];
+    for (let j = 0; j < span; j++) parts.push(_ssCellSignature(cellAt(i, j)));
+    out.push(parts.join('\u0001'));
+  }
+  return out;
+}
+
+function _ssSignatureIsBlank(signature) {
+  return !/[^\u0001]/.test(String(signature ?? ''));
+}
+
+// Longest common subsequence over line signatures, returning the matched
+// (before, after) index pairs. Bounded by the read window — at most 500 rows
+// and 100 columns — so the full table is cheap and needs no heuristics.
+function _ssLcsPairs(before, after) {
+  const n = before.length;
+  const m = after.length;
+  const width = m + 1;
+  const dp = new Int32Array((n + 1) * width);
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      dp[i * width + j] = before[i] === after[j]
+        ? dp[(i + 1) * width + (j + 1)] + 1
+        : Math.max(dp[(i + 1) * width + j], dp[i * width + (j + 1)]);
+    }
+  }
+  const pairs = [];
+  let i = 0;
+  let j = 0;
+  while (i < n && j < m) {
+    if (before[i] === after[j]) { pairs.push([i, j]); i++; j++; }
+    else if (dp[(i + 1) * width + j] >= dp[i * width + (j + 1)]) i++;
+    else j++;
+  }
+  return pairs;
+}
+
+// Move every cell onto its new line. Cells outside the window Google spoke
+// about stay exactly where they are; a line Google deleted drops out, which is
+// only ever reached for lines the app had not edited (an edited one refuses
+// above).
+function _ssShiftCellsAlongAxis(cells, axis, map, rows, cols) {
+  const out = {};
+  for (const [key, value] of Object.entries(cells || {})) {
+    const [row, column] = key.split(',').map(Number);
+    if (!Number.isSafeInteger(row) || !Number.isSafeInteger(column)) continue;
+    if (row >= rows || column >= cols) { out[key] = value; continue; }
+    const index = axis === 'row' ? row : column;
+    if (!map.has(index)) continue;
+    const moved = map.get(index);
+    out[axis === 'row' ? `${moved},${column}` : `${row},${moved}`] = value;
+  }
+  return out;
+}
+
+function _ssAlignGoogleStructure({ checkpoint, incoming, existing, rows, cols }) {
+  const checkpointAt = (r, c) => _ssCheckpointCell(checkpoint[`${r},${c}`]);
+  const incomingAt = (r, c) => incoming.get(`${r},${c}`) || null;
+  const localAt = (r, c) => existing[`${r},${c}`] || null;
+  const moving = [];
+  const refusals = [];
+
+  for (const axis of ['row', 'column']) {
+    const isRow = axis === 'row';
+    const count = isRow ? rows : cols;
+    const span = isRow ? cols : rows;
+    const orient = fn => (i, j) => (isRow ? fn(i, j) : fn(j, i));
+
+    // Only lines the app has changed since the checkpoint need the mapping to
+    // be right. Checked first because it is cheap and almost always empty.
+    const dirty = new Set();
+    for (let i = 0; i < count; i++) {
+      for (let j = 0; j < span; j++) {
+        const r = isRow ? i : j;
+        const c = isRow ? j : i;
+        if (_ssCellSignature(localAt(r, c)) !== _ssCellSignature(checkpointAt(r, c))) {
+          dirty.add(i);
+          break;
+        }
+      }
+    }
+    if (!dirty.size) continue;
+
+    const before = _ssAxisSignatures(count, span, orient(checkpointAt));
+    const after = _ssAxisSignatures(count, span, orient(incomingAt));
+    let identical = true;
+    for (let i = 0; i < count; i++) {
+      if (before[i] !== after[i]) { identical = false; break; }
+    }
+    if (identical) continue;
+
+    const pairs = _ssLcsPairs(before, after);
+    const map = new Map(pairs);
+    let moved = false;
+    for (const [a, b] of pairs) if (a !== b) { moved = true; break; }
+    if (!moved) continue;
+
+    const tally = sequence => {
+      const counts = new Map();
+      for (const entry of sequence) counts.set(entry, (counts.get(entry) || 0) + 1);
+      return counts;
+    };
+    const beforeCounts = tally(before);
+    const afterCounts = tally(after);
+    // Ordered so the reason names the actual problem. Checking uniqueness first
+    // reported a deleted row as "not unique", which is true of nothing and
+    // sends somebody looking in the wrong place.
+    let reason = null;
+    for (const index of dirty) {
+      const signature = before[index];
+      const seenAfter = afterCounts.get(signature) || 0;
+      if (_ssSignatureIsBlank(signature)) {
+        reason = `a ${axis} edited here is empty in Google, so where it moved to cannot be identified`;
+      } else if (beforeCounts.get(signature) !== 1) {
+        reason = `a ${axis} edited here appears more than once in the tab, so where it moved to cannot be identified`;
+      } else if (seenAfter === 0) {
+        reason = `a ${axis} edited here was deleted in Google`;
+      } else if (seenAfter > 1) {
+        reason = `a ${axis} edited here now appears more than once in Google, so which copy it became cannot be identified`;
+      } else if (!map.has(index)) {
+        reason = `a ${axis} edited here could not be matched to its new position`;
+      }
+      if (reason) break;
+    }
+    // Collected rather than returned, because a failure on one axis is only
+    // meaningful once the other has been looked at. When rows AND columns both
+    // move, every line signature changes on both axes and each one reports
+    // something like "deleted in Google" — true of neither, and misleading.
+    if (reason) refusals.push({ axis, reason });
+    else moving.push({ axis, map });
+  }
+
+  if (refusals.length > 1 || (refusals.length === 1 && moving.length)) {
+    return { refuse: true, reason: 'the structure of this tab moved on both axes at once, which cannot be reconciled automatically' };
+  }
+  if (refusals.length === 1) return { refuse: true, reason: refusals[0].reason };
+  if (moving.length > 1) {
+    return { refuse: true, reason: 'rows and columns both moved in Google, which cannot be reconciled automatically' };
+  }
+  if (!moving.length) return { transform: false };
+  const { axis, map } = moving[0];
+  return {
+    transform: true,
+    axis,
+    checkpoint: _ssShiftCellsAlongAxis(checkpoint, axis, map, rows, cols),
+    existing: _ssShiftCellsAlongAxis(existing, axis, map, rows, cols),
+  };
+}
+
 async function ssPullFromGoogle(projectId, options) {
   const silent = options?.silent === true;
   const project = (_ssData?.projects || []).find(p => p.id === projectId);
@@ -12389,6 +12664,11 @@ async function ssPullFromGoogle(projectId, options) {
     }
     let renamed = 0;
     let missing = 0;
+    // MB1188-016: tabs whose structure moved and were realigned, and tabs held
+    // back because the move could not be identified with certainty.
+    let shifted = 0;
+    let held = 0;
+    const heldTabs = [];
 
     for (const { sheetId, tab } of plan) {
       // Resolve by id first, title second — and adopt the id when a link
@@ -12460,8 +12740,28 @@ async function ssPullFromGoogle(projectId, options) {
         });
       });
 
-      const checkpoint = tab.checkpoint || {};
-      const existing = target.cells || {};
+      let checkpoint = tab.checkpoint || {};
+      let existing = target.cells || {};
+
+      // MB1188-016: recover any row or column that MOVED before merging, so a
+      // local edit follows its row instead of being stranded at a coordinate
+      // that now means something else.
+      const alignment = _ssAlignGoogleStructure({
+        checkpoint, incoming, existing, rows: rowsThatFit, cols: colsThatFit,
+      });
+      if (alignment.refuse) {
+        // Deliberately BEFORE anything is written: the checkpoint does not
+        // advance, so nothing is half-merged and the next sync tries again.
+        held += 1;
+        heldTabs.push(`${readTitle} (${alignment.reason})`);
+        console.warn(`[google] "${readTitle}" not merged: ${alignment.reason}`);
+        continue;
+      }
+      if (alignment.transform) {
+        checkpoint = alignment.checkpoint;
+        existing = alignment.existing;
+        shifted += 1;
+      }
       const cells = {};
       const newConflicts = [];
       const keys = new Set([
@@ -12519,7 +12819,10 @@ async function ssPullFromGoogle(projectId, options) {
         // alone rather than collapsing the column.
         (remote.columnWidths || []).forEach((width, index) => {
           if (index < colsThatFit && Number.isFinite(width) && width > 0) {
-            target.colWidths[index] = width;
+            // MB1188-014: clamped to the range the workbook validator and the
+            // renderer both accept. Unclamped, a narrow Google column landed
+            // here and every subsequent save of the project threw.
+            target.colWidths[index] = Math.round(Math.min(1000, Math.max(40, width)));
           }
         });
       }
@@ -12599,15 +12902,17 @@ async function ssPullFromGoogle(projectId, options) {
     ssRenderHomeView();
     // Silent when nothing moved: this runs on a timer, and a toast every few
     // minutes saying "nothing happened" is how people learn to ignore toasts.
-    if (changed || clashes || dropped || renamed || missing || !silent) {
+    if (changed || clashes || dropped || renamed || missing || shifted || held || !silent) {
       const parts = [];
       if (changed) parts.push(`${changed.toLocaleString()} cell${changed === 1 ? '' : 's'} updated from Google`);
       if (clashes) parts.push(`${clashes} also changed here — kept yours, see conflicts`);
       if (dropped) parts.push(`${dropped} tab${dropped === 1 ? '' : 's'} larger than this app can hold`);
       if (renamed) parts.push(`${renamed} tab${renamed === 1 ? ' was' : 's were'} renamed in Google — still linked`);
       if (missing) parts.push(`${missing} linked tab${missing === 1 ? ' is' : 's are'} no longer in Google`);
+      if (shifted) parts.push(`${shifted} tab${shifted === 1 ? '' : 's'} realigned after rows or columns moved in Google`);
+      if (held) parts.push(`${held} tab${held === 1 ? '' : 's'} NOT merged — ${heldTabs.join('; ')}`);
       showToast(parts.length ? parts.join('. ') + '.' : 'Already up to date with Google.',
-        clashes || dropped || missing ? 'warning' : 'success');
+        clashes || dropped || missing || held ? 'warning' : 'success');
     }
     return true;
   } catch (error) {
@@ -12902,7 +13207,7 @@ async function ssImportBuildProject(name, sheets, extraBytes, linkFor) {
     const colWidths = [];
     for (let c = 0; c < numCols; c++) {
       const given = Number(givenWidths?.[c]);
-      if (Number.isFinite(given) && given > 0) { colWidths.push(Math.min(600, Math.max(24, Math.round(given)))); continue; }
+      if (Number.isFinite(given) && given > 0) { colWidths.push(Math.min(600, Math.max(40, Math.round(given)))); continue; }
       let maxLen = 4;
       rows2d.forEach(r => { if (r[c]) maxLen = Math.max(maxLen, String(r[c]).length); });
       colWidths.push(Math.min(240, Math.max(70, maxLen * 8)));
@@ -20258,8 +20563,6 @@ async function runPostLoginMaintenance() {
     ['retention cleanup', pruneOldLogs],
     ['AI to-do v2 migration', migrateAiTodos],
     ['AI to-do v3 migration', migrateAiTodosV3],
-    // MB1188-008: settles profiles added from the signed-out login screen.
-    ['staff directory publication', flushPendingDirectoryPublication],
   ];
   const failures = [];
   for (const [label, job] of jobs) {

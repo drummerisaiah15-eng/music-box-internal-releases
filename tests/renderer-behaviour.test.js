@@ -2122,3 +2122,264 @@ test('AUDIT: the colour picker cannot recolour the wrong key entry', () => {
   assert.match(declaration('ssColorPickerApply'),
     /That colour key entry has changed/, 'and the person is told, not ignored');
 });
+
+// ── MB1188-014: a narrow Google column must not destroy the import ───────────
+//
+// Reported as "That spreadsheet was not imported: spreadsheets has invalid
+// column widths" on a real sheet. Three places defined the legal range for a
+// width and they disagreed: main.js clamped Google's pixelSize to 24..600, the
+// importer mirrored that, and normalizeSpreadsheetWorkbook demanded 40..1000.
+// Any column narrower than 40px — a spacer, a checkbox column — landed in the
+// 24..39 gap and the whole workbook was refused.
+//
+// These run the real normalizer and look at what it produced. A test that
+// merely asserted the source mentions a clamp would have passed against the
+// broken code, which is the mistake that shipped this bug's neighbours.
+
+const widthBook = (colWidths, cells = { '0,0': cell('KEEP ME') }) => ({
+  activeProject: 'p1',
+  projects: [{
+    id: 'p1', name: 'P', activeId: 's1',
+    sheets: [{ id: 's1', name: 'S', rows: 3, cols: 3, colWidths, cells }],
+  }],
+});
+
+test('MB1188-014: a 30px column is coerced, not refused, and the workbook survives', () => {
+  const { norm } = roundTripApi();
+
+  // 30 is squarely in the gap: main.js would emit it, the normalizer refused it.
+  const normalized = norm(widthBook([30, 100, 100]));
+  const sheet = normalized.projects[0].sheets[0];
+
+  assert.deepEqual(sheet.colWidths, [40, 100, 100], 'the narrow column is widened to the floor');
+  // The point of the fix: the rest of the workbook still arrives. Refusing was
+  // costing every cell in the project, not merely the width.
+  assert.equal(sheet.cells['0,0'].v, 'KEEP ME', 'and no content was lost to a width');
+  assert.equal(normalized.projects[0].name, 'P');
+});
+
+test('MB1188-014: widths out of range in either direction are clamped, never thrown', () => {
+  const { norm } = roundTripApi();
+  const widths = v => norm(widthBook(v)).projects[0].sheets[0].colWidths;
+
+  assert.deepEqual(widths([39]), [40], 'one below the floor');
+  assert.deepEqual(widths([24]), [40], 'the old producer floor');
+  assert.deepEqual(widths([1001]), [1000], 'above the ceiling');
+  assert.deepEqual(widths([0]), [40], 'zero, which Google uses for hidden');
+  assert.deepEqual(widths([-5]), [40], 'negative');
+  assert.deepEqual(widths(['abc']), [100], 'not a number at all falls back');
+  assert.deepEqual(widths([40, 1000]), [40, 1000], 'the bounds themselves are untouched');
+});
+
+test('MB1188-014: structure is still refused — coercion is only for decoration', () => {
+  const { norm } = roundTripApi();
+  // Four widths on a three-column sheet is a broken record, not an ugly one.
+  assert.throws(() => norm(widthBook([100, 100, 100, 100])),
+    /invalid column widths/, 'more widths than columns still refuses');
+  assert.throws(() => norm(widthBook('100,100')),
+    /invalid column widths/, 'a non-array still refuses');
+});
+
+test('MB1188-014: every width main.js can emit is accepted by the workbook validator', () => {
+  // A cross-module contract, executed rather than pattern-matched. main.js and
+  // the normalizer live in different processes and drifted apart silently for
+  // exactly this reason, so the clamp itself is lifted out of main.js and run.
+  const mainSource = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  const clampLine = mainSource
+    .split('\n')
+    .find(line => line.includes('Number.isFinite(pixels) && pixels > 0'));
+  assert.ok(clampLine, 'the pixelSize clamp is still where this test expects it');
+
+  const clamp = new Function('pixels', clampLine.trim());
+  const { norm } = roundTripApi();
+
+  for (const pixels of [1, 2, 21, 23, 24, 25, 39, 40, 41, 100, 599, 600, 601, 5000]) {
+    const emitted = clamp(pixels);
+    // 0 is main.js's "hidden" sentinel; both consumers skip it before storing.
+    if (emitted === 0) continue;
+    const kept = norm(widthBook([emitted])).projects[0].sheets[0].colWidths[0];
+    assert.equal(kept, emitted,
+      `a Google column of ${pixels}px becomes ${emitted}, which must survive storage unchanged`);
+  }
+});
+
+// ── MB1188-016: rows and columns that MOVED in Google ────────────────────────
+//
+// Inserting a row in Google shifts everything below it. The merge is keyed by
+// absolute "row,column", so before this the checkpoint for row 9 described
+// whatever now sat at row 10. Rows nobody had edited survived that on their own
+// — "Google changed, the app did not" takes Google's value, and after a shift
+// Google's value IS the shifted content. The rows that broke were the edited
+// ones: the local edit stayed at its old coordinate, destroyed whatever moved
+// into that slot, and its own row came back with the edit undone.
+//
+// These drive the real aligner AND the real cell merge, then read the grid that
+// came out. The end state is the assertion — a test that only checked the
+// aligner returned a map would not have caught the stranded edit.
+
+function googleStructureApi() {
+  const context = vm.createContext({
+    String, JSON, Object, Array, Number, Math, Boolean, Map, Set, Int32Array, RegExp, console,
+  });
+  vm.runInContext(`
+    ${declaration('_ssCheckpointCell')}
+    ${declaration('_ssCellSignature')}
+    ${declaration('_ssMergeCellFromGoogle')}
+    ${declaration('_ssAxisSignatures')}
+    ${declaration('_ssSignatureIsBlank')}
+    ${declaration('_ssLcsPairs')}
+    ${declaration('_ssShiftCellsAlongAxis')}
+    ${declaration('_ssAlignGoogleStructure')}
+    globalThis.api = {
+      align: a => _ssAlignGoogleStructure(a),
+      merge: (b, r, l) => _ssMergeCellFromGoogle(b, r, l),
+    };
+  `, context);
+
+  // Drives one column of a tab end to end: align, then merge, then report the
+  // grid the app would be left holding.
+  return function pull({ before, after, edits = {} }) {
+    const cell = v => ({ v, bg: '', tc: '', b: false });
+    const checkpoint = {};
+    const existing = {};
+    before.forEach((v, r) => { if (v !== '') { checkpoint[`${r},0`] = v; existing[`${r},0`] = cell(v); } });
+    for (const [r, v] of Object.entries(edits)) existing[`${r},0`] = cell(v);
+    const incoming = new Map();
+    after.forEach((v, r) => { if (v !== '') incoming.set(`${r},0`, cell(v)); });
+    const rows = Math.max(before.length, after.length);
+
+    const alignment = context.api.align({ checkpoint, incoming, existing, rows, cols: 1 });
+    if (alignment.refuse) return { refused: alignment.reason };
+
+    const base = alignment.transform ? alignment.checkpoint : checkpoint;
+    const local = alignment.transform ? alignment.existing : existing;
+    const keys = new Set([...Object.keys(local), ...incoming.keys(), ...Object.keys(base)]);
+    const grid = [];
+    const out = {};
+    for (const key of keys) {
+      const outcome = context.api.merge(base[key], incoming.get(key) || null, local[key] || null);
+      if (outcome.cell) out[key] = outcome.cell;
+    }
+    for (let r = 0; r < rows; r++) grid.push(out[`${r},0`]?.v ?? '');
+    return { grid, axis: alignment.axis || null, transformed: alignment.transform === true };
+  };
+}
+
+test('MB1188-016: a row inserted in Google carries the app\'s edit with it', () => {
+  const pull = googleStructureApi();
+  const result = pull({
+    before: ['Mon', 'Tue', 'Wed', 'Thu', 'Fri'],
+    after: ['Mon', '', 'Tue', 'Wed', 'Thu', 'Fri'],
+    edits: { 3: 'Thu — CANCELLED' },
+  });
+
+  assert.equal(result.refused, undefined, 'a clean single insert is resolvable');
+  assert.equal(result.axis, 'row');
+  // Before the fix this was ['Mon','','Tue','Thu — CANCELLED','Thu','Fri'] —
+  // Wednesday destroyed, and Thursday back without its edit.
+  assert.deepEqual(result.grid, ['Mon', '', 'Tue', 'Wed', 'Thu — CANCELLED', 'Fri']);
+});
+
+test('MB1188-016: a row deleted in Google closes the gap and keeps the edit', () => {
+  const pull = googleStructureApi();
+  const result = pull({
+    before: ['Mon', 'Tue', 'Wed', 'Thu', 'Fri'],
+    after: ['Mon', 'Wed', 'Thu', 'Fri', ''],
+    edits: { 3: 'Thu — CANCELLED' },
+  });
+
+  assert.equal(result.refused, undefined);
+  assert.deepEqual(result.grid, ['Mon', 'Wed', 'Thu — CANCELLED', 'Fri', '']);
+});
+
+test('MB1188-016: with no local edits nothing is realigned, because nothing needs to be', () => {
+  const pull = googleStructureApi();
+  const result = pull({
+    before: ['Mon', 'Tue', 'Wed'],
+    after: ['Mon', '', 'Tue', 'Wed'],
+  });
+
+  assert.equal(result.transformed, false, 'the existing merge already handles this correctly');
+  assert.deepEqual(result.grid, ['Mon', '', 'Tue', 'Wed']);
+});
+
+test('MB1188-016: an edited row deleted in Google is refused, and the reason says so', () => {
+  const pull = googleStructureApi();
+  const result = pull({
+    before: ['Mon', 'Tue', 'Wed'],
+    after: ['Mon', 'Wed', ''],
+    edits: { 1: 'Tue — MOVED' },
+  });
+
+  // Guessing here would silently discard somebody's edit.
+  assert.match(result.refused, /deleted in Google/);
+});
+
+test('MB1188-016: an edited row that is not unique is refused rather than guessed', () => {
+  const pull = googleStructureApi();
+  const result = pull({
+    before: ['Open', 'Open', 'Wed'],
+    after: ['', 'Open', 'Open', 'Wed'],
+    edits: { 1: 'Open — STAFFED' },
+  });
+
+  assert.match(result.refused, /appears more than once in the tab/);
+});
+
+test('MB1188-016: the same alignment works down the column axis', () => {
+  const context = vm.createContext({
+    String, JSON, Object, Array, Number, Math, Boolean, Map, Set, Int32Array, RegExp, console,
+  });
+  vm.runInContext(`
+    ${declaration('_ssCheckpointCell')}
+    ${declaration('_ssCellSignature')}
+    ${declaration('_ssAxisSignatures')}
+    ${declaration('_ssSignatureIsBlank')}
+    ${declaration('_ssLcsPairs')}
+    ${declaration('_ssShiftCellsAlongAxis')}
+    ${declaration('_ssAlignGoogleStructure')}
+    globalThis.align = a => _ssAlignGoogleStructure(a);
+  `, context);
+  const cell = v => ({ v, bg: '', tc: '', b: false });
+
+  // One row, three columns; a column is inserted at the front in Google.
+  const checkpoint = { '0,0': 'Name', '0,1': 'Room', '0,2': 'Time' };
+  const existing = { '0,0': cell('Name'), '0,1': cell('Room — B'), '0,2': cell('Time') };
+  const incoming = new Map([['0,1', cell('Name')], ['0,2', cell('Room')], ['0,3', cell('Time')]]);
+
+  const alignment = context.align({ checkpoint, incoming, existing, rows: 1, cols: 4 });
+
+  assert.equal(alignment.refuse, undefined);
+  assert.equal(alignment.axis, 'column', 'the move is recognised along columns');
+  assert.equal(alignment.existing['0,2'].v, 'Room — B', 'the edit followed its column');
+});
+
+test('MB1188-016: structure moving on both axes at once is refused, not guessed', () => {
+  const context = vm.createContext({
+    String, JSON, Object, Array, Number, Math, Boolean, Map, Set, Int32Array, RegExp, console,
+  });
+  vm.runInContext(`
+    ${declaration('_ssCheckpointCell')}
+    ${declaration('_ssCellSignature')}
+    ${declaration('_ssAxisSignatures')}
+    ${declaration('_ssSignatureIsBlank')}
+    ${declaration('_ssLcsPairs')}
+    ${declaration('_ssShiftCellsAlongAxis')}
+    ${declaration('_ssAlignGoogleStructure')}
+    globalThis.align = a => _ssAlignGoogleStructure(a);
+  `, context);
+  const cell = v => ({ v, bg: '', tc: '', b: false });
+
+  // A row AND a column inserted at the front: everything moves diagonally.
+  const checkpoint = { '0,0': 'A', '0,1': 'B', '1,0': 'C', '1,1': 'D' };
+  const existing = {
+    '0,0': cell('A'), '0,1': cell('B'), '1,0': cell('C — EDITED'), '1,1': cell('D'),
+  };
+  const incoming = new Map([
+    ['1,1', cell('A')], ['1,2', cell('B')], ['2,1', cell('C')], ['2,2', cell('D')],
+  ]);
+
+  const alignment = context.align({ checkpoint, incoming, existing, rows: 3, cols: 3 });
+
+  assert.match(alignment.reason || '', /moved on both axes at once/);
+});

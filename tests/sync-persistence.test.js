@@ -2197,8 +2197,10 @@ test('H-10: listener failures quarantine the key and stop its listener immediate
     script.includes('const _syncKeyUnsubs = new Map()'),
     '_syncKeyUnsubs per-key Map declared'
   );
-  // The snapshot .catch() path (reconcile failure) must unsubscribe.
-  const subscribeFn = declaration('subscribeToSync');
+  // MB1188-015: the listener body moved out of subscribeToSync into
+  // _subscribeSyncKey so that one key can be subscribed on its own. The
+  // guarantees below are unchanged — they just live in the extracted function.
+  const subscribeFn = declaration('_subscribeSyncKey');
   // The reconcile .catch() section — search 700 chars to clear the lengthy comments.
   const catchSection = subscribeFn.slice(subscribeFn.indexOf('.catch(err => {'));
   assert.ok(
@@ -4353,7 +4355,10 @@ function directoryPublishApi(overrides = {}) {
     localStorage,
     _syncReady: overrides.syncReady === true,
     _syncBootstrapComplete: overrides.syncReady === true,
-    isElizabeth: () => overrides.owner === true,
+    // MB1188-029: publishing needs somebody signed in, not the owner.
+    currentUser: () => (overrides.signedOut === true
+      ? null
+      : (overrides.owner === true ? 'Elizabeth Chaves' : 'Nina Front Desk')),
     showToast: (message, tone) => published.push({ toast: message, tone }),
     renderManageProfiles: () => {},
     STORE: {
@@ -4376,19 +4381,21 @@ function directoryPublishApi(overrides = {}) {
     ${declaration('_setDirectoryPublicationPending')}
     ${declaration('publishStaffDirectory')}
     ${declaration('flushPendingDirectoryPublication')}
+    ${declaration('retryDirectoryPublication')}
     globalThis.api = {
       publish: () => publishStaffDirectory(),
       flushPending: () => flushPendingDirectoryPublication(),
       pending: () => _directoryPublicationPending(),
       markPending: () => _setDirectoryPublicationPending(true),
+      retry: () => retryDirectoryPublication(),
     };
   `, context);
   return { context, published, localStorage };
 }
 
 test('MB1188-008: adding a profile while signed out records the debt', async () => {
-  const { context } = directoryPublishApi({ owner: false });
-  assert.equal(await context.api.publish(), false, 'a non-owner cannot publish');
+  const { context } = directoryPublishApi({ signedOut: true });
+  assert.equal(await context.api.publish(), false, 'nobody is signed in, so nothing can be published');
   assert.equal(context.api.pending(), true,
     'the Mac remembers that its profile list is ahead of the others');
 });
@@ -4404,7 +4411,12 @@ test('MB1188-008: the marker survives a restart', () => {
 });
 
 test('MB1188-008: the owner signing in publishes and clears the marker', async () => {
-  const { context, published } = directoryPublishApi({ owner: true, storage: {
+  // MB1188-028: syncReady added. Without it this asserted that the marker is
+  // cleared while the cloud is DOWN — the bug itself, three cases before a
+  // sibling test asserting the opposite. It passed because publishStaffDirectory
+  // cleared the marker unconditionally, and it is why nothing caught profiles
+  // never reaching Firestore.
+  const { context, published } = directoryPublishApi({ owner: true, syncReady: true, storage: {
     tmb__directory_publish_pending: '1',
   } });
   assert.equal(context.api.pending(), true);
@@ -4415,14 +4427,39 @@ test('MB1188-008: the owner signing in publishes and clears the marker', async (
   assert.deepEqual(Array.from(write.value, row => row.name), ['QA Front Desk']);
 });
 
-test('MB1188-008: someone else signing in leaves the marker for the owner', async () => {
-  const { context, published } = directoryPublishApi({ owner: false, storage: {
+test('MB1188-029: someone other than the owner signing in shares them too', async () => {
+  // This asserted the opposite until MB1188-029: that a non-owner signing in
+  // left the debt for Elizabeth. That was the policy, and it is what made
+  // profiles added on a Mac she never signs into stay local forever.
+  const { context, published } = directoryPublishApi({ owner: false, syncReady: true, storage: {
     tmb__directory_publish_pending: '1',
   } });
+
   await context.api.flushPending();
-  assert.equal(context.api.pending(), true, 'still pending — only the owner can publish');
-  assert.equal(published.some(entry => entry.key === 'staff_directory'), false,
-    'and nothing was written');
+
+  assert.equal(context.api.pending(), false, 'the debt is settled by whoever signed in');
+  const write = published.find(entry => entry.key === 'staff_directory');
+  assert.ok(write, 'and the directory actually went out');
+});
+
+test('MB1188-029: nobody signed in still cannot publish', async () => {
+  const { context, published } = directoryPublishApi({ signedOut: true, syncReady: true, storage: {
+    tmb__directory_publish_pending: '1',
+  } });
+
+  await context.api.flushPending();
+
+  assert.equal(context.api.pending(), true, 'the login screen has no session to publish under');
+  assert.equal(published.some(entry => entry.key === 'staff_directory'), false);
+});
+
+test('MB1188-029: the manual retry no longer refuses everyone but the owner', async () => {
+  const { context, published } = directoryPublishApi({ owner: false, syncReady: true, storage: {
+    tmb__directory_publish_pending: '1',
+  } });
+
+  assert.equal(await context.api.retry(), true);
+  assert.ok(published.find(entry => entry.key === 'staff_directory'));
 });
 
 test('MB1188-008: the marker stays set when the write does not reach the cloud', async () => {
@@ -4445,9 +4482,18 @@ test('MB1188-008: a rejected export does not clear the marker', async () => {
 });
 
 test('MB1188-008: publication is a post-login maintenance job with a manual retry', () => {
-  assert.match(declaration('runPostLoginMaintenance'),
-    /\['staff directory publication', flushPendingDirectoryPublication\]/,
-    'owner login must settle the debt, not just record it');
+  // MB1188-028: moved out of runPostLoginMaintenance. completeLogin() starts
+  // Firebase only after maintenance settles, so the job ran with the cloud
+  // still down every time. It now runs at sync-bootstrap completion, which is
+  // the first moment publishing can actually reach the cloud.
+  assert.doesNotMatch(declaration('runPostLoginMaintenance'),
+    /flushPendingDirectoryPublication/,
+    'maintenance runs before initFirebase(), so the debt cannot be settled there');
+  const whole = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const bootstrapIndex = whole.indexOf('_syncBootstrapComplete = true;');
+  assert.match(whole.slice(bootstrapIndex, bootstrapIndex + 1500),
+    /flushPendingDirectoryPublication\(\)/,
+    'owner login must settle the debt once the cloud is reachable');
   assert.match(declaration('renderManageProfiles'), /retryDirectoryPublication\(\)/,
     'and the owner needs a way to retry it by hand');
   assert.match(declaration('renderManageProfiles'), /_directoryPublicationPending\(\)/,
@@ -4948,4 +4994,221 @@ test('a directory publish that fails says so rather than only setting a flag', (
   assert.match(publish, /'danger'/);
   assert.match(publish, /_setDirectoryPublicationPending\(true\)/,
     'and the durable marker is still set so it can be retried');
+});
+
+// ── MB1188-015: a project created on the other Mac must become visible here ───
+//
+// The two-Mac symptom was "projects created on one Mac do not appear on the
+// other". The index merged correctly and the project documents existed in
+// Firestore, but this Mac had no listener for spreadsheet_<newId>, because
+// subscribeToSync() only ever ran at bootstrap and after quarantine recovery.
+// The document never arrived and _ssReadStoredWorkbook parked the id as
+// "still loading" forever.
+//
+// These drive the real _ssEnsureProjectSubscriptions against a Firestore stub
+// that records which document keys were actually subscribed to. Asserting that
+// the source mentions the function would have passed against the broken build,
+// where the function simply was never called.
+
+function subscriptionHarness({ indexProjects = [], alreadySubscribed = [], quarantined = [] } = {}) {
+  const subscribed = [];
+  const context = contextWith({
+    _syncReady: true,
+    _firestoreDb: {},
+    _decCache: { spreadsheets: { projects: indexProjects } },
+    _syncBootstrapFailedKeys: new Set(quarantined),
+    _syncKeyUnsubs: new Map(alreadySubscribed.map(key => [key, () => {}])),
+    _syncUnsubs: [],
+    studioRef: () => ({
+      collection: () => ({
+        doc: key => ({
+          onSnapshot: () => { subscribed.push(key); return () => {}; },
+        }),
+      }),
+    }),
+    _serializeKeyReconcile: () => Promise.resolve(),
+    _reconcileRemoteSnapshot: async () => ({}),
+  });
+  vm.runInContext(`
+    ${declaration('_ssProjectSyncKey')}
+    ${declaration('_ssIsProjectSyncKey')}
+    ${declaration('_ssKnownProjectSyncKeys')}
+    ${declaration('_subscribeSyncKey')}
+    ${declaration('_ssEnsureProjectSubscriptions')}
+    globalThis.ensure = () => _ssEnsureProjectSubscriptions();
+  `, context);
+  return { ensure: () => context.ensure(), subscribed, context };
+}
+
+test('MB1188-015: a project id arriving in the index gets a listener without a restart', () => {
+  // Bootstrap subscribed to p1. The other Mac then created p2, which reached
+  // this Mac as a new index entry.
+  const { ensure, subscribed } = subscriptionHarness({
+    indexProjects: [{ id: 'proj_one' }, { id: 'proj_two' }],
+    alreadySubscribed: ['spreadsheet_proj_one'],
+  });
+
+  ensure();
+
+  assert.deepEqual(subscribed, ['spreadsheet_proj_two'],
+    'the new project is subscribed, and only the new one');
+});
+
+test('MB1188-015: healthy listeners are never torn down and rebuilt', () => {
+  // Calling subscribeToSync() again would have worked, at the cost of dropping
+  // every live listener and making Firestore re-deliver every document.
+  const { ensure, subscribed } = subscriptionHarness({
+    indexProjects: [{ id: 'proj_one' }, { id: 'proj_two' }],
+    alreadySubscribed: ['spreadsheet_proj_one', 'spreadsheet_proj_two'],
+  });
+
+  ensure();
+
+  assert.deepEqual(subscribed, [], 'nothing already subscribed is touched');
+});
+
+test('MB1188-015: a tombstoned project still gets a listener', () => {
+  // Deliberate: its document has to keep syncing, or a deletion made here would
+  // read as mere absence on the other Mac.
+  const { ensure, subscribed } = subscriptionHarness({
+    indexProjects: [{ id: 'proj_gone', _deleted: true }],
+  });
+
+  ensure();
+
+  assert.deepEqual(subscribed, ['spreadsheet_proj_gone']);
+});
+
+test('MB1188-015: a quarantined project key is not resubscribed behind the recovery gate', () => {
+  const { ensure, subscribed, context } = subscriptionHarness({
+    indexProjects: [{ id: 'proj_bad' }],
+    quarantined: ['spreadsheet_proj_bad'],
+  });
+
+  ensure();
+
+  assert.deepEqual(subscribed, [], 'a frozen key stays frozen');
+  assert.equal(context._syncKeyUnsubs.has('spreadsheet_proj_bad'), false,
+    'and no unsub is recorded for it');
+});
+
+test('MB1188-015: nothing is subscribed before sync is ready', () => {
+  const { ensure, subscribed, context } = subscriptionHarness({
+    indexProjects: [{ id: 'proj_one' }],
+  });
+  context._syncReady = false;
+
+  ensure();
+
+  assert.deepEqual(subscribed, [], 'subscribing before bootstrap would race it');
+});
+
+test('MB1188-015: the index reconcile and the local commit both trigger the catch-up', () => {
+  // Wiring, so a source assertion is the right tool — but the guarantee each
+  // call site provides is covered behaviourally above.
+  const listener = declaration('_subscribeSyncKey');
+  assert.match(listener, /if \(key === 'spreadsheets'\) _ssEnsureProjectSubscriptions\(\);/,
+    'a project created on the other Mac is picked up when the index arrives');
+  const commit = declaration('_ssCommitSplitWorkbook');
+  assert.match(commit, /_ssEnsureProjectSubscriptions\(\)/,
+    'a project created on this Mac starts receiving the other Mac\'s edits');
+});
+
+// ── MB1188-028: profiles added at the login screen never reached the cloud ────
+//
+// Reported as "projects sync across both Macs now, but profiles never do", with
+// the staff_directory document in Firestore never changing.
+//
+// Profiles are created from the SIGNED-OUT login screen, where currentUser() is
+// null, so isElizabeth() is false and publishStaffDirectory() defers by setting
+// a pending marker. MB1188-008 added flushPendingDirectoryPublication to
+// runPostLoginMaintenance to settle that debt once the owner signs in — but
+// completeLogin() starts Firebase only AFTER maintenance settles
+// (`_postLoginMaintenancePromise.then(initFirebase)`), so at flush time
+// _syncReady and _syncBootstrapComplete were both false. `cloudRunning` was
+// therefore false every single time, the flush wrote locally with
+// includeSync:false, cleared the pending marker, returned true, and told the
+// person the profiles were "now shared with the other Macs".
+//
+// These run the real publishStaffDirectory against a STORE stub that records
+// exactly what was flushed and whether the cloud was included.
+
+function publishDirectoryHarness({ cloudReady }) {
+  const flushes = [];
+  const replaced = [];
+  const pendingMarker = { value: '1' };
+  const context = contextWith({
+    _syncReady: cloudReady,
+    _syncBootstrapComplete: cloudReady,
+    DIRECTORY_PUBLISH_PENDING_KEY: 'tmb__directory_publish_pending',
+    localStorage: {
+      getItem: key => (key === 'tmb__directory_publish_pending' ? pendingMarker.value : null),
+      setItem: (key, value) => { if (key === 'tmb__directory_publish_pending') pendingMarker.value = value; },
+      removeItem: key => { if (key === 'tmb__directory_publish_pending') pendingMarker.value = null; },
+    },
+    renderManageProfiles: () => {},
+    showToast: () => {},
+    currentUser: () => 'Elizabeth Chaves',
+    STORE: {
+      replace: async (key, value) => { replaced.push({ key, value }); },
+      flush: async (keys, options) => { flushes.push({ keys, options }); },
+    },
+    window: {
+      electronSession: {
+        exportDirectory: async () => ({ ok: true, directory: [{ id: 'p1', name: 'Nina', role: 'Front Desk' }] }),
+      },
+    },
+  });
+  vm.runInContext(`
+    ${declaration('_directoryPublicationPending')}
+    ${declaration('_setDirectoryPublicationPending')}
+    ${declaration('publishStaffDirectory')}
+    globalThis.publish = () => publishStaffDirectory();
+  `, context);
+  return {
+    publish: () => context.publish(),
+    flushes,
+    replaced,
+    stillPending: () => pendingMarker.value === '1',
+  };
+}
+
+test('MB1188-028: publishing before the cloud is up does NOT report success', async () => {
+  const harness = publishDirectoryHarness({ cloudReady: false });
+
+  const published = await harness.publish();
+
+  // The whole bug in one assertion: this used to be true.
+  assert.equal(published, false, 'a local-only write is not a publication');
+  assert.equal(harness.flushes[0].options.includeSync, false,
+    'and the flush genuinely did not reach the cloud');
+  assert.equal(harness.stillPending(), true,
+    'so the debt is still owed, and Manage Users keeps its "Share now" button');
+});
+
+test('MB1188-028: publishing once the cloud is up settles the debt', async () => {
+  const harness = publishDirectoryHarness({ cloudReady: true });
+
+  const published = await harness.publish();
+
+  assert.equal(published, true);
+  assert.equal(harness.flushes[0].options.includeSync, true, 'the directory went to the cloud');
+  assert.equal(harness.flushes[0].options.requireSync, true, 'and the write had to be acknowledged');
+  assert.equal(harness.stillPending(), false, 'only now is the marker cleared');
+  assert.equal(harness.replaced[0].key, 'staff_directory');
+});
+
+test('MB1188-028: the pending publication runs after sync bootstrap, not before Firebase starts', () => {
+  // Wiring, and worth pinning precisely because the previous placement looked
+  // correct in isolation and was ordered wrong.
+  const maintenance = declaration('runPostLoginMaintenance');
+  assert.doesNotMatch(maintenance, /flushPendingDirectoryPublication/,
+    'not in post-login maintenance, which runs BEFORE initFirebase()');
+
+  const script = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const bootstrapIndex = script.indexOf('_syncBootstrapComplete = true;');
+  assert.ok(bootstrapIndex > 0, 'sync bootstrap completion is where this belongs');
+  const afterBootstrap = script.slice(bootstrapIndex, bootstrapIndex + 1500);
+  assert.match(afterBootstrap, /flushPendingDirectoryPublication\(\)/,
+    'the flush runs once the cloud can actually be reached');
 });

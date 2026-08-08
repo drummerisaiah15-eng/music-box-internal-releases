@@ -2136,9 +2136,31 @@ function _applyStaffDirectory(entries) {
   return _allAppProfiles();
 }
 
-// Owner publishes; any profile may import what the owner published.
+// MB1188-029: any signed-in profile may publish; any may import.
+//
+// This was Owner-only, and that is what stopped profiles reaching the other
+// Mac at all. Profiles are created from the SIGNED-OUT login screen, so the
+// publication is always deferred to whoever signs in next — and if that person
+// was not Elizabeth, on that particular Mac, it never happened. A studio where
+// the owner only ever uses one Mac could never propagate a profile created on
+// the other one.
+//
+// Widening this is safe by construction, not by trust:
+//   - adding a profile is ALREADY ungated (app-session-add-staff-profile has no
+//     role check), so this grants no new ability to create anything; it only
+//     lets an addition that was already permitted reach the other Macs;
+//   - _applyStaffDirectory re-validates every field on the receiving side. It
+//     never grants Owner by import, forces unknown roles to Front Desk, caps
+//     custom profiles, and refuses a directory that would leave no owner;
+//   - the directory merges as a tombstoned record list keyed by id, so a Mac
+//     publishing a list that has not yet heard of the other's profiles cannot
+//     delete them. Absence is not a deletion.
+//
+// Removals and role changes stay Owner-only in their own handlers, so a
+// tombstone can still only originate from an owner action. What travels from a
+// non-owner Mac is additive.
 _secureHandle('app-session-export-directory', async () => {
-  _requireAppRole(new Set(['Owner']));
+  _requireAppRole(COMMUNICATION_ROLES);
   return { ok: true, directory: _buildStaffDirectory() };
 });
 
@@ -2484,7 +2506,9 @@ _secureHandle('google-sheet-read', async (_, request) => {
     const pixels = Number(entry?.pixelSize);
     // Bounded: a hidden column is 0 in Google and would vanish here, and a
     // pathological width should not be able to make one column the whole grid.
-    return Number.isFinite(pixels) && pixels > 0 ? Math.min(Math.max(Math.round(pixels), 24), 600) : 0;
+    // MB1188-014: floor is 40, not 24 — the workbook validator and the
+    // renderer both treat 40 as the minimum. A 0 still means "hidden".
+    return Number.isFinite(pixels) && pixels > 0 ? Math.min(Math.max(Math.round(pixels), 40), 600) : 0;
   });
 
   return {
