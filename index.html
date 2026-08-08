@@ -9285,17 +9285,11 @@ function normalizeSpreadsheetWorkbook(value) {
         rows: Number.isSafeInteger(link.rows) && link.rows > 0 ? Math.min(link.rows, 500) : 200,
         columns: Number.isSafeInteger(link.columns) && link.columns > 0 ? Math.min(link.columns, 100) : 30,
       };
-      if (link.pulledAt !== undefined) googleLink.pulledAt = String(link.pulledAt).slice(0, 40);
-      // MB1188-012: a background sync that fails has to leave a trace. Without
-      // one, a link that stopped working looked exactly like a link that had
-      // nothing to report.
-      if (link.lastError !== undefined) googleLink.lastError = String(link.lastError).slice(0, 300);
-      if (link.lastErrorAt !== undefined) googleLink.lastErrorAt = String(link.lastErrorAt).slice(0, 40);
-      if (Array.isArray(link.newTabs)) {
-        googleLink.newTabs = link.newTabs
-          .slice(0, 25)
-          .map(title => checkedString(title, 'Google tab name', 200));
-      }
+      // MB1188-026: pulledAt, lastError, lastErrorAt and newTabs are still
+      // ACCEPTED so a document written by an earlier build still validates, but
+      // they are deliberately not carried forward — they are per-Mac
+      // observations and belong in localStorage, not in shared studio data.
+      // Documents already carrying them shed them on their next write.
 
       const readCheckpoint = (input) => {
         if (input === undefined) return undefined;
@@ -10680,7 +10674,7 @@ function ssRenderHomeView() {
       </div>
       <div class="ss-proj-card-name">${escHtml(p.name)}</div>
       <div class="ss-proj-card-meta">${p.sheets.length} sheet${p.sheets.length!==1?'s':''}</div>
-      ${p.googleLink ? `<div class="ss-google-tag" title="Linked to ${escAttr(_ssGoogleTabSummary(p))} in Google Sheets${p.googleLink.pulledAt ? ' · last checked ' + escAttr(_ssShortWhen(p.googleLink.pulledAt)) : ''}">
+      ${p.googleLink ? `<div class="ss-google-tag" title="Linked to ${escAttr(_ssGoogleTabSummary(p))} in Google Sheets${_ssReadLinkState(p.id).pulledAt ? ' · last checked ' + escAttr(_ssShortWhen(_ssReadLinkState(p.id).pulledAt)) : ''}">
         <span class="ss-google-dot"></span>Google Sheets
       </div>
       ${_ssGoogleLinkNotice(p)}
@@ -12043,19 +12037,55 @@ function _ssGoogleLinkOf(projectId) {
 // What the badge says a project is linked to. One tab is named; several are
 // counted, because six tab names do not fit in a tooltip and the count is the
 // part somebody is actually checking.
+// MB1188-026: when this Mac last checked Google, and what it saw.
+//
+// This lives in localStorage, NOT in the synced project document, and that is
+// the whole point. It used to be written into googleLink, which meant every
+// automatic check changed the document — `pulledAt` is a fresh timestamp every
+// time — so the "only write when something actually changed" guard in
+// _ssCommitSplitWorkbook could never fire for a linked project. One project
+// document reached revision 447 in an evening for about twenty real edits,
+// each write re-encrypting the whole six-sheet workbook and pushing it to
+// Firestore. That is quota, contention and battery spent on nothing.
+//
+// It is also just more correct: "when did I last reach Google" and "did my
+// last attempt fail" are facts about this Mac, not about the studio's data.
+// Two Macs should not be overwriting each other's copy of them.
+function _ssLinkStateKey(projectId) {
+  return 'tmb__gsync_' + String(projectId ?? '');
+}
+
+function _ssReadLinkState(projectId) {
+  try {
+    const raw = localStorage.getItem(_ssLinkStateKey(projectId));
+    const parsed = raw ? JSON.parse(raw) : null;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch (_) { return {}; }
+}
+
+function _ssWriteLinkState(projectId, patch) {
+  try {
+    const next = { ..._ssReadLinkState(projectId), ...patch };
+    for (const [field, value] of Object.entries(next)) {
+      if (value === undefined || value === null) delete next[field];
+    }
+    localStorage.setItem(_ssLinkStateKey(projectId), JSON.stringify(next));
+  } catch (_) {}
+}
+
 // MB1188-012: what the link itself has to say — a failure it hit, or tabs in
 // Google nobody here has imported. Both used to be knowable only from a toast
 // that had already gone.
 function _ssGoogleLinkNotice(project) {
-  const link = project?.googleLink;
-  if (!link) return '';
-  if (link.lastError) {
-    return `<div class="ss-google-warn" title="${escAttr(link.lastError)}">` +
-      `Last check failed${link.lastErrorAt ? ' · ' + escHtml(_ssShortWhen(link.lastErrorAt)) : ''}</div>`;
+  if (!project?.googleLink) return '';
+  const state = _ssReadLinkState(project.id);
+  if (state.lastError) {
+    return `<div class="ss-google-warn" title="${escAttr(state.lastError)}">` +
+      `Last check failed${state.lastErrorAt ? ' · ' + escHtml(_ssShortWhen(state.lastErrorAt)) : ''}</div>`;
   }
-  if (Array.isArray(link.newTabs) && link.newTabs.length) {
-    const count = link.newTabs.length;
-    return `<div class="ss-google-warn" title="${escAttr(link.newTabs.join(', '))}">` +
+  if (Array.isArray(state.newTabs) && state.newTabs.length) {
+    const count = state.newTabs.length;
+    return `<div class="ss-google-warn" title="${escAttr(state.newTabs.join(', '))}">` +
       `${count} new tab${count === 1 ? '' : 's'} in Google</div>`;
   }
   return '';
@@ -12344,9 +12374,11 @@ async function ssPullFromGoogle(projectId, options) {
       // into the LIVE workbook and committed together. A checkpoint that
       // advanced without its cells, or a conflict announced without being
       // stored, is worse than not syncing the tab at all.
+      // No pulledAt here: see MB1188-026. Only the tab state below is shared,
+      // and when Google has not changed, it is byte-identical to what is
+      // already stored — so the commit skips the write entirely.
       live.googleLink = {
         ...liveLink,
-        pulledAt: new Date().toISOString(),
         tabs: {
           ...liveLink.tabs,
           [sheetId]: {
@@ -12389,19 +12421,16 @@ async function ssPullFromGoogle(projectId, options) {
       const linkedTitles = new Set(
         Object.values(finalProject.googleLink.tabs || {}).map(entry => entry?.title).filter(Boolean));
       const discovered = currentTabs
-        ? (currentTabs.map(tab => tab.title).filter(title => title && !linkedTitles.has(title)))
-        : (finalProject.googleLink.newTabs || []);
-      const nextLink = { ...finalProject.googleLink };
-      if (discovered.length) nextLink.newTabs = discovered.slice(0, 25);
-      else delete nextLink.newTabs;
-      // A completed sync clears any error the last one left behind.
-      delete nextLink.lastError;
-      delete nextLink.lastErrorAt;
-      finalProject.googleLink = nextLink;
-      _ssMirroringFromGoogle = true;
-      const savingState = ssSave();
-      _ssMirroringFromGoogle = false;
-      await savingState;
+        ? currentTabs.map(tab => tab.title).filter(title => title && !linkedTitles.has(title))
+        : (_ssReadLinkState(projectId).newTabs || []);
+      // Local, so this costs no cloud write. A completed sync also clears any
+      // error the last one left behind.
+      _ssWriteLinkState(projectId, {
+        pulledAt: new Date().toISOString(),
+        newTabs: discovered.length ? discovered.slice(0, 25) : null,
+        lastError: null,
+        lastErrorAt: null,
+      });
     }
 
     ssRender();
@@ -12427,20 +12456,10 @@ async function ssPullFromGoogle(projectId, options) {
     // background failure used to be indistinguishable from a link with nothing
     // to report, so a link that had stopped working could go unnoticed
     // indefinitely.
-    try {
-      const failed = (_ssData?.projects || []).find(entry => entry.id === projectId);
-      if (failed?.googleLink) {
-        failed.googleLink = {
-          ...failed.googleLink,
-          lastError: String(error?.message || error).slice(0, 300),
-          lastErrorAt: new Date().toISOString(),
-        };
-        _ssMirroringFromGoogle = true;
-        const savingError = ssSave();
-        _ssMirroringFromGoogle = false;
-        await savingError;
-      }
-    } catch (_) {}
+    _ssWriteLinkState(projectId, {
+      lastError: String(error?.message || error).slice(0, 300),
+      lastErrorAt: new Date().toISOString(),
+    });
     if (!silent) showToast(`Sync from Google failed: ${error?.message || error}`, 'danger');
     return false;
   } finally {

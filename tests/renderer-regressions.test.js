@@ -2171,15 +2171,16 @@ test('MB1188-012: a failed background sync leaves a durable trace', () => {
   assert.match(pull, /lastError: String\(error\?\.message \|\| error\)/,
     'a silent failure looked exactly like a link with nothing to report');
   assert.match(pull, /lastErrorAt: new Date\(\)\.toISOString\(\)/);
-  assert.match(pull, /delete nextLink\.lastError;/,
-    'and a completed sync clears it');
-  assert.match(namedFunctionSource('_ssGoogleLinkNotice'), /link\.lastError/,
+  assert.match(pull, /lastError: null,/, 'and a completed sync clears it');
+  // MB1188-026: recorded per Mac, so noticing a failure costs no cloud write.
+  assert.match(pull, /_ssWriteLinkState\(projectId, \{/);
+  assert.match(namedFunctionSource('_ssGoogleLinkNotice'), /state\.lastError/,
     'the project card shows it');
 });
 
 test('MB1188-012: tabs added in Google after the import are reported', () => {
   const pull = namedFunctionSource('ssPullFromGoogle');
-  assert.match(pull, /nextLink\.newTabs = discovered\.slice\(0, 25\)/);
+  assert.match(pull, /newTabs: discovered\.length \? discovered\.slice\(0, 25\) : null/);
   assert.match(namedFunctionSource('_ssGoogleLinkNotice'), /new tab\$\{count === 1 \? '' : 's'\} in Google/);
 });
 
@@ -2313,4 +2314,61 @@ test('MB1188-022: the live sync listener reads the workbook, not the index', () 
   assert.match(body, /_ssDurableWorkbook\(\)/, 'the assembled workbook is what it needs');
   assert.match(body, /ssRenderActivityBar\(\)/,
     'and an arriving change re-renders who is credited, not only the cells');
+});
+
+test('MB1188-026: a Google check that finds nothing new writes nothing to the cloud', () => {
+  // The project document reached revision 447 in one evening for about twenty
+  // real edits. Every automatic check stamped a fresh `pulledAt` into the
+  // SYNCED link, so the document differed every time and the "only write when
+  // something actually changed" guard in _ssCommitSplitWorkbook could never
+  // fire. Each of those writes re-encrypted and uploaded the whole six-sheet
+  // workbook.
+  const pull = namedFunctionSource('ssPullFromGoogle');
+  assert.doesNotMatch(pull, /pulledAt: new Date\(\)\.toISOString\(\),\s*\n\s*tabs:/,
+    'the shared link must not carry a fresh timestamp on every check');
+  assert.match(pull, /_ssWriteLinkState\(projectId, \{\s*\n\s*pulledAt:/,
+    'when this Mac last checked is recorded locally');
+
+  // Four saves per pull became one per tab that actually changed.
+  const saves = (pull.match(/ssSave\(\)/g) || []).length;
+  assert.ok(saves <= 2, `a pull should not save more than once per tab, found ${saves}`);
+
+  // And the fields are gone from the synced document entirely.
+  const source = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const start = source.indexOf('googleLink = {\n        spreadsheetId,');
+  assert.notEqual(start, -1, 'the normalizer builds the link');
+  const built = source.slice(start, source.indexOf('const readCheckpoint', start));
+  for (const field of ['pulledAt', 'lastError', 'lastErrorAt', 'newTabs']) {
+    assert.ok(!built.includes(`googleLink.${field} =`),
+      `${field} is a per-Mac observation and must not be carried into shared data`);
+  }
+});
+
+test('MB1188-026: per-Mac link state round-trips and drops empties', () => {
+  const store = new Map();
+  const context = vm.createContext({
+    JSON, Object, Array, String,
+    localStorage: {
+      getItem: k => (store.has(k) ? store.get(k) : null),
+      setItem: (k, v) => store.set(k, String(v)),
+    },
+  });
+  vm.runInContext(`
+    ${namedFunctionSource('_ssLinkStateKey')}
+    ${namedFunctionSource('_ssReadLinkState')}
+    ${namedFunctionSource('_ssWriteLinkState')}
+    globalThis.read = id => _ssReadLinkState(id);
+    globalThis.write = (id, patch) => _ssWriteLinkState(id, patch);
+  `, context);
+
+  assert.deepEqual(JSON.parse(JSON.stringify(context.read('p1'))), {}, 'unknown project is empty');
+  context.write('p1', { pulledAt: '2026-08-07T22:00:00.000Z', lastError: 'boom' });
+  assert.equal(context.read('p1').lastError, 'boom');
+  // A successful check clears the error rather than leaving it to be believed.
+  context.write('p1', { lastError: null, lastErrorAt: null });
+  assert.equal(context.read('p1').lastError, undefined);
+  assert.equal(context.read('p1').pulledAt, '2026-08-07T22:00:00.000Z', 'and keeps the rest');
+  // Corrupt JSON must not take the project card down with it.
+  store.set('tmb__gsync_p2', 'not json');
+  assert.deepEqual(JSON.parse(JSON.stringify(context.read('p2'))), {});
 });

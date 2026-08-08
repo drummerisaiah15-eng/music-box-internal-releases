@@ -1420,7 +1420,7 @@ test('MB1188-001: a Google link survives every split conversion', () => {
   const api = splitApi();
   const link = {
     spreadsheetId: '1zZ4M7ewY7cFBePc2nV-kX2j-YHr0rilPQ6bFvB7WYrg',
-    rows: 500, columns: 26, pulledAt: '2026-08-07T12:00:00.000Z',
+    rows: 500, columns: 26,
     tabs: {
       s1: { title: 'Monday',  checkpoint: { '0,0': 'TIME' }, mergeSig: 'abc123' },
       s2: { title: 'Tuesday', checkpoint: { '0,0': 'TIME' } },
@@ -1551,13 +1551,14 @@ test('MB1188-020: a Google link set locally is not reverted by the merge', () =>
   const merge = mergeApi();
   const before = { spreadsheetId: 'a'.repeat(30), rows: 200, columns: 30,
     tabs: { s1: { title: 'Thursday', checkpoint: { '0,0': 'old' } } } };
-  const after = { ...before, pulledAt: '2026-08-07T20:00:00.000Z',
+  const after = { ...before,
     tabs: { s1: { title: 'Thursday', checkpoint: { '0,0': 'new' } } } };
   const out = merge(keyBook({ googleLink: before }), keyBook({ googleLink: before }),
     keyBook({ googleLink: after }));
   assert.equal(out.projects[0].googleLink.tabs.s1.checkpoint['0,0'], 'new',
     'the advanced checkpoint is kept');
-  assert.equal(out.projects[0].googleLink.pulledAt, '2026-08-07T20:00:00.000Z');
+  // pulledAt is deliberately absent from shared state now — MB1188-026.
+  assert.equal(out.projects[0].googleLink.pulledAt, undefined);
 });
 
 test('MB1188-020: a field this Mac did not touch is left to the merge', () => {
