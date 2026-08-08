@@ -1865,3 +1865,28 @@ test('the renderer cleans the client ID field so it shows what will be saved', (
   assert.match(body, /idField\.value !== clientId\) idField\.value = clientId/,
     'the field is corrected in place rather than silently differing from the vault');
 });
+
+test('an unreadable Google vault is reported as such, not as "nothing saved"', () => {
+  // _googleVault() swallowed every error and returned {}. So a vault that could
+  // not be decrypted produced the identical message to one that was simply
+  // empty: "Add the Google OAuth client ID in Settings before connecting."
+  // On a second Mac that is the difference between a five-second fix and an
+  // hour of guessing.
+  const source = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  const vault = source.slice(source.indexOf('function _googleVault('),
+    source.indexOf('function _saveGoogleVault('));
+  assert.match(vault, /_googleVaultReadError = String\(error\?\.message \|\| error\)/,
+    'the read failure is recorded rather than discarded');
+  assert.match(vault, /_googleVaultReadError = null;/, 'and cleared on a good read');
+
+  const begin = source.slice(source.indexOf("_secureHandle('google-oauth-begin'"));
+  assert.match(begin.slice(0, 900), /could not be read/,
+    'connecting names the real problem');
+
+  const status = source.slice(source.indexOf("_secureHandle('google-status'"));
+  assert.match(status.slice(0, 600), /vaultError: _googleVaultReadError \|\| null/,
+    'and Settings can show it');
+
+  const renderer = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  assert.match(renderer, /could not be read: \$\{status\.vaultError\}/);
+});

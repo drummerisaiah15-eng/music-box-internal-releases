@@ -11798,7 +11798,12 @@ async function refreshGoogleSheetsStatus() {
   if (el) {
     const idField = document.getElementById('google-client-id');
     if (idField && !idField.value && status.configured) idField.placeholder = 'Saved';
-    el.textContent = !status.configured
+    el.textContent = status.vaultError
+      // An unreadable vault is not an empty one, and saying "no client ID
+      // saved yet" for both sends people to re-enter something that is
+      // already there and will fail again the same way.
+      ? `Saved Google credentials on this Mac could not be read: ${status.vaultError}`
+      : !status.configured
       ? 'No client ID saved yet.'
       : status.connected
         ? `Connected as ${status.account || 'a Google account'}.`

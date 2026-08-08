@@ -1199,12 +1199,23 @@ function _closeGoogleOAuthServer() {
   }
 }
 
+// The last failure reading the secret vault, if any.
+//
+// This used to swallow every error and return {}, which made "you have not
+// saved a client ID yet" and "I cannot read the vault at all" produce the exact
+// same message: 'Add the Google OAuth client ID in Settings before connecting.'
+// On a second Mac that is the difference between a five-second fix and an hour
+// of guessing, and we spent that hour.
+let _googleVaultReadError = null;
+
 function _googleVault() {
   try {
     const vault = _loadSecretVault();
+    _googleVaultReadError = null;
     const entry = vault[GOOGLE_VAULT_KEY];
     return _isPlainObject(entry) ? entry : {};
-  } catch (_) {
+  } catch (error) {
+    _googleVaultReadError = String(error?.message || error).slice(0, 300);
     return {};
   }
 }
@@ -2149,6 +2160,9 @@ _secureHandle('google-status', async () => {
   const vault = _googleVault();
   return {
     ok: true,
+    // Surfaced so Settings can distinguish an empty vault from an unreadable
+    // one instead of showing "not connected" for both.
+    vaultError: _googleVaultReadError || null,
     configured: _validGoogleClientId(vault.clientId || ''),
     connected: typeof vault.refreshToken === 'string' && vault.refreshToken.length > 0,
     account: typeof vault.account === 'string' ? vault.account : null,
@@ -2164,6 +2178,12 @@ _secureHandle('google-oauth-begin', async (_, request) => {
   if (!_isPlainObject(request)) throw new Error('Invalid Google sign-in request.');
   const vault = _googleVault();
   if (!_validGoogleClientId(vault.clientId || '')) {
+    // Say WHICH of the two it is.
+    if (_googleVaultReadError) {
+      throw new Error(
+        `The saved Google credentials on this Mac could not be read: ${_googleVaultReadError}. ` +
+        `Re-enter the client ID and secret in Settings.`);
+    }
     throw new Error('Add the Google OAuth client ID in Settings before connecting.');
   }
   return _beginGoogleOAuth({
