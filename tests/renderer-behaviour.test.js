@@ -2044,7 +2044,9 @@ test('custom fill colour: the picker is in-page, positioned right of the grid', 
 test('custom fill colour: the picker closes and stops listening', () => {
   // Every listener added on open is removed on close; a stray document-level
   // pointerdown or keydown handler would keep firing over the grid forever.
-  const open = declaration('ssToggleColorPicker');
+  // The listeners live on the shared opener now: the toolbar swatch and the
+  // colour-key swatch both route through it.
+  const open = declaration('ssOpenColorPickerFor');
   const close = declaration('ssCloseColorPicker');
   for (const [listener, handler] of [
     ['pointerdown', '_ssColorPickerOutside'],
@@ -2059,4 +2061,16 @@ test('custom fill colour: the picker closes and stops listening', () => {
   assert.match(close, /window\.removeEventListener\('resize', _ssPositionColorPicker\)/);
   assert.match(declaration('_ssColorPickerEscape'), /event\.stopPropagation\(\)/,
     'Escape closes the picker without also cancelling the cell edit underneath');
+});
+
+test('MB1188-020: the colour-key swatch uses the in-app picker too', () => {
+  // It built a hidden <input type="color"> and clicked it, which is the same
+  // system panel — and the same wrong corner of the screen — that the fill
+  // swatch had already been moved away from.
+  const pick = declaration('ssKeyPickColor');
+  assert.match(pick, /ssOpenColorPickerFor\(\{ kind: 'key', index: i \}/);
+  assert.doesNotMatch(pick, /createElement\('input'\)/, 'no hidden native input');
+  const apply = declaration('ssColorPickerApply');
+  assert.match(apply, /_ssPickerTarget\.kind === 'key'/, 'apply routes to whatever opened it');
+  assert.match(apply, /ssApplyCustomColor\(value\)/, 'and still fills cells otherwise');
 });

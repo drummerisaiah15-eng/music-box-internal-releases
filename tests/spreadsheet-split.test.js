@@ -1454,3 +1454,117 @@ test('MB1188-001: a Google link survives every split conversion', () => {
   );
   assert.deepEqual(assembled.projects[0].googleLink, link, '_ssAssembleWorkbook');
 });
+
+// ── MB1188-020: project-level state survives a save ─────────────────────────
+
+function mergeApi() {
+  const context = vm.createContext({
+    console: { warn() {}, error() {}, log() {} },
+    Date, Object, Map, Set, Array, JSON, Number, String, Boolean, Math, TextEncoder,
+    showToast() {},
+    _cloneJson: value => JSON.parse(JSON.stringify(value)),
+  });
+  vm.runInContext(`
+    var MAX_SPREADSHEET_CELL_CHARS = 50000, MAX_SPREADSHEET_SHEETS = 25,
+        MAX_SPREADSHEET_ROWS = 500, MAX_SPREADSHEET_COLS = 100,
+        MAX_SPREADSHEET_GRID_CELLS = 10000, MAX_SPREADSHEET_TOTAL_CELLS = 10000,
+        MAX_SPREADSHEET_TOTAL_CHARS = 400000, MAX_SPREADSHEET_SYNC_JSON_BYTES = 600000,
+        MAX_SPREADSHEET_ATTRIBUTIONS = 200, MAX_SPREADSHEET_ATTRIBUTION_NAME = 80,
+        MAX_RESOLVED_CONFLICT_IDS = 200, MAX_SPREADSHEET_CONFLICTS = 200;
+    ${declaration('_ssDigest')}
+    ${declaration('_recordContentKey')}
+    ${declaration('_conflictVariantKey')}
+    ${declaration('_ssOversizeError')}
+    ${declaration('_normalizeSpreadsheetAttribution')}
+    ${declaration('_mergeResolvedConflictIds')}
+    ${declaration('normalizeSpreadsheetWorkbook')}
+    ${declaration('_ssCellSignature')}
+    ${declaration('_ssConflictId')}
+    ${declaration('_ssSheetOf')}
+    ${declaration('_ssCellIsBlank')}
+    ${declaration('_ssAttributionActor')}
+    ${declaration('_ssStampAttribution')}
+    ${declaration('_ssStructureDigest')}
+    ${declaration('_ssStructureWasEditedRemotely')}
+    ${declaration('_deriveSpreadsheetOperations')}
+    ${declaration('_applySpreadsheetOperations')}
+    ${declaration('_mergeSpreadsheetEdits')}
+    globalThis.merge = (base, dirtyBase, dirty) =>
+      JSON.parse(JSON.stringify(_mergeSpreadsheetEdits(base, dirtyBase, dirty)));
+  `, context);
+  return context.merge;
+}
+
+const keySheet = () => ({
+  id: 's1', name: 'Sheet1', rows: 5, cols: 5,
+  colWidths: [100, 100, 100, 100, 100], cells: { '0,0': { v: 'x', bg: '', tc: '', b: false } },
+});
+const keyBook = over => ({
+  activeProject: 'p1',
+  projects: [{ id: 'p1', name: 'Color Block', activeId: 's1', sheets: [keySheet()], ...over }],
+});
+
+test('MB1188-020: turning the colour key on survives the save', () => {
+  // The merge rebuilds the workbook from the reconciled base and replays
+  // operations. colorKey is not an operation, so it reverted to the base copy
+  // every time — the toggle worked in memory and snapped shut on save.
+  const merge = mergeApi();
+  const off = { visible: false, entries: [{ bg: '#ffd966', tc: '#333333', label: 'Piano' }] };
+  const on = { visible: true, entries: off.entries };
+  const out = merge(keyBook({ colorKey: off }), keyBook({ colorKey: off }), keyBook({ colorKey: on }));
+  assert.equal(out.projects[0].colorKey.visible, true, 'the key stays open');
+});
+
+test('MB1188-020: adding a key entry does not close the key', () => {
+  // The reported symptom: pressing Add Entry made the whole key disappear,
+  // because the save reverted colorKey wholesale — entry and visibility both.
+  const merge = mergeApi();
+  const before = { visible: true, entries: [{ bg: '#ffd966', tc: '#333333', label: 'Piano' }] };
+  const after = {
+    visible: true,
+    entries: [...before.entries, { bg: '#ffffff', tc: '#333333', label: 'New Entry' }],
+  };
+  const out = merge(keyBook({ colorKey: before }), keyBook({ colorKey: before }), keyBook({ colorKey: after }));
+  assert.equal(out.projects[0].colorKey.visible, true, 'still open');
+  assert.equal(out.projects[0].colorKey.entries.length, 2, 'and the new entry is there');
+  assert.equal(out.projects[0].colorKey.entries[1].label, 'New Entry');
+});
+
+test('MB1188-020: the colour key is per project, so it spans every tab', () => {
+  // Stored on the project rather than the sheet, which is what makes it the
+  // same key on all six tabs and the same key for whoever opens it next.
+  const source = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const get = source.slice(source.indexOf('function ssGetColorKey('));
+  assert.match(get.slice(0, get.indexOf('\n}') + 2), /ssActiveProject\(\)/,
+    'read from the project, never from the active sheet');
+  assert.match(source, /\['id', 'name', 'activeId', 'sheets', 'colorKey', 'googleLink'\]/,
+    'and carried on the project document, so it syncs to the other Macs');
+});
+
+test('MB1188-020: a Google link set locally is not reverted by the merge', () => {
+  // Same defect, quieter symptom: a pull advances the checkpoint, the merge
+  // hands back the base link, and the next sync redoes work already done.
+  const merge = mergeApi();
+  const before = { spreadsheetId: 'a'.repeat(30), rows: 200, columns: 30,
+    tabs: { s1: { title: 'Thursday', checkpoint: { '0,0': 'old' } } } };
+  const after = { ...before, pulledAt: '2026-08-07T20:00:00.000Z',
+    tabs: { s1: { title: 'Thursday', checkpoint: { '0,0': 'new' } } } };
+  const out = merge(keyBook({ googleLink: before }), keyBook({ googleLink: before }),
+    keyBook({ googleLink: after }));
+  assert.equal(out.projects[0].googleLink.tabs.s1.checkpoint['0,0'], 'new',
+    'the advanced checkpoint is kept');
+  assert.equal(out.projects[0].googleLink.pulledAt, '2026-08-07T20:00:00.000Z');
+});
+
+test('MB1188-020: a field this Mac did not touch is left to the merge', () => {
+  // The rule is "this Mac changed it relative to what it started from", not
+  // "this Mac wins" — otherwise every save would stamp its own stale copy over
+  // whatever the other Mac had just done.
+  const merge = mergeApi();
+  const mine = { visible: false, entries: [{ bg: '#ffd966', tc: '#333333', label: 'Piano' }] };
+  const theirs = { visible: true, entries: [{ bg: '#6aa84f', tc: '#ffffff', label: 'Guitar' }] };
+  // base carries the other Mac's key; this Mac never touched its own copy.
+  const out = merge(keyBook({ colorKey: theirs }), keyBook({ colorKey: mine }), keyBook({ colorKey: mine }));
+  assert.deepEqual(JSON.parse(JSON.stringify(out.projects[0].colorKey)), theirs,
+    "an untouched field keeps the other Mac's value");
+});
