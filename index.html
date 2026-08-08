@@ -11812,8 +11812,13 @@ async function refreshGoogleSheetsStatus() {
 }
 
 async function saveGoogleCredentials() {
-  const clientId = (document.getElementById('google-client-id')?.value || '').trim();
-  const clientSecret = (document.getElementById('google-client-secret')?.value || '').trim();
+  // Same normalization as main, applied here too so the field visibly becomes
+  // what is about to be saved rather than the operator being told their own
+  // client ID is not a client ID.
+  const idField = document.getElementById('google-client-id');
+  const clientId = (idField?.value || '').replace(/\s+/g, '');
+  if (idField && idField.value !== clientId) idField.value = clientId;
+  const clientSecret = (document.getElementById('google-client-secret')?.value || '').replace(/\s+/g, '');
   try {
     const result = await _googleSheets().setCredentials({ clientId, clientSecret });
     const secretField = document.getElementById('google-client-secret');

@@ -2112,8 +2112,18 @@ _secureHandle('app-session-import-directory', async (_, directory) => {
 _secureHandle('google-set-credentials', async (_, request) => {
   _requireAppRole(OPERATIONS_MANAGER_ROLES);
   if (!_isPlainObject(request)) throw new Error('Invalid Google credentials.');
-  const clientId = String(request.clientId || '').trim();
-  const clientSecret = String(request.clientSecret || '').trim();
+  // Strip ALL whitespace, not just the ends.
+  //
+  // A client ID pasted from the Google console can arrive with spaces or a line
+  // break inside it — from the paste, from text substitution, from a value that
+  // was wrapped on screen when it was copied. `.trim()` leaves those, the
+  // pattern below then rejects it, Save fails, and the next thing the operator
+  // sees is "No client ID saved yet" on a field that visibly contains their
+  // client ID. Neither a Google client ID nor a client secret can legitimately
+  // contain whitespace, so removing it is unambiguous and cannot corrupt a
+  // valid value.
+  const clientId = String(request.clientId || '').replace(/\s+/g, '');
+  const clientSecret = String(request.clientSecret || '').replace(/\s+/g, '');
   if (!_validGoogleClientId(clientId)) {
     throw new Error('That does not look like a Google OAuth client ID. It should end in .apps.googleusercontent.com');
   }

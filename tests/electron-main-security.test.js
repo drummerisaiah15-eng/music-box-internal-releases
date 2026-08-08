@@ -1826,3 +1826,42 @@ test('P3-01: the Google comments describe the one-way code that is actually ther
   assert.match(source,
     /const GOOGLE_SCOPE = 'https:\/\/www\.googleapis\.com\/auth\/spreadsheets\.readonly'/);
 });
+
+test('Google credentials pasted with stray whitespace are accepted', () => {
+  // Reported live: the client ID field visibly contained the operator's client
+  // ID, Save was refused, and the app then said "No client ID saved yet" and
+  // "Add the Google OAuth client ID in Settings before connecting". The value
+  // had spaces inside it from the paste; .trim() only removes the ends.
+  const source = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  const start = source.indexOf("_secureHandle('google-set-credentials'");
+  const handler = source.slice(start, source.indexOf('_secureHandle(', start + 10));
+  assert.match(handler, /String\(request\.clientId \|\| ''\)\.replace\(\/\\s\+\/g, ''\)/,
+    'the client ID is stripped of all whitespace, not just trimmed');
+  assert.match(handler, /String\(request\.clientSecret \|\| ''\)\.replace\(\/\\s\+\/g, ''\)/,
+    'and so is the secret — a paste can pick up a trailing newline');
+
+  // The validator itself is unchanged and still strict.
+  const validator = source.slice(source.indexOf('function _validGoogleClientId('));
+  const pattern = /\^\[0-9\]\{6,32\}-\[A-Za-z0-9_\]\{8,64\}\\\.apps\\\.googleusercontent\\\.com\$/;
+  assert.match(validator.slice(0, 300), pattern, 'the shape requirement still holds');
+
+  // The exact value from the report, before and after.
+  const shape = /^[0-9]{6,32}-[A-Za-z0-9_]{8,64}\.apps\.googleusercontent\.com$/;
+  const pasted = '235779015004- 5m1 ddq0k4p1v4mq77lfl6513lcpbe3e. apps.googleusercontent.com';
+  assert.equal(shape.test(pasted.trim()), false, 'trimming alone did not save it');
+  assert.equal(shape.test(pasted.replace(/\s+/g, '')), true, 'stripping whitespace does');
+
+  // Junk is still refused — normalizing must not become "accept anything".
+  for (const junk of ['not a client id', '', 'abc.apps.googleusercontent.com',
+                      '123-short.apps.googleusercontent.example.com']) {
+    assert.equal(shape.test(junk.replace(/\s+/g, '')), false, `${junk} is still refused`);
+  }
+});
+
+test('the renderer cleans the client ID field so it shows what will be saved', () => {
+  const renderer = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const start = renderer.indexOf('async function saveGoogleCredentials(');
+  const body = renderer.slice(start, renderer.indexOf('\n}\n', start));
+  assert.match(body, /idField\.value !== clientId\) idField\.value = clientId/,
+    'the field is corrected in place rather than silently differing from the vault');
+});
