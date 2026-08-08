@@ -1674,3 +1674,56 @@ function normalizeApi() {
   `, context);
   return context.norm;
 }
+
+test('MB1188-023: an automatic Google check does not erase who edited a cell', () => {
+  // The bug behind "the activity keeps disappearing a couple of minutes later".
+  // A Google mirror save suppresses the actor on purpose, so its operations
+  // carry no author — and an authorless operation used to DELETE the existing
+  // stamp. Every automatic check erased the credit for exactly the cells
+  // somebody had just typed, because those are the ones that differ from the
+  // checkpoint and therefore produce an operation.
+  const context = vm.createContext({ Object, Date, JSON, Number, String, Math });
+  vm.runInContext(`
+    var MAX_SPREADSHEET_ATTRIBUTIONS = 200;
+    ${declaration('_ssStampAttribution')}
+    globalThis.stamp = (sheet, target, op) => { _ssStampAttribution(sheet, target, op); return sheet; };
+  `, context);
+
+  const existing = () => ({
+    editedBy: { '0,0': { by: 'Carrie Gass', at: '2026-08-07T21:50:00.000Z' } },
+  });
+
+  // A mirror write: the cell still has a value, but nobody to credit.
+  const mirrored = context.stamp(existing(), '0,0',
+    { value: { v: 'carrie test', bg: '', tc: '', b: false }, by: null, at: null });
+  assert.ok(mirrored.editedBy?.['0,0'], 'the credit survives a system write');
+  assert.equal(mirrored.editedBy['0,0'].by, 'Carrie Gass');
+
+  // A real edit by someone else still takes it over.
+  const taken = context.stamp(existing(), '0,0',
+    { value: { v: 'ana test', bg: '', tc: '', b: false }, by: 'Ana Chaves', at: '2026-08-07T21:55:00.000Z' });
+  assert.equal(taken.editedBy['0,0'].by, 'Ana Chaves', 'a real edit re-credits the cell');
+
+  // Clearing the cell still drops the credit with it — that branch was correct.
+  const cleared = context.stamp(existing(), '0,0', { value: null, by: null, at: null });
+  assert.equal(cleared.editedBy, undefined, 'a cleared cell keeps no credit');
+});
+
+test('MB1188-023: a system write leaves other cells’ credits untouched too', () => {
+  const context = vm.createContext({ Object, Date, JSON, Number, String, Math });
+  vm.runInContext(`
+    var MAX_SPREADSHEET_ATTRIBUTIONS = 200;
+    ${declaration('_ssStampAttribution')}
+    globalThis.stamp = (sheet, target, op) => { _ssStampAttribution(sheet, target, op); return sheet; };
+  `, context);
+  const sheet = {
+    editedBy: {
+      '0,0': { by: 'Megan', at: '2026-08-07T21:48:00.000Z' },
+      '1,1': { by: 'Carrie Gass', at: '2026-08-07T21:53:00.000Z' },
+    },
+  };
+  context.stamp(sheet, '1,1', { value: { v: 'x', bg: '', tc: '', b: false }, by: null, at: null });
+  assert.equal(sheet.editedBy['0,0'].by, 'Megan', 'the older credit is still there');
+  assert.equal(sheet.editedBy['1,1'].by, 'Carrie Gass',
+    'and so is the one the mirror wrote over — which is the one that kept vanishing');
+});

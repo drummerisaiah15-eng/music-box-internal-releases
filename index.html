@@ -9634,13 +9634,28 @@ function _ssCellsOf(workbook, projectId, sheetId) {
 // no-op replay never rewrites history with a later timestamp.
 function _ssStampAttribution(sheet, target, op) {
   if (!sheet) return;
-  if (op.value === null || !op.by || !op.at) {
+  // The cell itself is gone, so the credit for it goes too.
+  if (op.value === null) {
     if (sheet.editedBy) {
       delete sheet.editedBy[target];
       if (!Object.keys(sheet.editedBy).length) delete sheet.editedBy;
     }
     return;
   }
+  // MB1188-023: an operation with no author is a SYSTEM write, not an
+  // anonymous edit — a Google mirror save suppresses the actor on purpose
+  // (_ssAttributionActor returns null while _ssMirroringFromGoogle is set).
+  //
+  // This used to fall into the branch above and DELETE the existing stamp. So
+  // every automatic Google check quietly erased the credit for any cell it
+  // produced an operation for — which is every cell somebody had just typed,
+  // because those are exactly the ones that differ from the checkpoint. The
+  // edit stayed, the name vanished, and it happened on the sync timer, which
+  // is why it looked like it happened at random a couple of minutes later.
+  //
+  // Leave the existing credit alone. A system write has nobody to credit; that
+  // is not the same as knowing there is nobody to credit.
+  if (!op.by || !op.at) return;
   if (!sheet.editedBy) sheet.editedBy = {};
   sheet.editedBy[target] = { by: op.by, at: op.at };
   const keys = Object.keys(sheet.editedBy);
