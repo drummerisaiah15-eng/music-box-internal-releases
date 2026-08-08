@@ -1145,15 +1145,20 @@ _secureHandle('keychain-decrypt', async (_, b64) => {
 // ─────────────────────────────────────────────────────────────
 
 const GOOGLE_VAULT_KEY = 'app_google_sheets_v1';
-// MB161-016: two-way sync needs write access, so the narrow readonly scope is
-// gone — and with it the guarantee that Google would refuse a write on our
-// behalf regardless of what this code did. Safety now has to come from this
-// file instead, which is why every push re-reads its target cells immediately
-// beforehand and returns whatever it replaced so the caller can preserve it.
+// MB161-016 / P3-01: READ ONLY, and this comment used to say the opposite.
 //
-// Anyone connected under the old scope must reconnect. Google does not
-// silently upgrade an existing grant, and google-oauth-complete verifies the
-// scope actually granted rather than the one requested.
+// Two-way sync existed briefly and was removed. The scope below is the narrow
+// readonly one, which means Google itself refuses a write on our behalf no
+// matter what this file does — a guarantee that does not depend on this code
+// being correct. There is no push path, no write IPC and no write method on
+// the preload bridge.
+//
+// The previous version of this note described pushes and claimed the readonly
+// scope was gone. It was wrong, and wrong in the dangerous direction: it read
+// as licence to add a write. Do not.
+//
+// google-oauth-complete verifies the scope actually granted rather than the
+// one requested, because Google does not silently upgrade an existing grant.
 const GOOGLE_SCOPE = 'https://www.googleapis.com/auth/spreadsheets.readonly';
 const GOOGLE_AUTH_ENDPOINT = 'https://accounts.google.com/o/oauth2/v2/auth';
 const GOOGLE_TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';

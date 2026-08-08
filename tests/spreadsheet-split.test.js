@@ -1493,8 +1493,8 @@ function mergeApi() {
     ${declaration('_deriveSpreadsheetOperations')}
     ${declaration('_applySpreadsheetOperations')}
     ${declaration('_mergeSpreadsheetEdits')}
-    globalThis.merge = (base, dirtyBase, dirty) =>
-      JSON.parse(JSON.stringify(_mergeSpreadsheetEdits(base, dirtyBase, dirty)));
+    globalThis.merge = (base, dirtyBase, dirty, actor) =>
+      JSON.parse(JSON.stringify(_mergeSpreadsheetEdits(base, dirtyBase, dirty, actor)));
   `, context);
   return context.merge;
 }
@@ -1821,4 +1821,97 @@ test('AUDIT: every field the normalizer keeps is handled by the merge', () => {
       `the local copy the way colorKey and editedBy are, or make it an operation. ` +
       `A field the merge ignores reverts to the base on every save.`);
   }
+});
+
+// ── 1.2.3 pentest: P0-02, P0-03, P1-01 — behaviour, not call shape ──────────
+
+const pSheet = (id, cells = {}) => ({
+  id, name: id, rows: 5, cols: 5, colWidths: [100, 100, 100, 100, 100], cells,
+});
+const pBook = (sheets, activeId, over = {}) => ({
+  activeProject: 'p1',
+  projects: [{ id: 'p1', name: 'Color Block', activeId, sheets, ...over }],
+});
+
+test('P0-02: a sheet created here stays the active sheet after the save', () => {
+  // The reproduction: New Sheet shows a blank Sheet 2, the save settles, and
+  // the merge hands back activeId = Sheet 1 while the screen still shows
+  // Sheet 2. The next thing typed goes into Sheet 1.
+  const merge = mergeApi();
+  const base = pBook([pSheet('s1')], 's1');
+  const dirtyBase = pBook([pSheet('s1')], 's1');
+  const dirty = pBook([pSheet('s1'), pSheet('s2')], 's2');   // New Sheet pressed
+  const out = merge(base, dirtyBase, dirty);
+  assert.deepEqual(out.projects[0].sheets.map(s => s.id), ['s1', 's2'],
+    'the new sheet is kept');
+  assert.equal(out.projects[0].activeId, 's2',
+    'and it is still the active one — otherwise the next edit lands in s1');
+});
+
+test('P0-02: an edit after creating a sheet lands in the new sheet', () => {
+  // The consequence, end to end through the merge.
+  const merge = mergeApi();
+  const created = merge(pBook([pSheet('s1')], 's1'), pBook([pSheet('s1')], 's1'),
+    pBook([pSheet('s1'), pSheet('s2')], 's2'));
+  const active = created.projects[0].activeId;
+  const typed = pBook(
+    [pSheet('s1'), pSheet('s2', { '0,0': { v: 'VISIBLE-SHEET-2-EDIT', bg: '', tc: '', b: false } })],
+    active);
+  const out = merge(created, created, typed);
+  const sheets = Object.fromEntries(out.projects[0].sheets.map(s => [s.id, s.cells]));
+  assert.equal(sheets.s2['0,0']?.v, 'VISIBLE-SHEET-2-EDIT', 'the edit is in the new sheet');
+  assert.deepEqual(sheets.s1, {}, 'and sheet 1 is untouched');
+});
+
+test('P0-03: a conflict raised on the workbook being saved survives the merge', () => {
+  // A Google pull appends conflicts to _ssData._conflicts and then saves. The
+  // merge carried only the base's, so the pull said "kept yours, see
+  // conflicts", the checkpoint advanced past the remote value, and the only
+  // copy of what Google held was gone.
+  const merge = mergeApi();
+  const conflict = {
+    id: 'cf_remote2b', kind: 'cell', projectId: 'p1', sheetId: 's1', target: '0,0',
+    base: { v: 'Remote2', bg: '', tc: '', b: false },
+    local: { v: 'Local2', bg: '', tc: '', b: false },
+    remote: { v: 'Remote2B', bg: '', tc: '', b: false },
+    at: '2026-08-08T01:00:00.000Z',
+  };
+  const base = pBook([pSheet('s1', { '0,0': { v: 'Local2', bg: '', tc: '', b: false } })], 's1');
+  const dirty = { ...pBook([pSheet('s1', { '0,0': { v: 'Local2', bg: '', tc: '', b: false } })], 's1'),
+    _conflicts: [conflict] };
+  const out = merge(base, base, dirty);
+  const kept = out._conflicts || [];
+  assert.equal(kept.length, 1, 'the conflict is retained');
+  assert.equal(kept[0].remote.v, 'Remote2B',
+    "Google's losing value is recoverable, which is what the toast promised");
+  assert.equal(kept[0].local.v, 'Local2', 'and so is this Mac’s');
+});
+
+test('P0-03: a conflict already resolved is not brought back by the dirty side', () => {
+  const merge = mergeApi();
+  const conflict = { id: 'cf_settled', kind: 'cell', projectId: 'p1', sheetId: 's1',
+    target: '0,0', base: null, local: null, remote: null, at: '2026-08-08T01:00:00.000Z' };
+  const base = { ...pBook([pSheet('s1')], 's1'), _resolvedConflicts: ['cf_settled'] };
+  const dirty = { ...pBook([pSheet('s1')], 's1'), _conflicts: [conflict],
+    _resolvedConflicts: ['cf_settled'] };
+  const out = merge(base, base, dirty);
+  assert.deepEqual(out._conflicts, undefined, 'a settled conflict stays settled');
+});
+
+test('P1-01: a Google mirror write is not credited to whoever is signed in', () => {
+  // _ssMirroringFromGoogle is set, ssSave() is called, and the flag is cleared —
+  // but the merge runs asynchronously afterwards, so sampling the flag inside
+  // the merge read it after it had already gone back to false. The actor is now
+  // captured when the change is STAGED and passed in.
+  const merge = mergeApi();
+  const before = pBook([pSheet('s1')], 's1');
+  const after = pBook([pSheet('s1', { '0,0': { v: 'from Google', bg: '', tc: '', b: false } })], 's1');
+
+  const mirrored = merge(before, before, after, null);
+  assert.equal(mirrored.projects[0].sheets[0].editedBy, undefined,
+    'a system write credits nobody');
+
+  const human = merge(before, before, after, 'Carrie Gass');
+  assert.equal(human.projects[0].sheets[0].editedBy['0,0'].by, 'Carrie Gass',
+    'and a real edit still credits the person who made it');
 });

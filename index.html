@@ -2157,7 +2157,7 @@
         </div>
       </div>
 
-      <!-- MB161-014/016: Google Sheets, two-way -->
+      <!-- MB161-014/016: Google Sheets, one way — Google to the app -->
       <div class="settings-section manager-settings-section" id="owner-google-settings">
         <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
           <div class="settings-section-title" style="margin-bottom:0">📊 Google Sheets</div>
@@ -8728,7 +8728,7 @@ function _ssReadStoredWorkbook() {
 // Write the projects an edit session touched, then the index. Each project is
 // its own document with its own compare-and-set, so two Macs editing different
 // projects no longer contend at all.
-async function _ssCommitSplitWorkbook(dirtyBase, dirty) {
+async function _ssCommitSplitWorkbook(dirtyBase, dirty, stagedActor) {
   const at = new Date().toISOString();
   const written = [];
   for (const project of (dirty?.projects || [])) {
@@ -8749,6 +8749,7 @@ async function _ssCommitSplitWorkbook(dirtyBase, dirty) {
         durable ? _ssProjectDocToWorkbook(durable) : null,
         baseDoc ? _ssProjectDocToWorkbook(baseDoc) : null,
         _ssProjectDocToWorkbook(nextDoc),
+        stagedActor,
       )));
 
     // Only write what changed. Without this every keystroke rewrites every
@@ -8822,6 +8823,10 @@ async function _ssCommitSplitWorkbook(dirtyBase, dirty) {
 // Safe to attempt on both Macs at once: every key carries its own
 // compare-and-set, the documents written are byte-identical because they are
 // derived from the same workbook, and the index merge is a record list.
+// P1-01: who was responsible for the change currently staged, captured at
+// staging time. null means a system write — a Google mirror — which must not be
+// credited to whoever happens to be signed in.
+let _ssDirtyActor = null;
 let _ssMigrationRan = false;
 // MB1188-003: set while the migration holds the 'spreadsheets' key, so a
 // second caller joins the run in progress instead of queueing a duplicate.
@@ -9797,10 +9802,18 @@ function _ssStructureWasEditedRemotely(current, base) {
 }
 
 // Derive the user's intent as operations: base -> next.
-function _deriveSpreadsheetOperations(base, next) {
+// P1-01: the actor is passed IN, captured when the change was staged.
+//
+// This used to call _ssAttributionActor() here, which reads the
+// _ssMirroringFromGoogle flag. The Google pull sets that flag, calls ssSave(),
+// and clears it — but the merge runs asynchronously inside the save, long
+// after the flag is back to false. So a Google-originated cell was sampled as
+// an ordinary edit and stamped with whoever happened to be signed in. The flag
+// was never wrong; it was read at the wrong moment.
+function _deriveSpreadsheetOperations(base, next, stagedActor) {
   const ops = [];
   if (!base || !next) return ops;
-  const actor = _ssAttributionActor();
+  const actor = stagedActor === undefined ? _ssAttributionActor() : stagedActor;
   const stampedAt = new Date().toISOString();
   const baseProjects = new Map((base.projects || []).map(p => [p.id, p]));
   const nextProjects = new Map((next.projects || []).map(p => [p.id, p]));
@@ -9983,7 +9996,7 @@ function _applySpreadsheetOperations(target, ops) {
 // Committing it wholesale erases any remote cell that arrived while the user was
 // typing. Instead, apply the diff the user actually made (dirtyBase -> dirty)
 // onto the base that is durable at commit time, which includes that remote edit.
-function _mergeSpreadsheetEdits(base, dirtyBase, dirty) {
+function _mergeSpreadsheetEdits(base, dirtyBase, dirty, stagedActor) {
   if (!base || !dirtyBase || !dirty) return dirty;
 
   // P0-1: the user's changes are derived as typed operations carrying the value
@@ -10019,7 +10032,7 @@ function _mergeSpreadsheetEdits(base, dirtyBase, dirty) {
     }
   }
 
-  const ops = _deriveSpreadsheetOperations(dirtyBase, dirty);
+  const ops = _deriveSpreadsheetOperations(dirtyBase, dirty, stagedActor);
   const { workbook, conflicts } = _applySpreadsheetOperations(base, ops);
 
   // Projects created locally after the editor snapshot are additions, not edits.
@@ -10047,6 +10060,11 @@ function _mergeSpreadsheetEdits(base, dirtyBase, dirty) {
       if (!originSheets.has(sheet.id) && !present.has(sheet.id)) {
         project.sheets.push(_cloneJson(sheet));
         present.add(sheet.id);
+        // P0-02: a sheet created on this Mac took this `continue` and never
+        // reached the activeId line below, so the merge handed back the OLD
+        // active sheet while the screen was already showing the new blank one.
+        // Typing into the visible Sheet 2 then wrote into Sheet 1.
+        if (sheet.id === local.activeId) project.activeId = sheet.id;
         continue;
       }
       const target = (project.sheets || []).find(s => s.id === sheet.id);
@@ -10132,7 +10150,17 @@ function _mergeSpreadsheetEdits(base, dirtyBase, dirty) {
   // are de-duplicated by id. They are NOT trimmed to a cap: each one is the
   // only surviving copy of a value somebody lost, so the list shrinks by being
   // resolved and by nothing else.
-  const carried = Array.isArray(base._conflicts) ? base._conflicts : [];
+  // P0-03: from the reconciled base AND from the workbook being saved.
+  //
+  // A Google pull appends its conflicts to _ssData._conflicts and then saves.
+  // Taking only the base's meant the merge threw them away — the pull said
+  // "kept yours, see conflicts", the checkpoint advanced past the remote value,
+  // and the only surviving copy of what Google held was gone. The same defect
+  // as colorKey, googleLink and editedBy: state no operation describes.
+  const carried = [
+    ...(Array.isArray(base._conflicts) ? base._conflicts : []),
+    ...(Array.isArray(dirty?._conflicts) ? dirty._conflicts : []),
+  ];
   const merged = [];
   for (const entry of [...carried, ...conflicts]) {
     // A settled conflict must never come back, including from a stale Mac that
@@ -10181,6 +10209,7 @@ function _beginSpreadsheetSaveStage() {
     await gate.promise;
     const generation = _ssDirtyGeneration;
     const dirtySource = _ssDirtyWorkbook;
+    const stagedActor = _ssDirtyActor;
     if (!dirtySource) return true;
     // V159-002: re-read the base *inside* the lock. If a remote reconcile
     // committed while the user was typing, its cells are in this base and the
@@ -10196,9 +10225,9 @@ function _beginSpreadsheetSaveStage() {
     let normalized;
     if (_ssStorageMode(reconciledBase) === 'split' ||
         (reconciledBase === null && _ssStorageMode() === 'split')) {
-      normalized = await _ssCommitSplitWorkbook(_ssDirtyBase, dirtySource);
+      normalized = await _ssCommitSplitWorkbook(_ssDirtyBase, dirtySource, stagedActor);
     } else {
-      const merged = _mergeSpreadsheetEdits(reconciledBase, _ssDirtyBase, dirtySource);
+      const merged = _mergeSpreadsheetEdits(reconciledBase, _ssDirtyBase, dirtySource, stagedActor);
       normalized = normalizeSpreadsheetWorkbook(merged);
       await _commitEncryptedSnapshot('spreadsheets', JSON.stringify(normalized), normalized, {
         sync: true,
@@ -10211,7 +10240,19 @@ function _beginSpreadsheetSaveStage() {
     if (_ssDirtyGeneration === generation) {
       _ssDirtyWorkbook = null;
       _ssDirtyBase = null;
+      _ssDirtyActor = null;
       _ssData = normalized;
+      // P2-01: attribution is generated during this merge, so the panel was
+      // showing the workbook from before it. It said "no tracked edits" while
+      // the edit was durably stamped, and only corrected itself when something
+      // else caused a render. Never leave the screen contradicting the data.
+      try {
+        if (document.getElementById('page-spreadsheets')?.classList.contains('active') &&
+            !_ssEditCell) {
+          ssRenderActivityBar();
+          ssRenderTabs();
+        }
+      } catch (_) {}
     }
     return true;
   }).catch(error => {
@@ -10254,6 +10295,10 @@ function _stageDirtySpreadsheetSave(delayMs) {
   // back from the cloud".
   if (!_ssDirtyWorkbook) {
     _ssDirtyBase = _ssDurableWorkbook() || _cloneJson(_ssData);
+    // P1-01: sampled HERE, synchronously, while _ssMirroringFromGoogle still
+    // describes the change being staged. Reading it later — inside the save,
+    // which is asynchronous — reads it after the pull has already cleared it.
+    _ssDirtyActor = _ssAttributionActor();
   }
   _ssDirtyWorkbook = _ssData;
   _ssDirtyGeneration += 1;
@@ -10276,13 +10321,57 @@ function _scheduleSpreadsheetSave() {
   return _stageDirtySpreadsheetSave(500);
 }
 
+// P0-01: STAGE, then flush. This used to only release a save that had already
+// been staged and wait for it.
+//
+// Callers that mutated _ssData directly and then called this — the split-storage
+// import, project deletion, sheet deletion — wrote NOTHING, and every one of
+// them then reported success. The import showed a green toast and a project
+// card; the durable index had no such project and it was gone after restart.
+// Deletions vanished from the screen and came back. Save All, Force Sync, the
+// iCloud backup and the quit/update gate all trusted this same call, so each of
+// them certified data that was never written.
+//
+// Staging when nothing is dirty is cheap: the commit compares against the
+// durable document and skips the write when they match. So this is
+// unconditional on purpose — there is no state in which "flush" should mean
+// "write nothing and return true".
 async function _flushSpreadsheetSave() {
-  if (_ssSaveGate && !_ssSaveGate.released) {
-    _releaseSpreadsheetSaveGate(_ssSaveGate);
+  if (!_ssData) {
+    if (_ssSaveGate && !_ssSaveGate.released) _releaseSpreadsheetSaveGate(_ssSaveGate);
+    await _ssSavePending;
+    await STORE.flush(['spreadsheets']);
+    return true;
   }
-  await _ssSavePending;
+  const staged = await _stageDirtySpreadsheetSave(0);
+  if (staged === false) {
+    // Blocked: remote state is unknown, or the workbook is quarantined. Failing
+    // closed here is the whole point — the alternative is telling somebody
+    // their work is saved when it is not.
+    throw new Error(
+      'Spreadsheet changes could not be saved yet: this Mac is still confirming ' +
+      'the current workbook with the other Macs.');
+  }
   await STORE.flush(['spreadsheets']);
   return true;
+}
+
+// Did the durable store actually end up holding what we just claimed? Used
+// where reporting a false success is worst: an import that is not there, and a
+// deletion that comes back.
+function _ssDurablyHasProject(projectId) {
+  try {
+    const stored = STORE.get('spreadsheets', null);
+    if (_ssStorageMode(stored) === 'split') {
+      const record = (normalizeSpreadsheetIndex(stored).projects || [])
+        .find(entry => String(entry.id) === String(projectId));
+      return !!record && !record._deleted;
+    }
+    return (_ssDurableWorkbook()?.projects || [])
+      .some(entry => String(entry.id) === String(projectId));
+  } catch (_) {
+    return false;
+  }
 }
 
 function ssKey(r, c) { return r + ',' + c; }
@@ -12201,6 +12290,12 @@ async function ssPullFromGoogle(projectId, options) {
   // Merging under a live editor would rebuild the grid and throw the caret
   // away mid-word. Nothing is lost by waiting for the next round.
   if (_ssEditCell) return false;
+  // P1-01: let anything a person typed finish saving under their own name
+  // first. Staging the mirror on top of a dirty human batch would give every
+  // operation in it a single actor, and the mirror's is null.
+  if (_ssDirtyWorkbook) {
+    try { await _ssSavePending; } catch (_) { return false; }
+  }
 
   if (!await _ssGoogleAcquire(silent ? 0 : 10000)) {
     if (!silent) showToast('Still finishing an earlier check of Google. Try again in a moment.', 'warning');
@@ -12858,6 +12953,11 @@ async function ssImportBuildProject(name, sheets, extraBytes, linkFor) {
       if (_ssStorageMode() === 'split') {
         _ssData = normalized;
         await _flushSpreadsheetSave();
+        // P0-01: confirm against the durable index rather than assuming. This
+        // reported success for an import that was never written at all.
+        if (!_ssDurablyHasProject(project.id)) {
+          throw new Error('The imported project was not saved to this Mac.');
+        }
       } else {
         await STORE.replace('spreadsheets', normalized, { authoritative: 'confirmed workbook import' });
         // Held until the write that carries the imported cells has completed —

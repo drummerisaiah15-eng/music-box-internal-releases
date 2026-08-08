@@ -369,6 +369,10 @@ test('spreadsheet typing in A1 preserves an unrelated remote edit in B1', async 
     var _ssDurableWorkbook = () => (_durableStoreSnapshots.has('spreadsheets')
       ? JSON.parse(JSON.stringify(_durableStoreSnapshots.get('spreadsheets')))
       : null);
+    // _stageDirtySpreadsheetSave records who staged the change (P1-01). These
+    // harnesses are not about attribution, and slicing the real helper drags in
+    // a neighbouring const that collides with this sandbox's own.
+    if (typeof _ssAttributionActor === 'undefined') { var _ssAttributionActor = () => 'Tester'; }
     ${declaration('_stageDirtySpreadsheetSave')}
     ${declaration('_scheduleSpreadsheetSave')}
     ${declaration('_flushSpreadsheetSave')}
@@ -1795,6 +1799,10 @@ function authorityEditorContext(authority, { stored = null } = {}) {
     var _ssDurableWorkbook = () => (_durableStoreSnapshots.has('spreadsheets')
       ? JSON.parse(JSON.stringify(_durableStoreSnapshots.get('spreadsheets')))
       : null);
+    // _stageDirtySpreadsheetSave records who staged the change (P1-01). These
+    // harnesses are not about attribution, and slicing the real helper drags in
+    // a neighbouring const that collides with this sandbox's own.
+    if (typeof _ssAttributionActor === 'undefined') { var _ssAttributionActor = () => 'Tester'; }
     ${declaration('_stageDirtySpreadsheetSave')}
     globalThis.editorApi = {
       load: () => { ssLoad(); return _countSaves(); },
@@ -4788,4 +4796,104 @@ test('AUDIT: no human-data key is saved as a whole value any more', () => {
   // And the semantic paths are actually wired up.
   assert.match(declaration('deleteNote'), /_persistRecordList\('staff_notes'/);
   assert.match(declaration('toggleEmailFlag'), /_persistIdSet\('flagged_emails'/);
+});
+
+// ── 1.2.3 pentest P0-01: a flush must persist what is in memory ─────────────
+
+function flushHarness() {
+  const durable = { workbook: { activeProject: 'p1', projects: [] } };
+  const written = [];
+  const context = contextWith({
+    _cloneJson: v => JSON.parse(JSON.stringify(v)),
+    clearTimeout, setTimeout,
+    _keyMutationChains: new Map(),
+    _storeWriteChains: new Map(),
+    _storeWriteErrors: new Map(),
+    _durableStoreSnapshots: new Map(),
+    _syncReady: false,
+    _syncBootstrapComplete: false,
+    _ssBlockedWorkbook: null,
+    _ssAwaitingAuthority: false,
+    _ssEditCell: null,
+    document: { getElementById: () => null },
+    showToast: () => {},
+    ssGoHome: () => {},
+    ssRenderActivityBar: () => {},
+    ssRenderTabs: () => {},
+    _ssAttributionActor: () => 'Tester',
+    normalizeSpreadsheetWorkbook: v => JSON.parse(JSON.stringify(v)),
+    normalizeSpreadsheetIndex: v => JSON.parse(JSON.stringify(v)),
+    _ssStorageMode: () => 'split',
+    _newOperationId: () => 'op',
+    _scheduleSyncDrain: async () => false,
+    // Stands in for the durable store. Recording what arrives here is the
+    // whole point: the defect was a flush that wrote nothing and returned true.
+    _ssCommitSplitWorkbook: async (_base, dirty) => {
+      durable.workbook = JSON.parse(JSON.stringify(dirty));
+      written.push('commit');
+      return durable.workbook;
+    },
+    _ssDurableWorkbook: () => JSON.parse(JSON.stringify(durable.workbook)),
+    STORE: { flush: async () => { written.push('flush'); return true; } },
+  });
+  vm.runInContext(`
+    var _ssData = null, _ssSaveTimer = null, _ssSavePending = Promise.resolve(true),
+        _ssSaveGate = null, _ssDirtyWorkbook = null, _ssDirtyBase = null,
+        _ssDirtyGeneration = 0, _ssDirtyActor = null;
+    ${declaration('_serializeKeyMutation')}
+    ${declaration('_releaseSpreadsheetSaveGate')}
+    ${declaration('_beginSpreadsheetSaveStage')}
+    ${declaration('_stageDirtySpreadsheetSave')}
+    ${declaration('_flushSpreadsheetSave')}
+    globalThis.setWorkbook = book => { _ssData = book; };
+    globalThis.flush = () => _flushSpreadsheetSave();
+    globalThis.dirty = () => !!_ssDirtyWorkbook;
+    globalThis.block = () => { _ssAwaitingAuthority = true; };
+  `, context);
+  return {
+    context,
+    durable: () => durable.workbook,
+    written: () => written,
+  };
+}
+
+test('P0-01: flushing persists a workbook change that was never staged', async () => {
+  // The exact defect. The import did `_ssData = normalized` and then called the
+  // flush, which only released an ALREADY-staged save. Nothing was written, and
+  // every caller — import, delete, Save All, iCloud backup, the quit gate —
+  // then reported success. The project was gone after restart.
+  const api = flushHarness();
+  api.context.setWorkbook({
+    activeProject: 'p1',
+    projects: [{ id: 'p1', name: 'Google QA Import', activeId: 's1', sheets: [] }],
+  });
+  assert.equal(api.context.dirty(), false, 'precondition: nothing was staged');
+
+  await api.context.flush();
+
+  assert.deepEqual(api.durable().projects.map(p => p.name), ['Google QA Import'],
+    'the flush staged and persisted what was in memory');
+  assert.ok(api.written().includes('commit'), 'a durable commit actually happened');
+  assert.ok(api.written().includes('flush'), 'and the store was flushed after it');
+});
+
+test('P0-01: a flush that cannot stage fails closed rather than claiming success', async () => {
+  // Refusing is the point. The alternative is telling somebody their work is
+  // saved when it is not, which is what Save All and the quit gate did.
+  const api = flushHarness();
+  api.context.setWorkbook({ activeProject: 'p1', projects: [{ id: 'p1', name: 'Held', activeId: 's1', sheets: [] }] });
+  api.context.block();
+  await assert.rejects(() => api.context.flush(), /could not be saved yet/);
+  assert.equal(api.written().includes('commit'), false, 'and nothing was written');
+});
+
+test('P0-01: flushing an unchanged workbook is still safe', async () => {
+  // Staging unconditionally is only acceptable because an unchanged workbook
+  // costs nothing: the commit compares against the durable copy.
+  const api = flushHarness();
+  const book = { activeProject: 'p1', projects: [{ id: 'p1', name: 'Same', activeId: 's1', sheets: [] }] };
+  api.context.setWorkbook(book);
+  await api.context.flush();
+  await api.context.flush();
+  assert.deepEqual(api.durable().projects.map(p => p.name), ['Same']);
 });

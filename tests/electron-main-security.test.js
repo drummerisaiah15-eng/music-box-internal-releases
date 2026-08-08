@@ -1811,3 +1811,18 @@ test('MB1188-014: a Mac with a clock years ahead cannot crowd the others out', a
   }
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+test('P3-01: the Google comments describe the one-way code that is actually there', () => {
+  // The scope comment claimed the readonly scope was "gone" and described
+  // pushes re-reading their target cells. None of that is true, and it read as
+  // licence to add a write path. Comments are maintenance instructions.
+  const source = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  const start = source.indexOf('const GOOGLE_VAULT_KEY');
+  const note = source.slice(start, source.indexOf('const GOOGLE_AUTH_ENDPOINT', start));
+  assert.match(note, /READ ONLY/, 'the note says what the scope is');
+  assert.doesNotMatch(note, /every push re-reads/, 'and does not describe a push path');
+  assert.doesNotMatch(note, /readonly scope is\n\/\/ gone/, 'or claim the scope was removed');
+  // The guarantee itself, unchanged.
+  assert.match(source,
+    /const GOOGLE_SCOPE = 'https:\/\/www\.googleapis\.com\/auth\/spreadsheets\.readonly'/);
+});
