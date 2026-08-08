@@ -2074,3 +2074,27 @@ test('MB1188-020: the colour-key swatch uses the in-app picker too', () => {
   assert.match(apply, /_ssPickerTarget\.kind === 'key'/, 'apply routes to whatever opened it');
   assert.match(apply, /ssApplyCustomColor\(value\)/, 'and still fills cells otherwise');
 });
+
+test('the colour picker can sample any pixel on screen', () => {
+  // The magnifier from Apple's colour panel. Chromium ships the EyeDropper
+  // API, so this uses the platform's own picker rather than reimplementing
+  // one — it samples a real pixel, including from other windows.
+  const pick = declaration('ssColorPickerEyedropper');
+  assert.match(pick, /new window\.EyeDropper\(\)\.open\(\)/);
+  assert.match(pick, /ssColorPickerHex\(result\.sRGBHex\)/, 'the sampled colour lands in the picker');
+  assert.match(pick, /typeof window\.EyeDropper !== 'function'/,
+    'and it says so rather than throwing where the API is missing');
+
+  // Cancelling a pick is a change of mind, not a failure.
+  assert.match(pick, /catch \(_\) \{/);
+  assert.match(pick, /finally \{\s*\n\s*_ssEyedropperOpen = false;/,
+    'the guard is always released, including on cancel');
+
+  // The eyedropper's own overlay must not read as a click outside the popover,
+  // which would close the picker halfway through the pick.
+  assert.match(declaration('_ssColorPickerOutside'), /if \(_ssEyedropperOpen\) return;/);
+
+  // A control that cannot work should not be offered.
+  assert.match(declaration('ssOpenColorPickerFor'),
+    /dropper\.style\.display = typeof window\.EyeDropper === 'function' \? '' : 'none'/);
+});

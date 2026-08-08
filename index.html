@@ -841,8 +841,9 @@
     #ss-cp-preview {
       width:26px;height:26px;border-radius:6px;border:1px solid var(--divider);flex-shrink:0;
     }
+    #ss-cp-eyedropper { flex-shrink:0;padding:4px 7px;font-size:13px;line-height:1; }
     #ss-cp-hex {
-      flex:1;min-width:0;font-family:ui-monospace,Menlo,monospace;font-size:12px;
+      flex:1;min-width:60px;font-family:ui-monospace,Menlo,monospace;font-size:12px;
       padding:5px 7px;border:1px solid var(--divider);border-radius:6px;
       background:var(--bg);color:var(--text);
     }
@@ -1816,6 +1817,9 @@
             <input type="range" id="ss-cp-hue" min="0" max="360" value="30"
               aria-label="Hue" oninput="ssColorPickerHue(this.value)" />
             <div class="ss-cp-row">
+              <button type="button" id="ss-cp-eyedropper" class="ss-toolbar-btn"
+                title="Pick a colour from anywhere on screen"
+                onclick="ssColorPickerEyedropper()" aria-label="Pick a colour from the screen">&#9683;</button>
               <div id="ss-cp-preview"></div>
               <input id="ss-cp-hex" maxlength="7" spellcheck="false" aria-label="Hex colour"
                 onchange="ssColorPickerHex(this.value)" onkeydown="ssColorPickerHexKey(event)" />
@@ -13097,6 +13101,9 @@ function ssOpenColorPickerFor(target, seedHex) {
   const hue = document.getElementById('ss-cp-hue');
   if (hue) hue.value = String(Math.round(_ssPickerHue));
 
+  const dropper = document.getElementById('ss-cp-eyedropper');
+  if (dropper) dropper.style.display = typeof window.EyeDropper === 'function' ? '' : 'none';
+
   popover.classList.remove('hidden');
   button?.setAttribute('aria-expanded', 'true');
   _ssPositionColorPicker();
@@ -13138,6 +13145,7 @@ function _ssColorPickerOutside(event) {
   const popover = document.getElementById('ss-color-popover');
   const button = document.getElementById('ss-custom-color');
   if (!popover || popover.classList.contains('hidden')) return;
+  if (_ssEyedropperOpen) return;   // the pick overlay is not a click elsewhere
   if (popover.contains(event.target) || button?.contains(event.target)) return;
   ssCloseColorPicker();
 }
@@ -13190,6 +13198,34 @@ function ssColorPickerHexKey(event) {
   event.preventDefault();
   ssColorPickerHex(event.target.value);
   ssColorPickerApply();
+}
+
+// The screen eyedropper, the same idea as the magnifier in Apple's colour
+// panel. Chromium ships the EyeDropper API, so this is the platform's own
+// picker rather than a reimplementation — it samples a real pixel, including
+// from other windows.
+let _ssEyedropperOpen = false;
+
+async function ssColorPickerEyedropper() {
+  if (typeof window.EyeDropper !== 'function') {
+    showToast('Picking a colour from the screen is not available in this version.', 'warning');
+    return;
+  }
+  // The picker's outside-click handler would otherwise treat the eyedropper's
+  // own overlay as a click elsewhere and close the popover mid-pick.
+  _ssEyedropperOpen = true;
+  try {
+    const result = await new window.EyeDropper().open();
+    if (result?.sRGBHex) {
+      ssColorPickerHex(result.sRGBHex);
+      const hex = document.getElementById('ss-cp-hex');
+      if (hex) hex.value = _ssPickerHex();
+    }
+  } catch (_) {
+    // Escape or a click outside the pick: not an error, just a change of mind.
+  } finally {
+    _ssEyedropperOpen = false;
+  }
 }
 
 function ssColorPickerApply() {
