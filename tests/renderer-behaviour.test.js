@@ -1983,3 +1983,80 @@ test('MB1188-011: absent, blank and unformatted-blank are the same cell', () => 
   assert.notEqual(api.signature({ v: '', bg: '', tc: '', b: false, cb: true }), '',
     'an empty checkbox cell is not nothing');
 });
+
+// ── The custom fill colour is picked in the app, not by the system ──────────
+
+function colourPickerApi() {
+  const context = vm.createContext({ Math, Number, String, parseInt });
+  vm.runInContext(`
+    ${declaration('_ssHsvToHex')}
+    ${declaration('_ssHexToHsv')}
+    globalThis.toHex = (h, s, v) => _ssHsvToHex(h, s, v);
+    globalThis.toHsv = hex => _ssHexToHsv(hex);
+  `, context);
+  return context;
+}
+
+test('custom fill colour: hex survives a round trip exactly', () => {
+  // The picker stores hue/saturation/value and writes hex into the cell. If the
+  // conversion drifts, reopening the picker on a cell shifts its colour
+  // slightly every time — a fill that changes shade each time you look at it.
+  const api = colourPickerApi();
+  for (const hex of ['#ff9902', '#000000', '#ffffff', '#b8892b', '#6aa84f',
+                     '#ffd966', '#3c78d8', '#a0a0a0']) {
+    const hsv = api.toHsv(hex);
+    assert.ok(hsv, `${hex} parses`);
+    assert.equal(api.toHex(hsv.h, hsv.s, hsv.v), hex, `${hex} round-trips exactly`);
+  }
+});
+
+test('custom fill colour: malformed input is rejected, never guessed', () => {
+  const api = colourPickerApi();
+  for (const junk of ['nope', '', null, undefined, '#12345', '#gggggg', '12345678']) {
+    assert.equal(api.toHsv(junk), null, `${String(junk)} is refused`);
+  }
+  // Both spellings people actually type are accepted.
+  assert.ok(api.toHsv('ff9902'));
+  assert.ok(api.toHsv('  #FF9902  '));
+});
+
+test('custom fill colour: the picker is in-page, positioned right of the grid', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  // The system colour panel opened at the far left over the sidebar, and its
+  // position is not the page's to set. An <input type="color"> would bring it
+  // straight back.
+  // Comments are stripped first. Prose explaining WHY the native input was
+  // removed naturally quotes it, and scanning the raw file reports that
+  // explanation as the very thing it is describing — which has now happened
+  // three separate times in this codebase.
+  const code = source
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .split('\n').map(line => line.replace(/^\s*\/\/.*$/, '')).join('\n');
+  assert.doesNotMatch(code, /<input\b[^>]*\btype="color"/,
+    'no native colour input — macOS positions that panel itself');
+  assert.match(source, /id="ss-color-popover"/, 'the picker is in the page');
+  const place = declaration('_ssPositionColorPicker');
+  assert.match(place, /popover\.style\.right = right \+ 'px'/, 'anchored from the right edge');
+  assert.match(place, /Math\.max\(12, Math\.min\(top, window\.innerHeight - height - 12\)\)/,
+    'and clamped so a short window cannot open it off screen');
+});
+
+test('custom fill colour: the picker closes and stops listening', () => {
+  // Every listener added on open is removed on close; a stray document-level
+  // pointerdown or keydown handler would keep firing over the grid forever.
+  const open = declaration('ssToggleColorPicker');
+  const close = declaration('ssCloseColorPicker');
+  for (const [listener, handler] of [
+    ['pointerdown', '_ssColorPickerOutside'],
+    ['keydown', '_ssColorPickerEscape'],
+  ]) {
+    assert.ok(open.includes(`addEventListener('${listener}', ${handler}, true)`),
+      `open adds ${listener}`);
+    assert.ok(close.includes(`removeEventListener('${listener}', ${handler}, true)`),
+      `close removes ${listener}`);
+  }
+  assert.match(open, /window\.addEventListener\('resize', _ssPositionColorPicker\)/);
+  assert.match(close, /window\.removeEventListener\('resize', _ssPositionColorPicker\)/);
+  assert.match(declaration('_ssColorPickerEscape'), /event\.stopPropagation\(\)/,
+    'Escape closes the picker without also cancelling the cell edit underneath');
+});

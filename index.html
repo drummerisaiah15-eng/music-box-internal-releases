@@ -811,6 +811,41 @@
     .ss-google-dot {
       width:6px;height:6px;border-radius:50%;background:#0f9d58;display:inline-block;
     }
+    /* Custom fill colour, picked in the app rather than in the system panel. */
+    .ss-color-custom {
+      width:22px;height:22px;padding:2px;flex-shrink:0;
+      border:1.5px solid var(--divider);border-radius:5px;cursor:pointer;background:var(--bg);
+    }
+    .ss-color-custom:hover { border-color:var(--accent,#b8892b); }
+    .ss-color-custom > span {
+      display:block;width:100%;height:100%;border-radius:3px;
+      background:var(--ss-custom-chip,#ff9902);
+    }
+    #ss-color-popover {
+      position:fixed;width:232px;z-index:70;
+      background:var(--card,#fff);border:1px solid var(--divider);border-radius:12px;
+      box-shadow:0 12px 34px rgba(0,0,0,.20);padding:12px;
+    }
+    #ss-color-popover.hidden { display:none; }
+    #ss-cp-area {
+      position:relative;width:208px;height:118px;border-radius:8px;cursor:crosshair;
+      border:1px solid var(--divider);
+    }
+    #ss-cp-thumb {
+      position:absolute;width:12px;height:12px;border-radius:50%;
+      border:2px solid #fff;box-shadow:0 0 0 1px rgba(0,0,0,.45);
+      transform:translate(-50%,-50%);pointer-events:none;
+    }
+    #ss-cp-hue { width:208px;margin:10px 0 8px;accent-color:#888; }
+    .ss-cp-row { display:flex;align-items:center;gap:8px; }
+    #ss-cp-preview {
+      width:26px;height:26px;border-radius:6px;border:1px solid var(--divider);flex-shrink:0;
+    }
+    #ss-cp-hex {
+      flex:1;min-width:0;font-family:ui-monospace,Menlo,monospace;font-size:12px;
+      padding:5px 7px;border:1px solid var(--divider);border-radius:6px;
+      background:var(--bg);color:var(--text);
+    }
     /* MB1188-012: a link that stopped working, or tabs nobody has imported. */
     .ss-google-warn {
       display:inline-flex;align-items:center;margin-top:5px;
@@ -1728,7 +1763,14 @@
             <span style="font-size:11px;color:var(--text-muted);font-weight:600;white-space:nowrap;flex-shrink:0">FILL:</span>
             <div class="ss-color-clear" onclick="ssClearColor()" title="No fill">✕</div>
             <div id="ss-color-palette" style="display:flex;gap:4px;align-items:center;flex-wrap:wrap"></div>
-            <input type="color" id="ss-custom-color" style="width:22px;height:22px;padding:1px 2px;border:1.5px solid var(--divider);border-radius:5px;cursor:pointer;background:var(--bg)" title="Custom fill color" onchange="ssApplyCustomColor(this.value)" />
+            <!-- Was <input type="color">, which opens macOS's own colour panel.
+                 That panel is positioned by the system — it opened over the
+                 sidebar at the far left of the screen and nothing in the page
+                 could move it. This is an in-app picker, so its position is
+                 ours to decide. -->
+            <button type="button" id="ss-custom-color" class="ss-color-custom"
+              title="Custom fill colour" aria-haspopup="dialog" aria-expanded="false"
+              onclick="ssToggleColorPicker(event)"><span id="ss-custom-color-chip"></span></button>
             <div class="ss-sep"></div>
             <button class="ss-toolbar-btn" id="ss-btn-bold" onclick="ssToggleBold()" style="font-weight:700">B</button>
             <div class="ss-sep"></div>
@@ -1751,6 +1793,22 @@
                  readout doubles as the discovery hint and the way back to 100%. -->
             <button class="ss-toolbar-btn" id="ss-zoom-btn" onclick="ssResetZoom()"
               title="Zoom — pinch the trackpad, or ⌘− and ⌘+. Click to reset to 100%.">100%</button>
+          </div>
+          <!-- Anchored to the right of the grid, on purpose. The system colour
+               panel it replaced opened at the far left, on top of the sidebar,
+               and covered the very cells you were colouring. -->
+          <div id="ss-color-popover" class="hidden" role="dialog" aria-label="Custom fill colour">
+            <div id="ss-cp-area" onpointerdown="ssColorPickerPointer(event)">
+              <div id="ss-cp-thumb"></div>
+            </div>
+            <input type="range" id="ss-cp-hue" min="0" max="360" value="30"
+              aria-label="Hue" oninput="ssColorPickerHue(this.value)" />
+            <div class="ss-cp-row">
+              <div id="ss-cp-preview"></div>
+              <input id="ss-cp-hex" maxlength="7" spellcheck="false" aria-label="Hex colour"
+                onchange="ssColorPickerHex(this.value)" onkeydown="ssColorPickerHexKey(event)" />
+              <button class="ss-toolbar-btn" onclick="ssColorPickerApply()">Fill</button>
+            </div>
           </div>
           <!-- Cells clip rather than grow, so the whole value of the selected
                cell is read here. Full width and on its own row, directly under
@@ -12918,6 +12976,182 @@ function ssFormulaBarFocus() {
 
 function ssApplyColor(ci) { const c=SS_COLORS[ci]; ssApplyBg(c.bg,c.tc); }
 function ssApplyCustomColor(bg) { ssApplyBg(bg,''); }
+
+// ── Custom fill colour, picked inside the app ───────────────────────────────
+//
+// This replaced <input type="color">. On macOS that opens NSColorPanel, whose
+// position belongs to the system: it appeared at the top-left of the display,
+// over the sidebar and over the grid being coloured, and no amount of CSS could
+// move it. Owning the picker is the only way to decide where it goes.
+let _ssPickerHue = 30;
+let _ssPickerSat = 1;
+let _ssPickerVal = 1;
+
+function _ssHsvToHex(h, s, v) {
+  const f = n => {
+    const k = (n + h / 60) % 6;
+    const value = v - v * s * Math.max(Math.min(k, 4 - k, 1), 0);
+    return Math.round(value * 255).toString(16).padStart(2, '0');
+  };
+  return '#' + f(5) + f(3) + f(1);
+}
+
+function _ssHexToHsv(hex) {
+  const match = /^#?([0-9a-f]{6})$/i.exec(String(hex || '').trim());
+  if (!match) return null;
+  const int = parseInt(match[1], 16);
+  const r = ((int >> 16) & 255) / 255, g = ((int >> 8) & 255) / 255, b = (int & 255) / 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
+  let h = 0;
+  if (d) {
+    if (max === r) h = ((g - b) / d) % 6;
+    else if (max === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+    h *= 60;
+    if (h < 0) h += 360;
+  }
+  return { h, s: max ? d / max : 0, v: max };
+}
+
+function _ssPickerHex() { return _ssHsvToHex(_ssPickerHue, _ssPickerSat, _ssPickerVal); }
+
+function _ssRenderColorPicker() {
+  const area = document.getElementById('ss-cp-area');
+  const thumb = document.getElementById('ss-cp-thumb');
+  const preview = document.getElementById('ss-cp-preview');
+  const hex = document.getElementById('ss-cp-hex');
+  const chip = document.getElementById('ss-custom-color-chip');
+  if (!area) return;
+  const value = _ssPickerHex();
+  area.style.background =
+    `linear-gradient(to top, #000, rgba(0,0,0,0)), ` +
+    `linear-gradient(to right, #fff, hsl(${_ssPickerHue}, 100%, 50%))`;
+  if (thumb) {
+    thumb.style.left = (_ssPickerSat * 100) + '%';
+    thumb.style.top = ((1 - _ssPickerVal) * 100) + '%';
+  }
+  if (preview) preview.style.background = value;
+  // Never fight the person typing: only restate the field when it is not focused.
+  if (hex && document.activeElement !== hex) hex.value = value;
+  if (chip) chip.style.background = value;
+}
+
+function ssToggleColorPicker(event) {
+  event?.stopPropagation();
+  const popover = document.getElementById('ss-color-popover');
+  const button = document.getElementById('ss-custom-color');
+  if (!popover) return;
+  if (!popover.classList.contains('hidden')) return ssCloseColorPicker();
+
+  // Seed from the selected cell, so opening the picker on a coloured cell
+  // starts where that cell already is instead of somewhere arbitrary.
+  try {
+    const existing = ssActiveSheet()?.cells?.[ssKey(_ssSelR, _ssSelC)]?.bg;
+    const seeded = _ssHexToHsv(existing);
+    if (seeded) { _ssPickerHue = seeded.h; _ssPickerSat = seeded.s; _ssPickerVal = seeded.v; }
+  } catch (_) {}
+  const hue = document.getElementById('ss-cp-hue');
+  if (hue) hue.value = String(Math.round(_ssPickerHue));
+
+  popover.classList.remove('hidden');
+  button?.setAttribute('aria-expanded', 'true');
+  _ssPositionColorPicker();
+  _ssRenderColorPicker();
+  document.addEventListener('pointerdown', _ssColorPickerOutside, true);
+  document.addEventListener('keydown', _ssColorPickerEscape, true);
+  window.addEventListener('resize', _ssPositionColorPicker);
+}
+
+// Right-hand side of the grid, level with the toolbar — clear of the sidebar
+// and clear of the cells being coloured. Clamped so it can never open off
+// screen on a short window.
+function _ssPositionColorPicker() {
+  const popover = document.getElementById('ss-color-popover');
+  const toolbar = document.getElementById('ss-toolbar');
+  if (!popover || popover.classList.contains('hidden')) return;
+  const anchor = toolbar?.getBoundingClientRect();
+  const width = popover.offsetWidth || 232;
+  const height = popover.offsetHeight || 240;
+  const right = anchor ? Math.max(window.innerWidth - anchor.right, 12) : 24;
+  const top = anchor ? anchor.bottom + 8 : 120;
+  popover.style.right = right + 'px';
+  popover.style.top = Math.max(12, Math.min(top, window.innerHeight - height - 12)) + 'px';
+  popover.style.left = 'auto';
+  if (width + right > window.innerWidth) popover.style.right = '12px';
+}
+
+function ssCloseColorPicker() {
+  const popover = document.getElementById('ss-color-popover');
+  if (!popover) return;
+  popover.classList.add('hidden');
+  document.getElementById('ss-custom-color')?.setAttribute('aria-expanded', 'false');
+  document.removeEventListener('pointerdown', _ssColorPickerOutside, true);
+  document.removeEventListener('keydown', _ssColorPickerEscape, true);
+  window.removeEventListener('resize', _ssPositionColorPicker);
+}
+
+function _ssColorPickerOutside(event) {
+  const popover = document.getElementById('ss-color-popover');
+  const button = document.getElementById('ss-custom-color');
+  if (!popover || popover.classList.contains('hidden')) return;
+  if (popover.contains(event.target) || button?.contains(event.target)) return;
+  ssCloseColorPicker();
+}
+
+function _ssColorPickerEscape(event) {
+  if (event.key !== 'Escape') return;
+  // Taken before the grid's own Escape handler, which would otherwise cancel
+  // the cell edit underneath as well.
+  event.stopPropagation();
+  ssCloseColorPicker();
+}
+
+function ssColorPickerPointer(event) {
+  const area = document.getElementById('ss-cp-area');
+  if (!area) return;
+  const track = move => {
+    const box = area.getBoundingClientRect();
+    _ssPickerSat = Math.min(Math.max((move.clientX - box.left) / box.width, 0), 1);
+    _ssPickerVal = 1 - Math.min(Math.max((move.clientY - box.top) / box.height, 0), 1);
+    _ssRenderColorPicker();
+  };
+  track(event);
+  // Dragging past the edge of the square must keep tracking, which is why this
+  // listens on the document rather than on the square.
+  const stop = () => {
+    document.removeEventListener('pointermove', track);
+    document.removeEventListener('pointerup', stop);
+  };
+  document.addEventListener('pointermove', track);
+  document.addEventListener('pointerup', stop);
+}
+
+function ssColorPickerHue(value) {
+  const hue = Number(value);
+  _ssPickerHue = Number.isFinite(hue) ? Math.min(Math.max(hue, 0), 360) : 0;
+  _ssRenderColorPicker();
+}
+
+function ssColorPickerHex(value) {
+  const parsed = _ssHexToHsv(value);
+  if (!parsed) { _ssRenderColorPicker(); return; }   // reject, never guess
+  _ssPickerHue = parsed.h; _ssPickerSat = parsed.s; _ssPickerVal = parsed.v;
+  const hue = document.getElementById('ss-cp-hue');
+  if (hue) hue.value = String(Math.round(_ssPickerHue));
+  _ssRenderColorPicker();
+}
+
+function ssColorPickerHexKey(event) {
+  if (event.key !== 'Enter') return;
+  event.preventDefault();
+  ssColorPickerHex(event.target.value);
+  ssColorPickerApply();
+}
+
+function ssColorPickerApply() {
+  ssApplyCustomColor(_ssPickerHex());
+  ssCloseColorPicker();
+}
 function ssClearColor() { ssApplyBg('',''); }
 
 // "No colour" is the empty string, never null. Writing null here is what made
