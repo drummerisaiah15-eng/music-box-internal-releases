@@ -2265,3 +2265,26 @@ test('the morning briefing has no dead sections', () => {
       `${id} is an empty placeholder that nothing fills — a permanently blank section`);
   }
 });
+
+test('gridlines stay one real pixel at every zoom level', () => {
+  // The grid is scaled with CSS `zoom`, which scales border-width too. At 75%
+  // a 1px border paints 0.75px, and Chromium antialiases that into something
+  // paler than the fill on either side — so the lines faded out exactly when
+  // the grid was zoomed out far enough to need them. Darkening the colour
+  // could not fix a width problem, which is why it had to be done twice.
+  const source = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  assert.match(source, /border:var\(--ss-line, 1px\) solid #83888d/,
+    'the width is a variable, not a literal');
+  const apply = namedFunctionSource('ssApplyZoom');
+  assert.match(apply, /setProperty\('--ss-line',/, 'and zoom sets it');
+  assert.match(apply, /\(1 \/ _ssZoom\)/, 'to the inverse of the zoom');
+
+  // Check the arithmetic rather than trusting the expression.
+  const context = vm.createContext({ Number });
+  vm.runInContext(`globalThis.line = z => z === 1 ? 1 : Number((1 / z).toFixed(3));`, context);
+  for (const zoom of [0.5, 0.67, 0.75, 1, 1.5, 2]) {
+    const painted = context.line(zoom) * zoom;
+    assert.ok(Math.abs(painted - 1) < 0.005,
+      `at ${zoom * 100}% the line paints ${painted.toFixed(3)}px, not 1px`);
+  }
+});
