@@ -9634,8 +9634,18 @@ function _ssCellsOf(workbook, projectId, sheetId) {
 // no-op replay never rewrites history with a later timestamp.
 function _ssStampAttribution(sheet, target, op) {
   if (!sheet) return;
-  // The cell itself is gone, so the credit for it goes too.
-  if (op.value === null) {
+  // The cell itself is gone — or has been emptied back out — so the credit for
+  // it goes too.
+  //
+  // MB1188-024: clearing a cell writes a blank record rather than removing the
+  // key, so `value` is an empty cell object rather than null. That still read
+  // as an edit, which meant typing something and then deleting it left you
+  // credited with a change to a cell that ends up holding nothing. A cell with
+  // nothing in it has nothing to attribute.
+  //
+  // _ssCellIsBlank treats a merge span as structure rather than emptiness, so
+  // a blank merged cell keeps its credit.
+  if (op.value === null || _ssCellIsBlank(op.value)) {
     if (sheet.editedBy) {
       delete sheet.editedBy[target];
       if (!Object.keys(sheet.editedBy).length) delete sheet.editedBy;

@@ -1682,9 +1682,10 @@ test('MB1188-023: an automatic Google check does not erase who edited a cell', (
   // stamp. Every automatic check erased the credit for exactly the cells
   // somebody had just typed, because those are the ones that differ from the
   // checkpoint and therefore produce an operation.
-  const context = vm.createContext({ Object, Date, JSON, Number, String, Math });
+  const context = vm.createContext({ Object, Date, JSON, Number, String, Math, Array });
   vm.runInContext(`
     var MAX_SPREADSHEET_ATTRIBUTIONS = 200;
+    ${declaration('_ssCellIsBlank')}
     ${declaration('_ssStampAttribution')}
     globalThis.stamp = (sheet, target, op) => { _ssStampAttribution(sheet, target, op); return sheet; };
   `, context);
@@ -1710,9 +1711,10 @@ test('MB1188-023: an automatic Google check does not erase who edited a cell', (
 });
 
 test('MB1188-023: a system write leaves other cells’ credits untouched too', () => {
-  const context = vm.createContext({ Object, Date, JSON, Number, String, Math });
+  const context = vm.createContext({ Object, Date, JSON, Number, String, Math, Array });
   vm.runInContext(`
     var MAX_SPREADSHEET_ATTRIBUTIONS = 200;
+    ${declaration('_ssCellIsBlank')}
     ${declaration('_ssStampAttribution')}
     globalThis.stamp = (sheet, target, op) => { _ssStampAttribution(sheet, target, op); return sheet; };
   `, context);
@@ -1726,4 +1728,67 @@ test('MB1188-023: a system write leaves other cells’ credits untouched too', (
   assert.equal(sheet.editedBy['0,0'].by, 'Megan', 'the older credit is still there');
   assert.equal(sheet.editedBy['1,1'].by, 'Carrie Gass',
     'and so is the one the mirror wrote over — which is the one that kept vanishing');
+});
+
+test('MB1188-024: typing something and deleting it is not counted as a change', () => {
+  // Clearing a cell writes a blank record rather than removing the key, so the
+  // operation's value is an empty cell object rather than null. That read as an
+  // edit, and left you credited with a change to a cell holding nothing.
+  const context = vm.createContext({ Object, Date, JSON, Number, String, Math, Array });
+  vm.runInContext(`
+    var MAX_SPREADSHEET_ATTRIBUTIONS = 200;
+    ${declaration('_ssCellIsBlank')}
+    ${declaration('_ssStampAttribution')}
+    globalThis.stamp = (sheet, target, op) => { _ssStampAttribution(sheet, target, op); return sheet; };
+  `, context);
+  const blank = { v: '', bg: '', tc: '', b: false };
+  const at = '2026-08-07T21:55:00.000Z';
+
+  // Type something: credited.
+  const sheet = context.stamp({}, '0,0',
+    { value: { v: 'oops', bg: '', tc: '', b: false }, by: 'Ana Chaves', at });
+  assert.equal(sheet.editedBy['0,0'].by, 'Ana Chaves');
+
+  // Delete it again: the credit goes with it.
+  context.stamp(sheet, '0,0', { value: blank, by: 'Ana Chaves', at });
+  assert.equal(sheet.editedBy, undefined, 'no credit for a cell that ends up empty');
+});
+
+test('MB1188-024: emptying one cell leaves the other credits alone', () => {
+  const context = vm.createContext({ Object, Date, JSON, Number, String, Math, Array });
+  vm.runInContext(`
+    var MAX_SPREADSHEET_ATTRIBUTIONS = 200;
+    ${declaration('_ssCellIsBlank')}
+    ${declaration('_ssStampAttribution')}
+    globalThis.stamp = (sheet, target, op) => { _ssStampAttribution(sheet, target, op); return sheet; };
+  `, context);
+  const sheet = { editedBy: {
+    '0,0': { by: 'Megan', at: '2026-08-07T21:48:00.000Z' },
+    '1,1': { by: 'Ana Chaves', at: '2026-08-07T21:53:00.000Z' },
+  } };
+  context.stamp(sheet, '1,1',
+    { value: { v: '', bg: '', tc: '', b: false }, by: 'Ana Chaves', at: '2026-08-07T21:55:00.000Z' });
+  assert.equal(sheet.editedBy['1,1'], undefined, 'the emptied cell loses its credit');
+  assert.equal(sheet.editedBy['0,0'].by, 'Megan', 'and nothing else is touched');
+});
+
+test('MB1188-024: a fill, or a blank merged cell, is still a real change', () => {
+  // Emptying the TEXT is not the same as emptying the cell. Colouring a cell
+  // with no text in it is a deliberate act on a schedule built out of colour,
+  // and a merge span is structure rather than emptiness.
+  const context = vm.createContext({ Object, Date, JSON, Number, String, Math, Array });
+  vm.runInContext(`
+    var MAX_SPREADSHEET_ATTRIBUTIONS = 200;
+    ${declaration('_ssCellIsBlank')}
+    ${declaration('_ssStampAttribution')}
+    globalThis.stamp = (sheet, target, op) => { _ssStampAttribution(sheet, target, op); return sheet; };
+  `, context);
+  const at = '2026-08-07T21:55:00.000Z';
+  const filled = context.stamp({}, '0,0',
+    { value: { v: '', bg: '#ffd966', tc: '', b: false }, by: 'Ana Chaves', at });
+  assert.ok(filled.editedBy?.['0,0'], 'a fill with no text is still a change');
+
+  const merged = context.stamp({}, '1,1',
+    { value: { v: '', bg: '', tc: '', b: false, rs: 2, cs: 1 }, by: 'Ana Chaves', at });
+  assert.ok(merged.editedBy?.['1,1'], 'and so is a merge');
 });
