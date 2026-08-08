@@ -2470,12 +2470,6 @@
         <div id="briefing-imsg"></div>
       </div>
 
-      <!-- Waitlist & Trials -->
-      <div class="briefing-section">
-        <div class="briefing-section-title">🆕 Waitlist & Recent Trials</div>
-        <div id="briefing-regs"></div>
-      </div>
-
       <div class="flex justify-between items-center mt-5">
         <div class="text-sm">Start your day with everything you need.</div>
         <button class="btn btn-primary" onclick="closeBriefing()">Let's Go →</button>
@@ -16483,17 +16477,9 @@ function showBriefing() {
       : unreadTexts.slice(0, 5).map(c => `<div class="briefing-item"><span class="briefing-item-icon">💬</span><div><strong>${escHtml(c.name || c.phone || 'Unknown')}</strong> — ${escHtml((c.lastMsg?.body || '').slice(0,80))}</div></div>`).join('');
   } catch(_) {}
 
-  // Waitlist + recent trials
-  try {
-    const waitingCount = (STORE.get('waitlist', [])).filter(w => w.status === 'waiting').length;
-    const pendingTrials = (STORE.get('trial_lessons', [])).filter(t => t.outcome === 'pending' || t.outcome === 'follow-up');
-    let regsHtml = '';
-    if (waitingCount > 0) regsHtml += `<div class="briefing-item"><span class="briefing-item-icon">⏳</span><div><strong>${waitingCount}</strong> student${waitingCount !== 1 ? 's' : ''} on the waitlist</div></div>`;
-    if (pendingTrials.length > 0) regsHtml += pendingTrials.slice(0, 4).map(t => `<div class="briefing-item"><span class="briefing-item-icon">🆕</span><div><strong>${escHtml(t.name || '')}</strong> — trial ${t.outcome === 'follow-up' ? 'needs follow-up' : 'pending'}</div></div>`).join('');
-    if (!regsHtml) regsHtml = '<div class="briefing-item"><span class="briefing-item-icon">✅</span><div>No pending trials or waitlist activity</div></div>';
-    const regsEl = document.getElementById('briefing-regs');
-    if (regsEl) regsEl.innerHTML = regsHtml;
-  } catch(_) {}
+  // Waitlist and trials were removed from the briefing: `waitlist` and
+  // `trial_lessons` are not synchronized keys and nothing in the app writes
+  // them any more, so the section could only ever report no activity.
 
   try { renderBriefingTodo(); } catch(_) {}
   try { renderBriefingMyTasks(); } catch(_) {}

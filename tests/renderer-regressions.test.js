@@ -2243,3 +2243,25 @@ test('MB1188-007: no caller awaits between reading a shared list and saving it',
   assert.deepEqual(offences, [],
     'pass options.base with the list you read, or move the read after the await');
 });
+
+test('the morning briefing has no dead sections', () => {
+  // Waitlist and trials sat on the briefing reading `waitlist` and
+  // `trial_lessons`, which nothing writes and which are not synchronized keys.
+  // It could only ever say "no activity" — a permanent row of nothing.
+  const source = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const start = source.indexOf('<!-- Morning Briefing');
+  const modal = start >= 0 ? source.slice(start, source.indexOf('</div>\n  </div>', start)) : source;
+  for (const gone of ['briefing-regs', 'Waitlist &amp; Recent Trials', 'Waitlist & Recent Trials']) {
+    assert.ok(!modal.includes(gone), `${gone} is gone from the briefing`);
+  }
+  assert.ok(!source.includes("STORE.get('waitlist'"), 'and nothing reads the dead key');
+  assert.ok(!source.includes("STORE.get('trial_lessons'"), 'or the other one');
+  // Every empty placeholder in the briefing must have something that fills it.
+  // Scoped to `<div id="x"></div>` — those are the render targets. Wrapper
+  // elements that only carry styling are not, and requiring those to be
+  // referenced would fail on markup that is doing nothing wrong.
+  for (const [, id] of source.matchAll(/<div id="(briefing-[a-z-]+)"><\/div>/g)) {
+    assert.ok(source.includes(`getElementById('${id}')`),
+      `${id} is an empty placeholder that nothing fills — a permanently blank section`);
+  }
+});
