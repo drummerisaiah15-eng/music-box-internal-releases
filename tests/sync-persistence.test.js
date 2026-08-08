@@ -4732,3 +4732,60 @@ test('MB1188-025: the firestore rules admit a real project document key', () => 
   }
   assert.ok(!pattern.test('spreadsheet_' + 'x'.repeat(200)), 'and the bound still holds');
 });
+
+// ── AUDIT: human data that was still being saved whole ──────────────────────
+
+test('AUDIT/MB1188-027: flagging an email keeps the other Mac’s flags', () => {
+  // flagged_emails is a set of message ids, not records, so the record-list
+  // merge cannot key on it — and it was still being saved whole. Flagging an
+  // email on one Mac erased whatever the other had flagged since.
+  const context = contextWith({});
+  vm.runInContext(`
+    ${declaration('_persistIdSet')}
+    // Expose the delta the way the real one computes it: once, outside the
+    // mutator, so a re-run against a newer base is idempotent.
+    globalThis.apply = (base, next, current) => {
+      const baseSet = new Set(base.map(String));
+      const nextSet = new Set(next.map(String));
+      const added = [...nextSet].filter(id => !baseSet.has(id));
+      const removed = [...baseSet].filter(id => !nextSet.has(id));
+      const result = new Set(current.map(String));
+      for (const id of removed) result.delete(id);
+      for (const id of added) result.add(id);
+      return [...result];
+    };
+  `, context);
+
+  // This Mac flags 'a'. The other Mac has flagged 'b' in the meantime.
+  assert.deepEqual(Array.from(context.apply([], ['a'], ['b'])).sort(), ['a', 'b'],
+    'both flags survive');
+  // Unflagging removes only what this Mac saw flagged.
+  assert.deepEqual(Array.from(context.apply(['a'], [], ['a', 'b'])), ['b'],
+    'unflagging one leaves the other alone');
+  // Replaying the same intent changes nothing.
+  const once = context.apply([], ['a'], ['b']);
+  assert.deepEqual(Array.from(context.apply([], ['a'], once)).sort(), ['a', 'b'],
+    'idempotent on replay');
+});
+
+test('AUDIT: no human-data key is saved as a whole value any more', () => {
+  // The keys that hold something a person typed. Each of these was found by
+  // this audit or the one before it; a new one appearing here would be the
+  // same bug a fourth time.
+  const source = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const forbidden = [
+    ["STORE.replace('todo_items'", 'to-dos'],
+    ["STORE.replace('assigned_tasks'", 'assigned tasks'],
+    ["STORE.replace('policies'", 'policies'],
+    ["STORE.replace('step_up_receipts'", 'Step Up receipts'],
+    ["STORE.replace('staff_notes'", 'team notes'],
+    ["STORE.replace('flagged_emails'", 'email flags'],
+  ];
+  for (const [pattern, what] of forbidden) {
+    assert.ok(!source.includes(pattern),
+      `${what} must not be saved as a whole value — use _persistRecordList or _persistIdSet`);
+  }
+  // And the semantic paths are actually wired up.
+  assert.match(declaration('deleteNote'), /_persistRecordList\('staff_notes'/);
+  assert.match(declaration('toggleEmailFlag'), /_persistIdSet\('flagged_emails'/);
+});

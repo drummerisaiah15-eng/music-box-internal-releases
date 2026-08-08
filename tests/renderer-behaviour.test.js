@@ -2068,7 +2068,7 @@ test('MB1188-020: the colour-key swatch uses the in-app picker too', () => {
   // system panel — and the same wrong corner of the screen — that the fill
   // swatch had already been moved away from.
   const pick = declaration('ssKeyPickColor');
-  assert.match(pick, /ssOpenColorPickerFor\(\{ kind: 'key', index: i \}/);
+  assert.match(pick, /ssOpenColorPickerFor\(\s*\{ kind: 'key', index: i, was:/);
   assert.doesNotMatch(pick, /createElement\('input'\)/, 'no hidden native input');
   const apply = declaration('ssColorPickerApply');
   assert.match(apply, /_ssPickerTarget\.kind === 'key'/, 'apply routes to whatever opened it');
@@ -2097,4 +2097,28 @@ test('the colour picker can sample any pixel on screen', () => {
   // A control that cannot work should not be offered.
   assert.match(declaration('ssOpenColorPickerFor'),
     /dropper\.style\.display = typeof window\.EyeDropper === 'function' \? '' : 'none'/);
+});
+
+test('AUDIT: the colour picker cannot recolour the wrong key entry', () => {
+  // Colour key entries have no ids, so an index is all there is to go on — and
+  // an arriving change from another Mac can add, remove or reorder entries
+  // while the picker is open.
+  const context = vm.createContext({ Object, Array, String });
+  vm.runInContext(`
+    ${declaration('_ssPickerKeyEntry')}
+    globalThis.find = (entries, target) => _ssPickerKeyEntry({ entries }, target);
+  `, context);
+  const entry = (label, bg) => ({ bg, tc: '#333333', label });
+  const piano = entry('Piano', '#ffd966');
+  const drums = entry('Drums', '#6aa84f');
+  const target = { kind: 'key', index: 1, was: { ...drums } };
+
+  assert.equal(context.find([piano, drums], target)?.label, 'Drums', 'found where it was');
+  // Another Mac inserted a row above it: the index now points at the wrong one.
+  assert.equal(context.find([piano, entry('Groups', '#3c78d8'), drums], target)?.label,
+    'Drums', 'followed the entry, not the index');
+  // It was deleted: refuse rather than recolour whatever moved into that slot.
+  assert.equal(context.find([piano], target), null, 'gone means gone');
+  assert.match(declaration('ssColorPickerApply'),
+    /That colour key entry has changed/, 'and the person is told, not ignored');
 });

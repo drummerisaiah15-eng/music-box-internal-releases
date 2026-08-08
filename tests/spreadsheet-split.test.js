@@ -1793,3 +1793,32 @@ test('MB1188-024: a fill, or a blank merged cell, is still a real change', () =>
     { value: { v: '', bg: '', tc: '', b: false, rs: 2, cs: 1 }, by: 'Ana Chaves', at });
   assert.ok(merged.editedBy?.['1,1'], 'and so is a merge');
 });
+
+test('AUDIT: every field the normalizer keeps is handled by the merge', () => {
+  // Three separate bugs this session had one shape: colorKey, googleLink and
+  // editedBy were each kept by the normalizer, described by no operation, and
+  // therefore silently reverted to the base copy on every save. The symptoms
+  // were a colour key that snapped shut, a Google checkpoint that never
+  // advanced, and an activity panel that emptied itself.
+  //
+  // This is the tripwire. A field added to either allowlist without a
+  // corresponding decision in _mergeSpreadsheetEdits fails here rather than
+  // being discovered weeks later as data quietly going missing.
+  const source = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const listOf = pattern => {
+    const match = pattern.exec(source);
+    assert.ok(match, `allowlist ${pattern} still exists`);
+    return match[1].split(',').map(entry => entry.trim().replace(/^'|'$/g, ''));
+  };
+  const projectFields = listOf(/\['id', 'name', 'activeId', 'sheets', ([^\]]*)\]/);
+  const sheetFields = listOf(/\['id', 'name', 'rows', 'cols', ([^\]]*)\]/);
+
+  const merge = declaration('_mergeSpreadsheetEdits');
+  for (const field of [...projectFields, ...sheetFields, 'activeId', 'rows', 'cols']) {
+    if (!field || field === 'id' || field === 'name') continue;
+    assert.ok(merge.includes(field),
+      `_mergeSpreadsheetEdits says nothing about "${field}". Either carry it from ` +
+      `the local copy the way colorKey and editedBy are, or make it an operation. ` +
+      `A field the merge ignores reverts to the base on every save.`);
+  }
+});

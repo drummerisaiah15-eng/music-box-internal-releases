@@ -6639,6 +6639,33 @@ function _applyRecordListDelta(current, delta) {
 // them and rewriting each into explicit add/patch/remove calls would be a dozen
 // chances to get it wrong. The delta is derived here instead, from the value
 // this Mac was looking at when the save was requested.
+// AUDIT/MB1188-027: the same idea for a bare list of ids.
+//
+// `flagged_emails` is a set of message ids, not records, so _persistRecordList
+// cannot merge it — there is no `id` field to key on. It was still being saved
+// whole, which meant flagging an email on one Mac erased whatever the other Mac
+// had flagged since. Only the ids this caller actually added or removed are
+// applied to the reconciled current value.
+function _persistIdSet(key, nextIds, options = {}) {
+  const { reason = 'id list save' } = options;
+  const base = STORE.get(key, []);
+  if (!Array.isArray(base) || !Array.isArray(nextIds)) {
+    return STORE.replace(key, nextIds, { authoritative: `${reason} (not a list)` });
+  }
+  const baseSet = new Set(base.map(String));
+  const nextSet = new Set(nextIds.map(String));
+  // Computed once, outside the mutator, so a re-run against a newer base is
+  // idempotent — the same rule _persistRecordList follows.
+  const added = [...nextSet].filter(id => !baseSet.has(id));
+  const removed = [...baseSet].filter(id => !nextSet.has(id));
+  return STORE.mutate(key, current => {
+    const result = new Set((Array.isArray(current) ? current : []).map(String));
+    for (const id of removed) result.delete(id);
+    for (const id of added) result.add(id);
+    return [...result];
+  }, []);
+}
+
 // IMPORTANT INVARIANT. `base` defaults to the stored value read HERE, which is
 // only the same thing the caller derived `nextList` from if nothing was awaited
 // between their read and this call. Every current caller reads and saves in one
@@ -13327,12 +13354,15 @@ function ssColorPickerApply() {
   const value = _ssPickerHex();
   if (_ssPickerTarget.kind === 'key') {
     const ck = ssGetColorKey();
-    const entry = ck.entries[_ssPickerTarget.index];
+    const entry = _ssPickerKeyEntry(ck, _ssPickerTarget);
     if (entry) {
       entry.bg = value;
       entry.tc = _ssContrastingText(value);
       ssSave();
       ssRenderColorKey();
+    } else {
+      // Better to do nothing and say so than to colour the wrong row.
+      showToast('That colour key entry has changed — open it again to recolour it.', 'warning');
     }
   } else {
     ssApplyCustomColor(value);
@@ -13509,8 +13539,28 @@ function ssRenderColorKey() {
 // fill swatch had.
 function ssKeyPickColor(i) {
   const ck = ssGetColorKey();
-  if (!ck.entries[i]) return;
-  ssOpenColorPickerFor({ kind: 'key', index: i }, ck.entries[i].bg || '#ffffff');
+  const entry = ck.entries[i];
+  if (!entry) return;
+  // AUDIT: remember WHICH entry, not just where it was sitting. The key has no
+  // ids, so an index is all there is — and an arriving change from another Mac
+  // can add, remove or reorder entries while this picker is open, which would
+  // land the chosen colour on somebody else's row.
+  ssOpenColorPickerFor(
+    { kind: 'key', index: i, was: { bg: entry.bg, tc: entry.tc, label: entry.label } },
+    entry.bg || '#ffffff');
+}
+
+// The entry this picker was opened on, or null if it is no longer there.
+function _ssPickerKeyEntry(ck, target) {
+  const same = entry => entry &&
+    entry.label === target.was?.label &&
+    entry.bg === target.was?.bg &&
+    entry.tc === target.was?.tc;
+  const atIndex = ck.entries[target.index];
+  if (same(atIndex)) return atIndex;
+  // Moved rather than removed: find it by what it was.
+  const found = ck.entries.find(same);
+  return found || null;
 }
 
 // Readable text on whatever background was chosen. Perceived brightness, not a
@@ -15360,7 +15410,7 @@ async function toggleEmailFlag(id) {
     ? flagged.filter(flaggedId => flaggedId !== id)
     : [...flagged, id];
   try {
-    await STORE.replace('flagged_emails', nextFlagged, { authoritative: 'email flag toggle' });
+    await _persistIdSet('flagged_emails', nextFlagged, { reason: 'email flag toggle' });
     email.flagged = nextFlagged.includes(id);
     renderEmailList();
     return true;
@@ -16056,7 +16106,10 @@ async function sendReply(emailId) {
         // local archive happens to fail.
         const sent = STORE.get('sent_emails', []);
         sent.unshift({
-          id: Date.now(),
+          // AUDIT: two Macs replying in the same millisecond produced the same
+          // id. This record exists because the send is irreversible, so it is
+          // the last thing that should be ambiguous.
+          id: _newRecordId(),
           to: original ? original.from : 'Unknown',
           toEmail: original ? original.email : '',
           subject: original ? 'Re: ' + original.subject : 'Reply',
@@ -16091,7 +16144,7 @@ async function sendReply(emailId) {
     // Demo mode — log locally
     const sent = STORE.get('sent_emails', []);
     sent.unshift({
-      id: Date.now(),
+      id: _newRecordId(),
       to: original ? original.from : 'Unknown',
       toEmail: original ? original.email : '',
       subject: original ? 'Re: ' + original.subject : 'Reply',
@@ -16661,7 +16714,13 @@ function renderStaff() {
   const allNotes = STORE.get('staff_notes', []);
   const prunedNotes = allNotes.filter(n => new Date(n.created || 0).getTime() >= cutoffMs);
   if (prunedNotes.length !== allNotes.length) {
-    persistInBackground('staff_notes', prunedNotes, 'Expired team-note cleanup');
+    // Whole-value again, and this one runs on every render of the Staff page:
+    // a note another Mac posted seconds ago but that had not yet arrived here
+    // was absent from this list and therefore deleted for everybody. Only the
+    // notes this Mac can see to be expired are removed.
+    _persistRecordList('staff_notes', prunedNotes, { reason: 'expired team-note cleanup' })
+      .catch(error => console.warn(
+        '[storage] Expired team-note cleanup was not saved:', error?.message || error));
   }
   const notes = prunedNotes;
   const el = document.getElementById('staff-notes-list');
@@ -16736,7 +16795,9 @@ async function deleteNote(id) {
   let notes = STORE.get('staff_notes', []);
   notes = notes.filter(n => String(n.id) !== String(id));
   try {
-    await STORE.replace('staff_notes', notes, { authoritative: 'staff note prune' });
+    // A whole-value save here erased any note another Mac had posted since this
+    // list was read. Only the note actually being deleted is removed.
+    await _persistRecordList('staff_notes', notes, { reason: 'team note deletion' });
     renderStaff();
     showToast('Note deleted.', 'success');
     return true;
