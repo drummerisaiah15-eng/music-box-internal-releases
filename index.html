@@ -4207,6 +4207,10 @@ function _ensureCurrentValuePending(key) {
   return _writePendingSyncRecord(key, _newOperationId(), localCiphertext);
 }
 
+// Rules rejections repeat on every drain for as long as the rules are wrong,
+// so each key says it once rather than once a minute forever.
+const _syncPermissionNotified = new Set();
+
 function _surfaceSyncDeliveryError(key, err) {
   setSyncStatus('error');
   if (err?.code === 'SYNC_CONFLICT') {
@@ -4217,7 +4221,32 @@ function _surfaceSyncDeliveryError(key, err) {
     _updateSyncConflictActions();
     return;
   }
-  showToast(`Cloud save for ${key} is still pending: ${err?.message || err}`, 'warning');
+  // MB1188-025: a rules rejection is not a transient "still pending".
+  //
+  // Firestore answers "Missing or insufficient permissions" when the deployed
+  // security rules do not admit the document being written. For a
+  // `spreadsheet_<id>` key that means the rules on the Firebase project predate
+  // per-project spreadsheet documents, so EVERY project write is refused and
+  // will go on being refused until the rules are published. Reporting that as
+  // pending invites people to wait for something that cannot happen.
+  const message = String(err?.message || err || '');
+  const denied = err?.code === 'permission-denied' ||
+    /Missing or insufficient permissions/i.test(message);
+  if (denied) {
+    if (_syncPermissionNotified.has(key)) return;
+    _syncPermissionNotified.add(key);
+    const isProjectDocument = _ssIsProjectSyncKey(key);
+    showToast(
+      isProjectDocument
+        ? `Firebase refused to store this spreadsheet project. The security rules on ` +
+          `the Firebase project need publishing — they do not yet allow one document ` +
+          `per project. Your work is saved on this Mac and will upload once they do.`
+        : `Firebase refused to store ${key}: the security rules do not allow it. ` +
+          `Your work is saved on this Mac.`,
+      'danger');
+    return;
+  }
+  showToast(`Cloud save for ${key} is still pending: ${message}`, 'warning');
 }
 
 // ─── C-02: automatic two-device merge on CAS conflict ────────────────────────

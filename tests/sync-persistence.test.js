@@ -4671,3 +4671,64 @@ test('MB1188-013: every human-data key has a declared identity', () => {
   assert.match(declaration('_normalizeSyncValue'), /_validateSyncRecordList\(key, value\)/,
     'and the validator actually runs on the sync path');
 });
+
+test('MB1188-025: a rules rejection is reported as a rejection, not as pending', () => {
+  // Firestore answers "Missing or insufficient permissions" when the deployed
+  // rules do not admit the document. For a spreadsheet_<id> key that means the
+  // rules predate per-project documents, so every project write is refused and
+  // will go on being refused. Calling that "still pending" invites people to
+  // wait for something that cannot happen.
+  const toasts = [];
+  const context = contextWith({
+    setSyncStatus: () => {},
+    showToast: (message, tone) => toasts.push({ message, tone }),
+    _syncConflictNotified: new Set(),
+    _updateSyncConflictActions: () => {},
+  });
+  vm.runInContext(`
+    var SPREADSHEET_PROJECT_KEY_PREFIX = 'spreadsheet_';
+    var SPREADSHEET_PROJECT_ID_PATTERN = /^[A-Za-z0-9_-]{1,100}$/;
+    const _syncPermissionNotified = new Set();
+    ${declaration('_ssIsProjectSyncKey')}
+    ${declaration('_surfaceSyncDeliveryError')}
+    globalThis.surface = (key, err) => _surfaceSyncDeliveryError(key, err);
+  `, context);
+
+  // The exact key and message seen in the app.
+  context.surface('spreadsheet_proj_r_msjm7iuj_xFgoHf7oWMv',
+    { message: 'Missing or insufficient permissions.' });
+  assert.equal(toasts.length, 1);
+  assert.equal(toasts[0].tone, 'danger', 'this is a failure, not a delay');
+  assert.match(toasts[0].message, /security rules/, 'it names the actual cause');
+  assert.match(toasts[0].message, /saved on this Mac/, 'and says the work is safe');
+  assert.doesNotMatch(toasts[0].message, /still pending/);
+
+  // Repeats are silent: the rules stay wrong until somebody publishes them, and
+  // the drain retries on a timer.
+  context.surface('spreadsheet_proj_r_msjm7iuj_xFgoHf7oWMv',
+    { message: 'Missing or insufficient permissions.' });
+  assert.equal(toasts.length, 1, 'said once, not once a minute forever');
+
+  // A different key still reports, and a genuinely transient failure is still
+  // described as pending.
+  context.surface('todo_items', { code: 'permission-denied', message: 'nope' });
+  assert.match(toasts[1].message, /security rules do not allow it/);
+  context.surface('logs', { message: 'network unreachable' });
+  assert.match(toasts[2].message, /still pending/);
+  assert.equal(toasts[2].tone, 'warning');
+});
+
+test('MB1188-025: the firestore rules admit a real project document key', () => {
+  // The client and the rules have to agree on the shape of a project key. If
+  // they drift, every per-project write is refused and the only symptom is a
+  // toast about permissions.
+  const rules = fs.readFileSync(path.join(__dirname, '..', 'firestore.rules'), 'utf8');
+  const match = /keyId\.matches\('(spreadsheet_[^']+)'\)/.exec(rules);
+  assert.ok(match, 'the rules carry a project-key pattern');
+  // Firestore matches() is fully anchored.
+  const pattern = new RegExp('^' + match[1] + '$');
+  for (const id of ['proj_r_msjm7iuj_xFgoHf7oWMv', 'proj_r_abc123_XYZ', 'proj_r_0_a']) {
+    assert.ok(pattern.test('spreadsheet_' + id), `${id} is admitted by the rules`);
+  }
+  assert.ok(!pattern.test('spreadsheet_' + 'x'.repeat(200)), 'and the bound still holds');
+});
