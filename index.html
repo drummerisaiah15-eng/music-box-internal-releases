@@ -9977,6 +9977,29 @@ function _mergeSpreadsheetEdits(base, dirtyBase, dirty) {
       const target = (project.sheets || []).find(s => s.id === sheet.id);
       const originSheet = (origin2.sheets || []).find(s => s.id === sheet.id);
       if (!target || !originSheet) continue;
+      // MB1188-021: attribution is sheet-level state no operation describes.
+      //
+      // This merge rebuilds each sheet from the reconciled base and replays
+      // operations onto it, and only a cell with an operation gets stamped. So
+      // every stamp this Mac was holding that the base did not also have was
+      // destroyed on the next save — which is why the activity panel kept
+      // emptying itself for no visible reason, and why a second profile could
+      // see the edited cell but no record of who edited it.
+      //
+      // Union by cell, newest wins. The other Mac's stamps arrive in the base
+      // and are kept; this Mac's are added back; a cell both stamped keeps the
+      // later one. Stamps for cells that no longer exist are dropped later by
+      // _normalizeSpreadsheetAttribution, so this cannot resurrect one.
+      if (sheet.editedBy) {
+        const stamps = { ...(target.editedBy || {}) };
+        for (const [cellKey, stamp] of Object.entries(sheet.editedBy)) {
+          const existing = stamps[cellKey];
+          if (!existing || Date.parse(stamp.at) > Date.parse(existing.at)) {
+            stamps[cellKey] = { ...stamp };
+          }
+        }
+        if (Object.keys(stamps).length) target.editedBy = stamps;
+      }
       // Sheet renames likewise travel as operations; do not overwrite here.
       if (sheet.rows !== originSheet.rows) target.rows = sheet.rows;
       if (sheet.cols !== originSheet.cols) target.cols = sheet.cols;

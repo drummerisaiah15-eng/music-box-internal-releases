@@ -1462,6 +1462,10 @@ function mergeApi() {
     console: { warn() {}, error() {}, log() {} },
     Date, Object, Map, Set, Array, JSON, Number, String, Boolean, Math, TextEncoder,
     showToast() {},
+    // Attribution needs to know who is typing; without these the stamping path
+    // runs but records nobody, and the test reads as a merge bug.
+    currentUser: () => 'Emma Minnetto',
+    _ssMirroringFromGoogle: false,
     _cloneJson: value => JSON.parse(JSON.stringify(value)),
   });
   vm.runInContext(`
@@ -1568,3 +1572,105 @@ test('MB1188-020: a field this Mac did not touch is left to the merge', () => {
   assert.deepEqual(JSON.parse(JSON.stringify(out.projects[0].colorKey)), theirs,
     "an untouched field keeps the other Mac's value");
 });
+
+// ── MB1188-021: the activity panel stops emptying itself ───────────────────
+
+test('MB1188-021: an existing stamp is not destroyed by the next save', () => {
+  // Reproduces what was seen on screen: Emma edits a cell and her name appears
+  // in the panel; Carrie opens the same sheet seconds later, sees the edited
+  // cell, and the panel says no edits have ever been tracked.
+  //
+  // The merge rebuilds each sheet from the durable base and only stamps cells
+  // that have an operation, so every stamp this Mac held that the base did not
+  // also hold was thrown away on the next save.
+  const merge = mergeApi();
+  const stamped = {
+    id: 's1', name: 'Monday', rows: 5, cols: 5, colWidths: [100, 100, 100, 100, 100],
+    cells: { '0,0': { v: 'old', bg: '', tc: '', b: false } },
+    editedBy: { '0,0': { by: 'Elizabeth Chaves', at: '2026-08-07T20:00:00.000Z' } },
+  };
+  const withSheet = sheet => ({
+    activeProject: 'p1',
+    projects: [{ id: 'p1', name: 'Color Block', activeId: 's1', sheets: [sheet] }],
+  });
+  // The durable base carries no stamps — a Google mirror save writes this way.
+  const base = withSheet({ ...stamped, editedBy: undefined });
+  const edited = {
+    ...stamped,
+    cells: { ...stamped.cells, '1,1': { v: 'new', bg: '', tc: '', b: false } },
+  };
+  const out = merge(base, withSheet(stamped), withSheet(edited));
+  const kept = out.projects[0].sheets[0].editedBy || {};
+  assert.ok(kept['0,0'], 'the earlier stamp survives the save');
+  assert.equal(kept['0,0'].by, 'Elizabeth Chaves');
+  assert.ok(kept['1,1'], 'and the new edit is stamped too');
+});
+
+test('MB1188-021: the other Mac’s stamps are kept, and the newer one wins', () => {
+  const merge = mergeApi();
+  const sheetWith = editedBy => ({
+    id: 's1', name: 'Monday', rows: 5, cols: 5, colWidths: [100, 100, 100, 100, 100],
+    cells: { '0,0': { v: 'x', bg: '', tc: '', b: false },
+             '2,2': { v: 'y', bg: '', tc: '', b: false } },
+    editedBy,
+  });
+  const withSheet = sheet => ({
+    activeProject: 'p1',
+    projects: [{ id: 'p1', name: 'Color Block', activeId: 's1', sheets: [sheet] }],
+  });
+  // The base carries a stamp only the other Mac has; this Mac carries its own,
+  // plus an older stamp on the same cell the base stamped later.
+  const base = withSheet(sheetWith({
+    '2,2': { by: 'Carrie Gass', at: '2026-08-07T21:00:00.000Z' },
+    '0,0': { by: 'Carrie Gass', at: '2026-08-07T21:00:00.000Z' },
+  }));
+  const mine = withSheet(sheetWith({
+    '0,0': { by: 'Emma Minnetto', at: '2026-08-07T20:00:00.000Z' },
+  }));
+  const out = merge(base, mine, mine);
+  const kept = out.projects[0].sheets[0].editedBy || {};
+  assert.equal(kept['2,2'].by, 'Carrie Gass', "the other Mac's stamp is kept");
+  assert.equal(kept['0,0'].by, 'Carrie Gass', 'and the later stamp wins on a shared cell');
+});
+
+test('MB1188-021: a stamp for a cell that no longer exists is not resurrected', () => {
+  // Carrying stamps forward must not undo the pruning that stops the map
+  // growing forever as people clear and retype cells.
+  const merge = mergeApi();
+  const withSheet = (cells, editedBy) => ({
+    activeProject: 'p1',
+    projects: [{ id: 'p1', name: 'Color Block', activeId: 's1', sheets: [{
+      id: 's1', name: 'Monday', rows: 5, cols: 5, colWidths: [100, 100, 100, 100, 100],
+      cells, editedBy }] }],
+  });
+  const gone = { '9,9': { by: 'Elizabeth Chaves', at: '2026-08-07T20:00:00.000Z' } };
+  const cells = { '0,0': { v: 'kept', bg: '', tc: '', b: false } };
+  const merged = merge(withSheet(cells, undefined), withSheet(cells, gone), withSheet(cells, gone));
+  // Pruning happens in the normalizer, which every save runs the merge through.
+  const out = normalizeApi()(merged);
+  const kept = out.projects[0].sheets[0].editedBy || {};
+  assert.equal(kept['9,9'], undefined, 'a stamp with no cell behind it is dropped');
+});
+
+function normalizeApi() {
+  const context = vm.createContext({
+    console: { warn() {}, error() {}, log() {} },
+    Date, Object, Map, Set, Array, JSON, Number, String, Boolean, Math, TextEncoder,
+    showToast() {},
+    _cloneJson: value => JSON.parse(JSON.stringify(value)),
+  });
+  vm.runInContext(`
+    var MAX_SPREADSHEET_CELL_CHARS = 50000, MAX_SPREADSHEET_SHEETS = 25,
+        MAX_SPREADSHEET_ROWS = 500, MAX_SPREADSHEET_COLS = 100,
+        MAX_SPREADSHEET_GRID_CELLS = 10000, MAX_SPREADSHEET_TOTAL_CELLS = 10000,
+        MAX_SPREADSHEET_TOTAL_CHARS = 400000, MAX_SPREADSHEET_SYNC_JSON_BYTES = 600000,
+        MAX_SPREADSHEET_ATTRIBUTIONS = 200, MAX_SPREADSHEET_ATTRIBUTION_NAME = 80,
+        MAX_RESOLVED_CONFLICT_IDS = 200, MAX_SPREADSHEET_CONFLICTS = 200;
+    ${declaration('_ssOversizeError')}
+    ${declaration('_normalizeSpreadsheetAttribution')}
+    ${declaration('_mergeResolvedConflictIds')}
+    ${declaration('normalizeSpreadsheetWorkbook')}
+    globalThis.norm = book => JSON.parse(JSON.stringify(normalizeSpreadsheetWorkbook(book)));
+  `, context);
+  return context.norm;
+}
