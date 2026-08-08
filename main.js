@@ -1180,6 +1180,41 @@ const GOOGLE_ERROR_HTML = `<!doctype html><html><head><meta charset="utf-8">
 </head><body><h2>Google sign-in failed</h2><p>Close this tab and try connecting again from Music Box.</p></body></html>`;
 
 // `123456789012-abc123def456.apps.googleusercontent.com`
+// Characters that render as nothing and survive a copy/paste: zero-width
+// spaces and joiners, soft hyphens, bidi marks, the BOM. JavaScript's \s does
+// NOT match most of these, which is why a client ID that looked perfect on
+// screen kept being refused — the visible text validated fine, the stored
+// string had something invisible wedged into it.
+const INVISIBLE = /[\s\u00AD\u034F\u061C\u180E\u200B-\u200F\u2028\u2029\u202A-\u202E\u2060-\u206F\uFEFF]/g;
+
+function _cleanGoogleClientId(value) {
+  // A Google client ID is digits, one hyphen, alphanumerics/underscore, dots.
+  // Anything else is contamination from wherever it was copied.
+  return String(value || '').replace(INVISIBLE, '').replace(/[^A-Za-z0-9._-]/g, '');
+}
+
+function _cleanGoogleSecret(value) {
+  // Invisible characters only. A secret's real content is never guessed at or
+  // rewritten — if what remains is not valid, it is refused, not repaired.
+  return String(value || '').replace(INVISIBLE, '');
+}
+
+function _describeGoogleClientIdProblem(raw, cleaned) {
+  const base = 'That does not look like a Google OAuth client ID. ' +
+    'It should end in .apps.googleusercontent.com';
+  const original = String(raw || '');
+  if (original !== cleaned && _validGoogleClientId(cleaned)) {
+    // Should not happen — cleaned is what gets validated — but never lie.
+    return base;
+  }
+  if (original !== cleaned) {
+    const removed = original.length - cleaned.length;
+    return `${base} (${removed} hidden or invalid character${removed === 1 ? '' : 's'} ` +
+      `were removed from what you pasted, and what was left still does not match: "${cleaned}")`;
+  }
+  return `${base} (received: "${cleaned}")`;
+}
+
 function _validGoogleClientId(value) {
   return typeof value === 'string' &&
     /^[0-9]{6,32}-[A-Za-z0-9_]{8,64}\.apps\.googleusercontent\.com$/.test(value);
@@ -2123,7 +2158,7 @@ _secureHandle('app-session-import-directory', async (_, directory) => {
 _secureHandle('google-set-credentials', async (_, request) => {
   _requireAppRole(OPERATIONS_MANAGER_ROLES);
   if (!_isPlainObject(request)) throw new Error('Invalid Google credentials.');
-  // Strip ALL whitespace, not just the ends.
+  // Strip whitespace AND the invisible characters \s does not cover.
   //
   // A client ID pasted from the Google console can arrive with spaces or a line
   // break inside it — from the paste, from text substitution, from a value that
@@ -2133,10 +2168,12 @@ _secureHandle('google-set-credentials', async (_, request) => {
   // client ID. Neither a Google client ID nor a client secret can legitimately
   // contain whitespace, so removing it is unambiguous and cannot corrupt a
   // valid value.
-  const clientId = String(request.clientId || '').replace(/\s+/g, '');
-  const clientSecret = String(request.clientSecret || '').replace(/\s+/g, '');
+  const clientId = _cleanGoogleClientId(request.clientId);
+  const clientSecret = _cleanGoogleSecret(request.clientSecret);
   if (!_validGoogleClientId(clientId)) {
-    throw new Error('That does not look like a Google OAuth client ID. It should end in .apps.googleusercontent.com');
+    // The client ID is public, so it is safe to say precisely what is wrong.
+    // The secret is not, and is never described.
+    throw new Error(_describeGoogleClientIdProblem(request.clientId, clientId));
   }
   if (!_validGoogleClientSecret(clientSecret)) {
     throw new Error('That does not look like a Google OAuth client secret.');

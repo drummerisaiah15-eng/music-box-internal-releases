@@ -1835,9 +1835,9 @@ test('Google credentials pasted with stray whitespace are accepted', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
   const start = source.indexOf("_secureHandle('google-set-credentials'");
   const handler = source.slice(start, source.indexOf('_secureHandle(', start + 10));
-  assert.match(handler, /String\(request\.clientId \|\| ''\)\.replace\(\/\\s\+\/g, ''\)/,
-    'the client ID is stripped of all whitespace, not just trimmed');
-  assert.match(handler, /String\(request\.clientSecret \|\| ''\)\.replace\(\/\\s\+\/g, ''\)/,
+  assert.ok(handler.includes('_cleanGoogleClientId(request.clientId)'),
+    'the client ID is cleaned, not merely trimmed');
+  assert.ok(handler.includes('_cleanGoogleSecret(request.clientSecret)'),
     'and so is the secret — a paste can pick up a trailing newline');
 
   // The validator itself is unchanged and still strict.
@@ -1889,4 +1889,65 @@ test('an unreadable Google vault is reported as such, not as "nothing saved"', (
 
   const renderer = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
   assert.match(renderer, /could not be read: \$\{status\.vaultError\}/);
+});
+
+test('a Google client ID with invisible characters is accepted', () => {
+  // Reported live, twice. The field showed a perfectly correct client ID and
+  // Save kept refusing it. The visible text validates fine — what was stored
+  // had characters that render as nothing wedged into it, and JavaScript's \s
+  // does NOT match zero-width spaces, soft hyphens, bidi marks or the BOM. So
+  // the first fix (strip whitespace) looked right and changed nothing at all.
+  const source = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  assert.ok(source.includes('const INVISIBLE ='), 'the invisible-character class exists');
+  for (const codepoint of ['u200B', 'u200F', 'u2028', 'u2060', 'uFEFF', 'u00AD']) {
+    assert.ok(source.includes(codepoint), `${codepoint} must be stripped — \\s does not cover it`);
+  }
+
+  // Behaviour, not shape. Characters are built by code point so nothing here
+  // depends on how this file survives an editor.
+  const ch = code => String.fromCharCode(code);
+  const INVISIBLE = new RegExp(
+    '[\\s' + ch(0x00AD) + ch(0x034F) + ch(0x061C) + ch(0x180E) +
+    ch(0x200B) + '-' + ch(0x200F) + ch(0x2028) + ch(0x2029) +
+    ch(0x202A) + '-' + ch(0x202E) + ch(0x2060) + '-' + ch(0x206F) + ch(0xFEFF) + ']', 'g');
+  const clean = v => String(v || '').replace(INVISIBLE, '').replace(/[^A-Za-z0-9._-]/g, '');
+  const shape = /^[0-9]{6,32}-[A-Za-z0-9_]{8,64}\.apps\.googleusercontent\.com$/;
+  const good = '235779015004-5m1ddq0k4p1v4mq77lfl6513lcpbe3e.apps.googleusercontent.com';
+  const withChar = code => '235779015004-' + ch(code) + '5m1ddq0k4p1v4mq77lfl6513lcpbe3e.apps.googleusercontent.com';
+
+  assert.equal(shape.test(good), true, 'precondition: the visible value is valid');
+  const contaminated = [
+    ['zero-width space', withChar(0x200B)],
+    ['soft hyphen', withChar(0x00AD)],
+    ['bidi mark', withChar(0x200E)],
+    ['line separator', withChar(0x2028)],
+    ['word joiner', withChar(0x2060)],
+    ['non-breaking space', withChar(0x00A0)],
+    ['BOM at the front', ch(0xFEFF) + good],
+    ['smart quotes around it', ch(0x201C) + good + ch(0x201D)],
+    ['spaces and a newline', '2357 79015004-\n5m1ddq0k4p1v4mq77lfl6513lcpbe3e. apps.googleusercontent.com'],
+  ];
+  for (const [label, value] of contaminated) {
+    assert.equal(shape.test(value), false, `precondition: ${label} breaks it`);
+    assert.equal(shape.test(clean(value)), true, `${label} is cleaned and accepted`);
+  }
+
+  // Cleaning must not become "accept anything".
+  for (const junk of ['not-an-id', '', 'abc.apps.googleusercontent.com',
+                      '123-short.apps.googleusercontent.example.com']) {
+    assert.equal(shape.test(clean(junk)), false, `${JSON.stringify(junk)} is still refused`);
+  }
+});
+
+test('a refused client ID says what was wrong with it', () => {
+  // The client ID is public, so naming the problem is safe. The secret is not,
+  // and is never described.
+  const source = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  const describe = source.slice(source.indexOf('function _describeGoogleClientIdProblem('));
+  assert.match(describe.slice(0, 900), /hidden or invalid character/,
+    'it says characters were removed');
+  const secretClean = source.slice(source.indexOf('function _cleanGoogleSecret('));
+  assert.match(secretClean.slice(0, 500), /INVISIBLE/);
+  assert.doesNotMatch(secretClean.slice(0, 500), /\[\^A-Za-z0-9/,
+    'a secret is never rewritten beyond removing invisible characters');
 });

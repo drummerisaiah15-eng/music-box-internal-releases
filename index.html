@@ -11821,9 +11821,13 @@ async function saveGoogleCredentials() {
   // what is about to be saved rather than the operator being told their own
   // client ID is not a client ID.
   const idField = document.getElementById('google-client-id');
-  const clientId = (idField?.value || '').replace(/\s+/g, '');
+  // Same cleaning as main: whitespace plus the invisible characters \s misses.
+  const clientId = (idField?.value || '')
+    .replace(/[\s\u00AD\u034F\u061C\u180E\u200B-\u200F\u2028\u2029\u202A-\u202E\u2060-\u206F\uFEFF]/g, '')
+    .replace(/[^A-Za-z0-9._-]/g, '');
   if (idField && idField.value !== clientId) idField.value = clientId;
-  const clientSecret = (document.getElementById('google-client-secret')?.value || '').replace(/\s+/g, '');
+  const clientSecret = (document.getElementById('google-client-secret')?.value || '')
+    .replace(/[\s\u00AD\u034F\u061C\u180E\u200B-\u200F\u2028\u2029\u202A-\u202E\u2060-\u206F\uFEFF]/g, '');
   try {
     const result = await _googleSheets().setCredentials({ clientId, clientSecret });
     const secretField = document.getElementById('google-client-secret');
