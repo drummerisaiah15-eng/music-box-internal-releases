@@ -2087,8 +2087,11 @@ test('MB1188-004/005: the pull holds ids, never objects, across its awaits', () 
   // just told the user was kept.
   const pull = namedFunctionSource('ssPullFromGoogle');
 
-  // Only ids and plain values survive the loop boundary.
-  assert.match(pull, /const projectId = project\.id;/);
+  // Only ids and plain values survive the loop boundary. `projectId` is the
+  // function's own parameter — it used to be redeclared inside the try as
+  // well, which shadowed it and made the catch below look like a scoping bug.
+  assert.match(pull, /^function ssPullFromGoogle\(projectId, options\)/);
+  assert.doesNotMatch(pull, /const projectId = /, 'not shadowed');
   assert.match(pull, /const plan = linked\.map\(entry => \(\{ sheetId: entry\.sheet\.id, tab: entry\.tab \}\)\);/);
   assert.match(pull, /for \(const \{ sheetId, tab \} of plan\)/);
 
@@ -2293,4 +2296,21 @@ test('gridlines darken with zoom without changing layout', () => {
     assert.ok(value >= previous, `line gets lighter as zoom rises (${zoom})`);
     previous = value;
   }
+});
+
+test('MB1188-022: the live sync listener reads the workbook, not the index', () => {
+  // Under split storage the 'spreadsheets' key is the INDEX — a list of project
+  // ids. Normalizing that as a workbook throws on every sync event; the catch
+  // swallowed it and the early return meant nothing re-rendered, so changes
+  // arriving from another Mac were never shown. MB161-040 fixed exactly this
+  // in the save path and this listener was missed.
+  const source = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const start = source.indexOf("document.addEventListener('tmb_sync_spreadsheets'");
+  assert.notEqual(start, -1, 'the listener exists');
+  const body = source.slice(start, source.indexOf('\n});', start) + 4);
+  assert.doesNotMatch(body, /normalizeSpreadsheetWorkbook\(STORE\.get\('spreadsheets'/,
+    'the raw key is the index, not a workbook');
+  assert.match(body, /_ssDurableWorkbook\(\)/, 'the assembled workbook is what it needs');
+  assert.match(body, /ssRenderActivityBar\(\)/,
+    'and an arriving change re-renders who is credited, not only the cells');
 });

@@ -12109,7 +12109,6 @@ async function ssPullFromGoogle(projectId, options) {
     // reported all six, and no checkpoint advanced, so the next pull did it all
     // over again. The same detachment threw away any conflict raised along the
     // way, after the UI had already promised it was kept.
-    const projectId = project.id;
     const plan = linked.map(entry => ({ sheetId: entry.sheet.id, tab: entry.tab }));
     const spreadsheetId = link.spreadsheetId;
     const readRows = link.rows;
@@ -13480,10 +13479,26 @@ function ssKeyAdd() {
 // Live sync incoming spreadsheet changes
 document.addEventListener('tmb_sync_spreadsheets', () => {
   if (!_ssDirtyWorkbook) {
-    try { _ssData = normalizeSpreadsheetWorkbook(STORE.get('spreadsheets', null)); }
-    catch (_) { return; }
+    // MB1188-022: must be the assembled WORKBOOK, not the raw key.
+    //
+    // Under split storage the 'spreadsheets' key holds the INDEX — a list of
+    // project ids — so this normalized a manifest as though it were a
+    // workbook. It threw every time, the catch swallowed it, and the early
+    // return meant nothing re-rendered either. Arriving changes from another
+    // Mac were silently never shown. Same defect as MB161-040, in a listener
+    // that was missed when that one was fixed.
+    const durable = _ssDurableWorkbook();
+    if (!durable) return;
+    _ssData = durable;
   }
-  if (document.getElementById('page-spreadsheets')?.classList.contains('active')) ssRenderGrid();
+  if (document.getElementById('page-spreadsheets')?.classList.contains('active')) {
+    // The whole editor, not just the grid: an arriving change can alter the
+    // sheet list, the colour key and who is credited for what, and a panel
+    // left showing the previous state is how "the activity disappeared"
+    // becomes indistinguishable from "the activity is stale".
+    try { ssRender(); } catch (_) { ssRenderGrid(); }
+    try { ssRenderActivityBar(); } catch (_) {}
+  }
 });
 
 document.addEventListener('mouseup',    () => { _ssIsSelecting = false; _ssDragOrigin = null; });
