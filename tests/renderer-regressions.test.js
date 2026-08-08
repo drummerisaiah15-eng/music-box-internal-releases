@@ -2372,3 +2372,15 @@ test('MB1188-026: per-Mac link state round-trips and drops empties', () => {
   store.set('tmb__gsync_p2', 'not json');
   assert.deepEqual(JSON.parse(JSON.stringify(context.read('p2'))), {});
 });
+
+// A regex "no-undef" scanner was written here and removed again. It could not
+// catch the bug that motivated it — `_ssDurablyHasProject(project.id)`, where
+// `project` is a callback parameter in a different scope of the same function,
+// so a function-level scan sees it as declared. Distinguishing that needs real
+// scope analysis, which needs a parser this project does not carry.
+//
+// It is gone rather than kept-with-caveats, because a test that cannot detect
+// its own motivating failure invites trust it has not earned. The protection
+// that actually works for this class is exercising the path: see the P0-01
+// staging tests in sync-persistence, which run the real save pipeline and
+// assert what reached durable storage.

@@ -12995,7 +12995,7 @@ async function ssImportBuildProject(name, sheets, extraBytes, linkFor) {
         await _flushSpreadsheetSave();
         // P0-01: confirm against the durable index rather than assuming. This
         // reported success for an import that was never written at all.
-        if (!_ssDurablyHasProject(project.id)) {
+        if (!_ssDurablyHasProject(pid)) {
           throw new Error('The imported project was not saved to this Mac.');
         }
       } else {
