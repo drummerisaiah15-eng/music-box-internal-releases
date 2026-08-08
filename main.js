@@ -2136,31 +2136,29 @@ function _applyStaffDirectory(entries) {
   return _allAppProfiles();
 }
 
-// MB1188-029: any signed-in profile may publish; any may import.
+// Owner publishes; any profile may import what the owner published.
 //
-// This was Owner-only, and that is what stopped profiles reaching the other
-// Mac at all. Profiles are created from the SIGNED-OUT login screen, so the
-// publication is always deferred to whoever signs in next — and if that person
-// was not Elizabeth, on that particular Mac, it never happened. A studio where
-// the owner only ever uses one Mac could never propagate a profile created on
-// the other one.
+// MB1188-029 widened this to COMMUNICATION_ROLES and it was WRONG. The safety
+// case rested on two claims a pentest disproved:
 //
-// Widening this is safe by construction, not by trust:
-//   - adding a profile is ALREADY ungated (app-session-add-staff-profile has no
-//     role check), so this grants no new ability to create anything; it only
-//     lets an addition that was already permitted reach the other Macs;
-//   - _applyStaffDirectory re-validates every field on the receiving side. It
-//     never grants Owner by import, forces unknown roles to Front Desk, caps
-//     custom profiles, and refuses a directory that would leave no owner;
-//   - the directory merges as a tombstoned record list keyed by id, so a Mac
-//     publishing a list that has not yet heard of the other's profiles cannot
-//     delete them. Absence is not a deletion.
+//   "absence is not a deletion" — false on the path that actually runs. The
+//   tombstoned merge only happens on the CAS-conflict rebase; steady state is
+//   _reconcileRemoteSnapshot -> _refreshForSyncKey(key, decoded) with the RAW
+//   remote list, and _applyStaffDirectory below rebuilds the vault wholesale.
+//   A stale Mac publishing therefore DELETES custom profiles and resets role
+//   overrides on the other Mac. No attacker needed — being behind is enough.
 //
-// Removals and role changes stay Owner-only in their own handlers, so a
-// tombstone can still only originate from an owner action. What travels from a
-// non-owner Mac is additive.
+//   "removals stay owner-gated" — false. app-session-remove-staff-profile and
+//   app-session-set-profile-role are OPERATIONS_MANAGER_ROLES, and
+//   ASSIGNABLE_PROFILE_ROLES contains 'Operations Manager', so an imported
+//   directory can promote someone who may then remove and re-role everybody
+//   except the Owner.
+//
+// Reverted until _applyStaffDirectory merges against local state instead of
+// replacing it. Widening the publisher is only safe once absence stops meaning
+// deletion on the receiving side.
 _secureHandle('app-session-export-directory', async () => {
-  _requireAppRole(COMMUNICATION_ROLES);
+  _requireAppRole(new Set(['Owner']));
   return { ok: true, directory: _buildStaffDirectory() };
 });
 

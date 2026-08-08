@@ -973,14 +973,27 @@ test('directory: a session whose profile was removed is ended', () => {
   assert.equal(target.state.sessionReset, true, 'the removed profile is signed out');
 });
 
-test('directory: export needs a signed-in profile, import is validated in main', () => {
-  // MB1188-029: publishing was Owner-only. A profile can only be created from
-  // the signed-out login screen, so the publication is always deferred to
-  // whoever signs in next — and requiring that to be Elizabeth, on that
-  // particular Mac, is why profiles created on the other Mac never travelled.
+test('directory: export is owner-only, import is validated in main', () => {
+  // MB1188-029 widened this and was reverted. The reason is asserted below, so
+  // that reinstating it means confronting the reason rather than rediscovering
+  // it: a published directory REBUILDS the receiving vault, so a stale
+  // publisher deletes rather than merely failing to add.
   const exportBody = extractHandlerBody(main, 'app-session-export-directory');
-  assert.match(exportBody, /_requireAppRole\(COMMUNICATION_ROLES\)/,
-    'any signed-in profile publishes; the receiving side re-validates everything');
+  assert.match(exportBody, /_requireAppRole\(new Set\(\['Owner'\]\)\)/,
+    'only the owner publishes');
+  const apply = extractFunction(main, '_applyStaffDirectory');
+  assert.match(apply, /vault\[STAFF_PROFILES_VAULT_KEY\] = custom/,
+    'import REPLACES the custom profile list — absence really is deletion here');
+  assert.match(apply, /else delete vault\[PROFILE_ROLE_OVERRIDES_VAULT_KEY\]/,
+    'and an absent role override is a demotion, not a no-op');
+  // Widening the publisher is only safe once these two stop being true.
+  for (const handler of ['app-session-remove-staff-profile', 'app-session-set-profile-role']) {
+    const start = main.indexOf(`_secureHandle('${handler}'`);
+    assert.match(main.slice(start, start + 200), /_requireAppRole\(OPERATIONS_MANAGER_ROLES\)/,
+      `${handler} is Operations-Manager-gated, NOT owner-gated — do not claim otherwise`);
+  }
+  assert.match(main, /ASSIGNABLE_PROFILE_ROLES = Object\.freeze\(\['Operations Manager'/,
+    'and Operations Manager is grantable by import, so it is not a trust root');
   const importBody = extractHandlerBody(main, 'app-session-import-directory');
   assert.match(importBody, /_applyStaffDirectory\(directory\)/,
     'import runs through the validating applier, not a raw vault write');
@@ -1006,13 +1019,9 @@ test('directory: the renderer publishes on every profile change and merges on ar
     const body = renderer.slice(start, renderer.indexOf('\n}\n', start) + 2);
     assert.match(body, /publishStaffDirectory\(\)/, `${name} publishes the directory`);
   }
-  // MB1188-029: publishing needs somebody signed in, not the owner specifically.
+  // Only the owner may publish.
   const fn = renderer.slice(renderer.indexOf('async function publishStaffDirectory('));
-  const publishBody = fn.slice(0, fn.indexOf('\n}') + 2);
-  assert.match(publishBody, /if \(!currentUser\(\)\)/,
-    'the login screen has no session to publish under, so it still defers');
-  assert.doesNotMatch(publishBody, /isElizabeth\(\)/,
-    'but signing in as anyone settles it');
+  assert.match(fn.slice(0, fn.indexOf('\n}') + 2), /isElizabeth\(\)/);
 });
 
 // --- V159-008: immutable per-device iCloud snapshots -------------------------
@@ -1312,14 +1321,8 @@ test('MB161-005: adding a user that could not be published says so', () => {
   const body = fn.slice(0, fn.indexOf('\nfunction ', 1));
   assert.match(body, /const published = await publishStaffDirectory\(\);/,
     'the publish result is read, not discarded');
-  // MB1188-029: the message no longer names Elizabeth, because it no longer has
-  // to be her. It must still say the profile is only on this Mac so far.
-  assert.match(body, /was added on this Mac/,
-    'a local-only add is described as local-only');
-  assert.match(body, /Signing in here will share them with the other Macs/,
-    'and says exactly what makes it reach the others');
-  assert.doesNotMatch(body, /Elizabeth can sign in here/,
-    'the old instruction described a flow that no longer exists');
+  assert.match(body, /not yet[\s\S]*shared with the other Macs/,
+    'and a local-only add is described as local-only');
 });
 
 // ── MB161-014: Google Sheets, read-only ─────────────────────────────────────
@@ -1720,12 +1723,8 @@ test('MB161-031: the owner keeps everything that is about ownership or secrets',
   for (const handler of [
     'app-session-stage-owner-pin', 'app-session-commit-owner-pin',
     'app-session-cancel-owner-pin', 'firebase-configure', 'firebase-clear',
-    // MB1188-029: app-session-export-directory was here. Publishing is no
-    // longer an owner act — it carries no privilege of its own, because the
-    // receiving Mac re-validates every field and can never be made to grant
-    // Owner. What stays owner-only is everything DESTRUCTIVE: removing a
-    // profile and changing a role, asserted just below and in the MB1188-029
-    // tests at the end of this file.
+    // Publishing the directory to every Mac stays an owner act.
+    'app-session-export-directory',
   ]) {
     const start = main.indexOf(`_secureHandle('${handler}'`);
     assert.notEqual(start, -1, `${handler} exists`);
@@ -2012,49 +2011,3 @@ test('a client ID of the wrong length is saved with a warning, not silently', ()
   assert.match(renderer, /result\.lengthWarning/, 'and the operator is shown it');
 });
 
-test('MB1188-029: any signed-in profile may publish the directory, but only the owner may remove', () => {
-  // Publishing was Owner-only, which is what stopped a profile created on the
-  // non-owner Mac from ever reaching the other. Widening it is safe because
-  // creating a profile is already ungated and the receiving side re-validates
-  // everything — but the destructive operations must NOT widen with it.
-  const exportStart = main.indexOf("_secureHandle('app-session-export-directory'");
-  assert.notEqual(exportStart, -1);
-  const exportBody = main.slice(exportStart, exportStart + 400);
-  assert.match(exportBody, /_requireAppRole\(COMMUNICATION_ROLES\)/,
-    'publishing is open to any signed-in profile');
-  assert.doesNotMatch(exportBody, /_requireAppRole\(new Set\(\['Owner'\]\)\)/);
-
-  // COMMUNICATION_ROLES must still be a closed set of known roles — widening to
-  // "any signed-in profile" must not become "no check at all".
-  assert.match(main,
-    /const COMMUNICATION_ROLES = new Set\(\['Owner', 'Operations Manager', 'Operations & Events', 'Front Desk'\]\)/);
-
-  // Removal and role change stay owner-gated, so a tombstone can still only
-  // originate from an owner action and what travels from a non-owner Mac is
-  // additive.
-  for (const handler of ['app-session-remove-staff-profile', 'app-session-set-profile-role']) {
-    const start = main.indexOf(`_secureHandle('${handler}'`);
-    assert.notEqual(start, -1, `${handler} exists`);
-    const body = main.slice(start, start + 3000);
-    assert.match(body, /_requireNotOwnerTarget\(target,/, `${handler} still protects Owner profiles`);
-  }
-
-  // Importing was already open to every role and must stay that way, or a Mac
-  // could publish something it could never receive.
-  const importStart = main.indexOf("_secureHandle('app-session-import-directory'");
-  assert.match(main.slice(importStart, importStart + 300), /_requireAppRole\(COMMUNICATION_ROLES\)/);
-});
-
-test('MB1188-029: an imported directory still cannot grant Owner or empty the owner slot', () => {
-  // The safety argument for widening publication rests entirely on this, so it
-  // is asserted here rather than assumed.
-  const apply = extractFunction(main, '_applyStaffDirectory');
-  assert.match(apply, /raw\.role === 'Owner' && isBuiltIn && APP_PROFILE_ROLES\[name\] === 'Owner'/,
-    'Owner is only ever kept for the built-in owner identity');
-  assert.match(apply, /ASSIGNABLE_PROFILE_ROLES\.includes\(raw\.role\) \? raw\.role : 'Front Desk'/,
-    'any unknown role falls back to Front Desk');
-  assert.match(apply, /The staff directory would leave no owner/,
-    'a directory that would strand a Mac without an owner is refused');
-  assert.match(apply, /custom\.length >= MAX_CUSTOM_STAFF_PROFILES/,
-    'and the profile count stays bounded');
-});

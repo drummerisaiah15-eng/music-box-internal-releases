@@ -4355,10 +4355,7 @@ function directoryPublishApi(overrides = {}) {
     localStorage,
     _syncReady: overrides.syncReady === true,
     _syncBootstrapComplete: overrides.syncReady === true,
-    // MB1188-029: publishing needs somebody signed in, not the owner.
-    currentUser: () => (overrides.signedOut === true
-      ? null
-      : (overrides.owner === true ? 'Elizabeth Chaves' : 'Nina Front Desk')),
+    isElizabeth: () => overrides.owner === true,
     showToast: (message, tone) => published.push({ toast: message, tone }),
     renderManageProfiles: () => {},
     STORE: {
@@ -4394,8 +4391,8 @@ function directoryPublishApi(overrides = {}) {
 }
 
 test('MB1188-008: adding a profile while signed out records the debt', async () => {
-  const { context } = directoryPublishApi({ signedOut: true });
-  assert.equal(await context.api.publish(), false, 'nobody is signed in, so nothing can be published');
+  const { context } = directoryPublishApi({ owner: false });
+  assert.equal(await context.api.publish(), false, 'a non-owner cannot publish');
   assert.equal(context.api.pending(), true,
     'the Mac remembers that its profile list is ahead of the others');
 });
@@ -4427,39 +4424,17 @@ test('MB1188-008: the owner signing in publishes and clears the marker', async (
   assert.deepEqual(Array.from(write.value, row => row.name), ['QA Front Desk']);
 });
 
-test('MB1188-029: someone other than the owner signing in shares them too', async () => {
-  // This asserted the opposite until MB1188-029: that a non-owner signing in
-  // left the debt for Elizabeth. That was the policy, and it is what made
-  // profiles added on a Mac she never signs into stay local forever.
-  const { context, published } = directoryPublishApi({ owner: false, syncReady: true, storage: {
+test('MB1188-008: someone else signing in leaves the marker for the owner', async () => {
+  // MB1188-029 inverted this and was reverted after a pentest: a published
+  // directory REBUILDS the receiving Mac's vault, so letting a Mac that is
+  // behind publish deletes profiles rather than merely failing to add them.
+  const { context, published } = directoryPublishApi({ owner: false, storage: {
     tmb__directory_publish_pending: '1',
   } });
-
   await context.api.flushPending();
-
-  assert.equal(context.api.pending(), false, 'the debt is settled by whoever signed in');
-  const write = published.find(entry => entry.key === 'staff_directory');
-  assert.ok(write, 'and the directory actually went out');
-});
-
-test('MB1188-029: nobody signed in still cannot publish', async () => {
-  const { context, published } = directoryPublishApi({ signedOut: true, syncReady: true, storage: {
-    tmb__directory_publish_pending: '1',
-  } });
-
-  await context.api.flushPending();
-
-  assert.equal(context.api.pending(), true, 'the login screen has no session to publish under');
-  assert.equal(published.some(entry => entry.key === 'staff_directory'), false);
-});
-
-test('MB1188-029: the manual retry no longer refuses everyone but the owner', async () => {
-  const { context, published } = directoryPublishApi({ owner: false, syncReady: true, storage: {
-    tmb__directory_publish_pending: '1',
-  } });
-
-  assert.equal(await context.api.retry(), true);
-  assert.ok(published.find(entry => entry.key === 'staff_directory'));
+  assert.equal(context.api.pending(), true, 'still pending — only the owner can publish');
+  assert.equal(published.some(entry => entry.key === 'staff_directory'), false,
+    'and nothing was written');
 });
 
 test('MB1188-008: the marker stays set when the write does not reach the cloud', async () => {
@@ -5148,7 +5123,7 @@ function publishDirectoryHarness({ cloudReady }) {
     },
     renderManageProfiles: () => {},
     showToast: () => {},
-    currentUser: () => 'Elizabeth Chaves',
+    isElizabeth: () => true,
     STORE: {
       replace: async (key, value) => { replaced.push({ key, value }); },
       flush: async (keys, options) => { flushes.push({ keys, options }); },

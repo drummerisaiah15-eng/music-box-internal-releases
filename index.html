@@ -2752,13 +2752,11 @@ async function publishStaffDirectory() {
     _setDirectoryPublicationPending(true);
     return false;
   }
-  // MB1188-029: publishing needs somebody signed in, but no longer needs it to
-  // be the owner. Nobody is signed in at the login screen, which is the only
-  // place a profile can be created, so this defer is still the normal path —
-  // it is just settled by whoever signs in next rather than by Elizabeth
-  // specifically, on that particular Mac. See app-session-export-directory in
-  // main.js for why widening it is safe.
-  if (!currentUser()) {
+  // Publishing is owner-only. MB1188-029 widened this and was reverted: the
+  // receiving Mac applies a published directory by REBUILDING its vault, so a
+  // stale publisher deletes profiles rather than merely failing to add them.
+  // See app-session-export-directory in main.js.
+  if (!isElizabeth()) {
     _setDirectoryPublicationPending(true);
     return false;
   }
@@ -2812,10 +2810,9 @@ async function publishStaffDirectory() {
 // add recorded the debt, and nothing ever settled it.
 async function flushPendingDirectoryPublication() {
   if (!_directoryPublicationPending()) return true;
-  // MB1188-029: anyone signed in can settle this now. It used to wait for
-  // Elizabeth, which meant a profile added on a Mac she never signs into stayed
-  // local forever.
-  if (!currentUser()) return true;
+  // Only the owner can publish. Anyone else signing in leaves the marker alone
+  // so it is still there when Elizabeth does.
+  if (!isElizabeth()) return true;
   const published = await publishStaffDirectory();
   if (published) {
     showToast(
@@ -2831,8 +2828,8 @@ async function flushPendingDirectoryPublication() {
 }
 
 async function retryDirectoryPublication() {
-  if (!currentUser()) {
-    showToast('Sign in to share profiles with the other Macs.', 'warning');
+  if (!isElizabeth()) {
+    showToast('Only the owner can share profiles with the other Macs.', 'warning');
     return false;
   }
   const published = await publishStaffDirectory();
@@ -3057,8 +3054,8 @@ async function addLoginUser() {
       showToast(`${result.profile.name} was added with Front Desk access.`, 'success');
     } else {
       showToast(
-        `${result.profile.name} was added on this Mac with Front Desk access. ` +
-        `Signing in here will share them with the other Macs.`,
+        `${result.profile.name} was added on this Mac with Front Desk access, but not yet ` +
+        `shared with the other Macs. Elizabeth can sign in here to publish it.`,
         'warning'
       );
     }
@@ -12414,7 +12411,7 @@ function _ssMergeCellFromGoogle(base, remote, local) {
 
 // MB1188-016: rows and columns that MOVED in Google.
 //
-// The merge above is per-cell and keyed by an absolute "row,column". That is
+// The merge below is per-cell and keyed by an absolute "row,column". That is
 // right while Google only ever edits in place, and quietly destructive the
 // moment somebody inserts or deletes a row: everything below shifts, so the
 // checkpoint for row 9 now describes whatever sits at row 10.
@@ -12422,172 +12419,91 @@ function _ssMergeCellFromGoogle(base, remote, local) {
 // Rows the app has NOT touched survive that on their own — "Google changed,
 // the app did not" takes Google's value, and after a shift Google's value is
 // exactly the shifted content. The rows that break are the ones the studio
-// edited. The stranded local edit stays at its old coordinate, lands on top of
+// edited: the stranded local edit stays at its old coordinate, lands on top of
 // whatever moved into that slot and destroys it, while the row the edit
-// belonged to reappears with the edit undone. One conflict is raised and it
-// describes the collision rather than the shift. So the damage is confined to
-// precisely the rows somebody cared about enough to change.
+// belonged to reappears with the edit undone.
 //
-// Google exposes no structural change feed — the Sheets API has no such events
-// and Drive revisions are whole-file snapshots — so the mapping is recovered by
-// diffing the checkpoint's lines against the incoming lines by content.
+// The first attempt at this recovered the mapping with an LCS diff over line
+// content and shifted the cells through it. A pentest killed that design, and
+// the reason is worth keeping: a uniqueness check proves a line's content is
+// unique on each side, but NOT that a match is the same line. Deleting a
+// column can make one row's new signature equal a different row's old
+// signature; every guard passed, the transform was applied, and an edit landed
+// on the wrong row with no conflict raised. Silently wrong beats loudly
+// refused only if you never look.
 //
-// The trust rule is what keeps this honest: an alignment only has to be right
-// for lines the app has locally modified, because every other line the existing
-// merge already handles correctly. So a line the app edited must match exactly
-// one incoming line and be unique enough on both sides to identify. When it is
-// not — a tab of blank or repeated rows, a row deleted in Google that was
-// edited here, structure moved on both axes at once — this refuses and says so.
-// Guessing is what the original bug did, and guessing is what did the damage.
-function _ssAxisSignatures(count, span, cellAt) {
-  const out = [];
-  for (let i = 0; i < count; i++) {
-    const parts = [];
-    for (let j = 0; j < span; j++) parts.push(_ssCellSignature(cellAt(i, j)));
-    out.push(parts.join('\u0001'));
-  }
-  return out;
-}
-
+// So this no longer maps anything. It only DETECTS that structure moved under
+// an edit, and holds the tab when it did. Everything it can prove, it proves
+// from content that did not move.
 function _ssSignatureIsBlank(signature) {
   return !/[^\u0001]/.test(String(signature ?? ''));
 }
 
-// Longest common subsequence over line signatures, returning the matched
-// (before, after) index pairs. Bounded by the read window — at most 500 rows
-// and 100 columns — so the full table is cheap and needs no heuristics.
-function _ssLcsPairs(before, after) {
-  const n = before.length;
-  const m = after.length;
-  const width = m + 1;
-  const dp = new Int32Array((n + 1) * width);
-  for (let i = n - 1; i >= 0; i--) {
-    for (let j = m - 1; j >= 0; j--) {
-      dp[i * width + j] = before[i] === after[j]
-        ? dp[(i + 1) * width + (j + 1)] + 1
-        : Math.max(dp[(i + 1) * width + j], dp[i * width + (j + 1)]);
+// Movement, stated without a mapping: some cell's exact content is no longer
+// where it was, and IS somewhere else in the grid.
+//
+// The first version of this compared whole-line signatures, and a pentest repro
+// walked straight through it — Google inserted a row AND typed into a
+// previously-empty column, so every shifted line's signature changed and no
+// line matched anything. Comparing cells instead survives that: the individual
+// values still moved, whatever else happened around them.
+//
+// Content merely CHANGING in place is not movement, and neither is a value
+// appearing or being cleared — those are ordinary concurrent edits that
+// _ssMergeCellFromGoogle resolves cell by cell, raising a real conflict when it
+// cannot. Refusing those would hold a tab every time somebody typed in Google.
+//
+// Deliberately biased toward holding: a repeated value can look relocated when
+// only one of its copies was edited in place. That costs a loud message and a
+// retry. The opposite error cost somebody's edit, silently.
+function _ssContentRelocated(checkpointAt, incomingAt, rows, cols) {
+  const incomingAnywhere = new Set();
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const signature = _ssCellSignature(incomingAt(r, c));
+      if (signature) incomingAnywhere.add(signature);
     }
   }
-  const pairs = [];
-  let i = 0;
-  let j = 0;
-  while (i < n && j < m) {
-    if (before[i] === after[j]) { pairs.push([i, j]); i++; j++; }
-    else if (dp[(i + 1) * width + j] >= dp[i * width + (j + 1)]) i++;
-    else j++;
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const base = _ssCellSignature(checkpointAt(r, c));
+      if (!base) continue;
+      if (_ssCellSignature(incomingAt(r, c)) === base) continue;
+      if (incomingAnywhere.has(base)) return true;
+    }
   }
-  return pairs;
+  return false;
 }
 
-// Move every cell onto its new line. Cells outside the window Google spoke
-// about stay exactly where they are; a line Google deleted drops out, which is
-// only ever reached for lines the app had not edited (an edited one refuses
-// above).
-function _ssShiftCellsAlongAxis(cells, axis, map, rows, cols) {
-  const out = {};
-  for (const [key, value] of Object.entries(cells || {})) {
-    const [row, column] = key.split(',').map(Number);
-    if (!Number.isSafeInteger(row) || !Number.isSafeInteger(column)) continue;
-    if (row >= rows || column >= cols) { out[key] = value; continue; }
-    const index = axis === 'row' ? row : column;
-    if (!map.has(index)) continue;
-    const moved = map.get(index);
-    out[axis === 'row' ? `${moved},${column}` : `${row},${moved}`] = value;
-  }
-  return out;
-}
-
-function _ssAlignGoogleStructure({ checkpoint, incoming, existing, rows, cols }) {
+// Returns { refuse, reason } or {}. Deliberately has no success case that
+// changes anything: the merge either runs exactly as it always did, or the tab
+// is held and reported by name. A false hold costs a loud message and a retry
+// next sync. A false transform cost somebody's edit.
+function _ssGoogleStructureHold({ checkpoint, incoming, existing, rows, cols }) {
   const checkpointAt = (r, c) => _ssCheckpointCell(checkpoint[`${r},${c}`]);
   const incomingAt = (r, c) => incoming.get(`${r},${c}`) || null;
   const localAt = (r, c) => existing[`${r},${c}`] || null;
-  const moving = [];
-  const refusals = [];
 
-  for (const axis of ['row', 'column']) {
-    const isRow = axis === 'row';
-    const count = isRow ? rows : cols;
-    const span = isRow ? cols : rows;
-    const orient = fn => (i, j) => (isRow ? fn(i, j) : fn(j, i));
-
-    // Only lines the app has changed since the checkpoint need the mapping to
-    // be right. Checked first because it is cheap and almost always empty.
-    const dirty = new Set();
-    for (let i = 0; i < count; i++) {
-      for (let j = 0; j < span; j++) {
-        const r = isRow ? i : j;
-        const c = isRow ? j : i;
-        if (_ssCellSignature(localAt(r, c)) !== _ssCellSignature(checkpointAt(r, c))) {
-          dirty.add(i);
-          break;
-        }
+  // Only cells the app has changed since the checkpoint can be harmed. Every
+  // other cell the existing merge already resolves correctly under a shift,
+  // which is why an untouched mirror needs no intervention at all. Checked
+  // first because it is cheap and almost always empty.
+  let dirty = false;
+  for (let r = 0; r < rows && !dirty; r++) {
+    for (let c = 0; c < cols; c++) {
+      if (_ssCellSignature(localAt(r, c)) !== _ssCellSignature(checkpointAt(r, c))) {
+        dirty = true;
+        break;
       }
     }
-    if (!dirty.size) continue;
-
-    const before = _ssAxisSignatures(count, span, orient(checkpointAt));
-    const after = _ssAxisSignatures(count, span, orient(incomingAt));
-    let identical = true;
-    for (let i = 0; i < count; i++) {
-      if (before[i] !== after[i]) { identical = false; break; }
-    }
-    if (identical) continue;
-
-    const pairs = _ssLcsPairs(before, after);
-    const map = new Map(pairs);
-    let moved = false;
-    for (const [a, b] of pairs) if (a !== b) { moved = true; break; }
-    if (!moved) continue;
-
-    const tally = sequence => {
-      const counts = new Map();
-      for (const entry of sequence) counts.set(entry, (counts.get(entry) || 0) + 1);
-      return counts;
-    };
-    const beforeCounts = tally(before);
-    const afterCounts = tally(after);
-    // Ordered so the reason names the actual problem. Checking uniqueness first
-    // reported a deleted row as "not unique", which is true of nothing and
-    // sends somebody looking in the wrong place.
-    let reason = null;
-    for (const index of dirty) {
-      const signature = before[index];
-      const seenAfter = afterCounts.get(signature) || 0;
-      if (_ssSignatureIsBlank(signature)) {
-        reason = `a ${axis} edited here is empty in Google, so where it moved to cannot be identified`;
-      } else if (beforeCounts.get(signature) !== 1) {
-        reason = `a ${axis} edited here appears more than once in the tab, so where it moved to cannot be identified`;
-      } else if (seenAfter === 0) {
-        reason = `a ${axis} edited here was deleted in Google`;
-      } else if (seenAfter > 1) {
-        reason = `a ${axis} edited here now appears more than once in Google, so which copy it became cannot be identified`;
-      } else if (!map.has(index)) {
-        reason = `a ${axis} edited here could not be matched to its new position`;
-      }
-      if (reason) break;
-    }
-    // Collected rather than returned, because a failure on one axis is only
-    // meaningful once the other has been looked at. When rows AND columns both
-    // move, every line signature changes on both axes and each one reports
-    // something like "deleted in Google" — true of neither, and misleading.
-    if (reason) refusals.push({ axis, reason });
-    else moving.push({ axis, map });
   }
+  if (!dirty) return {};
+  if (!_ssContentRelocated(checkpointAt, incomingAt, rows, cols)) return {};
 
-  if (refusals.length > 1 || (refusals.length === 1 && moving.length)) {
-    return { refuse: true, reason: 'the structure of this tab moved on both axes at once, which cannot be reconciled automatically' };
-  }
-  if (refusals.length === 1) return { refuse: true, reason: refusals[0].reason };
-  if (moving.length > 1) {
-    return { refuse: true, reason: 'rows and columns both moved in Google, which cannot be reconciled automatically' };
-  }
-  if (!moving.length) return { transform: false };
-  const { axis, map } = moving[0];
   return {
-    transform: true,
-    axis,
-    checkpoint: _ssShiftCellsAlongAxis(checkpoint, axis, map, rows, cols),
-    existing: _ssShiftCellsAlongAxis(existing, axis, map, rows, cols),
+    refuse: true,
+    reason: 'rows or columns moved in Google while this Mac has unsent edits in '
+      + 'this tab, so the two cannot be lined up safely',
   };
 }
 
@@ -12664,9 +12580,7 @@ async function ssPullFromGoogle(projectId, options) {
     }
     let renamed = 0;
     let missing = 0;
-    // MB1188-016: tabs whose structure moved and were realigned, and tabs held
-    // back because the move could not be identified with certainty.
-    let shifted = 0;
+    // MB1188-016: tabs held back because structure moved under a local edit.
     let held = 0;
     const heldTabs = [];
 
@@ -12740,27 +12654,20 @@ async function ssPullFromGoogle(projectId, options) {
         });
       });
 
-      let checkpoint = tab.checkpoint || {};
-      let existing = target.cells || {};
+      const checkpoint = tab.checkpoint || {};
+      const existing = target.cells || {};
 
-      // MB1188-016: recover any row or column that MOVED before merging, so a
-      // local edit follows its row instead of being stranded at a coordinate
-      // that now means something else.
-      const alignment = _ssAlignGoogleStructure({
+      // MB1188-016: hold the tab if structure moved under an edit made here.
+      const hold = _ssGoogleStructureHold({
         checkpoint, incoming, existing, rows: rowsThatFit, cols: colsThatFit,
       });
-      if (alignment.refuse) {
+      if (hold.refuse) {
         // Deliberately BEFORE anything is written: the checkpoint does not
         // advance, so nothing is half-merged and the next sync tries again.
         held += 1;
-        heldTabs.push(`${readTitle} (${alignment.reason})`);
-        console.warn(`[google] "${readTitle}" not merged: ${alignment.reason}`);
+        heldTabs.push(`${readTitle} (${hold.reason})`);
+        console.warn(`[google] "${readTitle}" not merged: ${hold.reason}`);
         continue;
-      }
-      if (alignment.transform) {
-        checkpoint = alignment.checkpoint;
-        existing = alignment.existing;
-        shifted += 1;
       }
       const cells = {};
       const newConflicts = [];
@@ -12902,14 +12809,13 @@ async function ssPullFromGoogle(projectId, options) {
     ssRenderHomeView();
     // Silent when nothing moved: this runs on a timer, and a toast every few
     // minutes saying "nothing happened" is how people learn to ignore toasts.
-    if (changed || clashes || dropped || renamed || missing || shifted || held || !silent) {
+    if (changed || clashes || dropped || renamed || missing || held || !silent) {
       const parts = [];
       if (changed) parts.push(`${changed.toLocaleString()} cell${changed === 1 ? '' : 's'} updated from Google`);
       if (clashes) parts.push(`${clashes} also changed here — kept yours, see conflicts`);
       if (dropped) parts.push(`${dropped} tab${dropped === 1 ? '' : 's'} larger than this app can hold`);
       if (renamed) parts.push(`${renamed} tab${renamed === 1 ? ' was' : 's were'} renamed in Google — still linked`);
       if (missing) parts.push(`${missing} linked tab${missing === 1 ? ' is' : 's are'} no longer in Google`);
-      if (shifted) parts.push(`${shifted} tab${shifted === 1 ? '' : 's'} realigned after rows or columns moved in Google`);
       if (held) parts.push(`${held} tab${held === 1 ? '' : 's'} NOT merged — ${heldTabs.join('; ')}`);
       showToast(parts.length ? parts.join('. ') + '.' : 'Already up to date with Google.',
         clashes || dropped || missing || held ? 'warning' : 'success');
