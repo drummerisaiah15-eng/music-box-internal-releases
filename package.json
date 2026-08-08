@@ -1,6 +1,6 @@
 {
   "name": "music-box-internal",
-  "version": "1.2.4",
+  "version": "1.2.5",
   "description": "The Music Box — Internal Operations",
   "main": "main.js",
   "scripts": {
@@ -23,7 +23,7 @@
     "copyright": "© 2025 The Music Box",
     "artifactName": "Music-Box-Internal-${version}-${arch}.${ext}",
     "forceCodeSigning": true,
-    "afterPack": "tests/harden-electron-fuses.js",
+    "afterPack": "./scripts/after-pack.js",
     "afterAllArtifactBuild": "tests/release-artifact-gate.js",
     "mac": {
       "category": "public.app-category.business",

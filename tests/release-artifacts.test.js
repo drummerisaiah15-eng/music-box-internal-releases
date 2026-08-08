@@ -320,7 +320,15 @@ test('build config pins deterministic updater artifact names', () => {
     'Music-Box-Internal-${version}-${arch}.${ext}',
   );
   assert.equal(packageMetadata.build.forceCodeSigning, true);
-  assert.equal(packageMetadata.build.afterPack, 'tests/harden-electron-fuses.js');
+  // The hook is composed now: electron-builder allows one afterPack, and both
+  // the fuse hardening and the ATS narrowing have to run. Assert the fuses are
+  // still actually invoked rather than just that the path is unchanged —
+  // pointing afterPack elsewhere without calling them is the failure mode.
+  assert.equal(packageMetadata.build.afterPack, './scripts/after-pack.js');
+  const composed = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'after-pack.js'), 'utf8');
+  assert.match(composed, /require\('\.\.\/tests\/harden-electron-fuses\.js'\)\.default/);
+  assert.match(composed, /await hardenElectronFuses\(context\)/,
+    'the fuse hardening must still run on every packed build');
   assert.equal(packageMetadata.build.afterAllArtifactBuild, 'tests/release-artifact-gate.js');
   assert.equal(packageMetadata.build.dmg.sign, true);
   assert.equal(packageMetadata.build.publish.provider, 'github');
@@ -1212,7 +1220,39 @@ test('release gate fails when the DMG has no stapled notarization ticket', t => 
   );
 });
 
-test('MB1188 minor: App Transport Security is not claimed to be narrowed', () => {
+test('App Transport Security is narrowed by a step that verifies the artifact', () => {
+  // The first attempt set mac.extendInfo.NSAppTransportSecurity in
+  // package.json. electron-builder deep-merges extendInfo into Electron's own
+  // ATS block and the existing `true` wins, so the built app still allowed
+  // arbitrary loads while the config said otherwise. It was removed rather than
+  // left claiming something untrue.
+  //
+  // This is the replacement: an afterPack hook that rewrites the plist and then
+  // reads it back, failing the build if it did not take. It runs before code
+  // signing, so the change is inside the signature.
+  const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+  assert.equal(pkg.build?.mac?.extendInfo?.NSAppTransportSecurity, undefined,
+    'extendInfo is silently ignored for this key — do not use it');
+  assert.equal(pkg.build?.afterPack, './scripts/after-pack.js');
+
+  const hook = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'after-pack.js'), 'utf8');
+  assert.match(hook, /NSAllowsArbitraryLoads: false/);
+  assert.match(hook, /NSAllowsLocalNetworking: true/,
+    'the Google OAuth loopback callback must still be reachable');
+  // The read-back is the point of the whole file.
+  assert.match(hook, /'-extract', 'NSAppTransportSecurity\.NSAllowsArbitraryLoads'/);
+  assert.match(hook, /refusing to produce this build/,
+    'a build that failed to narrow ATS must fail, not ship quietly');
+});
+
+test('the ATS hook is a build step, not shipped inside the app', () => {
+  const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+  const files = pkg.build?.files || [];
+  assert.ok(!files.some(entry => String(entry).includes('scripts/')),
+    'scripts/ must not be packaged into the app bundle');
+});
+
+test('superseded: App Transport Security is not claimed to be narrowed', () => {
   // A previous attempt set mac.extendInfo.NSAppTransportSecurity with
   // NSAllowsArbitraryLoads: false. Verifying the BUILT Info.plist showed it had
   // no effect: electron-builder deep-merges extendInfo into Electron's own ATS
