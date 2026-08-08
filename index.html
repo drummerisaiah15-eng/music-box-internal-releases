@@ -2780,6 +2780,15 @@ async function publishStaffDirectory() {
   } catch (error) {
     console.warn('[profiles] directory was not published:', error?.message || error);
     _setDirectoryPublicationPending(true);
+    // Say it out loud. This failed silently for hours: adds and removals both
+    // stopped reaching the other Mac, the only trace was a banner in a settings
+    // panel nobody had reason to open, and the sync badge still said "Synced"
+    // because the badge describes delivery, not refusal.
+    try {
+      showToast(
+        `Profile changes were not shared with the other Macs: ${error?.message || error}`,
+        'danger');
+    } catch (_) {}
     return false;
   }
 }
@@ -6019,8 +6028,9 @@ const SYNC_RECORD_IDENTITY = Object.freeze({
   assigned_tasks: 'id',
   policies: 'id',
   step_up_receipts: 'id',
-  // Profiles are identified by name; they have never carried an id.
-  staff_directory: 'name',
+  // Directory entries carry a real id (_directoryEntryId), and the merge keys
+  // on it. Keying this on `name` was wrong — see the tombstone note below.
+  staff_directory: 'id',
 });
 
 function _validateSyncRecordList(key, list) {
@@ -6041,10 +6051,19 @@ function _validateSyncRecordList(key, list) {
     }
     const idText = String(id);
     if (!idText || idText.length > 200) throw new Error(`${where} has an invalid ${identity}`);
-    // Two records sharing an identity is what makes a merge combine two
-    // different people's work into one, so it is refused rather than resolved.
-    if (seen.has(idText)) throw new Error(`${where} repeats ${identity} "${idText}"`);
-    seen.add(idText);
+    // Two LIVE records sharing an identity is what makes a merge combine two
+    // different people's work into one, so that is refused rather than resolved.
+    //
+    // A live record and a TOMBSTONE for the same identity is a different thing
+    // entirely: it is the normal transient state of a tombstoned list, which is
+    // exactly what the merge exists to settle. Refusing it rejected the whole
+    // key — and because the directory publishes a tombstone for every removed
+    // profile, removing someone and adding them back stopped ALL profile sync
+    // in both directions, silently, while both Macs still said "Synced".
+    const state = record._deleted === true ? 'deleted' : 'live';
+    const seenKey = state + '\u0000' + idText;
+    if (seen.has(seenKey)) throw new Error(`${where} repeats ${identity} "${idText}"`);
+    seen.add(seenKey);
     for (const [field, fieldValue] of Object.entries(record)) {
       if (typeof fieldValue === 'string' && fieldValue.length > MAX_SYNC_FIELD_CHARS) {
         throw new Error(`${where} has an oversized "${field}"`);

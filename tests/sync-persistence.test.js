@@ -4647,14 +4647,53 @@ test('MB1188-013: an oversized field is refused, not truncated', () => {
     /oversized "body"/);
 });
 
-test('MB1188-013: staff_directory is keyed by name, which is all it has ever had', () => {
+test('MB1188-013: staff_directory is keyed by the id its records actually carry', () => {
+  // Keyed on `name` originally, which was simply wrong: every directory entry
+  // carries a real id from _directoryEntryId, and the merge keys on it.
   const api = syncValidatorApi();
-  api.check('staff_directory', [{ name: 'Ana', role: 'Front Desk' }]);
-  assert.throws(() => api.check('staff_directory', [{ role: 'Front Desk' }]),
-    /has no usable name/);
-  assert.throws(() => api.check('staff_directory',
-    [{ name: 'Ana', role: 'Front Desk' }, { name: 'Ana', role: 'Owner' }]),
-    /repeats name "Ana"/);
+  api.check('staff_directory', [{ id: 'd_ana', name: 'Ana', role: 'Front Desk' }]);
+  assert.throws(() => api.check('staff_directory', [{ name: 'Ana', role: 'Front Desk' }]),
+    /has no usable id/);
+  assert.throws(() => api.check('staff_directory', [
+    { id: 'd_ana', name: 'Ana', role: 'Front Desk' },
+    { id: 'd_ana', name: 'Ana', role: 'Owner' },
+  ]), /repeats id "d_ana"/, 'two live records sharing an identity is still refused');
+});
+
+test('MB1188-013: a tombstone beside its live record is not a duplicate', () => {
+  // This is what broke profile sync completely. The directory publishes a
+  // tombstone for every removed profile, so removing someone and adding them
+  // back put a live record and a tombstone with the same identity in one
+  // payload. The validator rejected the whole key, so NOTHING about profiles
+  // synced in either direction — while both Macs went on saying "Synced",
+  // because the failure was on the write and swallowed.
+  const api = syncValidatorApi();
+  const live = { id: 'd_megan', name: 'Megan', role: 'Front Desk', builtIn: false };
+  const other = { id: 'd_ana', name: 'Ana', role: 'Front Desk', builtIn: false };
+  const tomb = { id: 'd_megan', name: 'Megan', role: 'Front Desk', builtIn: false,
+    _deleted: true, _deletedAt: '2026-08-08T00:00:00.000Z' };
+
+  assert.doesNotThrow(() => api.check('staff_directory', [live, other]));
+  assert.doesNotThrow(() => api.check('staff_directory', [other, tomb]),
+    'a removal on its own');
+  assert.doesNotThrow(() => api.check('staff_directory', [live, other, tomb]),
+    'removed and added back — the transient state the merge exists to settle');
+
+  // Two tombstones for one identity is still a duplicate.
+  assert.throws(() => api.check('staff_directory', [tomb, { ...tomb }]),
+    /repeats id "d_megan"/);
+});
+
+test('MB1188-013: the same rule protects every tombstoned list', () => {
+  const api = syncValidatorApi();
+  const record = (id, over = {}) => ({ id, body: 'x', ...over });
+  for (const key of ['logs', 'staff_notes', 'todo_items', 'assigned_tasks']) {
+    assert.doesNotThrow(
+      () => api.check(key, [record('r1'), record('r1', { _deleted: true })]),
+      `${key}: a tombstone may sit beside its record`);
+    assert.throws(() => api.check(key, [record('r1'), record('r1')]),
+      /repeats id/, `${key}: two live records may not`);
+  }
 });
 
 test('MB1188-013: well-formed data passes untouched', () => {
@@ -4896,4 +4935,17 @@ test('P0-01: flushing an unchanged workbook is still safe', async () => {
   await api.context.flush();
   await api.context.flush();
   assert.deepEqual(api.durable().projects.map(p => p.name), ['Same']);
+});
+
+test('a directory publish that fails says so rather than only setting a flag', () => {
+  // The validator regression above stopped every profile change reaching the
+  // other Mac. The only trace was a banner inside Settings, and the top-bar
+  // sync badge still said "Synced" — it describes delivery, not refusal. Hours
+  // went into that.
+  const publish = declaration('publishStaffDirectory');
+  assert.match(publish, /Profile changes were not shared with the other Macs/,
+    'the operator is told at the moment it happens');
+  assert.match(publish, /'danger'/);
+  assert.match(publish, /_setDirectoryPublicationPending\(true\)/,
+    'and the durable marker is still set so it can be retried');
 });
