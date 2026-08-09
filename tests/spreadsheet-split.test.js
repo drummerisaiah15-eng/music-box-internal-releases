@@ -1336,6 +1336,8 @@ test('MB161-012: capacity is measured per project once storage is split', () => 
     var MAX_SPREADSHEET_TOTAL_CELLS = 10000;
     var MAX_SPREADSHEET_TOTAL_CHARS = 400000;
     var MAX_SPREADSHEET_SYNC_JSON_BYTES = 600000;
+    // MB1188-031: capacity measures the sheet ceiling too, across every project.
+    var MAX_SPREADSHEET_SHEETS = 25;
     function _ssStorageMode() { return _mode; }
     ${declaration('_ssProjectAsDoc')}
     ${declaration('_ssCapacity')}
@@ -1666,7 +1668,9 @@ function normalizeApi() {
         MAX_SPREADSHEET_GRID_CELLS = 10000, MAX_SPREADSHEET_TOTAL_CELLS = 10000,
         MAX_SPREADSHEET_TOTAL_CHARS = 400000, MAX_SPREADSHEET_SYNC_JSON_BYTES = 600000,
         MAX_SPREADSHEET_ATTRIBUTIONS = 200, MAX_SPREADSHEET_ATTRIBUTION_NAME = 80,
-        MAX_RESOLVED_CONFLICT_IDS = 200, MAX_SPREADSHEET_CONFLICTS = 200;
+        MAX_RESOLVED_CONFLICT_IDS = 200, MAX_SPREADSHEET_CONFLICTS = 200,
+        // MB1188-031: the project count no longer borrows the sheet ceiling.
+        MAX_SPREADSHEET_PROJECTS = 25;
     ${declaration('_ssOversizeError')}
     ${declaration('_normalizeSpreadsheetAttribution')}
     ${declaration('_mergeResolvedConflictIds')}

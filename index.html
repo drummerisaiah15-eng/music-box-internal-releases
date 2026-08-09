@@ -8251,7 +8251,13 @@ const SS_DEFAULT_TIMES = [
 ];
 
 const MAX_SPREADSHEET_CELL_CHARS = 50000;
-const MAX_SPREADSHEET_SHEETS = 25;
+// MB1188-031: raised from 25. This is the TOTAL across every project, and a
+// studio running a project per week-view plus specials passes 25 immediately —
+// Isaiah was at 21 across five projects and could not import a sixth. The real
+// constraints are per-project and unchanged: MAX_SPREADSHEET_GRID_CELLS and the
+// sync document budget. This is a coarse guard on top of those, not the thing
+// keeping the workbook small.
+const MAX_SPREADSHEET_SHEETS = 60;
 const MAX_SPREADSHEET_ROWS = 500;
 const MAX_SPREADSHEET_COLS = 100;
 const MAX_SPREADSHEET_GRID_CELLS = 10000;
@@ -9045,6 +9051,11 @@ function _ssCapacity(workbook, projectId = workbook?.activeProject) {
     : (workbook?.projects || []);
   let cells = 0;
   let characters = 0;
+  // MB1188-031: the sheet ceiling is enforced across every project at once by
+  // normalizeSpreadsheetWorkbook, so it is counted that way here even under
+  // split storage, where the other measures are per-project.
+  let sheets = 0;
+  for (const project of workbook?.projects || []) sheets += (project?.sheets || []).length;
   for (const project of scope) {
     for (const sheet of project?.sheets || []) {
       const entries = Object.entries(sheet?.cells || {});
@@ -9062,6 +9073,7 @@ function _ssCapacity(workbook, projectId = workbook?.activeProject) {
     cells: { used: cells, limit: MAX_SPREADSHEET_TOTAL_CELLS, label: 'cells' },
     characters: { used: characters, limit: MAX_SPREADSHEET_TOTAL_CHARS, label: 'characters' },
     bytes: { used: bytes, limit: MAX_SPREADSHEET_SYNC_JSON_BYTES, label: 'total size' },
+    sheets: { used: sheets, limit: MAX_SPREADSHEET_SHEETS, label: 'sheets' },
   };
   // Report against whichever measure is closest to its limit — quoting the
   // roomiest one would be technically true and completely useless.
@@ -9077,6 +9089,7 @@ function _ssCapacityRefusal(workbook, extra = {}) {
     cells: capacity.cells.used + (extra.cells || 0),
     characters: capacity.characters.used + (extra.characters || 0),
     bytes: capacity.bytes.used + (extra.bytes || 0),
+    sheets: capacity.sheets.used + (extra.sheets || 0),
   };
   // Refuse only a change that BOTH lands over the limit and makes things worse.
   //
@@ -9095,6 +9108,16 @@ function _ssCapacityRefusal(workbook, extra = {}) {
       : null,
     blocks(wouldBe.bytes, capacity.bytes)
       ? `${Math.round(wouldBe.bytes / 1024)} KB against a limit of ${Math.round(capacity.bytes.limit / 1024)} KB`
+      : null,
+    // MB1188-031: this used to be missing here entirely, so an import that
+    // would breach it built everything, tried to save, and was refused by the
+    // validator with "spreadsheets exceeds the 25-sheet limit" — which reads as
+    // a complaint about the SHEET BEING IMPORTED. Isaiah quite reasonably
+    // replied that his project only has 6 tabs. The ceiling is the total across
+    // every project, so the message has to say so and show the arithmetic.
+    blocks(wouldBe.sheets, capacity.sheets)
+      ? `${wouldBe.sheets} sheets across all projects — ${capacity.sheets.used} now, ` +
+        `plus ${extra.sheets || 0} — against a limit of ${capacity.sheets.limit} in total`
       : null,
   ].filter(Boolean);
   if (!over.length) return null;
@@ -9185,7 +9208,10 @@ function normalizeSpreadsheetWorkbook(value) {
       typeof source.activeProject !== 'string' ||
       !Array.isArray(source.projects) ||
       source.projects.length < 1 ||
-      source.projects.length > MAX_SPREADSHEET_SHEETS) {
+      // MB1188-031: was MAX_SPREADSHEET_SHEETS, which conflated two different
+      // ceilings — raising the sheet total would have quietly raised the number
+      // of projects too, past the limit the index normalizer still enforces.
+      source.projects.length > MAX_SPREADSHEET_PROJECTS) {
     throw new Error('spreadsheets has an invalid project structure');
   }
 
@@ -9231,7 +9257,8 @@ function normalizeSpreadsheetWorkbook(value) {
     }
     totalSheets += project.sheets.length;
     if (totalSheets > MAX_SPREADSHEET_SHEETS) {
-      throw new Error(`spreadsheets exceeds the ${MAX_SPREADSHEET_SHEETS}-sheet limit`);
+      throw new Error(
+        `spreadsheets holds more than ${MAX_SPREADSHEET_SHEETS} sheets across all projects combined`);
     }
 
     const localSheetIds = new Set();
@@ -13222,7 +13249,7 @@ async function ssImportBuildProject(name, sheets, extraBytes, linkFor) {
       totals.cells += entries.length;
       totals.characters += entries.reduce((n, c) => n + String(c?.v ?? '').length, 0);
       return totals;
-    }, { cells: 0, characters: 0 });
+    }, { cells: 0, characters: 0, sheets: builtSheets.length });
     incoming.bytes = new TextEncoder().encode(JSON.stringify(builtSheets)).byteLength;
     // MB161-018: a Google import stores a checkpoint too — a copy of every text
     // value as Google last held it — and it is attached AFTER this check, in the

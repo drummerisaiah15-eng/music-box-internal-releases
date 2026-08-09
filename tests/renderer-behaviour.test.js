@@ -964,6 +964,8 @@ function capacityApi(workbook) {
     var MAX_SPREADSHEET_TOTAL_CELLS = 10000;
     var MAX_SPREADSHEET_TOTAL_CHARS = 400000;
     var MAX_SPREADSHEET_SYNC_JSON_BYTES = 600000;
+    // MB1188-031: capacity now measures the sheet ceiling too.
+    var MAX_SPREADSHEET_SHEETS = 25;
     var _ssData = ${JSON.stringify(workbook)};
     // MB161-012: capacity is per project once storage is split. These fixtures
     // exercise the legacy (workbook-wide) path, which is what an un-migrated
@@ -2467,4 +2469,92 @@ test('MB1188-030: the merge records what it settled, and the link carries it', (
   assert.match(normalize, /'mergeSig', 'settled'/,
     'the tab allowlist admits it — otherwise the whole workbook is refused');
   assert.match(normalize, /MAX_SPREADSHEET_SETTLED_CELLS/, 'and it is bounded');
+});
+
+// ── MB1188-031: the sheet ceiling is a TOTAL, and the message has to say so ───
+//
+// Importing a 6-tab Google spreadsheet was refused with "spreadsheets exceeds
+// the 25-sheet limit" while the workbook already held 21 sheets across five
+// projects. The number is a total across every project, but the message reads
+// as a complaint about the spreadsheet being imported — Isaiah replied, quite
+// reasonably, that the project only has 6 sheets.
+//
+// Worse, nothing checked it up front. _ssCapacityRefusal measured cells,
+// characters and bytes but not sheets, so the import built everything, tried to
+// save, and was refused by the workbook validator instead — the exact
+// half-built failure MB161-011 exists to prevent.
+
+// Isaiah's actual workbook: 6 + 7 + 2 + 4 + 2 = 21 sheets across five projects.
+const studioWorkbook = () => ({
+  activeProject: 'p1',
+  projects: [6, 7, 2, 4, 2].map((count, i) => ({
+    id: `p${i + 1}`,
+    name: `Project ${i + 1}`,
+    sheets: Array.from({ length: count }, (_, n) => ({
+      id: `p${i + 1}s${n}`, name: `S${n}`, rows: 5, cols: 5, colWidths: [], cells: {},
+    })),
+  })),
+});
+
+test('MB1188-031: the sheet total is counted across every project, not just the open one', () => {
+  // Split storage measures cells per project; the sheet ceiling is not per
+  // project, and counting it that way would never refuse anything.
+  const { api } = capacityApi(studioWorkbook());
+  assert.equal(api.capacity().sheets.used, 21);
+  assert.equal(api.capacity().sheets.limit, 25);
+});
+
+test('MB1188-031: a 6-tab import over the total is refused UP FRONT, with the arithmetic', () => {
+  const { api } = capacityApi(studioWorkbook());
+
+  const refusal = api.refusal({ cells: 200, characters: 900, bytes: 4000, sheets: 6 });
+
+  assert.ok(refusal, 'refused before anything is built or written');
+  // The numbers Isaiah needed and did not get.
+  assert.match(refusal, /27 sheets across all projects/);
+  assert.match(refusal, /21 now/);
+  assert.match(refusal, /plus 6/);
+  assert.match(refusal, /limit of 25 in total/);
+});
+
+test('MB1188-031: an import that fits is not refused', () => {
+  const { api } = capacityApi(studioWorkbook());
+  assert.equal(api.refusal({ cells: 10, characters: 10, bytes: 10, sheets: 4 }), null);
+});
+
+test('MB1188-031: a workbook already over the ceiling can still be pruned', () => {
+  // The no-exit trap the cells/characters/bytes checks already avoid: if being
+  // over were enough to refuse, deleting a project would be refused too — and
+  // deleting is the only way back under.
+  const over = studioWorkbook();
+  over.projects.push({
+    id: 'p6', name: 'Overflow',
+    sheets: Array.from({ length: 10 }, (_, n) => ({
+      id: `p6s${n}`, name: `S${n}`, rows: 5, cols: 5, colWidths: [], cells: {},
+    })),
+  });
+  const { api } = capacityApi(over);
+  assert.equal(api.capacity().sheets.used, 31);
+  assert.equal(api.refusal({ sheets: -10 }), null, 'removing sheets is never refused');
+});
+
+test('MB1188-031: the validator says the limit is a total', () => {
+  assert.match(declaration('normalizeSpreadsheetWorkbook'),
+    /more than \$\{MAX_SPREADSHEET_SHEETS\} sheets across all projects combined/,
+    'anything that still reaches the validator gets an honest message');
+});
+
+test('MB1188-031: the sheet total and the project count are separate ceilings', () => {
+  // They shared one constant, so raising the sheet total from 25 to 60 would
+  // have silently allowed 60 projects — past the 25 the index normalizer still
+  // enforces, which is a refusal on save rather than a refusal up front.
+  const script = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  assert.match(script, /const MAX_SPREADSHEET_SHEETS = 60;/, 'sheets, in total, across all projects');
+  assert.match(script, /const MAX_SPREADSHEET_PROJECTS = 25;/, 'projects');
+  assert.match(declaration('normalizeSpreadsheetWorkbook'),
+    /source\.projects\.length > MAX_SPREADSHEET_PROJECTS/,
+    'the project count is checked against the project limit, not the sheet one');
+  assert.match(declaration('normalizeSpreadsheetIndex'),
+    /live\.length > MAX_SPREADSHEET_PROJECTS/,
+    'and the index agrees, so the two cannot disagree about what is savable');
 });
