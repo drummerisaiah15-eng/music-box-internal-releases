@@ -1624,12 +1624,25 @@ test('MB161-020: the read asks Google for the validation that draws the box', ()
   // A Google checkbox is a validation rule; the cell value is just TRUE/FALSE.
   // Without this in the mask the tick is simply absent from the response, which
   // is why an imported checkbox column arrived reading "FALSE" all the way down.
-  assert.match(read, /dataValidation\(condition\(type\)\)/);
+  // MB1188-032: `values` as well as `type`, because the same rule is also how
+  // Google carries a dropdown, and without the options one imports as whatever
+  // text happened to be selected.
+  assert.match(read, /dataValidation\(condition\(type,values\(userEnteredValue\)\)\)/);
   assert.match(read, /cell\.dataValidation\?\.condition\?\.type === 'BOOLEAN'/);
-  assert.match(read, /formatLine\.push\(\{ bg, tc, b: bold, cb: checkbox \}\)/);
+  assert.match(read, /cell\.dataValidation\?\.condition\?\.type === 'ONE_OF_LIST'/);
+  assert.match(read, /formatLine\.push\(options/, 'a dropdown carries its options');
+  assert.match(read, /\{ bg, tc, b: bold, cb: checkbox \}/, 'everything else is unchanged');
+  // ONE_OF_RANGE points at another range and must NOT be followed: that would
+  // be a second read of a range nobody asked for, possibly on another tab.
+  // Scanned as a comparison, not as a bare word: the comment in main.js
+  // explaining WHY it is not followed contains the name, and a looser pattern
+  // fails on the explanation. Third time this codebase has caught someone out
+  // that way.
+  assert.doesNotMatch(read, /type === 'ONE_OF_RANGE'/);
   // An unticked box is content, so it has to count towards the used extent or
-  // an empty checkbox column would be trimmed away entirely.
-  assert.match(read, /bg \|\| tc \|\| bold \|\| checkbox/);
+  // an empty checkbox column would be trimmed away entirely. Same for a
+  // dropdown nobody has chosen from yet.
+  assert.match(read, /bg \|\| tc \|\| bold \|\| checkbox \|\| options/);
 });
 
 test('MB161-022: the newer colourStyle wins over the deprecated colour field', () => {

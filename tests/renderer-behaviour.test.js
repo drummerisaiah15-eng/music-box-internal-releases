@@ -464,6 +464,10 @@ function roundTripApi() {
     ${declaration('_ssOversizeError')}
     ${declaration('_normalizeSpreadsheetAttribution')}
     ${declaration('normalizeSpreadsheetWorkbook')}
+    // MB1188-032: option lists are bounded on save.
+    var MAX_SPREADSHEET_LISTS = 24;
+    var MAX_SPREADSHEET_LIST_OPTIONS = 50;
+    var MAX_SPREADSHEET_LIST_OPTION_CHARS = 200;
     globalThis.api = {
       merge: (base, dirtyBase, dirty) => _mergeSpreadsheetEdits(base, dirtyBase, dirty),
       norm: value => normalizeSpreadsheetWorkbook(value),
@@ -2557,4 +2561,190 @@ test('MB1188-031: the sheet total and the project count are separate ceilings', 
   assert.match(declaration('normalizeSpreadsheetIndex'),
     /live\.length > MAX_SPREADSHEET_PROJECTS/,
     'and the index agrees, so the two cannot disagree about what is savable');
+});
+
+// ── MB1188-032: Google dropdowns import as dropdowns ─────────────────────────
+//
+// A dropdown in Google is a data-validation rule, exactly like a checkbox. The
+// read only ever looked for BOOLEAN, so a dropdown arrived as whatever text
+// happened to be selected — "Wednesday" as a word, with no list behind it and
+// nothing stopping a typo.
+//
+// Google reports the rule on EVERY cell it covers, so a seven-option column
+// eighty rows deep arrives as eighty copies of the same seven strings. They are
+// interned per sheet, and each cell keeps an index.
+
+function optionListApi() {
+  const context = vm.createContext({ String, JSON, Object, Array, Number, Math, Boolean, Map, Set, console });
+  vm.runInContext(`
+    const MAX_SPREADSHEET_LISTS = 24;
+    const MAX_SPREADSHEET_LIST_OPTIONS = 50;
+    ${declaration('_ssInternOptionLists')}
+    globalThis.intern = formats => {
+      const out = _ssInternOptionLists(formats);
+      return { lists: out.lists, indexAt: [...out.indexAt.entries()] };
+    };
+  `, context);
+  return context;
+}
+
+const DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+
+test('MB1188-032: a repeated dropdown is stored once, not once per cell', () => {
+  const context = optionListApi();
+  // What Google actually sends: the same rule on all eighty cells.
+  const formats = Array.from({ length: 80 }, () => [{ bg: '', tc: '', b: false, dv: DAYS }]);
+
+  const { lists, indexAt } = context.intern(formats);
+
+  assert.equal(lists.length, 1, 'eighty identical rules collapse to one list');
+  assert.deepEqual(lists[0], DAYS);
+  assert.equal(indexAt.length, 80, 'and every cell still points at it');
+  assert.deepEqual(indexAt[0], ['0,0', 0]);
+  assert.deepEqual(indexAt[79], ['79,0', 0]);
+});
+
+test('MB1188-032: different lists get different entries', () => {
+  const context = optionListApi();
+  const reasons = ['Sick', 'Requested'];
+  const { lists, indexAt } = context.intern([
+    [{ dv: DAYS }, { dv: reasons }],
+    [{ dv: DAYS }, { dv: reasons }],
+  ]);
+
+  assert.equal(lists.length, 2);
+  assert.deepEqual(lists[0], DAYS);
+  assert.deepEqual(lists[1], reasons);
+  assert.deepEqual(new Map(indexAt).get('1,1'), 1, 'the second column keeps its own list');
+});
+
+test('MB1188-032: cells with no dropdown are untouched', () => {
+  const context = optionListApi();
+  const { lists, indexAt } = context.intern([[{ bg: '#000000' }, { v: 'plain' }]]);
+  assert.equal(lists.length, 0);
+  assert.equal(indexAt.length, 0);
+});
+
+test('MB1188-032: the number of distinct lists is bounded', () => {
+  const context = optionListApi();
+  // 30 distinct lists on one sheet, against a ceiling of 24.
+  const formats = [Array.from({ length: 30 }, (_, i) => ({ dv: [`only-${i}`] }))];
+
+  const { lists, indexAt } = context.intern(formats);
+
+  assert.equal(lists.length, 24, 'bounded');
+  // The surplus is left as plain text rather than pointing at nothing.
+  assert.equal(indexAt.length, 24);
+  assert.equal(new Map(indexAt).has('0,29'), false);
+});
+
+test('MB1188-032: a workbook carrying dropdowns survives normalization', () => {
+  const { norm } = roundTripApi();
+  const book = {
+    activeProject: 'p1',
+    projects: [{
+      id: 'p1', name: 'Absences', activeId: 's1',
+      sheets: [{
+        id: 's1', name: 'Tracker', rows: 4, cols: 2, colWidths: [],
+        lists: [DAYS],
+        cells: {
+          '0,0': { v: 'Wednesday', bg: '#fff2cc', tc: '', b: false, dv: 0 },
+          '1,0': { v: '', bg: '', tc: '', b: false, dv: 0 },
+          '0,1': { v: 'plain', bg: '', tc: '', b: false },
+        },
+      }],
+    }],
+  };
+
+  const sheet = norm(book).projects[0].sheets[0];
+
+  assert.deepEqual(sheet.lists, [DAYS], 'the list survives the save');
+  assert.equal(sheet.cells['0,0'].dv, 0, 'and the cell keeps pointing at it');
+  assert.equal(sheet.cells['1,0'].dv, 0, 'including one nobody has chosen from yet');
+  assert.equal('dv' in sheet.cells['0,1'], false, 'an ordinary cell gains nothing');
+});
+
+test('MB1188-032: a dangling list index is dropped, not thrown on', () => {
+  // Same trade as a bad colour and as MB1188-014: losing the dropdown costs a
+  // dropdown; refusing costs the entire workbook and quarantines the project.
+  const { norm } = roundTripApi();
+  const book = {
+    activeProject: 'p1',
+    projects: [{
+      id: 'p1', name: 'P', activeId: 's1',
+      sheets: [{
+        id: 's1', name: 'S', rows: 2, cols: 1, colWidths: [],
+        lists: [DAYS],
+        cells: { '0,0': { v: 'Wednesday', bg: '', tc: '', b: false, dv: 7 } },
+      }],
+    }],
+  };
+
+  const sheet = norm(book).projects[0].sheets[0];
+
+  assert.equal('dv' in sheet.cells['0,0'], false, 'the dangling index is dropped');
+  assert.equal(sheet.cells['0,0'].v, 'Wednesday', 'and the value is untouched');
+});
+
+test('MB1188-032: option lists are bounded and de-duplicated on save', () => {
+  const { norm } = roundTripApi();
+  const book = {
+    activeProject: 'p1',
+    projects: [{
+      id: 'p1', name: 'P', activeId: 's1',
+      sheets: [{
+        id: 's1', name: 'S', rows: 2, cols: 1, colWidths: [],
+        lists: [['A', 'A', 'B', '', 123, 'C']],
+        cells: { '0,0': { v: 'A', bg: '', tc: '', b: false, dv: 0 } },
+      }],
+    }],
+  };
+
+  assert.deepEqual(norm(book).projects[0].sheets[0].lists, [['A', 'B', 'C']],
+    'duplicates, blanks and non-strings are dropped rather than refused');
+});
+
+test('MB1188-032: a merge does not revert a sheet\'s option lists', () => {
+  // §5 of the handoff, and the reason it keeps happening: the merge rebuilds the
+  // workbook from the reconciled base and replays OPERATIONS, which describe
+  // cells, sheets and names. Anything else attached to a sheet silently reverts
+  // — colorKey, googleLink, editedBy, _conflicts and the new-sheet activeId each
+  // went this way in turn. Option lists are the same class of state.
+  const { merge } = roundTripApi();
+  const sheetWith = lists => ({
+    id: 's1', name: 'S', rows: 3, cols: 2, colWidths: [],
+    cells: { '0,0': cell('Wednesday') },
+    ...(lists ? { lists } : {}),
+  });
+  const bookWith = lists => ({
+    activeProject: 'p1',
+    projects: [{ id: 'p1', name: 'P', activeId: 's1', sheets: [sheetWith(lists)] }],
+  });
+
+  // The other Mac has no lists; this Mac just imported them from Google.
+  const merged = merge(bookWith(null), bookWith(null), bookWith([DAYS]));
+
+  assert.deepEqual(merged.projects[0].sheets[0].lists, [DAYS],
+    'the lists this Mac gained are not thrown away by the merge');
+});
+
+test('MB1188-032: picking is constrained to the offered options', () => {
+  // The one place the app writes a cell value nobody typed. A dropdown that can
+  // be set to anything is not a dropdown, and this is exactly the surface where
+  // a stray value would flow on to Google-linked data.
+  const pick = declaration('ssPickCellOption');
+  assert.match(pick, /if \(!options \|\| \(option !== '' && !options\.includes\(option\)\)\) return;/,
+    'anything not on the list, and not the explicit clear, is refused');
+  assert.match(pick, /sheet\.cells\[key\] = \{ \.\.\.cell, v: option \}/,
+    'replaced rather than mutated, or the save derives no operation for it');
+  assert.match(pick, /ssPushUndo\(\)/, 'and it is undoable like any other edit');
+  assert.match(pick, /ssSave\(\)/, 'and it saves');
+});
+
+test('MB1188-032: only the caret opens the list, so the cell can still be selected', () => {
+  const grid = declaration('ssGridMouseDown');
+  assert.match(grid, /e\.target\.dataset\?\.dv === '1'/,
+    'checked against the caret, not the cell');
+  const render = declaration('ssRenderGrid');
+  assert.match(render, /ss-dv-caret" data-dv="1"/, 'and only the caret carries it');
 });

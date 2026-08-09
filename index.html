@@ -1060,6 +1060,18 @@
     }
     /* MB161-020: a checkbox cell. Centred like Google's, and sized so it still
        fits a 26px row without changing it. */
+    .ss-cell-dv { display:flex; align-items:center; justify-content:space-between; gap:4px; }
+    .ss-dv-caret { flex:0 0 auto; opacity:.45; font-size:10px; cursor:pointer; padding:0 2px; }
+    .ss-dv-caret:hover { opacity:1; }
+    .ss-dv-menu { position:fixed; z-index:9999; background:var(--surface,#fff);
+      border:1px solid var(--divider,#d8d8d8); border-radius:8px; padding:4px;
+      box-shadow:0 8px 24px rgba(0,0,0,.18); max-height:320px; overflow:auto; min-width:150px; }
+    .ss-dv-option { display:block; width:100%; text-align:left; background:none; border:0;
+      padding:4px 6px; cursor:pointer; border-radius:6px; font-size:12.5px; }
+    .ss-dv-option:hover { background:var(--hover,#f2f2f2); }
+    .ss-dv-current { font-weight:600; }
+    .ss-dv-chip { display:inline-block; padding:2px 10px; border-radius:999px; }
+    .ss-dv-clear { color:var(--text-muted,#777); font-size:11.5px; }
     .ss-cell-inner.ss-cell-check {
       display:flex;align-items:center;justify-content:center;padding:0;
     }
@@ -8251,6 +8263,10 @@ const SS_DEFAULT_TIMES = [
 ];
 
 const MAX_SPREADSHEET_CELL_CHARS = 50000;
+// MB1188-032: dropdown option lists, interned per sheet.
+const MAX_SPREADSHEET_LISTS = 24;
+const MAX_SPREADSHEET_LIST_OPTIONS = 50;
+const MAX_SPREADSHEET_LIST_OPTION_CHARS = 200;
 // MB1188-031: raised from 25. This is the TOTAL across every project, and a
 // studio running a project per week-view plus specials passes 25 immediately —
 // Isaiah was at 21 across five projects and could not import a sixth. The real
@@ -9265,7 +9281,7 @@ function normalizeSpreadsheetWorkbook(value) {
     const sheets = project.sheets.map(sheet => {
       if (!sheet || typeof sheet !== 'object' || Array.isArray(sheet) ||
           !Object.keys(sheet).every(key =>
-            ['id', 'name', 'rows', 'cols', 'colWidths', 'cells', 'editedBy'].includes(key)
+            ['id', 'name', 'rows', 'cols', 'colWidths', 'cells', 'editedBy', 'lists'].includes(key)
           )) {
         throw new Error('spreadsheets has an invalid sheet');
       }
@@ -9302,6 +9318,26 @@ function normalizeSpreadsheetWorkbook(value) {
         if (!Number.isFinite(number)) return 100;
         return Math.round(Math.min(1000, Math.max(40, number)));
       });
+      // MB1188-032: option lists for dropdown cells, interned per sheet. A cell
+      // holds an index into this, so a column of eighty dropdowns costs one
+      // list plus eighty small integers rather than eighty copies of it.
+      const lists = [];
+      if (Array.isArray(sheet.lists)) {
+        for (const list of sheet.lists.slice(0, MAX_SPREADSHEET_LISTS)) {
+          if (!Array.isArray(list)) { lists.push([]); continue; }
+          const options = [];
+          const seen = new Set();
+          for (const option of list) {
+            if (options.length >= MAX_SPREADSHEET_LIST_OPTIONS) break;
+            if (typeof option !== 'string' || !option) continue;
+            const trimmed = option.slice(0, MAX_SPREADSHEET_LIST_OPTION_CHARS);
+            if (seen.has(trimmed)) continue;
+            seen.add(trimmed);
+            options.push(trimmed);
+          }
+          lists.push(options);
+        }
+      }
       const rawCells = sheet.cells === undefined ? {} : sheet.cells;
       if (!rawCells || typeof rawCells !== 'object' || Array.isArray(rawCells)) {
         throw new Error('spreadsheets has invalid cells');
@@ -9321,7 +9357,7 @@ function normalizeSpreadsheetWorkbook(value) {
             // as constructed below — the whitelist is checked against the INPUT,
             // so a cell carrying a key this does not name is refused outright
             // and the project quarantines on save.
-            !Object.keys(cell).every(key => ['v', 'bg', 'tc', 'b', 'rs', 'cs', 'cb'].includes(key))) {
+            !Object.keys(cell).every(key => ['v', 'bg', 'tc', 'b', 'rs', 'cs', 'cb', 'dv'].includes(key))) {
           throw new Error('spreadsheets contains an invalid cell');
         }
         const row = Number(match[1]);
@@ -9366,6 +9402,14 @@ function normalizeSpreadsheetWorkbook(value) {
         if (cell.cb) normalizedCell.cb = true;
         if (rowSpan > 1) normalizedCell.rs = rowSpan;
         if (colSpan > 1) normalizedCell.cs = colSpan;
+        // MB1188-032: which option list this cell picks from. Dropped rather
+        // than refused when it points at nothing — a dangling index costs the
+        // dropdown, and refusing would cost the whole workbook. Same trade as
+        // the colour a few lines up, and as MB1188-014 taught the hard way.
+        if (Number.isSafeInteger(cell.dv) && cell.dv >= 0 && cell.dv < lists.length &&
+            lists[cell.dv].length) {
+          normalizedCell.dv = cell.dv;
+        }
         cells[cellKey] = normalizedCell;
         positions.set(cellKey, { row, col, rowSpan, colSpan });
       }
@@ -9420,6 +9464,7 @@ function normalizeSpreadsheetWorkbook(value) {
       }
 
       const normalizedSheet = { id: sheetId, name: sheetName, rows, cols, colWidths, cells };
+      if (lists.length) normalizedSheet.lists = lists;
       // Attribution is bookkeeping, not content: a bad entry must never make a
       // real workbook unloadable, so it is filtered and capped rather than
       // rejected — the same treatment _conflicts gets.
@@ -10255,6 +10300,13 @@ function _mergeSpreadsheetEdits(base, dirtyBase, dirty, stagedActor) {
       if (JSON.stringify(sheet.colWidths) !== JSON.stringify(originSheet.colWidths)) {
         target.colWidths = _cloneJson(sheet.colWidths);
       }
+      // MB1188-032: option lists are sheet-level state no operation describes,
+      // so without this they revert to the base copy on every merge — the same
+      // way colorKey, googleLink, editedBy and _conflicts each did in turn.
+      if (JSON.stringify(sheet.lists) !== JSON.stringify(originSheet.lists)) {
+        if (sheet.lists) target.lists = _cloneJson(sheet.lists);
+        else delete target.lists;
+      }
       if (sheet.id === local.activeId) project.activeId = sheet.id;
     }
     if (!project.sheets.some(s => s.id === project.activeId) && project.sheets.length) {
@@ -10973,6 +11025,87 @@ function ssRenderTabs() {
   ).join('') + `<div class="ss-tab-add" onclick="ssNewSheet()" title="New sheet">＋</div>`;
 }
 
+// MB1188-032: the options a cell offers, or null if it is not a dropdown.
+function _ssCellOptions(sheet, cell) {
+  if (!cell || !Number.isSafeInteger(cell.dv)) return null;
+  const list = sheet?.lists?.[cell.dv];
+  return Array.isArray(list) && list.length ? list : null;
+}
+
+// Open on the cell, so it reads as part of the grid rather than a modal. The
+// current value is marked, and every option carries the fill it already has
+// elsewhere in this column — which is where the colour comes from, since Google
+// reports a chip's colour on the cell rather than on the rule.
+function ssOpenCellDropdown(r, c) {
+  const sheet = ssActiveSheet();
+  if (!sheet) return;
+  const cell = sheet.cells[ssKey(r, c)];
+  const options = _ssCellOptions(sheet, cell);
+  if (!options) return;
+  _ssCloseCellDropdown();
+  const td = document.querySelector(`td[data-r="${r}"][data-c="${c}"]`);
+  if (!td) return;
+
+  // Whatever fill each option is drawn with elsewhere in the same column.
+  const swatches = new Map();
+  for (const [key, other] of Object.entries(sheet.cells || {})) {
+    const [, oc] = key.split(',').map(Number);
+    if (oc !== c || !other?.v || swatches.has(other.v)) continue;
+    if (other.bg || other.tc) swatches.set(other.v, { bg: other.bg || '', tc: other.tc || '' });
+  }
+
+  const menu = document.createElement('div');
+  menu.className = 'ss-dv-menu';
+  menu.id = 'ss-dv-menu';
+  const current = String(cell.v || '');
+  menu.innerHTML = options.map(option => {
+    const swatch = swatches.get(option) || {};
+    const style = `background:${safeCssColor(swatch.bg) || 'transparent'};` +
+      `color:${safeCssColor(swatch.tc) || 'inherit'}`;
+    return `<button type="button" class="ss-dv-option${option === current ? ' ss-dv-current' : ''}" ` +
+      `onclick="ssPickCellOption(${r},${c},${jsArg(option)})">` +
+      `<span class="ss-dv-chip" style="${style}">${escHtml(option)}</span></button>`;
+  }).join('') +
+    `<button type="button" class="ss-dv-option ss-dv-clear" onclick="ssPickCellOption(${r},${c},'')">Clear</button>`;
+  const box = td.getBoundingClientRect();
+  menu.style.left = `${Math.round(box.left)}px`;
+  menu.style.top = `${Math.round(box.bottom)}px`;
+  document.body.appendChild(menu);
+  setTimeout(() => document.addEventListener('mousedown', _ssDropdownAway, { once: true }), 0);
+}
+
+function _ssDropdownAway(event) {
+  if (event.target.closest?.('#ss-dv-menu')) {
+    document.addEventListener('mousedown', _ssDropdownAway, { once: true });
+    return;
+  }
+  _ssCloseCellDropdown();
+}
+
+function _ssCloseCellDropdown() {
+  document.getElementById('ss-dv-menu')?.remove();
+}
+
+function ssPickCellOption(r, c, option) {
+  _ssCloseCellDropdown();
+  const sheet = ssActiveSheet();
+  if (!sheet) return;
+  const key = ssKey(r, c);
+  const cell = sheet.cells[key];
+  const options = _ssCellOptions(sheet, cell);
+  // Only ever one of the offered options, or empty. A dropdown that could be
+  // set to anything is not a dropdown, and this is the one place the app writes
+  // a value it did not get from a person typing.
+  if (!options || (option !== '' && !options.includes(option))) return;
+  if (String(cell.v || '') === option) return;
+  ssPushUndo();
+  // Replaced rather than mutated, exactly as ssToggleCheckbox does: the save
+  // path derives operations by comparing objects, and mutating in place is how
+  // an edit gets missed.
+  sheet.cells[key] = { ...cell, v: option };
+  ssSave(); ssRenderGrid(); ssUpdateToolbar();
+}
+
 function ssRenderGrid() {
   const sheet = ssActiveSheet();
   const table = document.getElementById('ss-grid');
@@ -11037,6 +11170,12 @@ function ssRenderGrid() {
         html += `<div class="ss-cell-inner ss-cell-check"><span class="ss-check${
           _ssIsChecked(cell.v) ? ' ss-check-on' : ''}" data-cb="1">${
           _ssIsChecked(cell.v) ? '&#10003;' : ''}</span></div>`;
+      } else if (_ssCellOptions(sheet, cell)) {
+        // MB1188-032: a dropdown imported from Google. The value is still plain
+        // text — that is what Google holds and what the checkpoint compares —
+        // so only the drawing and the way it is edited change.
+        html += `<div class="ss-cell-inner ss-cell-dv">${escHtml(cell.v||'')}` +
+          `<span class="ss-dv-caret" data-dv="1">&#9662;</span></div>`;
       } else {
         html += `<div class="ss-cell-inner">${escHtml(cell.v||'')}</div>`;
       }
@@ -12453,6 +12592,35 @@ function _ssMergeCellFromGoogle(base, remote, local) {
   return { take: 'conflict', cell: local ?? null };
 }
 
+// MB1188-032: intern the option lists a Google read carries.
+//
+// Google reports the validation rule on EVERY cell it applies to, so a
+// seven-option dropdown down eighty rows arrives as eighty copies of the same
+// seven strings. Stored that way it would multiply the sync document against a
+// budget the project already has to fit inside. So identical lists collapse to
+// one entry and each cell keeps an index.
+function _ssInternOptionLists(formats) {
+  const lists = [];
+  const byKey = new Map();
+  const indexAt = new Map();
+  (formats || []).forEach((row, r) => {
+    (row || []).forEach((format, c) => {
+      const options = Array.isArray(format?.dv) ? format.dv.filter(o => typeof o === 'string' && o) : null;
+      if (!options || !options.length) return;
+      const key = JSON.stringify(options);
+      let index = byKey.get(key);
+      if (index === undefined) {
+        if (lists.length >= MAX_SPREADSHEET_LISTS) return;   // bounded; extras stay plain text
+        index = lists.length;
+        lists.push(options.slice(0, MAX_SPREADSHEET_LIST_OPTIONS));
+        byKey.set(key, index);
+      }
+      indexAt.set(r + ',' + c, index);
+    });
+  });
+  return { lists, indexAt };
+}
+
 // MB1188-016: rows and columns that MOVED in Google.
 //
 // The merge below is per-cell and keyed by an absolute "row,column". That is
@@ -12729,6 +12897,7 @@ async function ssPullFromGoogle(projectId, options) {
 
       // What Google sends now, in the app's cell shape.
       const incoming = new Map();
+      const interned = _ssInternOptionLists(remote.formats);
       (remote.rows || []).forEach((row, r) => {
         if (r >= rowsThatFit) return;
         row.forEach((value, c) => {
@@ -12738,10 +12907,12 @@ async function ssPullFromGoogle(projectId, options) {
           const tc = _ssImportColor(format?.tc);
           const bold = format?.b === true;
           const checkbox = format?.cb === true;
+          const listIndex = interned.indexAt.get(r + ',' + c);
           const text = String(value ?? '');
-          if (text === '' && !bg && !tc && !bold && !checkbox) return;
+          if (text === '' && !bg && !tc && !bold && !checkbox && listIndex === undefined) return;
           const built = { v: text, bg, tc, b: bold };
           if (checkbox) built.cb = true;
+          if (listIndex !== undefined) built.dv = listIndex;
           incoming.set(r + ',' + c, built);
         });
       });
@@ -12838,6 +13009,13 @@ async function ssPullFromGoogle(projectId, options) {
         });
       }
       target.cells = cells;
+      // MB1188-032: Google is the authority on which options a dropdown offers,
+      // so the lists are restated from the read rather than merged — the same
+      // treatment column widths get. A list removed in Google leaves the cells
+      // as plain text, which the normalizer already handles by dropping a
+      // dangling index rather than refusing the workbook.
+      if (interned.lists.length) target.lists = interned.lists;
+      else delete target.lists;
 
       // The checkpoint describes exactly the extent the app kept, never what
       // Google sent, so a row that did not fit cannot later read as "deleted".
@@ -13195,6 +13373,7 @@ async function ssImportBuildProject(name, sheets, extraBytes, linkFor) {
     // background, and dropping it because `val === ''` is what made the first
     // Google import look nothing like the sheet it came from.
     const formats = Array.isArray(s.formats) ? s.formats : null;
+    const interned = _ssInternOptionLists(formats);
     rows2d.forEach((row, ri) => {
       row.forEach((val, ci) => {
         const format = formats?.[ri]?.[ci];
@@ -13202,9 +13381,11 @@ async function ssImportBuildProject(name, sheets, extraBytes, linkFor) {
         const tc = _ssImportColor(format?.tc);
         const bold = format?.b === true;
         const checkbox = format?.cb === true;
-        if (val !== '' || bg || tc || bold || checkbox) {
+        const listIndex = interned.indexAt.get(ri + ',' + ci);
+        if (val !== '' || bg || tc || bold || checkbox || listIndex !== undefined) {
           const built = { v: val, bg, tc, b: bold };
           if (checkbox) built.cb = true;
+          if (listIndex !== undefined) built.dv = listIndex;
           cells[ri + ',' + ci] = built;
         }
       });
@@ -13237,7 +13418,8 @@ async function ssImportBuildProject(name, sheets, extraBytes, linkFor) {
       rows: storedRows,
       cols: storedCols,
       colWidths,
-      cells
+      cells,
+      ...(interned.lists.length ? { lists: interned.lists } : {}),
     };
   });
     // MB161-011: the import is fully built and measured BEFORE anything is
@@ -13408,6 +13590,17 @@ function ssGridMouseDown(e) {
   if (e.target.dataset?.cb === '1') {
     _ssSelR=r;_ssSelC=c;_ssSelR2=r;_ssSelC2=c;
     ssToggleCheckbox(r, c);
+    e.preventDefault();
+    return;
+  }
+
+  // MB1188-032: the same idea for a dropdown — the caret opens the list, the
+  // rest of the cell still just selects, so a dropdown cell can be selected,
+  // copied or recoloured without being changed.
+  if (e.target.dataset?.dv === '1') {
+    _ssSelR=r;_ssSelC=c;_ssSelR2=r;_ssSelC2=c;
+    ssRenderGrid();
+    ssOpenCellDropdown(r, c);
     e.preventDefault();
     return;
   }

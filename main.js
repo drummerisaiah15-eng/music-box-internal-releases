@@ -2411,7 +2411,13 @@ _secureHandle('google-sheet-read', async (_, request) => {
     // string TRUE or FALSE — which is why an imported checkbox column arrived as
     // a column reading "FALSE". The box itself is the validation rule, so
     // without this the tick is simply not in the response.
-    'data(rowData(values(formattedValue,dataValidation(condition(type)),effectiveFormat(backgroundColor,backgroundColorStyle,textFormat(bold,foregroundColor,foregroundColorStyle)))),columnMetadata(pixelSize)))',
+    //
+    // MB1188-032: `values` as well as `type`, because the same rule is how
+    // Google carries a DROPDOWN. Without the option list a dropdown imported as
+    // whatever text happened to be selected — "Wednesday" as a word, with no
+    // way to pick a different day and nothing stopping a typo. The list is a few
+    // short strings per column, not per cell, so the extra payload is small.
+    'data(rowData(values(formattedValue,dataValidation(condition(type,values(userEnteredValue))),effectiveFormat(backgroundColor,backgroundColorStyle,textFormat(bold,foregroundColor,foregroundColorStyle)))),columnMetadata(pixelSize)))',
   ].join(',');
   let payload;
   try {
@@ -2453,12 +2459,34 @@ _secureHandle('google-sheet-read', async (_, request) => {
                                  effective.textFormat?.foregroundColor, '#000000');
       const bold = effective.textFormat?.bold === true;
       const checkbox = cell.dataValidation?.condition?.type === 'BOOLEAN';
+      // MB1188-032: a dropdown. ONE_OF_LIST carries its options inline;
+      // ONE_OF_RANGE points at another range and is deliberately NOT followed —
+      // that would be a second read of a range we were never asked for, and the
+      // options could sit outside the window or even another tab.
+      let options = null;
+      if (cell.dataValidation?.condition?.type === 'ONE_OF_LIST') {
+        const listed = Array.isArray(cell.dataValidation.condition.values)
+          ? cell.dataValidation.condition.values : [];
+        const seen = new Set();
+        options = [];
+        for (const entry of listed) {
+          const value = String(entry?.userEnteredValue ?? '').slice(0, 200);
+          if (!value || seen.has(value)) continue;
+          seen.add(value);
+          options.push(value);
+          if (options.length >= 50) break;
+        }
+        if (!options.length) options = null;
+      }
       textLine.push(text);
-      formatLine.push({ bg, tc, b: bold, cb: checkbox });
+      formatLine.push(options
+        ? { bg, tc, b: bold, cb: checkbox, dv: options }
+        : { bg, tc, b: bold, cb: checkbox });
       if (text !== '') { cells += 1; lastCol = Math.max(lastCol, c); lastRow = Math.max(lastRow, r); }
       // A fill with no text is meaningful on its own — that is exactly how a
       // blocked-out slot is drawn — so it counts towards the used extent.
-      else if (bg || tc || bold || checkbox) { lastCol = Math.max(lastCol, c); lastRow = Math.max(lastRow, r); }
+      // A dropdown with nothing chosen yet is still a cell somebody set up.
+      else if (bg || tc || bold || checkbox || options) { lastCol = Math.max(lastCol, c); lastRow = Math.max(lastRow, r); }
     }
     grid.push(textLine);
     formats.push(formatLine);
