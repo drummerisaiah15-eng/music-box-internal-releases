@@ -2377,18 +2377,18 @@ test('MB1188-016: a blank line cannot be used as evidence of movement', () => {
   }).refuse, undefined, 'nothing actually moved, so nothing is held');
 });
 
-// ── MB1188-030: a held tab has to be able to clear ───────────────────────────
+// ── MB1188-034: a held tab is safe; MB1188-030's way of unsticking it was not ─
 //
 // Nothing is ever written back to Google — the OAuth scope is
-// spreadsheets.readonly. So when the merge keeps this Mac's value, the
-// checkpoint still records GOOGLE's, and those two never reconverge. Reading
-// that difference as "an unsent edit" made every actively-used tab permanently
-// dirty, so the first structural change in Google held it forever, with
-// re-importing the only way out. Isaiah hit exactly this: a held Monday tab
-// stopped syncing anything at all, including rows added in Google afterwards.
+// spreadsheets.readonly — so when the merge keeps this Mac's value the
+// checkpoint still records GOOGLE's, and the two never reconverge. MB1188-030
+// read that as "not unsent work" and excused those cells, which cleared the
+// permanent hold and reintroduced the corruption the hold exists to prevent: a
+// divergence the merge kept is exactly a local value a shift will strand, and
+// `settled` was written within minutes of any edit by the auto-sync.
 //
-// `settled` records the divergences the last merge deliberately kept, so only
-// genuinely new edits count as dirty.
+// So the hold is unconditional again. The permanence is real and still open —
+// the answer is a way OUT of a held tab, not a quieter way to corrupt it.
 
 function holdWithSettled() {
   const context = vm.createContext({
@@ -2406,12 +2406,18 @@ function holdWithSettled() {
   return context;
 }
 
-test('MB1188-030: a divergence the merge settled does not count as a new edit', () => {
+test('MB1188-034: a divergence the merge kept is STILL protected from a shift', () => {
+  // MB1188-030 excused these, reasoning that a divergence the merge already
+  // settled is not unsent work. A pentest showed the cost: `settled` is written
+  // on the first sync after any edit and auto-sync runs every few minutes, so
+  // every local edit stopped being protected within minutes. A row inserted in
+  // Google then moved a cancellation onto the wrong lesson silently.
+  //
+  // A divergence the merge kept is exactly a local value at a coordinate a
+  // shift will strand. It is the case the hold exists for.
   const context = holdWithSettled();
   const cell = v => ({ v, bg: '', tc: '', b: false });
 
-  // Twelve rows mirrored from Google. One cell was resolved in this Mac's
-  // favour at the last merge, so it differs from the checkpoint on purpose.
   const checkpoint = {};
   const existing = {};
   const incoming = new Map();
@@ -2424,55 +2430,48 @@ test('MB1188-030: a divergence the merge settled does not count as a new edit', 
     incoming.set(`${r + 2},1`, cell(`Student ${r}`));
   }
   existing['5,1'] = cell('Student 5 — CANCELLED');
-  const settled = { '5,1': context.sig(cell('Student 5 — CANCELLED')) };
 
-  // Without the record, this is the permanent-hold state Isaiah hit.
-  assert.equal(context.hold({ checkpoint, incoming, existing, rows: 14, cols: 2 }).refuse, true,
-    'a settled divergence used to read as an unsent edit forever');
-
-  // With it, the tab syncs — there is nothing new at risk.
-  assert.equal(context.hold({ checkpoint, incoming, existing, settled, rows: 14, cols: 2 }).refuse, undefined,
-    'a divergence the merge already settled is not a reason to hold');
+  // Held whether or not the divergence was previously settled. The `settled`
+  // argument is gone; passing one must change nothing.
+  assert.equal(context.hold({ checkpoint, incoming, existing, rows: 14, cols: 2 }).refuse, true);
+  assert.equal(
+    context.hold({
+      checkpoint, incoming, existing, rows: 14, cols: 2,
+      settled: { '5,1': context.sig(cell('Student 5 — CANCELLED')) },
+    }).refuse,
+    true,
+    'a recorded divergence does not disarm the hold');
 });
 
-test('MB1188-030: a NEW edit on top of a settled cell still holds', () => {
-  // The protection has to survive the fix: somebody editing that same cell
-  // again, after the merge settled it, is exactly the case the hold exists for.
-  const context = holdWithSettled();
-  const cell = v => ({ v, bg: '', tc: '', b: false });
+test('MB1188-034: a dropdown with nothing chosen is not a blank cell', () => {
+  // _deriveSpreadsheetOperations skips a cell that is blank on both sides, so
+  // calling these blank meant a dropdown column pulled from Google was dropped
+  // by the very next save, taking its option list with it. Only columns
+  // somebody had already chosen a value in survived.
+  const context = vm.createContext({ String, Object, Boolean, console });
+  vm.runInContext(`
+    ${declaration('_ssCellIsBlank')}
+    globalThis.blank = c => _ssCellIsBlank(c);
+  `, context);
 
-  const checkpoint = {};
-  const existing = {};
-  const incoming = new Map();
-  for (let r = 0; r < 12; r++) {
-    checkpoint[`${r},0`] = `Time ${r}`;
-    checkpoint[`${r},1`] = `Student ${r}`;
-    existing[`${r},0`] = cell(`Time ${r}`);
-    existing[`${r},1`] = cell(`Student ${r}`);
-    incoming.set(`${r + 2},0`, cell(`Time ${r}`));
-    incoming.set(`${r + 2},1`, cell(`Student ${r}`));
-  }
-  const settled = { '5,1': context.sig(cell('Student 5 — CANCELLED')) };
-  existing['5,1'] = cell('Student 5 — CANCELLED AGAIN, DIFFERENTLY');
-
-  assert.equal(context.hold({ checkpoint, incoming, existing, settled, rows: 14, cols: 2 }).refuse, true,
-    'the recorded signature no longer matches, so this is a fresh edit');
+  assert.equal(context.blank({ v: '', bg: '', tc: '', b: false }), true, 'an empty cell is blank');
+  assert.equal(context.blank({ v: '', bg: '', tc: '', b: false, dv: 'k1' }), false,
+    'a dropdown awaiting a choice is not');
+  assert.equal(context.blank(null), true);
 });
 
-test('MB1188-030: the merge records what it settled, and the link carries it', () => {
-  // Wiring — the behaviour above is only reachable if the pull actually writes
-  // `settled` and the workbook validator lets it through.
-  const pull = declaration('ssPullFromGoogle');
-  assert.match(pull, /if \(settledSignature !== googleSignature\) settled\[key\] = settledSignature;/,
-    'the merge records every divergence it deliberately kept');
-  assert.match(pull, /\.\.\.\(Object\.keys\(settled\)\.length \? \{ settled \} : \{\}\)/,
-    'and writes it beside the checkpoint it qualifies');
-  assert.match(pull, /settled: tab\.settled/, 'and the hold is given it');
+test('MB1188-034: the capacity reading ignores the sheet ceiling', () => {
+  // Sheets are a hard gate on adding another sheet, not a reading of how full
+  // the workbook is — and being workbook-wide they dominated the per-project
+  // measures. A studio with seven six-tab imports sat at 75% and the banner
+  // announced it was full while typing was never refused.
+  const { api } = capacityApi(studioWorkbook());
+  const capacity = api.capacity();
 
-  const normalize = declaration('normalizeSpreadsheetWorkbook');
-  assert.match(normalize, /'mergeSig', 'settled'/,
-    'the tab allowlist admits it — otherwise the whole workbook is refused');
-  assert.match(normalize, /MAX_SPREADSHEET_SETTLED_CELLS/, 'and it is bounded');
+  assert.notEqual(capacity.tightest.label, 'sheets', 'the notice never quotes sheets');
+  assert.ok(capacity.fraction < 0.1, 'a nearly-empty workbook does not read as full');
+  // The refusal still uses it — that is the whole point of measuring it.
+  assert.match(api.refusal({ sheets: 6 }) || '', /sheets across all projects/);
 });
 
 // ── MB1188-031: the sheet ceiling is a TOTAL, and the message has to say so ───
@@ -2563,7 +2562,7 @@ test('MB1188-031: the sheet total and the project count are separate ceilings', 
     'and the index agrees, so the two cannot disagree about what is savable');
 });
 
-// ── MB1188-032: Google dropdowns import as dropdowns ─────────────────────────
+// ── MB1188-032/033: Google dropdowns import as dropdowns ────────────────────
 //
 // A dropdown in Google is a data-validation rule, exactly like a checkbox. The
 // read only ever looked for BOOLEAN, so a dropdown arrived as whatever text
@@ -2572,169 +2571,261 @@ test('MB1188-031: the sheet total and the project count are separate ceilings', 
 //
 // Google reports the rule on EVERY cell it covers, so a seven-option column
 // eighty rows deep arrives as eighty copies of the same seven strings. They are
-// interned per sheet, and each cell keeps an index.
+// interned per sheet and each cell keeps a reference.
+//
+// MB1188-033: that reference is a DIGEST OF THE CONTENT. The first version
+// numbered lists by the order the scan met them, and a pentest showed what that
+// costs — see the rebinding tests below.
 
 function optionListApi() {
-  const context = vm.createContext({ String, JSON, Object, Array, Number, Math, Boolean, Map, Set, console });
+  const context = vm.createContext({ String, JSON, Object, Array, Number, Math, Boolean, Map, Set, BigInt, console });
   vm.runInContext(`
     const MAX_SPREADSHEET_LISTS = 24;
     const MAX_SPREADSHEET_LIST_OPTIONS = 50;
+    ${declaration('_ssDigest')}
+    ${declaration('_ssOptionListKey')}
     ${declaration('_ssInternOptionLists')}
     globalThis.intern = formats => {
       const out = _ssInternOptionLists(formats);
-      return { lists: out.lists, indexAt: [...out.indexAt.entries()] };
+      return { lists: out.lists, keyAt: [...out.keyAt.entries()] };
     };
+    globalThis.keyOf = options => _ssOptionListKey(options);
   `, context);
   return context;
 }
 
 const DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+const REASONS = ['Sick', 'Requested'];
 
 test('MB1188-032: a repeated dropdown is stored once, not once per cell', () => {
   const context = optionListApi();
-  // What Google actually sends: the same rule on all eighty cells.
   const formats = Array.from({ length: 80 }, () => [{ bg: '', tc: '', b: false, dv: DAYS }]);
 
-  const { lists, indexAt } = context.intern(formats);
+  const { lists, keyAt } = context.intern(formats);
 
-  assert.equal(lists.length, 1, 'eighty identical rules collapse to one list');
-  assert.deepEqual(lists[0], DAYS);
-  assert.equal(indexAt.length, 80, 'and every cell still points at it');
-  assert.deepEqual(indexAt[0], ['0,0', 0]);
-  assert.deepEqual(indexAt[79], ['79,0', 0]);
+  assert.equal(Object.keys(lists).length, 1, 'eighty identical rules collapse to one list');
+  assert.deepEqual(Object.values(lists)[0], DAYS);
+  assert.equal(keyAt.length, 80, 'and every cell still points at it');
+});
+
+test('MB1188-033: the SAME options always get the same key, whatever order they are met in', () => {
+  // The whole point. Shrink one column's validation range in Google and the
+  // scan meets the lists in a different order — with positional indices that
+  // renumbered everything under the cells the merge kept, so a Status cell
+  // silently started offering Reason options.
+  const context = optionListApi();
+
+  const first = context.intern([[{ dv: DAYS }, { dv: REASONS }]]);
+  const second = context.intern([[{ dv: REASONS }, { dv: DAYS }]]);   // met the other way round
+
+  assert.equal(new Map(first.keyAt).get('0,0'), new Map(second.keyAt).get('0,1'),
+    'the days list keeps its identity');
+  assert.equal(new Map(first.keyAt).get('0,1'), new Map(second.keyAt).get('0,0'),
+    'and so does the reasons list');
+  assert.deepEqual(Object.keys(first.lists).sort(), Object.keys(second.lists).sort());
+});
+
+test('MB1188-033: a dropdown that disappears in Google does not rebind the others', () => {
+  const context = optionListApi();
+  const both = context.intern([[{ dv: DAYS }], [{ dv: REASONS }]]);
+  const onlyReasons = context.intern([[{}], [{ dv: REASONS }]]);
+
+  assert.equal(new Map(both.keyAt).get('1,0'), new Map(onlyReasons.keyAt).get('1,0'),
+    'the surviving list is unchanged by the other one vanishing');
 });
 
 test('MB1188-032: different lists get different entries', () => {
   const context = optionListApi();
-  const reasons = ['Sick', 'Requested'];
-  const { lists, indexAt } = context.intern([
-    [{ dv: DAYS }, { dv: reasons }],
-    [{ dv: DAYS }, { dv: reasons }],
+  const { lists, keyAt } = context.intern([
+    [{ dv: DAYS }, { dv: REASONS }],
+    [{ dv: DAYS }, { dv: REASONS }],
   ]);
 
-  assert.equal(lists.length, 2);
-  assert.deepEqual(lists[0], DAYS);
-  assert.deepEqual(lists[1], reasons);
-  assert.deepEqual(new Map(indexAt).get('1,1'), 1, 'the second column keeps its own list');
+  assert.equal(Object.keys(lists).length, 2);
+  const map = new Map(keyAt);
+  assert.deepEqual(lists[map.get('0,0')], DAYS);
+  assert.deepEqual(lists[map.get('1,1')], REASONS);
+});
+
+test('MB1188-032: order matters — the same options in a different order are a different list', () => {
+  const context = optionListApi();
+  assert.notEqual(context.keyOf(['A', 'B']), context.keyOf(['B', 'A']));
 });
 
 test('MB1188-032: cells with no dropdown are untouched', () => {
   const context = optionListApi();
-  const { lists, indexAt } = context.intern([[{ bg: '#000000' }, { v: 'plain' }]]);
-  assert.equal(lists.length, 0);
-  assert.equal(indexAt.length, 0);
+  const { lists, keyAt } = context.intern([[{ bg: '#000000' }, { v: 'plain' }]]);
+  assert.equal(Object.keys(lists).length, 0);
+  assert.equal(keyAt.length, 0);
 });
 
 test('MB1188-032: the number of distinct lists is bounded', () => {
   const context = optionListApi();
-  // 30 distinct lists on one sheet, against a ceiling of 24.
   const formats = [Array.from({ length: 30 }, (_, i) => ({ dv: [`only-${i}`] }))];
 
-  const { lists, indexAt } = context.intern(formats);
+  const { lists, keyAt } = context.intern(formats);
 
-  assert.equal(lists.length, 24, 'bounded');
-  // The surplus is left as plain text rather than pointing at nothing.
-  assert.equal(indexAt.length, 24);
-  assert.equal(new Map(indexAt).has('0,29'), false);
+  assert.equal(Object.keys(lists).length, 24, 'bounded');
+  assert.equal(keyAt.length, 24, 'and the surplus stays plain text rather than dangling');
 });
 
 test('MB1188-032: a workbook carrying dropdowns survives normalization', () => {
   const { norm } = roundTripApi();
-  const book = {
+  const key = 'abc123';
+  const sheet = norm({
     activeProject: 'p1',
     projects: [{
       id: 'p1', name: 'Absences', activeId: 's1',
       sheets: [{
         id: 's1', name: 'Tracker', rows: 4, cols: 2, colWidths: [],
-        lists: [DAYS],
+        lists: { [key]: DAYS },
         cells: {
-          '0,0': { v: 'Wednesday', bg: '#fff2cc', tc: '', b: false, dv: 0 },
-          '1,0': { v: '', bg: '', tc: '', b: false, dv: 0 },
+          '0,0': { v: 'Wednesday', bg: '#fff2cc', tc: '', b: false, dv: key },
+          '1,0': { v: '', bg: '', tc: '', b: false, dv: key },
           '0,1': { v: 'plain', bg: '', tc: '', b: false },
         },
       }],
     }],
-  };
+  }).projects[0].sheets[0];
 
-  const sheet = norm(book).projects[0].sheets[0];
-
-  assert.deepEqual(sheet.lists, [DAYS], 'the list survives the save');
-  assert.equal(sheet.cells['0,0'].dv, 0, 'and the cell keeps pointing at it');
-  assert.equal(sheet.cells['1,0'].dv, 0, 'including one nobody has chosen from yet');
+  assert.deepEqual(sheet.lists[key], DAYS, 'the list survives the save');
+  assert.equal(sheet.cells['0,0'].dv, key, 'and the cell keeps pointing at it');
+  assert.equal(sheet.cells['1,0'].dv, key, 'including one nobody has chosen from yet');
   assert.equal('dv' in sheet.cells['0,1'], false, 'an ordinary cell gains nothing');
 });
 
-test('MB1188-032: a dangling list index is dropped, not thrown on', () => {
+test('MB1188-032: a dangling reference is dropped, not thrown on', () => {
   // Same trade as a bad colour and as MB1188-014: losing the dropdown costs a
   // dropdown; refusing costs the entire workbook and quarantines the project.
   const { norm } = roundTripApi();
-  const book = {
+  const sheet = norm({
     activeProject: 'p1',
     projects: [{
       id: 'p1', name: 'P', activeId: 's1',
       sheets: [{
         id: 's1', name: 'S', rows: 2, cols: 1, colWidths: [],
-        lists: [DAYS],
-        cells: { '0,0': { v: 'Wednesday', bg: '', tc: '', b: false, dv: 7 } },
+        lists: { good: DAYS },
+        cells: { '0,0': { v: 'Wednesday', bg: '', tc: '', b: false, dv: 'missing' } },
       }],
     }],
-  };
+  }).projects[0].sheets[0];
 
-  const sheet = norm(book).projects[0].sheets[0];
-
-  assert.equal('dv' in sheet.cells['0,0'], false, 'the dangling index is dropped');
+  assert.equal('dv' in sheet.cells['0,0'], false, 'the dangling reference is dropped');
   assert.equal(sheet.cells['0,0'].v, 'Wednesday', 'and the value is untouched');
 });
 
 test('MB1188-032: option lists are bounded and de-duplicated on save', () => {
   const { norm } = roundTripApi();
-  const book = {
+  const sheet = norm({
     activeProject: 'p1',
     projects: [{
       id: 'p1', name: 'P', activeId: 's1',
       sheets: [{
         id: 's1', name: 'S', rows: 2, cols: 1, colWidths: [],
-        lists: [['A', 'A', 'B', '', 123, 'C']],
-        cells: { '0,0': { v: 'A', bg: '', tc: '', b: false, dv: 0 } },
+        lists: { k1: ['A', 'A', 'B', '', 123, 'C'], bad: [1, 2, 3] },
+        cells: { '0,0': { v: 'A', bg: '', tc: '', b: false, dv: 'k1' } },
       }],
     }],
-  };
+  }).projects[0].sheets[0];
 
-  assert.deepEqual(norm(book).projects[0].sheets[0].lists, [['A', 'B', 'C']],
+  assert.deepEqual(sheet.lists.k1, ['A', 'B', 'C'],
     'duplicates, blanks and non-strings are dropped rather than refused');
+  assert.equal('bad' in sheet.lists, false,
+    'a list that normalizes away to nothing is removed, not kept for a cell to point at');
 });
 
-test('MB1188-032: a merge does not revert a sheet\'s option lists', () => {
-  // §5 of the handoff, and the reason it keeps happening: the merge rebuilds the
-  // workbook from the reconciled base and replays OPERATIONS, which describe
-  // cells, sheets and names. Anything else attached to a sheet silently reverts
-  // — colorKey, googleLink, editedBy, _conflicts and the new-sheet activeId each
-  // went this way in turn. Option lists are the same class of state.
+test('MB1188-033: two Macs merging their own lists does not rebind either one', () => {
+  // The old carry-across replaced the target's lists wholesale whenever this
+  // Mac's differed from its origin. The other Mac's cells kept indices that
+  // still resolved — to the wrong options.
   const { merge } = roundTripApi();
-  const sheetWith = lists => ({
-    id: 's1', name: 'S', rows: 3, cols: 2, colWidths: [],
-    cells: { '0,0': cell('Wednesday') },
-    ...(lists ? { lists } : {}),
-  });
-  const bookWith = lists => ({
+  const daysKey = 'kdays';
+  const reasonKey = 'kreason';
+  const book = (lists, cells) => ({
     activeProject: 'p1',
-    projects: [{ id: 'p1', name: 'P', activeId: 's1', sheets: [sheetWith(lists)] }],
+    projects: [{
+      id: 'p1', name: 'P', activeId: 's1',
+      sheets: [{
+        id: 's1', name: 'S', rows: 3, cols: 2, colWidths: [], cells,
+        ...(lists ? { lists } : {}),
+      }],
+    }],
   });
+  const theirs = { '0,0': { v: 'Monday', bg: '', tc: '', b: false, dv: daysKey } };
+  const mine = {
+    '0,0': { v: 'Monday', bg: '', tc: '', b: false, dv: daysKey },
+    '0,1': { v: 'Sick', bg: '', tc: '', b: false, dv: reasonKey },
+  };
 
-  // The other Mac has no lists; this Mac just imported them from Google.
-  const merged = merge(bookWith(null), bookWith(null), bookWith([DAYS]));
+  const merged = merge(
+    book({ [daysKey]: DAYS }, theirs),
+    book({ [daysKey]: DAYS }, theirs),
+    book({ [daysKey]: DAYS, [reasonKey]: REASONS }, mine),
+  );
+  const sheet = merged.projects[0].sheets[0];
 
-  assert.deepEqual(merged.projects[0].sheets[0].lists, [DAYS],
-    'the lists this Mac gained are not thrown away by the merge');
+  assert.deepEqual(sheet.lists[daysKey], DAYS, "the other Mac's list is not replaced");
+  assert.deepEqual(sheet.lists[reasonKey], REASONS, 'and this Mac\'s is added');
+  assert.equal(sheet.cells['0,0'].dv, daysKey, 'their cell still means what it meant');
+});
+
+test('MB1188-033: a list nothing references is not carried forever', () => {
+  const { merge } = roundTripApi();
+  const book = (lists, cells) => ({
+    activeProject: 'p1',
+    projects: [{
+      id: 'p1', name: 'P', activeId: 's1',
+      sheets: [{ id: 's1', name: 'S', rows: 3, cols: 2, colWidths: [], cells, ...(lists ? { lists } : {}) }],
+    }],
+  });
+  const cells = { '0,0': cell('plain') };
+
+  const merged = merge(book({ orphan: DAYS }, cells), book({ orphan: DAYS }, cells), book({ orphan: DAYS }, cells));
+
+  assert.equal(merged.projects[0].sheets[0].lists, undefined,
+    'dead bytes are not kept in the sync document');
+});
+
+test('MB1188-033: the pull restates which cells ARE dropdowns, not just the options', () => {
+  // `dv` is deliberately absent from _ssCellSignature — a dropdown is
+  // structure, and including it would make the checkpoint disagree with every
+  // stored cell and hold the tab forever. Which means the merge cannot see a
+  // dropdown appearing or disappearing in Google, so the pull restates it the
+  // way it restates column widths. Without this the feature only ever worked at
+  // first import.
+  const pull = declaration('ssPullFromGoogle');
+  assert.match(pull, /const listKey = interned\.keyAt\.get\(key\);/,
+    'every cell inside the window is re-checked against the current read');
+  assert.match(pull, /if \(listKey === undefined\) \{ if \(cell\.dv !== undefined\) delete cell\.dv; \}/,
+    'a dropdown removed in Google stops being one here');
+  assert.match(pull, /cells\[key\] = \{ v: '', bg: '', tc: '', b: false, dv: listKey \};/,
+    'and a cell that is only a dropdown, with nothing chosen, still arrives');
+});
+
+test('MB1188-033: picking is checked against what was on screen', () => {
+  const pick = declaration('ssPickCellOption');
+  assert.match(pick, /const offered = _ssOpenDropdownOptions;/,
+    'captured before the menu is torn down');
+  assert.match(pick, /if \(option !== '' && !\(offered \|\| \[\]\)\.includes\(option\)\) return;/,
+    'so a background sync swapping the lists cannot slip in an unseen option');
+  assert.match(pick, /if \(!options \|\| \(option !== '' && !options\.includes\(option\)\)\) return;/,
+    'and it must still be on the cell\'s current list');
+});
+
+test('MB1188-033: the dropdown reopens after a pick', () => {
+  // A {once:true} listener that re-armed itself left the grid dead until you
+  // clicked somewhere unrelated — it would have read as "works every other time".
+  const open = declaration('ssOpenCellDropdown');
+  const away = declaration('_ssDropdownAway');
+  const close = declaration('_ssCloseCellDropdown');
+  assert.doesNotMatch(open, /\{ once: true \}/, 'one plain listener');
+  assert.doesNotMatch(away, /addEventListener/, 'that does not re-arm itself');
+  assert.match(close, /removeEventListener\('mousedown', _ssDropdownAway\)/,
+    'and is removed when the menu closes');
 });
 
 test('MB1188-032: picking is constrained to the offered options', () => {
-  // The one place the app writes a cell value nobody typed. A dropdown that can
-  // be set to anything is not a dropdown, and this is exactly the surface where
-  // a stray value would flow on to Google-linked data.
   const pick = declaration('ssPickCellOption');
-  assert.match(pick, /if \(!options \|\| \(option !== '' && !options\.includes\(option\)\)\) return;/,
-    'anything not on the list, and not the explicit clear, is refused');
   assert.match(pick, /sheet\.cells\[key\] = \{ \.\.\.cell, v: option \}/,
     'replaced rather than mutated, or the save derives no operation for it');
   assert.match(pick, /ssPushUndo\(\)/, 'and it is undoable like any other edit');
@@ -2743,8 +2834,6 @@ test('MB1188-032: picking is constrained to the offered options', () => {
 
 test('MB1188-032: only the caret opens the list, so the cell can still be selected', () => {
   const grid = declaration('ssGridMouseDown');
-  assert.match(grid, /e\.target\.dataset\?\.dv === '1'/,
-    'checked against the caret, not the cell');
-  const render = declaration('ssRenderGrid');
-  assert.match(render, /ss-dv-caret" data-dv="1"/, 'and only the caret carries it');
+  assert.match(grid, /e\.target\.dataset\?\.dv === '1'/, 'checked against the caret, not the cell');
+  assert.match(declaration('ssRenderGrid'), /ss-dv-caret" data-dv="1"/, 'and only the caret carries it');
 });

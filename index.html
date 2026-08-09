@@ -9093,7 +9093,15 @@ function _ssCapacity(workbook, projectId = workbook?.activeProject) {
   };
   // Report against whichever measure is closest to its limit — quoting the
   // roomiest one would be technically true and completely useless.
-  const tightest = Object.values(measures).reduce((a, b) => (share(b) > share(a) ? b : a));
+  //
+  // MB1188-034: sheets are excluded from this. They are a hard gate on adding
+  // another sheet, not a reading of how full the workbook is, and being
+  // workbook-wide they dominate the per-project measures — a studio with seven
+  // six-tab imports sat at 75% and the banner announced it was full while
+  // typing was never refused. The refusal still uses the measure; only the
+  // "how full is this" reading ignores it.
+  const tightest = [measures.cells, measures.characters, measures.bytes]
+    .reduce((a, b) => (share(b) > share(a) ? b : a));
   return { ...measures, tightest, fraction: Math.min(1, share(tightest)) };
 }
 
@@ -9319,12 +9327,17 @@ function normalizeSpreadsheetWorkbook(value) {
         return Math.round(Math.min(1000, Math.max(40, number)));
       });
       // MB1188-032: option lists for dropdown cells, interned per sheet. A cell
-      // holds an index into this, so a column of eighty dropdowns costs one
-      // list plus eighty small integers rather than eighty copies of it.
-      const lists = [];
-      if (Array.isArray(sheet.lists)) {
-        for (const list of sheet.lists.slice(0, MAX_SPREADSHEET_LISTS)) {
-          if (!Array.isArray(list)) { lists.push([]); continue; }
+      // holds a reference into this, so a column of eighty dropdowns costs one
+      // list plus eighty short keys rather than eighty copies of it.
+      //
+      // MB1188-033: keyed by a digest of the options, not by position. See
+      // _ssInternOptionLists — positional indices silently rebound every cell
+      // whenever the numbering shifted.
+      const lists = {};
+      if (sheet.lists && typeof sheet.lists === 'object' && !Array.isArray(sheet.lists)) {
+        for (const [listKey, list] of Object.entries(sheet.lists)) {
+          if (Object.keys(lists).length >= MAX_SPREADSHEET_LISTS) break;
+          if (!/^[0-9a-z]{1,32}$/.test(listKey) || !Array.isArray(list)) continue;
           const options = [];
           const seen = new Set();
           for (const option of list) {
@@ -9335,7 +9348,9 @@ function normalizeSpreadsheetWorkbook(value) {
             seen.add(trimmed);
             options.push(trimmed);
           }
-          lists.push(options);
+          // An entry that normalized away to nothing is dropped, not kept as an
+          // empty list somebody's cell can point at.
+          if (options.length) lists[listKey] = options;
         }
       }
       const rawCells = sheet.cells === undefined ? {} : sheet.cells;
@@ -9406,8 +9421,8 @@ function normalizeSpreadsheetWorkbook(value) {
         // than refused when it points at nothing — a dangling index costs the
         // dropdown, and refusing would cost the whole workbook. Same trade as
         // the colour a few lines up, and as MB1188-014 taught the hard way.
-        if (Number.isSafeInteger(cell.dv) && cell.dv >= 0 && cell.dv < lists.length &&
-            lists[cell.dv].length) {
+        if (typeof cell.dv === 'string' &&
+            Object.prototype.hasOwnProperty.call(lists, cell.dv)) {
           normalizedCell.dv = cell.dv;
         }
         cells[cellKey] = normalizedCell;
@@ -9464,7 +9479,7 @@ function normalizeSpreadsheetWorkbook(value) {
       }
 
       const normalizedSheet = { id: sheetId, name: sheetName, rows, cols, colWidths, cells };
-      if (lists.length) normalizedSheet.lists = lists;
+      if (Object.keys(lists).length) normalizedSheet.lists = lists;
       // Attribution is bookkeeping, not content: a bad entry must never make a
       // real workbook unloadable, so it is filtered and capped rather than
       // rejected — the same treatment _conflicts gets.
@@ -9567,22 +9582,11 @@ function normalizeSpreadsheetWorkbook(value) {
           if (typeof tab.mergeSig === 'string' && tab.mergeSig.length <= 32) entry.mergeSig = tab.mergeSig;
           const checkpoint = readCheckpoint(tab.checkpoint);
           if (checkpoint) entry.checkpoint = checkpoint;
-          // MB1188-030: cell signatures this Mac settled on in place of Google's.
-          // Bounded like everything else on the link, and dropped rather than
-          // refused when it is malformed — losing it costs one needless hold,
-          // not data.
-          if (tab.settled && typeof tab.settled === 'object' && !Array.isArray(tab.settled)) {
-            const settled = {};
-            let kept = 0;
-            for (const [cellKey, signature] of Object.entries(tab.settled)) {
-              if (kept >= MAX_SPREADSHEET_SETTLED_CELLS) break;
-              if (!/^(0|[1-9]\d*),(0|[1-9]\d*)$/.test(cellKey)) continue;
-              if (typeof signature !== 'string' || signature.length > 512) continue;
-              settled[cellKey] = signature;
-              kept += 1;
-            }
-            if (kept) entry.settled = settled;
-          }
+          // MB1188-034: `settled` is still ACCEPTED here and then dropped.
+          // MB1188-030 wrote it and a pentest showed it disarmed the structure
+          // hold, so it is no longer produced or read — but a Mac still running
+          // the older build will keep sending it, and this allowlist refuses the
+          // whole workbook over a key it does not name. Named, and ignored.
           tabs[sheetKey] = entry;
         }
       } else if (link.title !== undefined && sheets.length) {
@@ -9868,6 +9872,12 @@ const MAX_SPREADSHEET_CONFLICTS = 200;
 // A cell with no text, no colour, no bold and no span carries no information,
 // whether it is stored as an empty record or absent altogether.
 function _ssCellIsBlank(cell) {
+  // MB1188-034: a dropdown with nothing chosen is not blank. It has no text, no
+  // fill and no tick, so this called it empty — and _deriveSpreadsheetOperations
+  // skips a cell that is blank on both sides, so a whole dropdown column pulled
+  // from Google was dropped by the very next save, taking its option list with
+  // it. Only a column somebody had already chosen a value in survived.
+  if (cell && typeof cell.dv === 'string' && cell.dv) return false;
   if (cell === null || cell === undefined) return true;
   if (typeof cell !== 'object' || Array.isArray(cell)) return false;
   return String(cell.v ?? '') === '' &&
@@ -10303,8 +10313,25 @@ function _mergeSpreadsheetEdits(base, dirtyBase, dirty, stagedActor) {
       // MB1188-032: option lists are sheet-level state no operation describes,
       // so without this they revert to the base copy on every merge — the same
       // way colorKey, googleLink, editedBy and _conflicts each did in turn.
-      if (JSON.stringify(sheet.lists) !== JSON.stringify(originSheet.lists)) {
-        if (sheet.lists) target.lists = _cloneJson(sheet.lists);
+      // MB1188-033: a union, not a winner.
+      //
+      // This used to replace the target's lists wholesale whenever this Mac's
+      // differed from its own origin, which rebound the OTHER Mac's cells to
+      // this Mac's lists — their `dv` still resolved, to the wrong options.
+      // Content-keyed lists make merging trivial and safe: the same options
+      // always produce the same key, so a union can never rebind anything. A
+      // list only disappears when no cell references it.
+      if (sheet.lists || target.lists) {
+        const union = { ...(target.lists || {}), ...(sheet.lists || {}) };
+        const referenced = new Set();
+        for (const value of Object.values(target.cells || {})) {
+          if (typeof value?.dv === 'string') referenced.add(value.dv);
+        }
+        const kept = {};
+        for (const [listKey, options] of Object.entries(union)) {
+          if (referenced.has(listKey)) kept[listKey] = _cloneJson(options);
+        }
+        if (Object.keys(kept).length) target.lists = kept;
         else delete target.lists;
       }
       if (sheet.id === local.activeId) project.activeId = sheet.id;
@@ -11025,9 +11052,13 @@ function ssRenderTabs() {
   ).join('') + `<div class="ss-tab-add" onclick="ssNewSheet()" title="New sheet">＋</div>`;
 }
 
+// What the open menu is actually showing, so a pick is checked against what the
+// person saw rather than against whatever the sheet holds by the time they click.
+let _ssOpenDropdownOptions = null;
+
 // MB1188-032: the options a cell offers, or null if it is not a dropdown.
 function _ssCellOptions(sheet, cell) {
-  if (!cell || !Number.isSafeInteger(cell.dv)) return null;
+  if (!cell || typeof cell.dv !== 'string') return null;
   const list = sheet?.lists?.[cell.dv];
   return Array.isArray(list) && list.length ? list : null;
 }
@@ -11054,6 +11085,7 @@ function ssOpenCellDropdown(r, c) {
     if (other.bg || other.tc) swatches.set(other.v, { bg: other.bg || '', tc: other.tc || '' });
   }
 
+  _ssOpenDropdownOptions = options.slice();
   const menu = document.createElement('div');
   menu.className = 'ss-dv-menu';
   menu.id = 'ss-dv-menu';
@@ -11071,22 +11103,35 @@ function ssOpenCellDropdown(r, c) {
   menu.style.left = `${Math.round(box.left)}px`;
   menu.style.top = `${Math.round(box.bottom)}px`;
   document.body.appendChild(menu);
-  setTimeout(() => document.addEventListener('mousedown', _ssDropdownAway, { once: true }), 0);
+  // MB1188-033: one plain listener, added on open and removed on close.
+  //
+  // This was a {once:true} listener that re-added itself whenever the click was
+  // inside the menu. Picking an option removed the menu but left that listener
+  // armed, and the grid's own mousedown handler runs first on the way up — so
+  // the next caret click opened the menu and the stale listener immediately
+  // closed it again. The dropdown appeared dead until you clicked somewhere
+  // else entirely. A pentest found it; it would have read as "the dropdown only
+  // works every other time".
+  setTimeout(() => document.addEventListener('mousedown', _ssDropdownAway), 0);
 }
 
 function _ssDropdownAway(event) {
-  if (event.target.closest?.('#ss-dv-menu')) {
-    document.addEventListener('mousedown', _ssDropdownAway, { once: true });
-    return;
-  }
+  if (event.target.closest?.('#ss-dv-menu')) return;
   _ssCloseCellDropdown();
 }
 
 function _ssCloseCellDropdown() {
+  _ssOpenDropdownOptions = null;
+  document.removeEventListener('mousedown', _ssDropdownAway);
   document.getElementById('ss-dv-menu')?.remove();
 }
 
 function ssPickCellOption(r, c, option) {
+  // MB1188-033: captured BEFORE the menu is torn down, and compared against
+  // what was actually on screen. Re-reading the sheet meant that if a
+  // background Google sync swapped the lists while the menu was open, an option
+  // from the NEW list would be accepted although nobody was ever shown it.
+  const offered = _ssOpenDropdownOptions;
   _ssCloseCellDropdown();
   const sheet = ssActiveSheet();
   if (!sheet) return;
@@ -11097,6 +11142,7 @@ function ssPickCellOption(r, c, option) {
   // set to anything is not a dropdown, and this is the one place the app writes
   // a value it did not get from a person typing.
   if (!options || (option !== '' && !options.includes(option))) return;
+  if (option !== '' && !(offered || []).includes(option)) return;
   if (String(cell.v || '') === option) return;
   ssPushUndo();
   // Replaced rather than mutated, exactly as ssToggleCheckbox does: the save
@@ -12598,27 +12644,39 @@ function _ssMergeCellFromGoogle(base, remote, local) {
 // seven-option dropdown down eighty rows arrives as eighty copies of the same
 // seven strings. Stored that way it would multiply the sync document against a
 // budget the project already has to fit inside. So identical lists collapse to
-// one entry and each cell keeps an index.
+// one entry and each cell keeps a reference.
+//
+// MB1188-033: that reference is a DIGEST OF THE CONTENT, not a position. The
+// first version numbered lists by the order the scan happened to meet them, and
+// a pentest showed what that costs: shrink one column's validation range in
+// Google and the numbering shifts under every cell the merge kept, so a Status
+// cell silently starts offering Reason options. Two Macs merging their own
+// lists produced the same rebinding. A content digest cannot renumber — the
+// same options always name the same list, and a reference either resolves or
+// it does not.
+function _ssOptionListKey(options) {
+  return _ssDigest(JSON.stringify(options));
+}
+
 function _ssInternOptionLists(formats) {
-  const lists = [];
-  const byKey = new Map();
-  const indexAt = new Map();
+  const lists = {};
+  const keyAt = new Map();
   (formats || []).forEach((row, r) => {
     (row || []).forEach((format, c) => {
       const options = Array.isArray(format?.dv) ? format.dv.filter(o => typeof o === 'string' && o) : null;
       if (!options || !options.length) return;
-      const key = JSON.stringify(options);
-      let index = byKey.get(key);
-      if (index === undefined) {
-        if (lists.length >= MAX_SPREADSHEET_LISTS) return;   // bounded; extras stay plain text
-        index = lists.length;
-        lists.push(options.slice(0, MAX_SPREADSHEET_LIST_OPTIONS));
-        byKey.set(key, index);
+      const trimmed = options.slice(0, MAX_SPREADSHEET_LIST_OPTIONS);
+      const key = _ssOptionListKey(trimmed);
+      if (!Object.prototype.hasOwnProperty.call(lists, key)) {
+        // Bounded; a sheet past the ceiling leaves the surplus as plain text
+        // rather than pointing at nothing.
+        if (Object.keys(lists).length >= MAX_SPREADSHEET_LISTS) return;
+        lists[key] = trimmed;
       }
-      indexAt.set(r + ',' + c, index);
+      keyAt.set(r + ',' + c, key);
     });
   });
-  return { lists, indexAt };
+  return { lists, keyAt };
 }
 
 // MB1188-016: rows and columns that MOVED in Google.
@@ -12668,7 +12726,6 @@ function _ssSignatureIsBlank(signature) {
 // and hold when one offset is corroborated — either by several cells agreeing,
 // or by a single cell whose content is unique on BOTH sides, which cannot be a
 // coincidence of repetition.
-const MAX_SPREADSHEET_SETTLED_CELLS = 2000;
 const SPREADSHEET_SHIFT_SUPPORT = 3;
 const SPREADSHEET_SHIFT_SAMPLES = 16;
 
@@ -12729,32 +12786,38 @@ function _ssContentRelocated(checkpointAt, incomingAt, rows, cols) {
 // changes anything: the merge either runs exactly as it always did, or the tab
 // is held and reported by name. A false hold costs a loud message and a retry
 // next sync. A false transform cost somebody's edit.
-function _ssGoogleStructureHold({ checkpoint, incoming, existing, settled, rows, cols }) {
+function _ssGoogleStructureHold({ checkpoint, incoming, existing, rows, cols }) {
   const checkpointAt = (r, c) => _ssCheckpointCell(checkpoint[`${r},${c}`]);
   const incomingAt = (r, c) => incoming.get(`${r},${c}`) || null;
   const localAt = (r, c) => existing[`${r},${c}`] || null;
-  const settledAt = settled || {};
 
   // Only cells the app has changed since the LAST MERGE can be harmed. Every
   // other cell the existing merge already resolves correctly under a shift,
   // which is why an untouched mirror needs no intervention at all.
   //
-  // MB1188-030: "since the last merge", not "differs from Google". Nothing is
-  // ever written back to Google, so a cell where this Mac's value won stays
-  // different from the checkpoint forever. Reading that as an unsent edit made
-  // every actively-used tab permanently dirty, and therefore permanently held
-  // the first time Google's structure moved. `settled` records the divergences
-  // the last merge deliberately kept, so only genuinely new edits count.
+  // MB1188-034: `settled` deliberately does NOT excuse a cell here.
+  //
+  // MB1188-030 used it to do exactly that, and a pentest showed the cost. The
+  // reasoning was that a divergence the merge already kept is not "unsent work",
+  // so it should not make a tab dirty forever. True as far as it goes — and
+  // fatal, because a divergence the merge kept is PRECISELY a local value
+  // sitting at a coordinate that a shift will strand. `settled` is written on
+  // the first sync after any edit, and auto-sync runs every few minutes, so
+  // every local edit stopped being protected within minutes of being made. A
+  // row inserted in Google then moved the cancellation onto the wrong lesson and
+  // un-cancelled the right one, with no conflict and nothing on screen.
+  //
+  // That is the bug MB1188-016 exists to prevent, reintroduced by the fix for
+  // its own side effect. Safety first: a tab that cannot be lined up is held.
+  // The permanence MB1188-030 was reaching for is real, but the answer is a way
+  // OUT of a held tab, not a quieter way to corrupt it.
   let dirty = false;
   for (let r = 0; r < rows && !dirty; r++) {
     for (let c = 0; c < cols; c++) {
-      const key = `${r},${c}`;
-      const mine = _ssCellSignature(localAt(r, c));
-      if (mine === _ssCellSignature(checkpointAt(r, c))) continue;
-      // Known divergence, still holding the value the merge settled on.
-      if (Object.prototype.hasOwnProperty.call(settledAt, key) && settledAt[key] === mine) continue;
-      dirty = true;
-      break;
+      if (_ssCellSignature(localAt(r, c)) !== _ssCellSignature(checkpointAt(r, c))) {
+        dirty = true;
+        break;
+      }
     }
   }
   if (!dirty) return {};
@@ -12907,12 +12970,12 @@ async function ssPullFromGoogle(projectId, options) {
           const tc = _ssImportColor(format?.tc);
           const bold = format?.b === true;
           const checkbox = format?.cb === true;
-          const listIndex = interned.indexAt.get(r + ',' + c);
+          const listKey = interned.keyAt.get(r + ',' + c);
           const text = String(value ?? '');
-          if (text === '' && !bg && !tc && !bold && !checkbox && listIndex === undefined) return;
+          if (text === '' && !bg && !tc && !bold && !checkbox && listKey === undefined) return;
           const built = { v: text, bg, tc, b: bold };
           if (checkbox) built.cb = true;
-          if (listIndex !== undefined) built.dv = listIndex;
+          if (listKey !== undefined) built.dv = listKey;
           incoming.set(r + ',' + c, built);
         });
       });
@@ -12922,8 +12985,7 @@ async function ssPullFromGoogle(projectId, options) {
 
       // MB1188-016: hold the tab if structure moved under an edit made here.
       const hold = _ssGoogleStructureHold({
-        checkpoint, incoming, existing, settled: tab.settled,
-        rows: rowsThatFit, cols: colsThatFit,
+        checkpoint, incoming, existing, rows: rowsThatFit, cols: colsThatFit,
       });
       if (hold.refuse) {
         // Deliberately BEFORE anything is written: the checkpoint does not
@@ -12934,7 +12996,6 @@ async function ssPullFromGoogle(projectId, options) {
         continue;
       }
       const cells = {};
-      const settled = {};
       const newConflicts = [];
       const keys = new Set([
         ...Object.keys(existing), ...incoming.keys(), ...Object.keys(checkpoint),
@@ -12956,16 +13017,6 @@ async function ssPullFromGoogle(projectId, options) {
           tabChanged += 1;
         } else {
           if (outcome.cell) cells[key] = outcome.cell;
-          // MB1188-030: this Mac's value survived and Google's did not, so the
-          // two are now legitimately different — and they will STAY different,
-          // because nothing is ever written back to Google (the OAuth scope is
-          // spreadsheets.readonly). Recorded so the next sync can tell settled
-          // divergence from a change somebody just made. Without this, the first
-          // app edit made a tab permanently "dirty" and the structure hold could
-          // never clear.
-          const settledSignature = _ssCellSignature(outcome.cell || null);
-          const googleSignature = _ssCellSignature(_ssCheckpointCell(checkpoint[key]));
-          if (settledSignature !== googleSignature) settled[key] = settledSignature;
           if (outcome.take === 'conflict') {
             clashes += 1;
             newConflicts.push({
@@ -13008,13 +13059,35 @@ async function ssPullFromGoogle(projectId, options) {
           }
         });
       }
+      // MB1188-032/033: Google is the authority on which cells ARE dropdowns and
+      // on what they offer, so both are restated from the read rather than
+      // merged — the same treatment column widths get.
+      //
+      // Restating the cell's reference matters as much as the list. `dv` is
+      // deliberately absent from _ssCellSignature: a dropdown is structure, and
+      // including it would make the checkpoint disagree with every stored cell
+      // and hold the tab forever. But that also means the merge cannot SEE a
+      // dropdown appearing or disappearing in Google — it reads as "no change"
+      // and keeps the local cell. Left there, the feature only ever worked at
+      // first import: a column turned into a dropdown afterwards stayed plain
+      // text, and one removed in Google kept offering options.
+      for (const [key, cell] of Object.entries(cells)) {
+        const [row, column] = key.split(',').map(Number);
+        if (!(row < rowsThatFit && column < colsThatFit)) continue;   // Google said nothing
+        const listKey = interned.keyAt.get(key);
+        if (listKey === undefined) { if (cell.dv !== undefined) delete cell.dv; }
+        else if (cell.dv !== listKey) cell.dv = listKey;
+      }
+      // A cell that is ONLY a dropdown — no text, no fill, nothing chosen yet —
+      // has nothing for the merge above to have created, so it is added here.
+      for (const [key, listKey] of interned.keyAt.entries()) {
+        if (cells[key]) continue;
+        const [row, column] = key.split(',').map(Number);
+        if (!(row < rowsThatFit && column < colsThatFit)) continue;
+        cells[key] = { v: '', bg: '', tc: '', b: false, dv: listKey };
+      }
       target.cells = cells;
-      // MB1188-032: Google is the authority on which options a dropdown offers,
-      // so the lists are restated from the read rather than merged — the same
-      // treatment column widths get. A list removed in Google leaves the cells
-      // as plain text, which the normalizer already handles by dropping a
-      // dangling index rather than refusing the workbook.
-      if (interned.lists.length) target.lists = interned.lists;
+      if (Object.keys(interned.lists).length) target.lists = interned.lists;
       else delete target.lists;
 
       // The checkpoint describes exactly the extent the app kept, never what
@@ -13042,9 +13115,6 @@ async function ssPullFromGoogle(projectId, options) {
             title: readTitle,
             ...(Number.isSafeInteger(remoteTab?.sheetId) ? { sheetId: remoteTab.sheetId } : {}),
             checkpoint: _ssGoogleCheckpoint(kept, keptFormats),
-            // MB1188-030: written in the same breath as the checkpoint, because
-            // it only means anything relative to that checkpoint.
-            ...(Object.keys(settled).length ? { settled } : {}),
             mergeSig,
           },
         },
@@ -13381,11 +13451,11 @@ async function ssImportBuildProject(name, sheets, extraBytes, linkFor) {
         const tc = _ssImportColor(format?.tc);
         const bold = format?.b === true;
         const checkbox = format?.cb === true;
-        const listIndex = interned.indexAt.get(ri + ',' + ci);
-        if (val !== '' || bg || tc || bold || checkbox || listIndex !== undefined) {
+        const listKey = interned.keyAt.get(ri + ',' + ci);
+        if (val !== '' || bg || tc || bold || checkbox || listKey !== undefined) {
           const built = { v: val, bg, tc, b: bold };
           if (checkbox) built.cb = true;
-          if (listIndex !== undefined) built.dv = listIndex;
+          if (listKey !== undefined) built.dv = listKey;
           cells[ri + ',' + ci] = built;
         }
       });
@@ -13419,7 +13489,7 @@ async function ssImportBuildProject(name, sheets, extraBytes, linkFor) {
       cols: storedCols,
       colWidths,
       cells,
-      ...(interned.lists.length ? { lists: interned.lists } : {}),
+      ...(Object.keys(interned.lists).length ? { lists: interned.lists } : {}),
     };
   });
     // MB161-011: the import is fully built and measured BEFORE anything is

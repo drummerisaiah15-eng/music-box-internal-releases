@@ -1369,7 +1369,7 @@ test('MB161-018: imported fills, bold and merges survive the build', () => {
   // first version of this kept cells only when `val !== ''`, which is exactly
   // the test that throws those away.
   // MB1188-032: a cell that is only a dropdown is worth keeping too.
-  assert.match(build, /if \(val !== '' \|\| bg \|\| tc \|\| bold \|\| checkbox \|\| listIndex !== undefined\)/,
+  assert.match(build, /if \(val !== '' \|\| bg \|\| tc \|\| bold \|\| checkbox \|\| listKey !== undefined\)/,
     'a cell worth keeping for its fill \u2014 or its checkbox \u2014 alone must be kept');
   assert.match(build, /_ssApplyImportedMerges\(cells, s\.merges, storedRows, storedCols\)/);
   // Optional, because CSV and .xlsx imports carry no formatting at all.
