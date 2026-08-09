@@ -9484,7 +9484,8 @@ function normalizeSpreadsheetWorkbook(value) {
           if (!tab || typeof tab !== 'object' || Array.isArray(tab)) {
             throw new Error('spreadsheets has an invalid Google tab');
           }
-          if (!Object.keys(tab).every(key => ['title', 'sheetId', 'checkpoint', 'mergeSig'].includes(key))) {
+          if (!Object.keys(tab).every(key =>
+              ['title', 'sheetId', 'checkpoint', 'mergeSig', 'settled'].includes(key))) {
             throw new Error('spreadsheets has an invalid Google tab');
           }
           const entry = { title: checkedString(tab.title, 'Google tab name', 200) };
@@ -9494,6 +9495,22 @@ function normalizeSpreadsheetWorkbook(value) {
           if (typeof tab.mergeSig === 'string' && tab.mergeSig.length <= 32) entry.mergeSig = tab.mergeSig;
           const checkpoint = readCheckpoint(tab.checkpoint);
           if (checkpoint) entry.checkpoint = checkpoint;
+          // MB1188-030: cell signatures this Mac settled on in place of Google's.
+          // Bounded like everything else on the link, and dropped rather than
+          // refused when it is malformed — losing it costs one needless hold,
+          // not data.
+          if (tab.settled && typeof tab.settled === 'object' && !Array.isArray(tab.settled)) {
+            const settled = {};
+            let kept = 0;
+            for (const [cellKey, signature] of Object.entries(tab.settled)) {
+              if (kept >= MAX_SPREADSHEET_SETTLED_CELLS) break;
+              if (!/^(0|[1-9]\d*),(0|[1-9]\d*)$/.test(cellKey)) continue;
+              if (typeof signature !== 'string' || signature.length > 512) continue;
+              settled[cellKey] = signature;
+              kept += 1;
+            }
+            if (kept) entry.settled = settled;
+          }
           tabs[sheetKey] = entry;
         }
       } else if (link.title !== undefined && sheets.length) {
@@ -12456,6 +12473,7 @@ function _ssSignatureIsBlank(signature) {
 // and hold when one offset is corroborated — either by several cells agreeing,
 // or by a single cell whose content is unique on BOTH sides, which cannot be a
 // coincidence of repetition.
+const MAX_SPREADSHEET_SETTLED_CELLS = 2000;
 const SPREADSHEET_SHIFT_SUPPORT = 3;
 const SPREADSHEET_SHIFT_SAMPLES = 16;
 
@@ -12516,22 +12534,32 @@ function _ssContentRelocated(checkpointAt, incomingAt, rows, cols) {
 // changes anything: the merge either runs exactly as it always did, or the tab
 // is held and reported by name. A false hold costs a loud message and a retry
 // next sync. A false transform cost somebody's edit.
-function _ssGoogleStructureHold({ checkpoint, incoming, existing, rows, cols }) {
+function _ssGoogleStructureHold({ checkpoint, incoming, existing, settled, rows, cols }) {
   const checkpointAt = (r, c) => _ssCheckpointCell(checkpoint[`${r},${c}`]);
   const incomingAt = (r, c) => incoming.get(`${r},${c}`) || null;
   const localAt = (r, c) => existing[`${r},${c}`] || null;
+  const settledAt = settled || {};
 
-  // Only cells the app has changed since the checkpoint can be harmed. Every
+  // Only cells the app has changed since the LAST MERGE can be harmed. Every
   // other cell the existing merge already resolves correctly under a shift,
-  // which is why an untouched mirror needs no intervention at all. Checked
-  // first because it is cheap and almost always empty.
+  // which is why an untouched mirror needs no intervention at all.
+  //
+  // MB1188-030: "since the last merge", not "differs from Google". Nothing is
+  // ever written back to Google, so a cell where this Mac's value won stays
+  // different from the checkpoint forever. Reading that as an unsent edit made
+  // every actively-used tab permanently dirty, and therefore permanently held
+  // the first time Google's structure moved. `settled` records the divergences
+  // the last merge deliberately kept, so only genuinely new edits count.
   let dirty = false;
   for (let r = 0; r < rows && !dirty; r++) {
     for (let c = 0; c < cols; c++) {
-      if (_ssCellSignature(localAt(r, c)) !== _ssCellSignature(checkpointAt(r, c))) {
-        dirty = true;
-        break;
-      }
+      const key = `${r},${c}`;
+      const mine = _ssCellSignature(localAt(r, c));
+      if (mine === _ssCellSignature(checkpointAt(r, c))) continue;
+      // Known divergence, still holding the value the merge settled on.
+      if (Object.prototype.hasOwnProperty.call(settledAt, key) && settledAt[key] === mine) continue;
+      dirty = true;
+      break;
     }
   }
   if (!dirty) return {};
@@ -12696,7 +12724,8 @@ async function ssPullFromGoogle(projectId, options) {
 
       // MB1188-016: hold the tab if structure moved under an edit made here.
       const hold = _ssGoogleStructureHold({
-        checkpoint, incoming, existing, rows: rowsThatFit, cols: colsThatFit,
+        checkpoint, incoming, existing, settled: tab.settled,
+        rows: rowsThatFit, cols: colsThatFit,
       });
       if (hold.refuse) {
         // Deliberately BEFORE anything is written: the checkpoint does not
@@ -12707,6 +12736,7 @@ async function ssPullFromGoogle(projectId, options) {
         continue;
       }
       const cells = {};
+      const settled = {};
       const newConflicts = [];
       const keys = new Set([
         ...Object.keys(existing), ...incoming.keys(), ...Object.keys(checkpoint),
@@ -12728,6 +12758,16 @@ async function ssPullFromGoogle(projectId, options) {
           tabChanged += 1;
         } else {
           if (outcome.cell) cells[key] = outcome.cell;
+          // MB1188-030: this Mac's value survived and Google's did not, so the
+          // two are now legitimately different — and they will STAY different,
+          // because nothing is ever written back to Google (the OAuth scope is
+          // spreadsheets.readonly). Recorded so the next sync can tell settled
+          // divergence from a change somebody just made. Without this, the first
+          // app edit made a tab permanently "dirty" and the structure hold could
+          // never clear.
+          const settledSignature = _ssCellSignature(outcome.cell || null);
+          const googleSignature = _ssCellSignature(_ssCheckpointCell(checkpoint[key]));
+          if (settledSignature !== googleSignature) settled[key] = settledSignature;
           if (outcome.take === 'conflict') {
             clashes += 1;
             newConflicts.push({
@@ -12797,6 +12837,9 @@ async function ssPullFromGoogle(projectId, options) {
             title: readTitle,
             ...(Number.isSafeInteger(remoteTab?.sheetId) ? { sheetId: remoteTab.sheetId } : {}),
             checkpoint: _ssGoogleCheckpoint(kept, keptFormats),
+            // MB1188-030: written in the same breath as the checkpoint, because
+            // it only means anything relative to that checkpoint.
+            ...(Object.keys(settled).length ? { settled } : {}),
             mergeSig,
           },
         },

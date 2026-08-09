@@ -2370,3 +2370,101 @@ test('MB1188-016: a blank line cannot be used as evidence of movement', () => {
     edits: { 1: 'Added here' },
   }).refuse, undefined, 'nothing actually moved, so nothing is held');
 });
+
+// ── MB1188-030: a held tab has to be able to clear ───────────────────────────
+//
+// Nothing is ever written back to Google — the OAuth scope is
+// spreadsheets.readonly. So when the merge keeps this Mac's value, the
+// checkpoint still records GOOGLE's, and those two never reconverge. Reading
+// that difference as "an unsent edit" made every actively-used tab permanently
+// dirty, so the first structural change in Google held it forever, with
+// re-importing the only way out. Isaiah hit exactly this: a held Monday tab
+// stopped syncing anything at all, including rows added in Google afterwards.
+//
+// `settled` records the divergences the last merge deliberately kept, so only
+// genuinely new edits count as dirty.
+
+function holdWithSettled() {
+  const context = vm.createContext({
+    String, JSON, Object, Array, Number, Math, Boolean, Map, Set, RegExp, console,
+  });
+  vm.runInContext(`
+    ${declaration('_ssCheckpointCell')}
+    ${declaration('_ssCellSignature')}
+    ${declaration('_ssSignatureIsBlank')}
+    ${declaration('_ssContentRelocated')}
+    ${declaration('_ssGoogleStructureHold')}
+    globalThis.hold = a => _ssGoogleStructureHold(a);
+    globalThis.sig = c => _ssCellSignature(c);
+  `, context);
+  return context;
+}
+
+test('MB1188-030: a divergence the merge settled does not count as a new edit', () => {
+  const context = holdWithSettled();
+  const cell = v => ({ v, bg: '', tc: '', b: false });
+
+  // Twelve rows mirrored from Google. One cell was resolved in this Mac's
+  // favour at the last merge, so it differs from the checkpoint on purpose.
+  const checkpoint = {};
+  const existing = {};
+  const incoming = new Map();
+  for (let r = 0; r < 12; r++) {
+    checkpoint[`${r},0`] = `Time ${r}`;
+    checkpoint[`${r},1`] = `Student ${r}`;
+    existing[`${r},0`] = cell(`Time ${r}`);
+    existing[`${r},1`] = cell(`Student ${r}`);
+    incoming.set(`${r + 2},0`, cell(`Time ${r}`));      // Google inserted 2 rows on top
+    incoming.set(`${r + 2},1`, cell(`Student ${r}`));
+  }
+  existing['5,1'] = cell('Student 5 — CANCELLED');
+  const settled = { '5,1': context.sig(cell('Student 5 — CANCELLED')) };
+
+  // Without the record, this is the permanent-hold state Isaiah hit.
+  assert.equal(context.hold({ checkpoint, incoming, existing, rows: 14, cols: 2 }).refuse, true,
+    'a settled divergence used to read as an unsent edit forever');
+
+  // With it, the tab syncs — there is nothing new at risk.
+  assert.equal(context.hold({ checkpoint, incoming, existing, settled, rows: 14, cols: 2 }).refuse, undefined,
+    'a divergence the merge already settled is not a reason to hold');
+});
+
+test('MB1188-030: a NEW edit on top of a settled cell still holds', () => {
+  // The protection has to survive the fix: somebody editing that same cell
+  // again, after the merge settled it, is exactly the case the hold exists for.
+  const context = holdWithSettled();
+  const cell = v => ({ v, bg: '', tc: '', b: false });
+
+  const checkpoint = {};
+  const existing = {};
+  const incoming = new Map();
+  for (let r = 0; r < 12; r++) {
+    checkpoint[`${r},0`] = `Time ${r}`;
+    checkpoint[`${r},1`] = `Student ${r}`;
+    existing[`${r},0`] = cell(`Time ${r}`);
+    existing[`${r},1`] = cell(`Student ${r}`);
+    incoming.set(`${r + 2},0`, cell(`Time ${r}`));
+    incoming.set(`${r + 2},1`, cell(`Student ${r}`));
+  }
+  const settled = { '5,1': context.sig(cell('Student 5 — CANCELLED')) };
+  existing['5,1'] = cell('Student 5 — CANCELLED AGAIN, DIFFERENTLY');
+
+  assert.equal(context.hold({ checkpoint, incoming, existing, settled, rows: 14, cols: 2 }).refuse, true,
+    'the recorded signature no longer matches, so this is a fresh edit');
+});
+
+test('MB1188-030: the merge records what it settled, and the link carries it', () => {
+  // Wiring — the behaviour above is only reachable if the pull actually writes
+  // `settled` and the workbook validator lets it through.
+  const pull = declaration('ssPullFromGoogle');
+  assert.match(pull, /if \(settledSignature !== googleSignature\) settled\[key\] = settledSignature;/,
+    'the merge records every divergence it deliberately kept');
+  assert.match(pull, /\.\.\.\(Object\.keys\(settled\)\.length \? \{ settled \} : \{\}\)/,
+    'and writes it beside the checkpoint it qualifies');
+  assert.match(pull, /settled: tab\.settled/, 'and the hold is given it');
+
+  const normalize = declaration('normalizeSpreadsheetWorkbook');
+  assert.match(normalize, /'mergeSig', 'settled'/,
+    'the tab allowlist admits it — otherwise the whole workbook is refused');
+  assert.match(normalize, /MAX_SPREADSHEET_SETTLED_CELLS/, 'and it is bounded');
+});
