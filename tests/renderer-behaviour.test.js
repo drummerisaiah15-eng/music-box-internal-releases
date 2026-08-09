@@ -2837,3 +2837,206 @@ test('MB1188-032: only the caret opens the list, so the cell can still be select
   assert.match(grid, /e\.target\.dataset\?\.dv === '1'/, 'checked against the caret, not the cell');
   assert.match(declaration('ssRenderGrid'), /ss-dv-caret" data-dv="1"/, 'and only the caret carries it');
 });
+
+// ── MB1188-035: a way out of a held tab ──────────────────────────────────────
+//
+// The hold is unconditional and safe, which is exactly why it needs an exit:
+// nothing is written back to Google, so a cell this Mac changed stays different
+// from the checkpoint forever, and while Google's structure sits moved relative
+// to that stale checkpoint the tab is held every sync. MB1188-030 tried to make
+// the hold quieter and reintroduced silent corruption. The answer is a person
+// choosing, not a quieter hold.
+
+function heldStateApi() {
+  const store = new Map();
+  const context = vm.createContext({
+    console, JSON, Object, Array, String, Number, Boolean, Date,
+    localStorage: {
+      getItem: k => (store.has(k) ? store.get(k) : null),
+      setItem: (k, v) => store.set(k, v),
+      removeItem: k => store.delete(k),
+    },
+  });
+  vm.runInContext(`
+    ${declaration('_ssLinkStateKey')}
+    ${declaration('_ssReadLinkState')}
+    ${declaration('_ssWriteLinkState')}
+    ${declaration('_ssTakeHoldOverride')}
+    ${declaration('_ssRecordHeldTab')}
+    ${declaration('_ssClearHeldTab')}
+    ${declaration('_ssHeldTabs')}
+    globalThis.api = {
+      record: (p, s, t, r) => _ssRecordHeldTab(p, s, t, r),
+      clear: (p, s) => _ssClearHeldTab(p, s),
+      held: p => _ssHeldTabs(p),
+      setOverride: v => { _ssHoldOverride = v; },
+      take: s => _ssTakeHoldOverride(s),
+      peek: () => _ssHoldOverride,
+    };
+  `, context);
+  return context.api;
+}
+
+test('MB1188-035: a held tab is remembered, so the notice outlives the toast', () => {
+  const api = heldStateApi();
+
+  api.record('p1', 's1', 'Monday', 'rows or columns moved in Google');
+
+  const held = api.held('p1');
+  assert.equal(held.length, 1);
+  assert.equal(held[0].sheetId, 's1');
+  assert.equal(held[0].title, 'Monday');
+  assert.match(held[0].reason, /rows or columns moved/);
+});
+
+test('MB1188-035: holding the same tab again does not stack up duplicates', () => {
+  const api = heldStateApi();
+  api.record('p1', 's1', 'Monday', 'first');
+  api.record('p1', 's1', 'Monday', 'second');
+  api.record('p1', 's2', 'Tuesday', 'other');
+
+  const held = api.held('p1');
+  assert.equal(held.length, 2, 'one entry per tab, however many syncs held it');
+  assert.equal(held.find(h => h.sheetId === 's1').reason, 'second', 'and the reason is current');
+});
+
+test('MB1188-035: a tab that merges again stops being listed', () => {
+  const api = heldStateApi();
+  api.record('p1', 's1', 'Monday', 'moved');
+  api.record('p1', 's2', 'Tuesday', 'moved');
+
+  api.clear('p1', 's1');
+
+  assert.deepEqual(api.held('p1').map(h => h.sheetId), ['s2']);
+});
+
+test('MB1188-035: the override fires once, for one tab, and then is gone', () => {
+  // A standing "always take Google" would be a permanent instruction to discard
+  // work — the kind of setting nobody remembers turning on.
+  const api = heldStateApi();
+  api.setOverride({ sheetId: 's1', choice: 'google' });
+
+  assert.equal(api.take('s2'), null, 'a different tab is not affected');
+  assert.equal(api.peek().sheetId, 's1', 'and the override survives for its own tab');
+  assert.equal(api.take('s1'), 'google');
+  assert.equal(api.take('s1'), null, 'consumed');
+  assert.equal(api.peek(), null);
+});
+
+test('MB1188-035: both choices advance the checkpoint, which is what unsticks the tab', () => {
+  const pull = declaration('ssPullFromGoogle');
+  // MB1188-036: each choice writes its own side directly. See that test for why
+  // routing "take Google's" through the merge deleted the tab.
+  assert.match(pull, /if \(override === 'google'\) \{/);
+  assert.match(pull, /target\.cells = cells;/,
+    'whichever side was chosen is what lands');
+  // Neither branch skips the checkpoint write — that is the whole point.
+  const afterCells = pull.slice(pull.indexOf('target.cells = cells;'));
+  assert.match(afterCells, /checkpoint: _ssGoogleCheckpoint\(kept, keptFormats\)/,
+    'both choices move the base forward, so the same shift is not re-detected');
+});
+
+test('MB1188-035: the hold still fires when nobody has chosen', () => {
+  const pull = declaration('ssPullFromGoogle');
+  assert.match(pull, /const hold = override \? \{\} : _ssGoogleStructureHold\(/,
+    'only an explicit choice bypasses it');
+  assert.match(pull, /_ssRecordHeldTab\(projectId, sheetId, readTitle, hold\.reason\)/,
+    'and a hold is recorded rather than only toasted');
+});
+
+test('MB1188-035: taking Google\'s version asks first, and names the tab', () => {
+  const resolve = declaration('ssResolveHeldTab');
+  assert.match(resolve, /choice === 'google' &&\s*!window\.confirm\(/,
+    'discarding this Mac\'s edits is confirmed');
+  assert.doesNotMatch(resolve.slice(0, resolve.indexOf('_ssHoldOverride =')), /choice === 'mine' &&\s*!window\.confirm/,
+    'keeping your own work does not need a warning');
+  assert.match(resolve, /_ssHoldOverride = null;/,
+    'and the override is dropped afterwards, however the pull went');
+});
+
+test('MB1188-035: the banner hides a held tab that no longer exists', () => {
+  // Otherwise a deleted sheet sits there forever offering buttons that do nothing.
+  assert.match(declaration('ssRenderHeldBanner'),
+    /held\.filter\(entry => \(project\.sheets \|\| \[\]\)\.some\(sheet => sheet\.id === entry\.sheetId\)\)/);
+  assert.match(declaration('ssRender'), /ssRenderHeldBanner\(\)/, 'and it is actually rendered');
+});
+
+test('MB1188-036: "take Google\'s" writes Google\'s cells, not the merge of nothing', () => {
+  // The P0. Expressing it as `existing = {}` and letting the ordinary merge run
+  // looked elegant and deleted the tab: _ssMergeCellFromGoogle's first rule is
+  // `r === b -> take local`, and local was null, so every cell Google had NOT
+  // changed since the checkpoint resolved to nothing. 11 of 14 cells dropped,
+  // the rest recorded as conflicts against null, checkpoint advanced over it.
+  const context = vm.createContext({ String, JSON, Object, Array, Number, Math, Boolean, Map, Set, console });
+  vm.runInContext(`
+    ${declaration('_ssCheckpointCell')}
+    ${declaration('_ssCellSignature')}
+    ${declaration('_ssMergeCellFromGoogle')}
+    globalThis.merge = (b, r, l) => _ssMergeCellFromGoogle(b, r, l);
+  `, context);
+  const cell = v => ({ v, bg: '', tc: '', b: false });
+
+  // Google agrees with the checkpoint for this cell — the common case.
+  const outcome = context.merge('Jazz 3', cell('Jazz 3'), null);
+  assert.equal(outcome.take, 'local');
+  assert.equal(outcome.cell, null,
+    'which is why running the merge with no local cell emptied the tab');
+
+  // So the pull must not do that. It copies the incoming cells straight across.
+  const pull = declaration('ssPullFromGoogle');
+  assert.match(pull, /for \(const \[key, cell\] of incoming\.entries\(\)\) cells\[key\] = \{ \.\.\.cell \};/,
+    "take Google's copies Google's cells directly");
+  assert.match(pull, /for \(const \[key, cell\] of Object\.entries\(existing\)\) cells\[key\] = \{ \.\.\.cell \};/,
+    'keep mine copies this Mac\'s cells directly');
+  assert.doesNotMatch(pull, /if \(override === 'google'\) existing = \{\};/,
+    'and neither runs a reconciliation, so no conflicts are invented');
+});
+
+test('MB1188-036: a stale banner click cannot resolve a tab that is not held', () => {
+  // The second P0: the override bypassed the hold for whatever tab the pull
+  // reached, so a banner row rendered before a sync cleared the hold could
+  // replace a perfectly healthy tab with Google's copy.
+  const resolve = declaration('ssResolveHeldTab');
+  assert.match(resolve, /const entry = _ssHeldTabs\(project\.id\)\.find\(held => held\.sheetId === sheetId\);/);
+  assert.match(resolve, /if \(!entry\) \{/, 'a tab that is not held is refused');
+  const beforeOverride = resolve.slice(0, resolve.indexOf('_ssHoldOverride = { sheetId, choice }'));
+  assert.match(beforeOverride, /if \(!entry\)/, 'and refused BEFORE the override is armed');
+});
+
+test('MB1188-036: a second resolve cannot steal the first one\'s choice', () => {
+  // _ssHoldOverride is one slot and _ssGoogleAcquire makes a second pull WAIT
+  // rather than refusing, so a second click overwrote the first choice: both
+  // tabs stayed held, both success toasts lied, and a destructive "take
+  // Google's" could be consumed by the other tab's pull.
+  const resolve = declaration('ssResolveHeldTab');
+  assert.match(resolve, /if \(_ssResolvingHeldTab\) \{/);
+  assert.match(resolve, /_ssResolvingHeldTab = true;/);
+  assert.match(resolve, /finally \{[\s\S]*_ssResolvingHeldTab = false;/,
+    'and it is released however the pull went');
+});
+
+test('MB1188-036: success means the tab is no longer held, not that the pull returned', () => {
+  // A tab renamed or deleted in Google is skipped BEFORE the override is
+  // consumed, so the pull succeeded, the hold remained, and the toast claimed
+  // it was resolved — leaving a row neither button could ever clear.
+  const resolve = declaration('ssResolveHeldTab');
+  assert.match(resolve, /const stillHeld = _ssHeldTabs\(project\.id\)\.some\(held => held\.sheetId === sheetId\);/);
+  assert.match(resolve, /if \(!pulled \|\| stillHeld\) \{/);
+  assert.match(resolve, /may have been renamed or removed in Google/);
+});
+
+test('MB1188-036: the newest held tabs are the ones kept', () => {
+  const api = heldStateApi();
+  for (let i = 0; i < 30; i++) api.record('p1', `s${i}`, `Tab ${i}`, 'moved');
+
+  const held = api.held('p1');
+  assert.ok(held.length <= 24, `bounded, got ${held.length}`);
+  assert.ok(held.some(h => h.sheetId === 's29'), 'the most recent is kept');
+  assert.equal(held.some(h => h.sheetId === 's0'), false, 'the oldest is dropped, not the newest');
+});
+
+test('MB1188-036: an unlinked project offers no buttons', () => {
+  assert.match(declaration('ssRenderHeldBanner'),
+    /project\?\.googleLink \? _ssHeldTabs\(project\.id\) : \[\]/,
+    'nothing to resolve against, so nothing is offered');
+});
