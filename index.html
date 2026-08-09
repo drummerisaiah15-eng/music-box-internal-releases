@@ -12439,37 +12439,74 @@ function _ssSignatureIsBlank(signature) {
   return !/[^\u0001]/.test(String(signature ?? ''));
 }
 
-// Movement, stated without a mapping: some cell's exact content is no longer
-// where it was, and IS somewhere else in the grid.
+// Movement, stated without a mapping.
 //
-// The first version of this compared whole-line signatures, and a pentest repro
-// walked straight through it — Google inserted a row AND typed into a
-// previously-empty column, so every shifted line's signature changed and no
-// line matched anything. Comparing cells instead survives that: the individual
-// values still moved, whatever else happened around them.
+// The first version asked "is this cell's content anywhere else in the grid?"
+// That is far too weak, and Isaiah hit it on the first real test: a schedule tab
+// is full of repeated values — hundreds of identical black cells, repeated
+// "opens 8/24", the same instructor name down a column — so editing ANY of them
+// in Google looked like a relocation and held the tab. Ordinary edits are the
+// common case; holding them makes the mirror useless.
 //
-// Content merely CHANGING in place is not movement, and neither is a value
-// appearing or being cleared — those are ordinary concurrent edits that
-// _ssMergeCellFromGoogle resolves cell by cell, raising a real conflict when it
-// cannot. Refusing those would hold a tab every time somebody typed in Google.
+// What actually distinguishes a shift is CONSISTENCY. Insert a row and dozens of
+// cells all move by exactly (+1, 0). A repeated value that happened to be edited
+// produces one scattered offset with nothing corroborating it.
 //
-// Deliberately biased toward holding: a repeated value can look relocated when
-// only one of its copies was edited in place. That costs a loud message and a
-// retry. The opposite error cost somebody's edit, silently.
+// So: tally the offsets of every cell whose content is no longer where it was,
+// and hold when one offset is corroborated — either by several cells agreeing,
+// or by a single cell whose content is unique on BOTH sides, which cannot be a
+// coincidence of repetition.
+const SPREADSHEET_SHIFT_SUPPORT = 3;
+const SPREADSHEET_SHIFT_SAMPLES = 16;
+
 function _ssContentRelocated(checkpointAt, incomingAt, rows, cols) {
-  const incomingAnywhere = new Set();
+  // Where each signature lives now. Bounded per signature: a grid of identical
+  // blank-but-black cells would otherwise make this quadratic, and those cells
+  // are indistinguishable from each other anyway.
+  const where = new Map();
+  const counts = new Map();
   for (let r = 0; r < rows; r++) {
     for (let c = 0; c < cols; c++) {
       const signature = _ssCellSignature(incomingAt(r, c));
-      if (signature) incomingAnywhere.add(signature);
+      if (!signature) continue;
+      counts.set(signature, (counts.get(signature) || 0) + 1);
+      if (!where.has(signature)) where.set(signature, []);
+      const seen = where.get(signature);
+      if (seen.length < SPREADSHEET_SHIFT_SAMPLES) seen.push([r, c]);
     }
   }
+
+  // How many times each signature appeared BEFORE, so "unique on both sides"
+  // can be judged.
+  const before = new Map();
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const signature = _ssCellSignature(checkpointAt(r, c));
+      if (signature) before.set(signature, (before.get(signature) || 0) + 1);
+    }
+  }
+
+  const support = new Map();
   for (let r = 0; r < rows; r++) {
     for (let c = 0; c < cols; c++) {
       const base = _ssCellSignature(checkpointAt(r, c));
       if (!base) continue;
-      if (_ssCellSignature(incomingAt(r, c)) === base) continue;
-      if (incomingAnywhere.has(base)) return true;
+      if (_ssCellSignature(incomingAt(r, c)) === base) continue;   // still in place
+      const seen = where.get(base);
+      if (!seen) continue;                                          // gone, not moved
+      const unique = before.get(base) === 1 && counts.get(base) === 1;
+      const offsets = new Set();
+      for (const [nr, nc] of seen) {
+        const offset = `${nr - r},${nc - c}`;
+        if (offset === '0,0' || offsets.has(offset)) continue;
+        offsets.add(offset);
+        // One cell, unique before and after, that is simply somewhere else.
+        // Repetition cannot explain that.
+        if (unique) return true;
+        const agreed = (support.get(offset) || 0) + 1;
+        if (agreed >= SPREADSHEET_SHIFT_SUPPORT) return true;
+        support.set(offset, agreed);
+      }
     }
   }
   return false;

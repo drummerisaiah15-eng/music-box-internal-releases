@@ -2292,11 +2292,11 @@ test('MB1188-016: an ordinary concurrent edit is NOT held', () => {
   }).refuse, undefined);
 });
 
-test('MB1188-016: the case that defeated the LCS design is held, not mis-mapped', () => {
-  // A column deleted in Google, which made row 1's old signature equal row 0's
-  // new one. The previous design matched them, passed every guard, and moved
-  // the edit onto the wrong row silently. Detection needs no mapping, so it
-  // simply sees content at a new index and holds.
+test('MB1188-016: a column deleted in Google under a local edit holds the tab', () => {
+  // The case that defeated the LCS design: deleting a column can make one row's
+  // new signature equal a different row's old one, so a content-matching MAP
+  // relocated an edit onto the wrong row silently. Detection needs no map — a
+  // column delete moves a whole column's worth of cells by the same offset.
   const context = vm.createContext({
     String, JSON, Object, Array, Number, Math, Boolean, Map, Set, RegExp, console,
   });
@@ -2310,19 +2310,53 @@ test('MB1188-016: the case that defeated the LCS design is held, not mis-mapped'
   `, context);
   const cell = v => ({ v, bg: '', tc: '', b: false });
 
-  const checkpoint = { '0,0': 'x', '0,1': 'y', '1,0': 'x', '1,1': 'y', '1,2': 'x' };
-  const existing = {
-    '0,0': cell('x'), '0,1': cell('y'),
-    '1,0': cell('x'), '1,1': cell('EDIT'), '1,2': cell('x'),
-  };
-  const incoming = new Map([
-    ['0,0', cell('x')], ['0,1', cell('y')], ['0,2', cell('x')],
-    ['1,0', cell('x')], ['1,1', cell('y')], ['1,2', cell('GOOG')],
-  ]);
+  const checkpoint = {};
+  const existing = {};
+  const incoming = new Map();
+  for (let r = 0; r < 5; r++) {
+    checkpoint[`${r},0`] = `Time ${r}`;
+    checkpoint[`${r},1`] = `Doomed ${r}`;
+    checkpoint[`${r},2`] = `Room ${r}`;
+    checkpoint[`${r},3`] = `Staff ${r}`;
+    for (const [k, v] of Object.entries(checkpoint)) if (k.startsWith(`${r},`)) existing[k] = cell(v);
+    // Google deleted column 1; everything to its right shifted one column left.
+    incoming.set(`${r},0`, cell(`Time ${r}`));
+    incoming.set(`${r},1`, cell(`Room ${r}`));
+    incoming.set(`${r},2`, cell(`Staff ${r}`));
+  }
+  existing['2,2'] = cell('Room 2 — MOVED TO STUDIO B');   // an edit made here
 
-  const result = context.hold({ checkpoint, incoming, existing, rows: 2, cols: 4 });
+  const result = context.hold({ checkpoint, incoming, existing, rows: 5, cols: 4 });
 
   assert.equal(result.refuse, true, 'held rather than realigned onto the wrong line');
+});
+
+test('MB1188-016: a shift too small to corroborate is NOT held — a known limit', () => {
+  // Honest boundary. Holding needs either several cells agreeing on one offset
+  // or a cell whose content is unique on both sides. A one-cell shift of a
+  // REPEATED value satisfies neither, so it falls through to the ordinary cell
+  // merge — which raises a conflict rather than silently overwriting.
+  //
+  // The alternative was holding on any repeated value appearing elsewhere, and
+  // that held every ordinary edit on a real schedule tab. This is the trade.
+  const context = vm.createContext({
+    String, JSON, Object, Array, Number, Math, Boolean, Map, Set, RegExp, console,
+  });
+  vm.runInContext(`
+    ${declaration('_ssCheckpointCell')}
+    ${declaration('_ssCellSignature')}
+    ${declaration('_ssSignatureIsBlank')}
+    ${declaration('_ssContentRelocated')}
+    ${declaration('_ssGoogleStructureHold')}
+    globalThis.hold = a => _ssGoogleStructureHold(a);
+  `, context);
+  const cell = v => ({ v, bg: '', tc: '', b: false });
+
+  const checkpoint = { '0,0': 'Dup', '1,0': 'Dup' };
+  const existing = { '0,0': cell('Dup'), '1,0': cell('Dup EDITED') };
+  const incoming = new Map([['1,0', cell('Dup')]]);
+
+  assert.equal(context.hold({ checkpoint, incoming, existing, rows: 2, cols: 1 }).refuse, undefined);
 });
 
 test('MB1188-016: a blank line cannot be used as evidence of movement', () => {
