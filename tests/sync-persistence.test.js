@@ -4903,6 +4903,11 @@ function flushHarness() {
     var _ssData = null, _ssSaveTimer = null, _ssSavePending = Promise.resolve(true),
         _ssSaveGate = null, _ssDirtyWorkbook = null, _ssDirtyBase = null,
         _ssDirtyGeneration = 0, _ssDirtyActor = null;
+    // MB1188-053/058: a failed save keeps the edit and backs off instead of
+    // retrying on every keystroke.
+    var _ssLastSaveRefusal = null, _ssOwnWriteError = null;
+    var SPREADSHEET_REFUSAL_RETRY_MS = 3000;
+    var ssRenderUnsavedBanner = () => {};
     ${declaration('_serializeKeyMutation')}
     ${declaration('_releaseSpreadsheetSaveGate')}
     ${declaration('_beginSpreadsheetSaveStage')}

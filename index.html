@@ -885,6 +885,12 @@
     #ss-capacity-notice.ss-capacity-critical .ss-capacity-bar > span { background:#c43c3c; }
 
     /* Unresolved conflicts */
+    #ss-unsaved-banner {
+      display:flex; flex-direction:column; gap:4px; margin:8px 0; padding:10px 14px;
+      border:1px solid #c43c3c; border-radius:8px; background:rgba(196,60,60,0.08);
+    }
+    #ss-unsaved-banner .ss-unsaved-title { font-weight:700; color:#c43c3c; }
+    #ss-unsaved-banner .ss-unsaved-why { color:var(--text-secondary); line-height:1.45; }
     #ss-conflict-banner {
       display:flex;align-items:center;gap:12px;margin-bottom:14px;
       padding:11px 15px;border-radius:9px;
@@ -1693,6 +1699,7 @@
            It used to be discovered at save time; now it is visible on the way
            there. -->
       <div id="ss-held-banner" style="display:none"></div>
+      <div id="ss-unsaved-banner" style="display:none"></div>
       <div id="ss-capacity-notice" style="display:none"></div>
 
       <!-- MB161-009: unresolved conflicts used to be preserved and invisible.
@@ -8773,10 +8780,23 @@ function _ssIndexAfterEdit(currentIndex, dirtyBase, dirty, at = new Date().toISO
     const existing = records.get(id);
     if (!existing) {
       records.set(id, { id, created: at, version: 1 });
-    } else if (existing._deleted) {
+    } else if (existing._deleted && !baseIds.has(id)) {
       // Re-created after a deletion. A new generation rather than a
       // resurrection: the version has to advance past the tombstone or the
       // merge will keep choosing the tombstone.
+      //
+      // MB1188-058: and ONLY when it really is a re-creation. The test is
+      // "present now, absent from the base this batch started from" — somebody
+      // made it during this batch. An id present in BOTH is not a re-creation;
+      // it is a project this Mac has simply never noticed was deleted, because
+      // the inbound listener refuses to refresh _ssData while a dirty batch is
+      // open. Advancing the version there republishes it at a HIGHER version
+      // than the tombstone, so the deletion loses the index merge and the
+      // project comes back on both Macs, document and all, with nothing said.
+      //
+      // The window used to be the 500ms save debounce, which made this a race
+      // nobody hit twice. MB1188-053 keeps a refused batch open indefinitely,
+      // which would have turned it into something a studio meets in a week.
       records.set(id, {
         id,
         created: existing.created ?? at,
@@ -8960,6 +8980,37 @@ function _ssReadStoredWorkbook() {
 async function _ssCommitSplitWorkbook(dirtyBase, dirty, stagedActor) {
   const at = new Date().toISOString();
   const written = [];
+
+  // MB1188-055: the index is BUILT AND VALIDATED FIRST, written last.
+  //
+  // _ssIndexAfterEdit runs normalizeSpreadsheetIndex, which throws — on the
+  // project ceiling among other things. Computing it after the document loop
+  // meant the validation that should gate the writes ran after them, so a
+  // refusal left a project document durable and synced with no index entry
+  // naming it: an orphan, invisible on both Macs and surviving relaunch.
+  //
+  // Reachable without any crash or injected fault. ssNewProject gates on
+  // _ssData.projects.length, and _ssAssembleWorkbook deliberately omits
+  // projects whose document has not arrived or will not parse, so at the
+  // ceiling the guard under-counts by exactly the pending set and lets the
+  // 26th project through. See MB1188-055 in ssNewProject.
+  //
+  // Same write ORDER as before — documents, then index — because an index
+  // naming a document that has not landed is read as "not arrived yet", while
+  // a document no index names is read as nothing at all.
+  const storedIndex = _durableStoreSnapshots.has('spreadsheets')
+    ? _cloneJson(_durableStoreSnapshots.get('spreadsheets'))
+    : null;
+  // Compare NORMALIZED against NORMALIZED. The stored index and the one the
+  // normalizer produces hold the same facts in a different key order, so
+  // comparing raw JSON reported a change on every save — rewriting a document
+  // both Macs write, for nothing, and manufacturing compare-and-set collisions
+  // out of pure bookkeeping.
+  const currentIndex = _ssStorageMode(storedIndex) === 'split'
+    ? normalizeSpreadsheetIndex(storedIndex)
+    : null;
+  const nextIndex = _ssIndexAfterEdit(currentIndex, dirtyBase, dirty, at, [..._ssDeletedProjectIds]);
+
   for (const project of (dirty?.projects || [])) {
     const id = String(project?.id ?? '');
     if (!SPREADSHEET_PROJECT_ID_PATTERN.test(id)) continue;
@@ -8994,18 +9045,6 @@ async function _ssCommitSplitWorkbook(dirtyBase, dirty, stagedActor) {
     written.push(key);
   }
 
-  const storedIndex = _durableStoreSnapshots.has('spreadsheets')
-    ? _cloneJson(_durableStoreSnapshots.get('spreadsheets'))
-    : null;
-  // Compare NORMALIZED against NORMALIZED. The stored index and the one the
-  // normalizer produces hold the same facts in a different key order, so
-  // comparing raw JSON reported a change on every save — rewriting a document
-  // both Macs write, for nothing, and manufacturing compare-and-set collisions
-  // out of pure bookkeeping.
-  const currentIndex = _ssStorageMode(storedIndex) === 'split'
-    ? normalizeSpreadsheetIndex(storedIndex)
-    : null;
-  const nextIndex = _ssIndexAfterEdit(currentIndex, dirtyBase, dirty, at, [..._ssDeletedProjectIds]);
   if (JSON.stringify(nextIndex) !== JSON.stringify(currentIndex)) {
     // MB161-047: written WITHOUT re-acquiring the 'spreadsheets' lock.
     //
@@ -9824,6 +9863,23 @@ let _ssDirtyBase = null;
 let _ssDirtyGeneration = 0;
 let _ssBlockedWorkbook = null;
 let _ssBlockedWorkbookError = '';
+// MB1188-053: the last refusal message, so a save that keeps failing for the
+// same reason says so once rather than once per keystroke.
+let _ssLastSaveRefusal = null;
+// MB1188-058: the exact error object this path recorded, so clearing it cannot
+// erase somebody else's. A failed workbook import also writes 'spreadsheets',
+// and an unconditional clear let the next ordinary cell edit wipe that record —
+// after which Save All reported a clean save over a failed import.
+let _ssOwnWriteError = null;
+// MB1188-058: how long to wait before retrying a save that was refused.
+//
+// The merge and the validator are O(workbook), and a refusal is most likely on
+// the largest workbooks — the ones near a ceiling. Retrying on every keystroke
+// cost about 1.25s of synchronous main-thread work per character on a 325 KB
+// workbook, so the queue grew faster than it drained and the app stopped
+// responding — while the banner was telling the person to edit their way out.
+// The edit is still kept and still retried; only the cadence changes.
+const SPREADSHEET_REFUSAL_RETRY_MS = 3000;
 // V160-002: true when the workbook on screen is a FABRICATED default shown only
 // because this Mac has no readable local copy AND remote state is still unknown.
 // Editing it would create a durable pending record at revision 0 — exactly the
@@ -10534,6 +10590,43 @@ function _mergeSpreadsheetEdits(base, dirtyBase, dirty, stagedActor) {
     }
   }
 
+  // MB1188-054: a cell outside the grid is grown to fit, not refused.
+  //
+  // `rows`/`cols` and the cells are copied under independent conditions, so one
+  // Mac trimming a schedule while the other types near the bottom produces a
+  // sheet whose cells sit past its own last row. normalizeSpreadsheetWorkbook
+  // then throws "contains an out-of-range cell" — and that refusal, not any
+  // storage fault, is the reachable trigger for the whole save-failure path.
+  // Growing the sheet keeps both people's work: the typist's lesson and the
+  // trimmer's tidier grid, which they can trim again. Refusing keeps neither.
+  // Beyond the app's own ceilings there is nothing to grow into, so those stay
+  // refusals — but they are reached by a different road entirely.
+  for (const project of workbook.projects || []) {
+    for (const sheet of project.sheets || []) {
+      let maxRow = -1;
+      let maxCol = -1;
+      for (const key of Object.keys(sheet.cells || {})) {
+        const match = /^(\d+),(\d+)$/.exec(key);
+        if (!match) continue;
+        const row = Number(match[1]);
+        const col = Number(match[2]);
+        if (row > maxRow) maxRow = row;
+        if (col > maxCol) maxCol = col;
+      }
+      const wantRows = Math.max(Number(sheet.rows) || 0, maxRow + 1);
+      const wantCols = Math.max(Number(sheet.cols) || 0, maxCol + 1);
+      if (wantRows <= (sheet.rows || 0) && wantCols <= (sheet.cols || 0)) continue;
+      if (wantRows > MAX_SPREADSHEET_ROWS || wantCols > MAX_SPREADSHEET_COLS ||
+          wantRows * wantCols > MAX_SPREADSHEET_GRID_CELLS) continue;
+      sheet.rows = wantRows;
+      sheet.cols = wantCols;
+      if (Array.isArray(sheet.colWidths)) {
+        while (sheet.colWidths.length < wantCols) sheet.colWidths.push(100);
+        sheet.colWidths.length = wantCols;
+      }
+    }
+  }
+
   if (JSON.stringify(dirty.activeProject) !== JSON.stringify(dirtyBase.activeProject)) {
     workbook.activeProject = dirty.activeProject;
   }
@@ -10643,6 +10736,22 @@ function _beginSpreadsheetSaveStage() {
         _scheduleSyncDrain('spreadsheets').catch(() => {});
       }
     }
+    // MB1188-053: the workbook is durable, so it is no longer an error.
+    //
+    // The failure path records the error under 'spreadsheets' because that is
+    // the key the quit and updater gates flush. Under split storage an ordinary
+    // cell edit only rewrites a PROJECT document, so nothing ever cleared it:
+    // the studio retyped the work, the data became durable, and the app went on
+    // refusing to quit and refusing to install an update for the rest of the
+    // session — with only "Quit Without Saving" as the way out, a button that
+    // says you are losing work when you are not. That is how a real warning
+    // gets trained into a reflex.
+    if (_ssOwnWriteError && _storeWriteErrors.get('spreadsheets') === _ssOwnWriteError) {
+      _storeWriteErrors.delete('spreadsheets');
+    }
+    _ssOwnWriteError = null;
+    _ssLastSaveRefusal = null;
+    try { ssRenderUnsavedBanner(); } catch (_) {}
     if (_ssDirtyGeneration === generation) {
       _ssDirtyWorkbook = null;
       _ssDirtyBase = null;
@@ -10662,22 +10771,47 @@ function _beginSpreadsheetSaveStage() {
     }
     return true;
   }).catch(error => {
-    _storeWriteErrors.set('spreadsheets', error);
-    if (_ssDirtyWorkbook) {
-      // MB161-040: must be the assembled WORKBOOK. Under split storage the
-      // durable 'spreadsheets' snapshot is the index — a list of project ids —
-      // so assigning it here replaced the entire workbook with a manifest.
-      const durable = _ssDurableWorkbook();
-      if (durable) {
-        _ssData = durable;
-        _ssDirtyWorkbook = null;
-        _ssDirtyBase = null;
-      }
+    // MB1188-059: record ours only where there is nothing else to lose.
+    //
+    // Setting it unconditionally clobbered an outstanding foreign failure — a
+    // refused workbook import writes 'spreadsheets' too — and because
+    // _ssOwnWriteError then matched, the next successful save legitimately
+    // cleared it. Save All and the quit gate went on to report a clean save
+    // over an import that never landed. That is the same lie this whole change
+    // exists to stop telling, arriving by a different door.
+    if (!_storeWriteErrors.has('spreadsheets') ||
+        _storeWriteErrors.get('spreadsheets') === _ssOwnWriteError) {
+      _ssOwnWriteError = error;
+      _storeWriteErrors.set('spreadsheets', error);
     }
-    showToast(`Spreadsheet changes were not saved: ${error?.message || error}`, 'danger');
-    try {
-      if (document.getElementById('page-spreadsheets')?.classList.contains('active')) ssGoHome();
-    } catch (_) {}
+    // MB1188-053: the edit STAYS.
+    //
+    // This used to restore _ssData from the durable copy, null _ssDirtyWorkbook
+    // AND _ssDirtyBase, and call ssGoHome(). The user was told the save failed,
+    // by which time the typing was already gone — with no way back. Retry could
+    // not help: after the revert _ssData equals durable, so the "only write what
+    // changed" check finds nothing to write. Undo could not help either; the
+    // undo stack holds the state BEFORE the edit. And the eject took the text
+    // off screen, so it could not even be copied out by hand before retyping.
+    //
+    // Nothing about the failure required any of that. The durable store is
+    // untouched — a refusal happens before _commitEncryptedSnapshot is reached —
+    // so keeping the live workbook risks nothing that was already safe. The
+    // dirty copy and _ssDirtyBase are what the retry needs: the base is the
+    // merge base, and destroying it is precisely why a retry could not work.
+    //
+    // The trigger is rarely a storage fault. This catch wraps the whole commit,
+    // so the reachable path is the workbook validator refusing a merge — most
+    // often when one Mac shrinks a sheet while the other types near the bottom.
+    // See MB1188-054, which stops that particular merge being refused at all.
+    const message = String(error?.message || error);
+    if (message !== _ssLastSaveRefusal) {
+      _ssLastSaveRefusal = message;
+      showToast(`Spreadsheet changes are NOT saved yet: ${message}`, 'danger');
+    }
+    // Said once in a toast and then permanently on screen, because the work is
+    // still in front of the person and they need to know it is not safe.
+    try { ssRenderUnsavedBanner(); } catch (_) {}
     throw error;
   });
 
@@ -10705,9 +10839,23 @@ function _stageDirtySpreadsheetSave(delayMs) {
     // describes the change being staged. Reading it later — inside the save,
     // which is asynchronous — reads it after the pull has already cleared it.
     _ssDirtyActor = _ssAttributionActor();
+  } else if (_ssDirtyActor !== null && _ssAttributionActor() === null) {
+    // MB1188-056: the actor is sampled once, when a batch OPENS. A Google
+    // mirror joining a batch a person already opened inherited that person —
+    // one keystroke and thirty cells Google changed were all stamped with their
+    // name, which feeds the Staff Workload report as "somebody actually typing
+    // in a cell". MB1188-023's rule settles it: a system write has nobody to
+    // credit, and crediting the wrong person is worse than crediting nobody.
+    _ssDirtyActor = null;
   }
   _ssDirtyWorkbook = _ssData;
   _ssDirtyGeneration += 1;
+  // MB1188-058: back off while the same refusal keeps coming back. The timer is
+  // reset on every edit below, so this settles a few seconds after typing stops
+  // — including the undo that clears the refusal.
+  if (_ssLastSaveRefusal && delayMs < SPREADSHEET_REFUSAL_RETRY_MS) {
+    delayMs = SPREADSHEET_REFUSAL_RETRY_MS;
+  }
   let gate = _ssSaveGate;
   if (!gate || gate.released) gate = _beginSpreadsheetSaveStage();
   clearTimeout(_ssSaveTimer);
@@ -10749,7 +10897,17 @@ async function _flushSpreadsheetSave() {
     await STORE.flush(['spreadsheets']);
     return true;
   }
-  const staged = await _stageDirtySpreadsheetSave(0);
+  const pending = _stageDirtySpreadsheetSave(0);
+  // MB1188-059: a flush is an explicit "save now" — quit, install an update,
+  // Save All, Force Sync. MB1188-058's refusal backoff rewrites a delay of 0 to
+  // three seconds, and this path awaited that timer, spending 3s of the main
+  // process's 5s flush budget before the cloud write even began. On a slow
+  // connection that produced "Music Box could not finish saving" on an ordinary
+  // quit — training exactly the reflex MB1188-053 set out to stop. The backoff
+  // is for typing; nothing that asked to save now should sit in it.
+  clearTimeout(_ssSaveTimer);
+  if (_ssSaveGate && !_ssSaveGate.released) _releaseSpreadsheetSaveGate(_ssSaveGate);
+  const staged = await pending;
   if (staged === false) {
     // Blocked: remote state is unknown, or the workbook is quarantined. Failing
     // closed here is the whole point — the alternative is telling somebody
@@ -10948,6 +11106,38 @@ function ssRenderCapacityNotice() {
 // A toast is gone in seconds and the hold repeats every sync, so this lives on
 // the project until somebody decides. Deliberately not auto-resolved: both
 // choices lose something, and which one is right is not the app's call.
+// MB1188-057: the sheet count lives in one place.
+//
+// It was written only by ssOpenProject, so adding or deleting a sheet left the
+// subtitle claiming the count from when the project was opened — "1 sheet" with
+// two tabs on screen, and the home card disagreeing with the page header. Every
+// path that can change the count renders, and ssRender() calls this.
+function ssRenderSheetCount() {
+  const label = document.getElementById('ss-page-sub');
+  if (!label) return;
+  const count = (ssActiveProject()?.sheets || []).length;
+  if (!count) { label.textContent = ''; return; }
+  label.textContent = `${count} sheet${count !== 1 ? 's' : ''}`;
+}
+
+// MB1188-053: what is on screen is not saved, and stays said until it is.
+function ssRenderUnsavedBanner() {
+  const banner = document.getElementById('ss-unsaved-banner');
+  if (!banner) return;
+  if (!_ssLastSaveRefusal) {
+    banner.style.display = 'none';
+    banner.innerHTML = '';
+    return;
+  }
+  banner.style.display = '';
+  banner.innerHTML =
+    `<span class="ss-unsaved-title">These changes are not saved yet</span>` +
+    `<span class="ss-unsaved-why">${escHtml(_ssLastSaveRefusal)}. ` +
+    `Your work is still here and still on screen — nothing has been discarded. ` +
+    `Music Box keeps trying every time you edit, so undoing the last change ` +
+    `will usually clear this.</span>`;
+}
+
 function ssRenderHeldBanner() {
   const banner = document.getElementById('ss-held-banner');
   if (!banner) return;
@@ -11243,7 +11433,7 @@ function ssOpenProject(id) {
   document.getElementById('ss-home-view').style.display = 'none';
   document.getElementById('ss-editor-view').style.display = '';
   document.getElementById('ss-page-title').textContent = proj.name;
-  document.getElementById('ss-page-sub').textContent = `${proj.sheets.length} sheet${proj.sheets.length!==1?'s':''}`;
+  ssRenderSheetCount();
   document.getElementById('ss-editor-project-name').textContent = proj.name;
   document.getElementById('ss-header-actions').innerHTML =
     `<button class="btn btn-ghost btn-sm" onclick="ssRenameCurrentProject()" style="color:var(--text-secondary)">Rename</button>
@@ -11253,7 +11443,7 @@ function ssOpenProject(id) {
   ssRender();
 }
 
-function ssRender() { ssRenderTabs(); ssRenderColorKey(); ssRenderGrid(); ssUpdateToolbar(); ssRenderConflictBanner(); ssRenderHeldBanner(); ssRenderCapacityNotice(); }
+function ssRender() { ssRenderTabs(); ssRenderColorKey(); ssRenderGrid(); ssUpdateToolbar(); ssRenderConflictBanner(); ssRenderHeldBanner(); ssRenderUnsavedBanner(); ssRenderCapacityNotice(); ssRenderSheetCount(); }
 
 function ssRenderHomeView() {
   const grid = document.getElementById('ss-project-grid');
@@ -11493,7 +11683,15 @@ function ssRenderGrid() {
       const cSpan = cell.cs > 1 ? ` colspan="${safeFiniteNumber(cell.cs, 1, cols, 1)}"` : '';
       html += `<td class="${cls}" data-r="${r}" data-c="${c}"${rSpan}${cSpan} style="${styles}">`;
       if (editing) {
-        const iv = _ssEditInitChar!==null ? _ssEditInitChar : (cell.v||'');
+        // MB1188-056: until the first `input` event fires, the character the
+        // user typed to start editing exists ONLY in the DOM — ssStartEdit puts
+        // it there and this render nulls it. Reseeding from the stored cell in
+        // that window replaced "N" with "OLD VALUE", so the next keystroke
+        // produced "OLD VALUEO". Read it back instead; innerHTML has not been
+        // reassigned yet, so the live element is still there to read.
+        const iv = _ssEditInitChar !== null
+          ? _ssEditInitChar
+          : (document.getElementById('ss-inp')?.textContent ?? (cell.v || ''));
         html += `<div class="ss-cell-input" id="ss-inp" contenteditable="true" spellcheck="false" onkeydown="ssCellKey(event)" oninput="ssCellInput(event)" onblur="ssCommitEdit()" onmousedown="event.stopPropagation()" ondblclick="event.stopPropagation()" onpaste="(function(e){e.preventDefault();var el=e.currentTarget;var t=(e.clipboardData||window.clipboardData).getData('text/plain');var s=window.getSelection();var selected=s&&el.contains(s.anchorNode)&&el.contains(s.focusNode)?s.toString().length:0;var room=Math.max(0,MAX_SPREADSHEET_CELL_CHARS-(el.textContent.length-selected));if(t.length>room){showToast('Paste was not inserted. A spreadsheet cell can contain up to 50,000 characters.','warning');return;}document.execCommand('insertText',false,t);})(event)">${escHtml(iv)}</div>`;
       } else if (cell.cb) {
         // MB161-020: the value is still the string TRUE or FALSE — that is what
@@ -12262,7 +12460,19 @@ function ssNewProject() {
   // card appeared, and the SAVE threw "exceeds the 25-project limit" — after
   // _ssCommitSplitWorkbook had already written and synced the new project's
   // document, leaving it orphaned on both Macs with no index entry naming it.
-  if (!_ssData || _ssData.projects.length >= MAX_SPREADSHEET_PROJECTS) {
+  // MB1188-055: count the index, not the assembled workbook.
+  //
+  // _ssAssembleWorkbook omits any project whose document has not arrived or
+  // will not parse — deliberately, so a slow document reads as "not here yet"
+  // rather than as a deletion. That makes _ssData.projects.length an UNDERCOUNT
+  // of what the index already holds, so at the ceiling this guard let the next
+  // project through and the save then threw. See MB1188-055 in
+  // _ssCommitSplitWorkbook for what that used to leave behind.
+  const projectCount = _ssData
+    ? _ssData.projects.length + _ssPendingProjectIds.filter(
+        id => !(_ssData.projects || []).some(project => project.id === id)).length
+    : 0;
+  if (!_ssData || projectCount >= MAX_SPREADSHEET_PROJECTS) {
     showToast(`Spreadsheets can hold at most ${MAX_SPREADSHEET_PROJECTS} projects. `
       + `Delete or export one you no longer need, then try again.`, 'warning');
     return;
@@ -13364,6 +13574,15 @@ async function ssPullFromGoogle(projectId, options) {
       if (!target) continue;                 // sheet deleted while reading
       const liveLink = live.googleLink;
       if (!liveLink) break;                  // unlinked while reading
+      // MB1188-056: somebody may have started typing since the entry gate.
+      //
+      // `_ssEditCell` is checked once, before this loop, and there are five
+      // awaits after it — the pending save, the connection lock, describe, the
+      // read, and the per-tab save. A pull returning in that window rebuilt the
+      // grid under a live caret and staged Google's cells into the human's open
+      // dirty batch. BREAK, not continue: nothing has been written for this tab
+      // and no checkpoint advances, so the next tick redoes it from scratch.
+      if (_ssEditCell || _ssDirtyWorkbook) break;
       // A tab that grew in Google returns more rows than the sheet has. Writing
       // them anyway produces an out-of-range cell, which the workbook validator
       // refuses outright — the sync would appear to work and then quarantine the
@@ -13687,7 +13906,9 @@ async function ssPullFromGoogle(projectId, options) {
       });
     }
 
-    ssRender();
+    // MB1188-056: not over a live editor. ssRenderGrid() reassigns the table's
+    // innerHTML unconditionally, which throws away the element the caret is in.
+    if (!_ssEditCell) ssRender();
     ssRenderHomeView();
     // Silent when nothing moved: this runs on a timer, and a toast every few
     // minutes saying "nothing happened" is how people learn to ignore toasts.

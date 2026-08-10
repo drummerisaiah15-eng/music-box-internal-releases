@@ -1898,9 +1898,15 @@ test('MB161-040: the merge base is a workbook, never the index', () => {
   assert.doesNotMatch(stage, /_durableStoreSnapshots\.get\('spreadsheets'\)/,
     'the raw snapshot is not a workbook and must not be used as one');
 
-  // And the recovery path after a failed write, where it would have replaced
-  // the entire workbook with a manifest.
-  assert.match(script, /const durable = _ssDurableWorkbook\(\);\s*\n\s*if \(durable\) \{\s*\n\s*_ssData = durable;/);
+  // MB1188-053: the other half of this — the recovery path after a failed
+  // write, where the raw index would have replaced the whole workbook — is gone
+  // entirely. A failed save no longer replaces _ssData with anything, because
+  // replacing it was itself the defect: it discarded the edit. The lesson still
+  // holds for _ssDurableWorkbook's remaining callers, which is what the helper
+  // assertions below cover.
+  const stagePath = namedFunctionSource('_beginSpreadsheetSaveStage');
+  assert.doesNotMatch(stagePath, /_ssData = durable;/,
+    'a failed save must not overwrite the live workbook with the durable one');
 
   const helper = namedFunctionSource('_ssDurableWorkbook');
   assert.match(helper, /_ssReadStoredWorkbook\(\)/, 'it assembles rather than reading a snapshot');

@@ -3250,8 +3250,11 @@ test('MB1188-040: the 26th project is refused by the guard, not by the save', ()
   // _ssCommitSplitWorkbook had already written and synced the new project's
   // document, leaving it orphaned on both Macs with no index entry naming it.
   const create = declaration('ssNewProject');
-  assert.match(create, /_ssData\.projects\.length >= MAX_SPREADSHEET_PROJECTS/,
+  assert.match(create, /projectCount >= MAX_SPREADSHEET_PROJECTS/,
     'projects are gated on the project ceiling');
+  // MB1188-055: and on a count that includes projects the index holds but the
+  // assembled workbook omits, which is what let the 26th through.
+  assert.match(create, /_ssPendingProjectIds\.filter\(/);
   assert.match(create, /totalSheets >= MAX_SPREADSHEET_SHEETS/,
     'and sheets on the sheet ceiling');
   assert.doesNotMatch(create, /projects\.length >= MAX_SPREADSHEET_SHEETS/,
@@ -3412,4 +3415,268 @@ test('MB1188-051: the pull is measured against the project it is pulling', () =>
   // The legacy fixture is workbook-wide, so this asserts the plumbing, not the
   // split scoping — which spreadsheet-split.test.js covers.
   assert.equal(typeof api.refusal({ cells: 200 }), 'string');
+});
+
+// ── MB1188-053..057: what the external 1.3.6 review found ───────────────────
+
+test('MB1188-053: a failed save keeps the edit, the dirty copy and the merge base', () => {
+  // The handler restored _ssData from the durable copy, nulled _ssDirtyWorkbook
+  // AND _ssDirtyBase, and called ssGoHome(). The user was told the save failed,
+  // by which time the typing was already gone. Retry could not help — after the
+  // revert _ssData equals durable, so the "only write what changed" check finds
+  // nothing. Undo could not help — the stack holds the state BEFORE the edit.
+  // And the eject took the text off screen, so it could not even be copied out.
+  const stage = declaration('_beginSpreadsheetSaveStage');
+  const catchBody = stage.slice(stage.indexOf('}).catch(error => {'));
+  assert.doesNotMatch(catchBody, /_ssData = durable;/, 'the live workbook is not replaced');
+  assert.doesNotMatch(catchBody, /_ssDirtyWorkbook = null;/, 'the dirty copy survives');
+  assert.doesNotMatch(catchBody, /_ssDirtyBase = null;/,
+    'and so does the merge base, which is what a retry needs');
+  assert.doesNotMatch(catchBody, /ssGoHome\(\);/,
+    'the person keeps looking at their unsaved work');
+  assert.match(catchBody, /_storeWriteErrors\.set\('spreadsheets', error\)/,
+    'the quit and updater gates still block while it is unsaved');
+});
+
+test('MB1188-053: the same refusal is announced once, not once per keystroke', () => {
+  const stage = declaration('_beginSpreadsheetSaveStage');
+  const catchBody = stage.slice(stage.indexOf('}).catch(error => {'));
+  assert.match(catchBody, /if \(message !== _ssLastSaveRefusal\) \{/);
+  assert.match(catchBody, /ssRenderUnsavedBanner\(\)/,
+    'the standing state is a banner, not a toast storm');
+
+  // The banner says the work is safe, because it is — the durable store is
+  // never reached by a refusal.
+  const banner = declaration('ssRenderUnsavedBanner');
+  assert.match(banner, /not saved yet/);
+  assert.match(banner, /nothing has been discarded/);
+  assert.match(banner, /if \(!_ssLastSaveRefusal\)/, 'and it clears itself');
+});
+
+test('MB1188-053: a durable workbook stops blocking quit and the updater', () => {
+  // The failure is recorded under 'spreadsheets' because that is the key the
+  // gates flush, but under split storage an ordinary edit only rewrites a
+  // PROJECT document — so nothing ever cleared it. The studio retyped the work,
+  // the data became durable, and the app went on refusing to quit and refusing
+  // to install an update for the rest of the session, offering only "Quit
+  // Without Saving": a warning that was no longer true, on the button that
+  // loses work when it is.
+  const stage = declaration('_beginSpreadsheetSaveStage');
+  const success = stage.slice(0, stage.indexOf('}).catch(error => {'));
+  assert.match(success, /_storeWriteErrors\.delete\('spreadsheets'\);/);
+  assert.match(success, /_ssLastSaveRefusal = null;/);
+  // Cleared on ANY successful workbook commit, not only when the index moved.
+  assert.ok(success.indexOf("_storeWriteErrors.delete('spreadsheets')")
+    < success.indexOf('if (_ssDirtyGeneration === generation)'));
+});
+
+test('MB1188-054: a cell stranded by the other Mac grows the sheet, not a refusal', () => {
+  // One person trims the schedule while the other types near the bottom. The
+  // merge copies rows/cols and cells under independent conditions, so the
+  // result has a cell past its own last row and the validator throws
+  // "contains an out-of-range cell" — the reachable trigger for the whole
+  // save-failure path, needing no storage fault at all.
+  const merge = declaration('_mergeSpreadsheetEdits');
+  assert.match(merge, /const wantRows = Math\.max\(Number\(sheet\.rows\) \|\| 0, maxRow \+ 1\);/);
+  assert.match(merge, /const wantCols = Math\.max\(Number\(sheet\.cols\) \|\| 0, maxCol \+ 1\);/);
+  assert.match(merge, /wantRows \* wantCols > MAX_SPREADSHEET_GRID_CELLS\) continue;/,
+    'beyond the app ceilings there is nothing to grow into');
+  assert.match(merge, /while \(sheet\.colWidths\.length < wantCols\) sheet\.colWidths\.push\(100\);/,
+    'and the widths follow the columns');
+
+  // Executed: the exact collision, through the real merge and the real
+  // validator, must produce a workbook that saves.
+  const round = roundTripApi();
+  const wb = (rows, cells) => ({
+    activeProject: 'p1',
+    projects: [{
+      id: 'p1', name: 'P', activeId: 's1',
+      sheets: [{ id: 's1', name: 'Week', rows, cols: 4, colWidths: [100, 100, 100, 100], cells }],
+    }],
+  });
+  const base = wb(100, { '0,0': cell('SAVED') });
+  const remote = wb(80, { '0,0': cell('SAVED') });                        // the other Mac trimmed
+  const local = wb(100, { '0,0': cell('SAVED'), '90,1': cell('LATE LESSON') }); // this Mac typed
+  const merged = round.merge(remote, base, local);
+  const out = merged.projects[0].sheets[0];
+  assert.ok(out.rows > 90, `the sheet grew to hold the typed cell, got rows=${out.rows}`);
+  assert.equal(out.cells['90,1'].v, 'LATE LESSON', 'and the lesson survived');
+  assert.equal(out.colWidths.length, out.cols, 'and the widths still match the columns');
+  assert.doesNotThrow(() => round.norm(merged), 'the result is a workbook that can be saved');
+});
+
+test('MB1188-055: the index is built and validated before any document is written', () => {
+  // _ssIndexAfterEdit runs normalizeSpreadsheetIndex, which throws. Computing
+  // it after the document loop meant the validation that should gate the writes
+  // ran after them, so a refusal left a project document durable and synced
+  // with no index entry naming it — invisible on both Macs, surviving relaunch.
+  const commit = declaration('_ssCommitSplitWorkbook');
+  const built = commit.indexOf('const nextIndex = _ssIndexAfterEdit(');
+  const loop = commit.indexOf('for (const project of (dirty?.projects || []))');
+  const written = commit.indexOf("await _commitEncryptedSnapshot(key,");
+  assert.notEqual(built, -1);
+  assert.ok(built < loop, 'the index is computed before the document loop');
+  assert.ok(built < written, 'and before anything reaches storage');
+  // The write ORDER is unchanged and deliberate: documents, then index.
+  assert.ok(written < commit.indexOf("await _commitEncryptedSnapshot('spreadsheets'"),
+    'an index naming a document that has not landed reads as "not arrived yet"');
+  assert.equal((commit.match(/_ssIndexAfterEdit\(/g) || []).length, 1, 'computed once');
+});
+
+test('MB1188-056: a pull that returns while somebody types changes nothing', () => {
+  const pull = declaration('ssPullFromGoogle');
+  assert.match(pull, /if \(_ssEditCell \|\| _ssDirtyWorkbook\) break;/,
+    'rechecked after the awaits, and BREAK so no checkpoint advances');
+  // After the live re-acquire, so the tab is known to still exist.
+  assert.ok(pull.indexOf('if (!liveLink) break;') < pull.indexOf('if (_ssEditCell || _ssDirtyWorkbook) break;'));
+  assert.match(pull, /if \(!_ssEditCell\) ssRender\(\);/,
+    'and the grid is never rebuilt under a live caret');
+});
+
+test('MB1188-056: a Google mirror never inherits the actor of an open human batch', () => {
+  // _ssDirtyActor is sampled once, when a batch OPENS. A mirror joining a batch
+  // a person already started was stamped with their name — one keystroke and
+  // thirty cells Google changed all credited to them, which feeds the Staff
+  // Workload report as "somebody actually typing in a cell".
+  const stage = declaration('_stageDirtySpreadsheetSave');
+  assert.match(stage, /\} else if \(_ssDirtyActor !== null && _ssAttributionActor\(\) === null\) \{/);
+  assert.match(stage, /_ssDirtyActor = null;/);
+});
+
+test('MB1188-056: the first keystroke survives a render landing mid-edit', () => {
+  // Until the first `input` event fires, that character exists ONLY in the DOM.
+  // Reseeding the editor from the stored cell replaced "N" with "OLD VALUE", so
+  // the next keystroke produced "OLD VALUEO".
+  const grid = declaration('ssRenderGrid');
+  assert.match(grid, /document\.getElementById\('ss-inp'\)\?\.textContent \?\? \(cell\.v \|\| ''\)/);
+  assert.doesNotMatch(grid, /_ssEditInitChar!==null \? _ssEditInitChar : \(cell\.v\|\|''\)/,
+    'the old reseed-from-cell form is gone');
+});
+
+test('MB1188-057: the sheet count is refreshed wherever it can change', () => {
+  const count = declaration('ssRenderSheetCount');
+  assert.match(count, /ss-page-sub/);
+  assert.match(count, /sheet\$\{count !== 1 \? 's' : ''\}/);
+  // One writer, called from the one render everything funnels through.
+  assert.match(declaration('ssRender'), /ssRenderSheetCount\(\)/);
+  assert.match(declaration('ssOpenProject'), /ssRenderSheetCount\(\)/);
+  assert.doesNotMatch(declaration('ssOpenProject'), /ss-page-sub'\)\.textContent =/,
+    'and nobody writes the element directly any more');
+  // ssNewSheet and ssDeleteSheet both render, which is now enough.
+  assert.match(declaration('ssNewSheet'), /ssRender\(\)/);
+  assert.match(declaration('ssDeleteSheet'), /ssRender\(\)/);
+});
+
+function indexAfterEditApi() {
+  const context = vm.createContext({
+    console, JSON, Object, Array, Map, Set, Number, String, Boolean, Date, TextEncoder,
+    _cloneJson: value => JSON.parse(JSON.stringify(value)),
+  });
+  vm.runInContext(`
+    var SPREADSHEET_INDEX_SCHEMA = 2;
+    var SPREADSHEET_PROJECT_ID_PATTERN = /^[A-Za-z0-9_-]{1,100}$/;
+    var MAX_SPREADSHEET_TOMBSTONES = 175, MAX_SPREADSHEET_INDEX_RECORDS = 400;
+    var MAX_SPREADSHEET_INDEX_BYTES = 64000, MAX_SPREADSHEET_PROJECTS = 25;
+    ${declaration('normalizeSpreadsheetIndex')}
+    ${declaration('_ssIndexAfterEdit')}
+    globalThis.api = {
+      next: (current, dirtyBase, dirty, deleted) =>
+        _ssIndexAfterEdit(current, dirtyBase, dirty, '2026-08-10T12:00:00.000Z', deleted || []),
+    };
+  `, context);
+  return context.api;
+}
+
+test('MB1188-058: a stale workbook cannot undo the other Mac\'s deletion', () => {
+  // MB1188-053 keeps a refused batch open indefinitely, and the inbound sync
+  // listener refuses to refresh _ssData while one is open. So this Mac's
+  // workbook can hold a project the other Mac has since deleted — and the
+  // "re-created after a deletion" branch could not tell that from a genuine
+  // re-creation. It republished the project at a HIGHER version than the
+  // tombstone, so the deletion lost the index merge and the project came back
+  // on both Macs, document and all, with nothing said.
+  const after = declaration('_ssIndexAfterEdit');
+  assert.match(after, /\} else if \(existing\._deleted && !baseIds\.has\(id\)\) \{/,
+    'a re-creation is present NOW and absent from the base this batch started from');
+
+  const api = indexAfterEditApi();
+  const wb = ids => ({ activeProject: ids[0], projects: ids.map(id => ({ id, name: id, activeId: id + '_s', sheets: [] })) });
+  const tombstoned = {
+    schema: 2,
+    projects: [
+      { id: 'proj_1', created: '2026-01-01T00:00:00.000Z', version: 1 },
+      { id: 'proj_2', created: '2026-01-01T00:00:00.000Z', version: 2, _deleted: true, _deletedAt: '2026-08-01T00:00:00.000Z' },
+    ],
+  };
+
+  // Stale: proj_2 is in the base AND still on screen, because this Mac never
+  // heard about the deletion. The tombstone must stand.
+  const stale = api.next(tombstoned, wb(['proj_1', 'proj_2']), wb(['proj_1', 'proj_2']));
+  const staleRecord = stale.projects.find(p => p.id === 'proj_2');
+  assert.equal(staleRecord._deleted, true, 'still deleted');
+  assert.equal(staleRecord.version, 2, 'and the version did not advance past the tombstone');
+
+  // Genuine re-creation: absent from the base, present now. That must win.
+  const remade = api.next(tombstoned, wb(['proj_1']), wb(['proj_1', 'proj_2']));
+  const remadeRecord = remade.projects.find(p => p.id === 'proj_2');
+  assert.ok(!remadeRecord._deleted, 'a project somebody really re-created is live again');
+  assert.equal(remadeRecord.version, 3, 'and outranks the tombstone');
+});
+
+test('MB1188-058: a refused save backs off instead of running on every keystroke', () => {
+  // The merge and the validator are O(workbook), and a refusal is most likely
+  // on the largest workbooks. Retrying per keystroke cost ~1.25s of synchronous
+  // main-thread work per character on a 325 KB workbook — the queue grew faster
+  // than it drained, while the banner told the person to edit their way out.
+  const stage = declaration('_stageDirtySpreadsheetSave');
+  assert.match(stage, /if \(_ssLastSaveRefusal && delayMs < SPREADSHEET_REFUSAL_RETRY_MS\) \{/);
+  assert.match(stage, /delayMs = SPREADSHEET_REFUSAL_RETRY_MS;/);
+  assert.match(script, /const SPREADSHEET_REFUSAL_RETRY_MS = 3000;/);
+  // Applied after the dirty copy is staged, so the edit is never at risk.
+  assert.ok(stage.indexOf('_ssDirtyWorkbook = _ssData;') < stage.indexOf('_ssLastSaveRefusal &&'));
+  // And the timer is still reset per edit, so it settles after typing stops.
+  assert.match(stage, /clearTimeout\(_ssSaveTimer\);/);
+});
+
+test('MB1188-058: clearing the write error cannot erase somebody else\'s', () => {
+  // A failed workbook import also records an error under 'spreadsheets'. An
+  // unconditional clear let the next ordinary cell edit wipe that record, after
+  // which Save All reported a clean save over a failed import.
+  const stage = declaration('_beginSpreadsheetSaveStage');
+  assert.match(stage, /_ssOwnWriteError = error;/);
+  assert.match(stage, /if \(_ssOwnWriteError && _storeWriteErrors\.get\('spreadsheets'\) === _ssOwnWriteError\) \{/);
+  assert.match(stage, /_ssOwnWriteError = null;/);
+  assert.match(script, /let _ssOwnWriteError = null;/);
+});
+
+test('MB1188-059: a refused save does not clobber another writer\'s error', () => {
+  // A refused workbook import writes 'spreadsheets' too. Setting ours
+  // unconditionally overwrote it — and because _ssOwnWriteError then matched,
+  // the next successful save legitimately cleared it. Save All and the quit
+  // gate went on to report a clean save over an import that never landed.
+  const stage = declaration('_beginSpreadsheetSaveStage');
+  assert.match(stage, /if \(!_storeWriteErrors\.has\('spreadsheets'\) \|\|\s*\n\s*_storeWriteErrors\.get\('spreadsheets'\) === _ssOwnWriteError\) \{/);
+  const catchBody = stage.slice(stage.indexOf('}).catch(error => {'));
+  assert.ok(catchBody.indexOf("_storeWriteErrors.has('spreadsheets')")
+    < catchBody.indexOf("_storeWriteErrors.set('spreadsheets', error)"),
+    'the guard comes before the write');
+});
+
+test('MB1188-059: an explicit flush never waits out the typing backoff', () => {
+  // MB1188-058 rewrites a delay of 0 to three seconds while a refusal stands.
+  // This path awaited that timer, spending 3s of the main process's 5s flush
+  // budget before the cloud write began — "Music Box could not finish saving"
+  // on an ordinary quit, which is the reflex MB1188-053 set out to stop.
+  const flush = declaration('_flushSpreadsheetSave');
+  assert.match(flush, /const pending = _stageDirtySpreadsheetSave\(0\);/);
+  assert.match(flush, /clearTimeout\(_ssSaveTimer\);/);
+  assert.match(flush, /if \(_ssSaveGate && !_ssSaveGate\.released\) _releaseSpreadsheetSaveGate\(_ssSaveGate\);/);
+  // Staged first, released second, awaited last — releasing before staging
+  // would flush the previous batch and leave this one waiting again. Measured
+  // from `const pending`, because the !_ssData branch above releases too.
+  const at = flush.indexOf('const pending =');
+  const released = flush.indexOf('_releaseSpreadsheetSaveGate(_ssSaveGate);', at);
+  assert.ok(at !== -1 && released > at, 'the gate is released after staging');
+  assert.ok(released < flush.indexOf('const staged = await pending;'),
+    'and before the result is awaited');
 });
