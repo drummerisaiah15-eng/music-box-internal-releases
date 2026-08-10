@@ -1338,6 +1338,8 @@ test('MB161-012: capacity is measured per project once storage is split', () => 
     var MAX_SPREADSHEET_SYNC_JSON_BYTES = 600000;
     // MB1188-031: capacity measures the sheet ceiling too, across every project.
     var MAX_SPREADSHEET_SHEETS = 25;
+    // MB1188-040: the project ceiling is measured now too.
+    var MAX_SPREADSHEET_PROJECTS = 25;
     function _ssStorageMode() { return _mode; }
     ${declaration('_ssProjectAsDoc')}
     ${declaration('_ssCapacity')}

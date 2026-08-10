@@ -4374,6 +4374,9 @@ function directoryPublishApi(overrides = {}) {
   });
   vm.runInContext(`
     var DIRECTORY_PUBLISH_PENDING_KEY = 'tmb__directory_publish_pending';
+    var DIRECTORY_IMPORT_PENDING_KEY = 'tmb__directory_import_pending';
+    ${declaration('_directoryImportPending')}
+    ${declaration('_setDirectoryImportPending')}
     ${declaration('_directoryPublicationPending')}
     ${declaration('_setDirectoryPublicationPending')}
     ${declaration('publishStaffDirectory')}
@@ -5135,6 +5138,9 @@ function publishDirectoryHarness({ cloudReady }) {
     },
   });
   vm.runInContext(`
+    var DIRECTORY_IMPORT_PENDING_KEY = 'tmb__directory_import_pending';
+    ${declaration('_directoryImportPending')}
+    ${declaration('_setDirectoryImportPending')}
     ${declaration('_directoryPublicationPending')}
     ${declaration('_setDirectoryPublicationPending')}
     ${declaration('publishStaffDirectory')}
@@ -5186,4 +5192,98 @@ test('MB1188-028: the pending publication runs after sync bootstrap, not before 
   const afterBootstrap = script.slice(bootstrapIndex, bootstrapIndex + 1500);
   assert.match(afterBootstrap, /flushPendingDirectoryPublication\(\)/,
     'the flush runs once the cloud can actually be reached');
+});
+
+test('MB1188-047: a directory that could not be applied is remembered and retried', () => {
+  // The Log Out button ends the main-process session and leaves every Firestore
+  // listener running, so app-session-import-directory throws "Sign in to Music
+  // Box before using this feature." and importStaffDirectory swallows it. The
+  // revision was already advanced by _persistRemoteValue, so
+  // _reconcileRemoteSnapshot short-circuited on that document for ever after —
+  // and _refreshForSyncKey is the ONLY caller of importStaffDirectory in the
+  // build. That Mac then held a stale vault, and because _applyStaffDirectory
+  // REBUILDS from what it is given, its next publish deleted the profile on the
+  // healthy Mac. Sync badge green throughout.
+  const refresh = declaration('_refreshForSyncKey');
+  assert.match(refresh, /\.then\(ok => _setDirectoryImportPending\(!ok\)\)/,
+    'the outcome of the apply is recorded, not discarded');
+  assert.match(refresh, /\.catch\(\(\) => _setDirectoryImportPending\(true\)\)/);
+
+  const flush = declaration('flushPendingDirectoryImport');
+  assert.match(flush, /STORE\.get\('staff_directory', null\)/,
+    're-applied from the value that was already accepted locally');
+  assert.match(flush, /_setDirectoryImportPending\(!applied\)/,
+    'and it stays pending until it actually works');
+});
+
+test('MB1188-047: a Mac that is behind never publishes over the good copy', () => {
+  const publish = declaration('publishStaffDirectory');
+  assert.match(publish, /if \(_directoryImportPending\(\)\) \{/,
+    'a known-stale vault is not publishable');
+  // Ordered before the export, so nothing is even read from the vault.
+  assert.ok(publish.indexOf('_directoryImportPending()')
+    < publish.indexOf('exportDirectory()'));
+  assert.match(publish.slice(publish.indexOf('_directoryImportPending()')),
+    /_setDirectoryPublicationPending\(true\);/,
+    'and the debt is still owed, so the Share now banner stays');
+});
+
+test('MB1188-047: at login the directory is applied before anything is published', () => {
+  // Both orders "work". Only this one cannot publish a vault that is known to
+  // be behind the shared copy.
+  const source = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  // The bootstrap site specifically — retryDirectoryPublication also flushes
+  // the import, and it appears earlier in the file.
+  const bootstrapAt = source.indexOf('_syncBootstrapComplete = true;');
+  assert.notEqual(bootstrapAt, -1);
+  const at = source.indexOf('await flushPendingDirectoryImport();', bootstrapAt);
+  assert.notEqual(at, -1, 'the pending import is flushed at bootstrap');
+  const publishAt = source.indexOf('await flushPendingDirectoryPublication();', at);
+  assert.notEqual(publishAt, -1, 'and the pending publication after it');
+  assert.ok(at < publishAt, 'apply first, publish second');
+  // And still after bootstrap, which is what MB1188-028 was for.
+  assert.ok(bootstrapAt < at);
+});
+
+test('MB1188-047: the marker survives a restart and is not sensitive', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  assert.match(source, /const DIRECTORY_IMPORT_PENDING_KEY = 'tmb__directory_import_pending';/);
+  const read = declaration('_directoryImportPending');
+  assert.match(read, /localStorage\.getItem\(DIRECTORY_IMPORT_PENDING_KEY\) === '1'/,
+    'plain localStorage — it must be readable before the vault is unlocked, '
+    + 'which is the exact situation that creates it');
+});
+
+test('MB1188-051: re-applying the directory does not delete an unpublished profile', () => {
+  // Adding a profile from the signed-out login screen is a supported flow — it
+  // is what the publication marker exists for. Re-applying the cloud copy over
+  // it deletes it, and because _applyStaffDirectory REBUILDS the vault, the
+  // publish that follows pushes the deletion to every Mac and reports "now
+  // shared with the other Macs". Both preconditions live in the same signed-out
+  // window, so this is the ordinary pairing, not an exotic one.
+  const flush = declaration('flushPendingDirectoryImport');
+  assert.match(flush, /if \(_directoryPublicationPending\(\)\) \{/,
+    'the unpublished case is handled explicitly');
+  assert.match(flush, /listProfiles\?\.\(\)/, 'what this Mac holds is read');
+  assert.doesNotMatch(flush, /electronSession\?\.exportDirectory/,
+    'and NOT through the Owner-only channel — the marker on a Front Desk Mac is '
+    + 'set precisely because the owner is not signed in there');
+  assert.match(flush, /if \(!local\) return false;/,
+    'and when it cannot be read, nothing is overwritten');
+  assert.match(flush, /if \(key && !byName\.has\(key\)\) byName\.set\(key, entry\);/,
+    'the cloud stays authoritative; only profiles it does not name are carried over');
+  // The union is built from the stored copy first, so a name in both keeps the
+  // cloud's role rather than this Mac's stale one.
+  assert.ok(flush.indexOf('new Map(stored.map') < flush.indexOf('for (const entry of local)'));
+});
+
+test('MB1188-051: one failed import does not lock publishing out for good', () => {
+  // Publishing is gated on the pending import, and the import was flushed in
+  // exactly one place — inside initFirebase, which has already run. A single
+  // transient failure blocked every publish for the rest of the session and
+  // across restarts, and the Share now button could not clear it either.
+  const retry = declaration('retryDirectoryPublication');
+  assert.match(retry, /await flushPendingDirectoryImport\(\);/);
+  assert.ok(retry.indexOf('flushPendingDirectoryImport()') < retry.indexOf('publishStaffDirectory()'),
+    'the button retries both halves, in the safe order');
 });

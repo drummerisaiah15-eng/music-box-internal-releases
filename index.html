@@ -2752,6 +2752,23 @@ function populateProfileSelects() {
 // sensitive, and it must be readable before encrypted storage is unlocked —
 // which is the exact situation that creates it.
 const DIRECTORY_PUBLISH_PENDING_KEY = 'tmb__directory_publish_pending';
+// MB1188-047: the mirror marker — a directory that ARRIVED and could not be
+// applied. Same storage and the same reasoning: it has to survive a restart and
+// be readable before the vault is unlocked, because being locked is what
+// creates it.
+const DIRECTORY_IMPORT_PENDING_KEY = 'tmb__directory_import_pending';
+
+function _directoryImportPending() {
+  try { return localStorage.getItem(DIRECTORY_IMPORT_PENDING_KEY) === '1'; }
+  catch (_) { return false; }
+}
+
+function _setDirectoryImportPending(pending) {
+  try {
+    if (pending) localStorage.setItem(DIRECTORY_IMPORT_PENDING_KEY, '1');
+    else localStorage.removeItem(DIRECTORY_IMPORT_PENDING_KEY);
+  } catch (_) {}
+}
 
 function _directoryPublicationPending() {
   try { return localStorage.getItem(DIRECTORY_PUBLISH_PENDING_KEY) === '1'; }
@@ -2776,6 +2793,14 @@ async function publishStaffDirectory() {
   // stale publisher deletes profiles rather than merely failing to add them.
   // See app-session-export-directory in main.js.
   if (!isElizabeth()) {
+    _setDirectoryPublicationPending(true);
+    return false;
+  }
+  // MB1188-047: never publish over a directory this Mac failed to apply. The
+  // vault is known-stale, and the receiver rebuilds from whatever it is sent,
+  // so publishing it is a deletion. Staying unpublished is the safe half of
+  // this trade — the "Share now" banner keeps saying so until the apply works.
+  if (_directoryImportPending()) {
     _setDirectoryPublicationPending(true);
     return false;
   }
@@ -2827,6 +2852,60 @@ async function publishStaffDirectory() {
 
 // Runs as a post-login maintenance job. This is the half that was missing:
 // add recorded the debt, and nothing ever settled it.
+// MB1188-047: re-apply a directory that arrived while nobody was signed in.
+// Runs before any publish, so a stale vault can never be the thing published.
+async function flushPendingDirectoryImport() {
+  if (!_directoryImportPending()) return true;
+  const stored = STORE.get('staff_directory', null);
+  if (!Array.isArray(stored) || !stored.length) {
+    // The marker describes a document that is no longer here to re-apply.
+    _setDirectoryImportPending(false);
+    return true;
+  }
+  let toApply = stored;
+  // MB1188-051: a re-apply is a REBUILD, and this Mac may be holding profiles
+  // the cloud has never seen.
+  //
+  // Adding a profile from the signed-out login screen is a supported flow — it
+  // is exactly what the publication marker exists for. Re-applying the cloud
+  // copy over it deletes it, and the publish that follows then pushes the
+  // deletion to every Mac and reports "now shared with the other Macs". Both
+  // preconditions live in the same signed-out window, so this is not an exotic
+  // pairing; it is the ordinary one. The cloud copy stays authoritative for
+  // every profile it names, and profiles only this Mac has are carried over.
+  if (_directoryPublicationPending()) {
+    // MB1188-052: read through listProfiles, NOT exportDirectory.
+    //
+    // exportDirectory is Owner-only, and the publication marker on a Front Desk
+    // Mac is set precisely because the owner is not signed in there — and can
+    // only be cleared by the owner, who by definition never will be. Reading it
+    // that way made the union branch fail on every login, so that Mac never
+    // re-applied a directory again: the permanent version of exactly the stale
+    // vault MB1188-047 exists to prevent, on the Mac most likely to have one.
+    // listProfiles is ungated and its { name, role, builtIn } shape is what the
+    // directory validator already accepts.
+    let local = null;
+    try {
+      const snapshot = await window.electronSession?.listProfiles?.();
+      if (snapshot?.ok === true && Array.isArray(snapshot.profiles)) local = snapshot.profiles;
+    } catch (_) { local = null; }
+    // Cannot see what is unpublished, so cannot safely overwrite it. Staying
+    // pending keeps publishing blocked, which is the safe half of the trade —
+    // the owner signing in can see the directory and will resolve both.
+    if (!local) return false;
+    const fold = name => String(name ?? '').trim().toLocaleLowerCase('en-US');
+    const byName = new Map(stored.map(entry => [fold(entry?.name), entry]));
+    for (const entry of local) {
+      const key = fold(entry?.name);
+      if (key && !byName.has(key)) byName.set(key, entry);
+    }
+    toApply = [...byName.values()];
+  }
+  const applied = await importStaffDirectory(toApply);
+  _setDirectoryImportPending(!applied);
+  return applied;
+}
+
 async function flushPendingDirectoryPublication() {
   if (!_directoryPublicationPending()) return true;
   // Only the owner can publish. Anyone else signing in leaves the marker alone
@@ -2851,6 +2930,13 @@ async function retryDirectoryPublication() {
     showToast('Only the owner can share profiles with the other Macs.', 'warning');
     return false;
   }
+  // MB1188-051: publishing is gated on the pending import, and the import was
+  // flushed in exactly one place — inside initFirebase, which has already run.
+  // Without this, a single transient failure (a closed IPC channel, a directory
+  // main.js refuses) blocked every publish for the rest of the session and
+  // across restarts, and the Share now button could not clear it either. The
+  // button is the retry; it has to retry BOTH halves.
+  await flushPendingDirectoryImport();
   const published = await publishStaffDirectory();
   showToast(
     published
@@ -6431,8 +6517,13 @@ async function _initFirebaseInner() {
     // the other Mac's vault over IPC, and the push was never happening.
     //
     // Here is the first moment publishing can actually reach the cloud.
-    void flushPendingDirectoryPublication().catch(error => {
-      console.warn('[profiles] pending publication failed:', error?.message || error);
+    // MB1188-047: apply first, publish second. Both orders "work"; only this
+    // one cannot publish a vault that is known to be behind the shared copy.
+    void (async () => {
+      await flushPendingDirectoryImport();
+      await flushPendingDirectoryPublication();
+    })().catch(error => {
+      console.warn('[profiles] pending directory work failed:', error?.message || error);
     });
 
     // Repointed at a different cloud, every stored revision describes a
@@ -6885,7 +6976,26 @@ function _refreshForSyncKey(key, value) {
   }
   if (key === 'staff_directory') {
     // V159-005: another Mac published a profile change; apply it locally.
-    try { importStaffDirectory(value); } catch (_) {}
+    //
+    // MB1188-047: and record whether that actually worked.
+    //
+    // The revision is persisted by _persistRemoteValue BEFORE this runs, so a
+    // refused apply was permanent: _reconcileRemoteSnapshot short-circuits on
+    // `remoteRevision === localRevision && hasLocal` from then on, and this is
+    // the only caller of importStaffDirectory in the build — nothing re-applied
+    // at launch, at login, or in post-login maintenance. The refusal is easy to
+    // reach: the Log Out button ends the main-process session and leaves every
+    // Firestore listener running, so app-session-import-directory throws "Sign
+    // in to Music Box before using this feature." and the catch below swallows
+    // it. That Mac then held a stale vault, and because _applyStaffDirectory
+    // REBUILDS from what it is given, its next publish deleted the profile on
+    // the healthy Mac. One console.warn, in a packaged app with no console, and
+    // a sync badge that stayed green throughout.
+    try {
+      void importStaffDirectory(value)
+        .then(ok => _setDirectoryImportPending(!ok))
+        .catch(() => _setDirectoryImportPending(true));
+    } catch (_) { _setDirectoryImportPending(true); }
   }
   if (key === 'step_up_receipts') {
     try { renderStepUpArchive(); } catch {}
@@ -8210,6 +8320,12 @@ function navigate(page) {
   }
   // Commit any in-progress spreadsheet cell edit before switching away
   if (typeof ssCommitEdit === 'function' && _ssEditCell) ssCommitEdit();
+  // MB1188-050: and stop checking Google. The timer was started when a project
+  // was opened and cleared only by ssGoHome(), so navigating away from
+  // Spreadsheets by any other route left it running for the rest of the
+  // session — the one thing in the app that can act on its own with nobody
+  // looking at the page it belongs to.
+  if (page !== 'spreadsheets') { try { ssStopAutoSync(); } catch (_) {} }
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
   document.getElementById('page-' + page).classList.add('active');
@@ -9097,6 +9213,14 @@ function _ssCapacity(workbook, projectId = workbook?.activeProject) {
     characters: { used: characters, limit: MAX_SPREADSHEET_TOTAL_CHARS, label: 'characters' },
     bytes: { used: bytes, limit: MAX_SPREADSHEET_SYNC_JSON_BYTES, label: 'total size' },
     sheets: { used: sheets, limit: MAX_SPREADSHEET_SHEETS, label: 'sheets' },
+    // MB1188-040: the validator enforces this and nothing here measured it, so
+    // the only way to discover the project ceiling was to trip over it during a
+    // save. Like sheets, it is workbook-wide and excluded from `tightest`.
+    projects: {
+      used: (workbook?.projects || []).length,
+      limit: MAX_SPREADSHEET_PROJECTS,
+      label: 'projects',
+    },
   };
   // Report against whichever measure is closest to its limit — quoting the
   // roomiest one would be technically true and completely useless.
@@ -9114,13 +9238,20 @@ function _ssCapacity(workbook, projectId = workbook?.activeProject) {
 
 // A sentence explaining why a change cannot be made, or null if it can.
 // `extra` is what the change would ADD, so a caller can ask before mutating.
-function _ssCapacityRefusal(workbook, extra = {}) {
-  const capacity = _ssCapacity(workbook);
+// MB1188-051: `projectId` is explicit now. Under split storage _ssCapacity
+// measures ONE project, defaulting to the open one — fine for every caller that
+// acts on what is on screen, and wrong for the Google pull, which the home
+// card's "Sync now" button fires for a project that is not active. The same
+// pull was refused or accepted depending only on which card had been opened
+// last, and the refusal told the studio to delete projects.
+function _ssCapacityRefusal(workbook, extra = {}, projectId = workbook?.activeProject) {
+  const capacity = _ssCapacity(workbook, projectId);
   const wouldBe = {
     cells: capacity.cells.used + (extra.cells || 0),
     characters: capacity.characters.used + (extra.characters || 0),
     bytes: capacity.bytes.used + (extra.bytes || 0),
     sheets: capacity.sheets.used + (extra.sheets || 0),
+    projects: capacity.projects.used + (extra.projects || 0),
   };
   // Refuse only a change that BOTH lands over the limit and makes things worse.
   //
@@ -9138,7 +9269,7 @@ function _ssCapacityRefusal(workbook, extra = {}) {
       ? `${wouldBe.characters.toLocaleString()} characters against a limit of ${capacity.characters.limit.toLocaleString()}`
       : null,
     blocks(wouldBe.bytes, capacity.bytes)
-      ? `${Math.round(wouldBe.bytes / 1024)} KB against a limit of ${Math.round(capacity.bytes.limit / 1024)} KB`
+      ? `${Math.ceil(wouldBe.bytes / 1024)} KB against a limit of ${Math.floor(capacity.bytes.limit / 1024)} KB`
       : null,
     // MB1188-031: this used to be missing here entirely, so an import that
     // would breach it built everything, tried to save, and was refused by the
@@ -9149,6 +9280,10 @@ function _ssCapacityRefusal(workbook, extra = {}) {
     blocks(wouldBe.sheets, capacity.sheets)
       ? `${wouldBe.sheets} sheets across all projects — ${capacity.sheets.used} now, ` +
         `plus ${extra.sheets || 0} — against a limit of ${capacity.sheets.limit} in total`
+      : null,
+    blocks(wouldBe.projects, capacity.projects)
+      ? `${wouldBe.projects} projects — ${capacity.projects.used} now, plus ` +
+        `${extra.projects || 0} — against a limit of ${capacity.projects.limit}`
       : null,
   ].filter(Boolean);
   if (!over.length) return null;
@@ -9325,10 +9460,21 @@ function normalizeSpreadsheetWorkbook(value) {
       // the sheet has columns is wrong, not merely ugly.
       // Clamped inline rather than via safeFiniteNumber() because fourteen test
       // harnesses splice this function out on its own.
-      if (!Array.isArray(rawWidths) || rawWidths.length > cols) {
+      if (!Array.isArray(rawWidths)) {
         throw new Error('spreadsheets has invalid column widths');
       }
-      const colWidths = rawWidths.map(width => {
+      // MB1188-038: extra widths are trimmed, not fatal.
+      //
+      // "More widths than the sheet has columns is wrong, not merely ugly" was
+      // right about the shape and wrong about the remedy. _mergeSpreadsheetEdits
+      // copies `cols` and `colWidths` under two INDEPENDENT conditions, so one
+      // Mac deleting a column while the other drags a column edge produces
+      // exactly this pair — and then every save of that project throws, reverts
+      // to durable, discards the staged batch and drops the user back to the
+      // project list. No Google import can reach it; only the app itself, which
+      // is the one producer this guard was never protecting against. A width
+      // past the last column describes nothing, so dropping it loses nothing.
+      const colWidths = rawWidths.slice(0, cols).map(width => {
         const number = Number(width);
         if (!Number.isFinite(number)) return 100;
         return Math.round(Math.min(1000, Math.max(40, number)));
@@ -9342,7 +9488,17 @@ function normalizeSpreadsheetWorkbook(value) {
       // whenever the numbering shifted.
       const lists = {};
       if (sheet.lists && typeof sheet.lists === 'object' && !Array.isArray(sheet.lists)) {
-        for (const [listKey, list] of Object.entries(sheet.lists)) {
+        // MB1188-049: sorted, so the cap falls the same way everywhere.
+        //
+        // _mergeSpreadsheetEdits unions two Macs' lists with a spread, and the
+        // resulting enumeration order differs between them. Once the union
+        // exceeded MAX_SPREADSHEET_LISTS the `break` below kept the first 24 in
+        // THAT order, so the two Macs kept different halves and cells silently
+        // lost their dropdown depending on which had saved last. A digest key
+        // sorts identically on every machine.
+        const listEntries = Object.entries(sheet.lists)
+          .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+        for (const [listKey, list] of listEntries) {
           if (Object.keys(lists).length >= MAX_SPREADSHEET_LISTS) break;
           if (!/^[0-9a-z]{1,32}$/.test(listKey) || !Array.isArray(list)) continue;
           const options = [];
@@ -10317,6 +10473,14 @@ function _mergeSpreadsheetEdits(base, dirtyBase, dirty, stagedActor) {
       if (JSON.stringify(sheet.colWidths) !== JSON.stringify(originSheet.colWidths)) {
         target.colWidths = _cloneJson(sheet.colWidths);
       }
+      // MB1188-038: the two lines above are independent, so this loop can leave
+      // the pair inconsistent — the other Mac's narrower grid with this Mac's
+      // wider width list. Reconcile here as well as in the validator, so the
+      // document that goes to Firestore is right rather than merely tolerated.
+      if (Array.isArray(target.colWidths) && Number.isSafeInteger(target.cols)) {
+        while (target.colWidths.length < target.cols) target.colWidths.push(100);
+        target.colWidths.length = target.cols;
+      }
       // MB1188-032: option lists are sheet-level state no operation describes,
       // so without this they revert to the base copy on every merge — the same
       // way colorKey, googleLink, editedBy and _conflicts each did in turn.
@@ -10850,10 +11014,11 @@ async function ssResolveHeldTab(sheetId, choice) {
     return false;
   }
   _ssResolvingHeldTab = true;
-  _ssHoldOverride = { sheetId, choice };
+  const token = 'hold_' + _newRecordId();
+  _ssHoldOverride = { sheetId, choice, projectId: project.id, token };
   let pulled = false;
   try {
-    pulled = await ssPullFromGoogle(project.id, { silent: false });
+    pulled = await ssPullFromGoogle(project.id, { silent: false, overrideToken: token });
   } finally {
     // Cleared however the pull went. Leaving a standing instruction to discard
     // work would be worse than making somebody ask again.
@@ -10867,10 +11032,17 @@ async function ssResolveHeldTab(sheetId, choice) {
   // ever clear.
   const stillHeld = _ssHeldTabs(project.id).some(held => held.sheetId === sheetId);
   ssRender();
-  if (!pulled || stillHeld) {
-    showToast(
-      `"${title}" could not be resolved — it may have been renamed or removed in Google. ` +
-      `Nothing was changed here.`,
+  // MB1188-046: `pulled` is a fact about the WHOLE pull, and ANDing it with a
+  // fact about this tab reported a completed, irreversible resolution as
+  // "Nothing was changed here." any time a later tab hit a rate limit or came
+  // back oversize. The symmetric case is worse: somebody reads that their edits
+  // were not touched, clicks the other button, and destroys the ones that had
+  // just been safely kept. This tab is resolved exactly when it is no longer
+  // held; whatever else the pull did is the pull's own toast to report.
+  if (stillHeld) {
+    showToast(pulled
+      ? `"${title}" is still held — it may have been renamed in Google. Nothing in it was changed.`
+      : `Could not reach Google, so "${title}" is unchanged. Try again in a moment.`,
       'warning');
     return false;
   }
@@ -11200,8 +11372,13 @@ function ssOpenCellDropdown(r, c) {
   const current = String(cell.v || '');
   menu.innerHTML = options.map(option => {
     const swatch = swatches.get(option) || {};
-    const style = `background:${safeCssColor(swatch.bg) || 'transparent'};` +
-      `color:${safeCssColor(swatch.tc) || 'inherit'}`;
+    // MB1188-039: safeCssColor() defaults to '#6b7280', which is never falsy,
+    // so `|| 'transparent'` and `|| 'inherit'` were dead code and EVERY option
+    // in a freshly imported Google dropdown rendered as an unreadable grey pill
+    // on grey. Swatches only exist for values already drawn somewhere in the
+    // same column; a new import has none, which is the common case.
+    const style = `background:${safeCssColor(swatch.bg, '') || 'transparent'};` +
+      `color:${safeCssColor(swatch.tc, '') || 'inherit'}`;
     return `<button type="button" class="ss-dv-option${option === current ? ' ss-dv-current' : ''}" ` +
       `onclick="ssPickCellOption(${r},${c},${jsArg(option)})">` +
       `<span class="ss-dv-chip" style="${style}">${escHtml(option)}</span></button>`;
@@ -12079,9 +12256,20 @@ function ssNewProject() {
     (count, project) => count + project.sheets.length,
     0
   ) || 0;
-  if (!_ssData || _ssData.projects.length >= MAX_SPREADSHEET_SHEETS ||
-      totalSheets >= MAX_SPREADSHEET_SHEETS) {
-    showToast(`Spreadsheets can contain at most ${MAX_SPREADSHEET_SHEETS} projects or sheets.`, 'warning');
+  // MB1188-040: projects are limited by MAX_SPREADSHEET_PROJECTS, sheets by
+  // MAX_SPREADSHEET_SHEETS. This gated both on the sheet ceiling, so once
+  // MB1188-031 raised that to 60 the 26th project sailed past the guard, the
+  // card appeared, and the SAVE threw "exceeds the 25-project limit" — after
+  // _ssCommitSplitWorkbook had already written and synced the new project's
+  // document, leaving it orphaned on both Macs with no index entry naming it.
+  if (!_ssData || _ssData.projects.length >= MAX_SPREADSHEET_PROJECTS) {
+    showToast(`Spreadsheets can hold at most ${MAX_SPREADSHEET_PROJECTS} projects. `
+      + `Delete or export one you no longer need, then try again.`, 'warning');
+    return;
+  }
+  if (totalSheets >= MAX_SPREADSHEET_SHEETS) {
+    showToast(`Spreadsheets can hold at most ${MAX_SPREADSHEET_SHEETS} sheets across `
+      + `all projects, and there are ${totalSheets} now.`, 'warning');
     return;
   }
   _ssShowProjNameModal('New Project', 'New Project', name => {
@@ -12669,8 +12857,18 @@ const MAX_HELD_TAB_RECORDS = 24;
 let _ssHoldOverride = null;
 let _ssResolvingHeldTab = false;
 
-function _ssTakeHoldOverride(sheetId) {
-  if (!_ssHoldOverride || _ssHoldOverride.sheetId !== sheetId) return null;
+// MB1188-042: an override belongs to the pull that was started to apply it.
+//
+// The slot was matched on sheetId alone, and _ssGoogleAcquire makes a second
+// pull WAIT rather than refusing — so a background sync already in flight when
+// somebody clicked Resolve consumed the choice itself. It merged against a
+// checkpoint the resolving pull was about to replace, the edits went, the tab
+// re-held anyway, and the button reported failure for work it had just
+// destroyed. The token is created by ssResolveHeldTab and passed to the one
+// call it makes; a background pull has none and can never take it.
+function _ssTakeHoldOverride(sheetId, token) {
+  if (!_ssHoldOverride || !token) return null;
+  if (_ssHoldOverride.sheetId !== sheetId || _ssHoldOverride.token !== token) return null;
   const choice = _ssHoldOverride.choice;
   _ssHoldOverride = null;
   return choice;
@@ -12926,12 +13124,62 @@ function _ssContentRelocated(checkpointAt, incomingAt, rows, cols) {
       const unique = before.get(base) === 1 && counts.get(base) === 1;
       const offsets = new Set();
       for (const [nr, nc] of seen) {
-        const offset = `${nr - r},${nc - c}`;
+        const dr = nr - r;
+        const dc = nc - c;
+        const offset = `${dr},${dc}`;
         if (offset === '0,0' || offsets.has(offset)) continue;
         offsets.add(offset);
+        // MB1188-037: a departure is not evidence on its own.
+        //
+        // "This content is no longer where it was" is true of a shift. It is
+        // equally true of somebody moving one booking to another slot, which is
+        // the most ordinary thing anyone does in a shared schedule — and which
+        // held the tab, permanently, essentially every time.
+        //
+        // The two are told apart by what ARRIVED. Under a real shift the cell
+        // now at (r,c) holds whatever used to sit one step back along the same
+        // offset. After a reschedule nothing lines up that way, because no
+        // coordinate moved.
+        const sr = r - dr;
+        const sc = c - dc;
+        const source = (sr >= 0 && sr < rows && sc >= 0 && sc < cols)
+          ? _ssCellSignature(checkpointAt(sr, sc))
+          : '';
+        const arrival = _ssCellSignature(incomingAt(r, c));
+        // STRONG corroboration: the cell standing here now holds exactly what
+        // sat one step back along this offset. Only a real shift does that, and
+        // a blank pre-image is not it — off the top of the window computes to
+        // the same empty signature as a genuinely empty cell, so an empty
+        // "match" is no evidence at all.
+        const strong = !!source && arrival === source;
+        if (!strong) {
+          // Weak, but not worthless. Two shapes are legitimate here and neither
+          // is proof on its own: the line an insert pushes IN — whose content
+          // is new to this tab, or which is one of the blank rows the insert
+          // brought with it — and a line whose predecessor was blank. Content
+          // the tab ALREADY held arriving here is a rearrangement, not a shift,
+          // and is refused outright.
+          if (arrival && before.has(arrival)) continue;
+          // Admitted only when a neighbouring cell made the SAME move. One cell
+          // going somewhere on its own is what a reschedule looks like.
+          let runs = false;
+          for (const [ar, ac] of [[r, c + 1], [r, c - 1], [r + 1, c], [r - 1, c]]) {
+            if (ar < 0 || ar >= rows || ac < 0 || ac >= cols) continue;
+            const neighbour = _ssCellSignature(checkpointAt(ar, ac));
+            if (!neighbour) continue;
+            const tr = ar + dr;
+            const tc = ac + dc;
+            if (tr < 0 || tr >= rows || tc < 0 || tc >= cols) continue;
+            if (_ssCellSignature(incomingAt(tr, tc)) === neighbour) { runs = true; break; }
+          }
+          if (!runs) continue;
+        }
         // One cell, unique before and after, that is simply somewhere else.
-        // Repetition cannot explain that.
-        if (unique) return true;
+        // Repetition cannot explain that — but a reschedule can, so this
+        // short-circuit is available only to a cell that corroborated strongly.
+        // Everything else has to reach the support threshold, which one moved
+        // booking never does and a moved ROW always does.
+        if (strong && unique) return true;
         const agreed = (support.get(offset) || 0) + 1;
         if (agreed >= SPREADSHEET_SHIFT_SUPPORT) return true;
         support.set(offset, agreed);
@@ -12991,6 +13239,9 @@ function _ssGoogleStructureHold({ checkpoint, incoming, existing, rows, cols }) 
 
 async function ssPullFromGoogle(projectId, options) {
   const silent = options?.silent === true;
+  // MB1188-042: only a pull that was given the token may apply a held-tab
+  // override. See _ssTakeHoldOverride.
+  const overrideToken = options?.overrideToken || null;
   const project = (_ssData?.projects || []).find(p => p.id === projectId);
   const link = project?.googleLink;
   if (!link || !_googleSheets()) return false;
@@ -13064,6 +13315,13 @@ async function ssPullFromGoogle(projectId, options) {
     let missing = 0;
     // MB1188-016: tabs held back because structure moved under a local edit.
     let held = 0;
+    // MB1188-045: tabs taken whole by an explicit choice. Counted separately
+    // because neither choice is "updated from Google", and without it a
+    // successful resolution fell through to the empty-summary branch and fired
+    // "Already up to date with Google." immediately before the success toast —
+    // two contradictory messages, the first of which called a destructive,
+    // irreversible action a no-op.
+    let resolved = 0;
     const heldTabs = [];
 
     for (const { sheetId, tab } of plan) {
@@ -13077,6 +13335,13 @@ async function ssPullFromGoogle(projectId, options) {
         // The tab is genuinely gone from Google. Skipping is right; doing it
         // silently is not.
         missing += 1;
+        // MB1188-043: and if it was held, stop holding it. The loop `continue`s
+        // before _ssClearHeldTab below, so a tab deleted in Google kept a
+        // banner row that NEITHER button could clear — "keep mine" and "take
+        // Google's" both skipped it and both reported failure, for ever. There
+        // is no Google copy left to reconcile against, and the local one is
+        // already the only one, so the hold has nothing left to protect.
+        _ssClearHeldTab(projectId, sheetId);
         continue;
       }
       const readTitle = remoteTab?.title || tab.title;
@@ -13144,7 +13409,7 @@ async function ssPullFromGoogle(projectId, options) {
 
       // MB1188-016: hold the tab if structure moved under an edit made here.
       // MB1188-035: an explicit choice for this tab overrides the hold, once.
-      const override = _ssTakeHoldOverride(sheetId);
+      const override = _ssTakeHoldOverride(sheetId, overrideToken);
       const hold = override ? {} : _ssGoogleStructureHold({
         checkpoint, incoming, existing, rows: rowsThatFit, cols: colsThatFit,
       });
@@ -13176,10 +13441,18 @@ async function ssPullFromGoogle(projectId, options) {
         ...Object.keys(existing), ...incoming.keys(), ...Object.keys(checkpoint),
       ]);
       let tabChanged = 0;
+      // MB1188-051: tallied per tab and folded into the totals only once the
+      // tab is actually written. Counted straight into `clashes`/`resolved`,
+      // a refused tab announced conflicts that were never stored and produced
+      // the exact contradictory pair MB1188-045 exists to prevent — "1 tab NOT
+      // merged … 1 held tab resolved." in one toast.
+      let tabClashes = 0;
+      let tabResolved = 0;
       if (override) {
         // Neither choice is a reconciliation, so neither runs one: no conflicts
         // are invented, and nothing is counted as "updated from Google" that a
         // person did not ask for.
+        tabResolved += 1;
         if (override === 'google') {
           for (const [key, cell] of incoming.entries()) cells[key] = { ...cell };
         } else {
@@ -13191,19 +13464,29 @@ async function ssPullFromGoogle(projectId, options) {
         // Outside the window we read, so Google has said nothing about it.
         // Dropping it here would delete app-only cells beyond the read extent.
         if (!(row < rowsThatFit && column < colsThatFit)) {
-          if (existing[key]) cells[key] = existing[key];
+          // MB1188-051: copied, never aliased. `cells` is a candidate that may
+          // still be thrown away by the capacity guard below, and both
+          // _ssApplyImportedMerges and the dropdown restatement mutate these
+          // objects IN PLACE. Sharing them with target.cells meant a tab that
+          // was refused still left a merge span clipped to the read width
+          // sitting against the restored, narrower `cols` — after which every
+          // save of that project threw "invalid merged-cell span", reverted to
+          // durable, discarded the staged batch and called ssGoHome(). The
+          // guard was causing the exact eject it was added to prevent. A held
+          // tab also silently lost its `dv` the same way.
+          if (existing[key]) cells[key] = { ...existing[key] };
           continue;
         }
         const local = existing[key] || null;
         const incomingCell = incoming.get(key) || null;
         const outcome = _ssMergeCellFromGoogle(checkpoint[key], incomingCell, local);
         if (outcome.take === 'remote') {
-          if (incomingCell) cells[key] = incomingCell;
+          if (incomingCell) cells[key] = { ...incomingCell };
           tabChanged += 1;
         } else {
-          if (outcome.cell) cells[key] = outcome.cell;
+          if (outcome.cell) cells[key] = { ...outcome.cell };
           if (outcome.take === 'conflict') {
-            clashes += 1;
+            tabClashes += 1;
             newConflicts.push({
               id: _ssConflictId(['google', link.spreadsheetId, tab.title, key,
                 String(checkpoint[key] ?? ''), String(local?.v ?? ''), String(incomingCell?.v ?? '')]),
@@ -13221,11 +13504,27 @@ async function ssPullFromGoogle(projectId, options) {
       // when Google's own structure has actually moved. Re-applying them every
       // sync would undo a merge somebody made here for no reason.
       const mergeSig = _ssDigest(JSON.stringify(remote.merges || []));
-      _ssApplyImportedMerges(
-        cells,
-        mergeSig === tab.mergeSig ? _ssMergesOf(existing) : remote.merges,
-        rowsThatFit, colsThatFit);
+      // MB1188-044: an override takes one side WHOLE, geometry included.
+      //
+      // Merged regions are normally restated only when Google's own structure
+      // moved, so a merge somebody made here survives an ordinary sync. Applied
+      // to "take Google's" that rule was actively destructive: a merged region
+      // that exists only on this Mac was stamped over the freshly-copied Google
+      // cells and _ssApplyImportedMerges blanked every cell it covered — eight
+      // of Google's cells gone from a single 3x3 — while the toast said the tab
+      // now matched Google. The checkpoint then recorded the blanks, so it
+      // could never heal. "Keep mine" has the mirror problem and the mirror
+      // answer: this Mac's geometry, whatever Google's signature says.
+      const mergesToApply = override
+        ? (override === 'google' ? (remote.merges || []) : _ssMergesOf(existing))
+        : (mergeSig === tab.mergeSig ? _ssMergesOf(existing) : remote.merges);
+      _ssApplyImportedMerges(cells, mergesToApply, rowsThatFit, colsThatFit);
 
+      // MB1188-048: what the sheet looked like before this tab was written, so
+      // a tab that turns out not to fit can be put back exactly as it was.
+      const priorRows = target.rows;
+      const priorCols = target.cols;
+      const priorWidths = Array.isArray(target.colWidths) ? [...target.colWidths] : null;
       target.rows = rowsThatFit;
       target.cols = colsThatFit;
       if (Array.isArray(target.colWidths)) {
@@ -13271,6 +13570,43 @@ async function ssPullFromGoogle(projectId, options) {
         if (!(row < rowsThatFit && column < colsThatFit)) continue;
         cells[key] = { v: '', bg: '', tc: '', b: false, dv: listKey };
       }
+      // MB1188-048: ask whether the tab FITS before writing it.
+      //
+      // The Google pull is the only path that grows a workbook without checking
+      // — every other one goes through _ssCapacityRefusal first. That was
+      // survivable while a pull only brought text, and stopped being so when
+      // dropdown import began materialising a stored cell for every cell Google
+      // reports a RULE on, empty ones included: four whole-column dropdowns
+      // across six tabs is enough. What happened instead was that the per-tab
+      // save threw from inside the loop, the catch reported "Sync from Google
+      // failed", and ssGoHome() dropped whoever was working out of the project
+      // — every time they opened it, because the checkpoint never advanced.
+      // Refusing the tab the way a held tab is refused keeps the project open,
+      // keeps every other tab syncing, and says which tab and why.
+      let deltaBytes = 0;
+      let deltaChars = 0;
+      try {
+        const encoder = new TextEncoder();
+        deltaBytes = encoder.encode(JSON.stringify(cells)).byteLength
+          - encoder.encode(JSON.stringify(existing)).byteLength;
+      } catch (_) { deltaBytes = 0; }
+      for (const cell of Object.values(cells)) deltaChars += String(cell?.v ?? '').length;
+      for (const cell of Object.values(existing)) deltaChars -= String(cell?.v ?? '').length;
+      const wouldNotFit = _ssCapacityRefusal(_ssData, {
+        cells: Math.max(0, Object.keys(cells).length - Object.keys(existing).length),
+        characters: Math.max(0, deltaChars),
+        bytes: Math.max(0, deltaBytes),
+      }, projectId);
+      if (wouldNotFit) {
+        target.rows = priorRows;
+        target.cols = priorCols;
+        if (priorWidths) target.colWidths = priorWidths;
+        held += 1;
+        heldTabs.push(`${readTitle} (${wouldNotFit})`);
+        console.warn(`[google] "${readTitle}" not merged: ${wouldNotFit}`);
+        _ssRecordHeldTab(projectId, sheetId, readTitle, wouldNotFit);
+        continue;
+      }
       // MB1188-036: `cells` already holds whichever side was chosen, so the
       // dropdown restatement above applied to it either way. Assigning
       // `existing` here instead left a "keep mine" tab half-restated — cells the
@@ -13285,6 +13621,8 @@ async function ssPullFromGoogle(projectId, options) {
       const keptFormats = (remote.formats || []).slice(0, rowsThatFit)
         .map(row => (row || []).slice(0, colsThatFit));
       changed += tabChanged;
+      clashes += tabClashes;
+      resolved += tabResolved;
 
       // Cells, checkpoint, link and any conflict this tab produced are written
       // into the LIVE workbook and committed together. A checkpoint that
@@ -13353,7 +13691,7 @@ async function ssPullFromGoogle(projectId, options) {
     ssRenderHomeView();
     // Silent when nothing moved: this runs on a timer, and a toast every few
     // minutes saying "nothing happened" is how people learn to ignore toasts.
-    if (changed || clashes || dropped || renamed || missing || held || !silent) {
+    if (changed || clashes || dropped || renamed || missing || held || resolved || !silent) {
       const parts = [];
       if (changed) parts.push(`${changed.toLocaleString()} cell${changed === 1 ? '' : 's'} updated from Google`);
       if (clashes) parts.push(`${clashes} also changed here — kept yours, see conflicts`);
@@ -13361,6 +13699,7 @@ async function ssPullFromGoogle(projectId, options) {
       if (renamed) parts.push(`${renamed} tab${renamed === 1 ? ' was' : 's were'} renamed in Google — still linked`);
       if (missing) parts.push(`${missing} linked tab${missing === 1 ? ' is' : 's are'} no longer in Google`);
       if (held) parts.push(`${held} tab${held === 1 ? '' : 's'} NOT merged — ${heldTabs.join('; ')}`);
+      if (resolved) parts.push(`${resolved} held tab${resolved === 1 ? '' : 's'} resolved`);
       showToast(parts.length ? parts.join('. ') + '.' : 'Already up to date with Google.',
         clashes || dropped || missing || held ? 'warning' : 'success');
     }

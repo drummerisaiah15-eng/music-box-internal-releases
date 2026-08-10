@@ -1984,7 +1984,21 @@ _secureHandle('app-session-remove-staff-profile', async (_, requestedName) => {
 // the directory but cannot decide roles — every field is re-validated here, and
 // Owner can never be granted through an imported record. Otherwise a tampered
 // renderer could promote itself simply by publishing a directory entry.
-const MAX_DIRECTORY_ENTRIES = MAX_CUSTOM_STAFF_PROFILES + 16;
+// MB1188-052: big enough that a real directory can never reach it.
+//
+// This was `+ 16`, which sounds generous and is not: the document also carries
+// a removal TOMBSTONE for every profile ever deleted, bounded at 200, so about
+// 62 lifetime removals made every other Mac refuse the whole thing. The
+// tombstone trim in _buildStaffDirectory bounds the document either way, but a
+// trim is not free — dropping a removal record means the id appears on one side
+// only at the next CAS rebase, and _mergeTombstonedRecordLists reads presence
+// on one side as creation, so a deleted profile comes back. Sizing the ceiling
+// to the real worst case turns the trim into a backstop that never fires.
+//
+// Worst case: 4 built-in profiles + 50 custom + 4 built-in removals + 200
+// custom removals. Measured at 33 KB — 5% of the 600 KB sync budget.
+const MAX_DIRECTORY_ENTRIES =
+  Object.keys(APP_PROFILE_ROLES).length * 2 + MAX_CUSTOM_STAFF_PROFILES + 200;
 
 function _directoryEntryId(name) {
   return 'profile:' + name.toLocaleLowerCase('en-US');
@@ -2033,7 +2047,7 @@ function _buildStaffDirectory() {
   const now = new Date().toISOString();
   const meta = _directoryMeta(vault);
 
-  const entries = _allAppProfiles().map(profile => ({
+  let entries = _allAppProfiles().map(profile => ({
     id: _directoryEntryId(profile.name),
     name: profile.name,
     role: profile.role,
@@ -2056,6 +2070,28 @@ function _buildStaffDirectory() {
       role: 'Front Desk', builtIn: false,
       _deleted: true, _deletedAt: record.at || now,
     });
+  }
+
+  // MB1188-052: the document this Mac publishes can never exceed what the
+  // receiving Mac will accept.
+  //
+  // _applyStaffDirectory throws on more than MAX_DIRECTORY_ENTRIES and nothing
+  // bounded what is emitted here, so enough lifetime removals made every other
+  // Mac refuse the whole directory — silently, because the refusal is swallowed
+  // and the sync badge stays green. Since MB1188-047 that refusal also blocks
+  // publishing, turning a stale list into a permanent studio-wide lockout whose
+  // only message blames the connection.
+  //
+  // Live profiles are never dropped: they ARE the directory. Tombstones are
+  // bookkeeping, and the oldest go first — one older than every peer's last
+  // sync has already done its work, and losing it costs far less than refusing
+  // the document.
+  if (entries.length > MAX_DIRECTORY_ENTRIES) {
+    const liveEntries = entries.filter(entry => entry._deleted !== true);
+    const graves = entries
+      .filter(entry => entry._deleted === true)
+      .sort((a, b) => String(b._deletedAt || '').localeCompare(String(a._deletedAt || '')));
+    entries = [...liveEntries, ...graves.slice(0, Math.max(0, MAX_DIRECTORY_ENTRIES - liveEntries.length))];
   }
 
   const live = new Set(entries.map(entry => entry.id));

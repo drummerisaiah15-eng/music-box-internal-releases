@@ -970,6 +970,8 @@ function capacityApi(workbook) {
     var MAX_SPREADSHEET_SYNC_JSON_BYTES = 600000;
     // MB1188-031: capacity now measures the sheet ceiling too.
     var MAX_SPREADSHEET_SHEETS = 25;
+    // MB1188-040: and the project ceiling, which nothing measured before.
+    var MAX_SPREADSHEET_PROJECTS = 25;
     var _ssData = ${JSON.stringify(workbook)};
     // MB161-012: capacity is per project once storage is split. These fixtures
     // exercise the legacy (workbook-wide) path, which is what an un-migrated
@@ -2177,13 +2179,32 @@ test('MB1188-014: widths out of range in either direction are clamped, never thr
   assert.deepEqual(widths([40, 1000]), [40, 1000], 'the bounds themselves are untouched');
 });
 
-test('MB1188-014: structure is still refused — coercion is only for decoration', () => {
+test('MB1188-038: more widths than columns is trimmed, not refused', () => {
   const { norm } = roundTripApi();
-  // Four widths on a three-column sheet is a broken record, not an ugly one.
-  assert.throws(() => norm(widthBook([100, 100, 100, 100])),
-    /invalid column widths/, 'more widths than columns still refuses');
+  // This used to throw. It was the wrong trade, and the producer it was
+  // guarding against turned out to be the app itself: _mergeSpreadsheetEdits
+  // copies `cols` and `colWidths` under two INDEPENDENT conditions, so one Mac
+  // deleting a column while the other drags a column edge manufactures exactly
+  // this pair — after which every save of that project threw, reverted to
+  // durable, discarded the staged batch and dropped the user to the home view.
+  // A width past the last column describes nothing, so dropping it loses
+  // nothing. Google can never produce it: both Google producers force
+  // length <= cols.
+  const trimmed = norm(widthBook([100, 100, 100, 100]));
+  assert.deepEqual(trimmed.projects[0].sheets[0].colWidths, [100, 100, 100],
+    'the surplus width is dropped and the workbook survives');
+  assert.equal(trimmed.projects[0].sheets[0].cols, 3, 'the column count is untouched');
+  // A shape that is not a list at all is still a broken record, not an ugly one.
   assert.throws(() => norm(widthBook('100,100')),
     /invalid column widths/, 'a non-array still refuses');
+});
+
+test('MB1188-038: the merge cannot hand the validator a pair it will not accept', () => {
+  // The producer side of the same defect. Reconciled where it is created, so
+  // the document that goes to Firestore is right rather than merely tolerated.
+  const merge = declaration('_mergeSpreadsheetEdits');
+  assert.match(merge, /while \(target\.colWidths\.length < target\.cols\) target\.colWidths\.push\(100\);/);
+  assert.match(merge, /target\.colWidths\.length = target\.cols;/);
 });
 
 test('MB1188-014: every width main.js can emit is accepted by the workbook validator', () => {
@@ -2870,7 +2891,7 @@ function heldStateApi() {
       clear: (p, s) => _ssClearHeldTab(p, s),
       held: p => _ssHeldTabs(p),
       setOverride: v => { _ssHoldOverride = v; },
-      take: s => _ssTakeHoldOverride(s),
+      take: (s, t) => _ssTakeHoldOverride(s, t),
       peek: () => _ssHoldOverride,
     };
   `, context);
@@ -2914,13 +2935,41 @@ test('MB1188-035: the override fires once, for one tab, and then is gone', () =>
   // A standing "always take Google" would be a permanent instruction to discard
   // work — the kind of setting nobody remembers turning on.
   const api = heldStateApi();
-  api.setOverride({ sheetId: 's1', choice: 'google' });
+  api.setOverride({ sheetId: 's1', choice: 'google', token: 't1' });
 
-  assert.equal(api.take('s2'), null, 'a different tab is not affected');
+  assert.equal(api.take('s2', 't1'), null, 'a different tab is not affected');
   assert.equal(api.peek().sheetId, 's1', 'and the override survives for its own tab');
-  assert.equal(api.take('s1'), 'google');
-  assert.equal(api.take('s1'), null, 'consumed');
+  assert.equal(api.take('s1', 't1'), 'google');
+  assert.equal(api.take('s1', 't1'), null, 'consumed');
   assert.equal(api.peek(), null);
+});
+
+test('MB1188-042: a background sync cannot consume a resolution meant for it', () => {
+  // _ssGoogleAcquire makes a second pull WAIT rather than refusing, so a
+  // background sync already in flight when somebody clicked Resolve took the
+  // choice itself: it merged against a checkpoint the resolving pull was about
+  // to replace, the edits went, the tab re-held anyway, and the button reported
+  // failure for work it had just destroyed. A background pull carries no token.
+  const api = heldStateApi();
+  api.setOverride({ sheetId: 's1', choice: 'google', projectId: 'p1', token: 'hold_abc' });
+
+  assert.equal(api.take('s1', null), null, 'no token, no override');
+  assert.equal(api.take('s1', undefined), null, 'and undefined is not a wildcard');
+  assert.equal(api.take('s1', 'hold_other'), null, 'nor is somebody else\'s token');
+  assert.equal(api.peek().token, 'hold_abc', 'the choice is still waiting for its own pull');
+  assert.equal(api.take('s1', 'hold_abc'), 'google', 'which can still take it');
+});
+
+test('MB1188-042: the token is minted per resolution and passed to the one pull', () => {
+  const resolve = declaration('ssResolveHeldTab');
+  assert.match(resolve, /const token = 'hold_' \+ _newRecordId\(\);/,
+    'a fresh token per click, not a constant');
+  assert.match(resolve, /_ssHoldOverride = \{ sheetId, choice, projectId: project\.id, token \};/);
+  assert.match(resolve, /ssPullFromGoogle\(project\.id, \{ silent: false, overrideToken: token \}\)/,
+    'and it is handed to exactly one call');
+  const pull = declaration('ssPullFromGoogle');
+  assert.match(pull, /const overrideToken = options\?\.overrideToken \|\| null;/);
+  assert.match(pull, /_ssTakeHoldOverride\(sheetId, overrideToken\)/);
 });
 
 test('MB1188-035: both choices advance the checkpoint, which is what unsticks the tab', () => {
@@ -3021,8 +3070,17 @@ test('MB1188-036: success means the tab is no longer held, not that the pull ret
   // it was resolved — leaving a row neither button could ever clear.
   const resolve = declaration('ssResolveHeldTab');
   assert.match(resolve, /const stillHeld = _ssHeldTabs\(project\.id\)\.some\(held => held\.sheetId === sheetId\);/);
-  assert.match(resolve, /if \(!pulled \|\| stillHeld\) \{/);
-  assert.match(resolve, /may have been renamed or removed in Google/);
+  // MB1188-046: and ONLY that. `pulled` is a fact about the whole pull, so
+  // ANDing the two reported a completed, irreversible resolution as "Nothing
+  // was changed here." whenever a LATER tab hit a rate limit or came back
+  // oversize. The symmetric case is worse: somebody reads that their edits were
+  // untouched, clicks the other button, and destroys the ones just kept.
+  assert.match(resolve, /if \(stillHeld\) \{/);
+  assert.doesNotMatch(resolve, /if \(!pulled \|\| stillHeld\)/,
+    'a failure elsewhere in the pull is not this tab\'s failure');
+  assert.match(resolve, /may have been renamed in Google/);
+  assert.match(resolve, /Could not reach Google/,
+    'an unreachable Google is reported as unreachable, not as a rename');
 });
 
 test('MB1188-036: the newest held tabs are the ones kept', () => {
@@ -3039,4 +3097,319 @@ test('MB1188-036: an unlinked project offers no buttons', () => {
   assert.match(declaration('ssRenderHeldBanner'),
     /project\?\.googleLink \? _ssHeldTabs\(project\.id\) : \[\]/,
     'nothing to resolve against, so nothing is offered');
+});
+
+// ── MB1188-037..050: what the 1.3.5 pentest found ───────────────────────────
+
+// The single-column structureHoldApi above cannot express a reschedule, which
+// is a move ACROSS columns. This one takes a grid of rows.
+function structureHoldGridApi() {
+  const context = vm.createContext({
+    String, JSON, Object, Array, Number, Math, Boolean, Map, Set, RegExp, console,
+  });
+  vm.runInContext(`
+    ${declaration('_ssCheckpointCell')}
+    ${declaration('_ssCellSignature')}
+    ${declaration('_ssSignatureIsBlank')}
+    ${declaration('_ssContentRelocated')}
+    ${declaration('_ssGoogleStructureHold')}
+    globalThis.hold = a => _ssGoogleStructureHold(a);
+  `, context);
+  const cell = v => ({ v, bg: '', tc: '', b: false });
+  return function check({ before, after, edits = [] }) {
+    const rows = Math.max(before.length, after.length);
+    const cols = Math.max(
+      ...before.map(row => row.length), ...after.map(row => row.length));
+    const checkpoint = {};
+    const existing = {};
+    before.forEach((row, r) => row.forEach((v, c) => {
+      if (v !== '') { checkpoint[`${r},${c}`] = v; existing[`${r},${c}`] = cell(v); }
+    }));
+    for (const [r, c, v] of edits) existing[`${r},${c}`] = cell(v);
+    const incoming = new Map();
+    after.forEach((row, r) => row.forEach((v, c) => {
+      if (v !== '') incoming.set(`${r},${c}`, cell(v));
+    }));
+    return context.hold({ checkpoint, incoming, existing, rows, cols });
+  };
+}
+
+// A week of lessons: date, time, pupil, tutor, room.
+const WEEK = [
+  ['Mon 17', '16:00', 'Wren P', 'Sarah K', 'R1'],
+  ['Mon 17', '17:00', 'Sam B',  'Tom H',   'R2'],
+  ['Tue 18', '16:00', 'Ada L',  'Sarah K', 'R1'],
+  ['Tue 18', '17:00', 'Ben C',  'Tom H',   'R2'],
+  ['Wed 19', '16:00', 'Cara M', 'Sarah K', 'R1'],
+];
+const clone = grid => grid.map(row => row.slice());
+
+test('MB1188-037: rescheduling one lesson in Google does NOT hold the tab', () => {
+  // The defect that made 1.3.5 unusable in practice. Moving a booking to
+  // another slot is the single most common thing anyone does in a shared
+  // schedule, and _ssContentRelocated read it as "this content is no longer
+  // where it was" — which is also what a shift looks like from the departure
+  // side alone. Simulated over an eight-hour day it held the tab 95% of the
+  // time, permanently, with recovery that only offers discarding one side.
+  const check = structureHoldGridApi();
+  const after = clone(WEEK);
+  after[0][2] = '';                 // Wren's 16:00 slot is now empty
+  after[4][2] = 'Wren P';           // and she is in Wednesday's
+  assert.equal(check({
+    before: WEEK, after, edits: [[3, 4, 'R3']],
+  }).refuse, undefined, 'nothing moved by a fixed offset, so nothing is held');
+});
+
+test('MB1188-037: two people swapped between slots does NOT hold the tab', () => {
+  const check = structureHoldGridApi();
+  const after = clone(WEEK);
+  after[0][2] = 'Ada L';
+  after[2][2] = 'Wren P';
+  assert.equal(check({
+    before: WEEK, after, edits: [[1, 4, 'R5']],
+  }).refuse, undefined);
+});
+
+test('MB1188-037: a row inserted in Google IS still held', () => {
+  // The protection this whole mechanism exists for, in the shape the fix is
+  // most at risk of losing: the line an insert pushes in carries content the
+  // tab has never held, so it cannot corroborate from the arrival side the way
+  // every other line does. It is admitted on the neighbouring line's evidence.
+  const check = structureHoldGridApi();
+  const after = clone(WEEK);
+  after.splice(2, 0, ['Tue 18', '15:00', 'New P', 'Sarah K', 'R1']);
+  assert.match(check({
+    before: WEEK, after, edits: [[4, 2, 'Ben C — CANCELLED']],
+  }).reason || '', /rows or columns moved in Google/);
+});
+
+test('MB1188-037: a column inserted in Google IS still held', () => {
+  const check = structureHoldGridApi();
+  const after = WEEK.map(row => [row[0], row[1], 'Grade 3', row[2], row[3], row[4]]);
+  assert.match(check({
+    before: WEEK, after, edits: [[2, 4, 'R7']],
+  }).reason || '', /rows or columns moved in Google/);
+});
+
+test('MB1188-037: a row deleted in Google IS still held', () => {
+  const check = structureHoldGridApi();
+  const after = clone(WEEK);
+  after.splice(1, 1);
+  after.push(['', '', '', '', '']);
+  assert.match(check({
+    before: WEEK, after, edits: [[3, 2, 'Ben C — CANCELLED']],
+  }).reason || '', /rows or columns moved in Google/);
+});
+
+test('MB1188-037: the arrival side is what tells a shift from a reschedule', () => {
+  const relocated = declaration('_ssContentRelocated');
+  assert.match(relocated, /const source = \(sr >= 0 && sr < rows && sc >= 0 && sc < cols\)/,
+    'the pre-image is bounds-checked before it is read');
+  assert.match(relocated, /const strong = !!source && arrival === source;/,
+    'a blank pre-image is not corroboration — off the top of the window reads '
+    + 'the same as genuinely empty');
+  assert.match(relocated, /if \(arrival && before\.has\(arrival\)\) continue;/,
+    'content the tab already held arriving here is a rearrangement, not a shift');
+  assert.match(relocated, /if \(!runs\) continue;/,
+    'and a weak vote needs a neighbour that made the same move');
+  assert.match(relocated, /if \(strong && unique\) return true;/,
+    'the single-cell short-circuit is what a reschedule trips, so only a '
+    + 'strongly corroborated cell may take it');
+  // The support threshold is deliberately NOT lowered. Dropping it to 2 was
+  // measured and rejected: it bought nothing on detection and multiplied false
+  // holds roughly fortyfold.
+  assert.match(script, /const SPREADSHEET_SHIFT_SUPPORT = 3;/);
+});
+
+test('MB1188-039: an imported dropdown option is not drawn grey on grey', () => {
+  // safeCssColor() falls back to '#6b7280', which is never falsy, so the
+  // `|| 'transparent'` and `|| 'inherit'` guards were dead code — and a freshly
+  // imported Google dropdown has no swatches at all, because swatches come from
+  // values already drawn somewhere in the same column. Every option in the menu
+  // rendered as an unreadable grey pill on grey. This is the first thing anyone
+  // sees when the dropdown feature works at all.
+  const open = declaration('ssOpenCellDropdown');
+  assert.match(open, /safeCssColor\(swatch\.bg, ''\) \|\| 'transparent'/);
+  assert.match(open, /safeCssColor\(swatch\.tc, ''\) \|\| 'inherit'/);
+  assert.doesNotMatch(open, /safeCssColor\(swatch\.bg\)/,
+    'the one-argument form re-arms the fallback');
+
+  // Executed, not only matched: the fallback really does still apply elsewhere.
+  const context = vm.createContext({ String });
+  vm.runInContext(`${declaration('safeCssColor')}
+    globalThis.c = (v, f) => (f === undefined ? safeCssColor(v) : safeCssColor(v, f));`, context);
+  assert.equal(context.c(''), '#6b7280', 'the default is unchanged for every other caller');
+  assert.equal(context.c('', ''), '', 'and an explicit empty fallback stays empty');
+  assert.equal(context.c('#ff0000', ''), '#ff0000', 'a real colour still passes through');
+});
+
+test('MB1188-040: the 26th project is refused by the guard, not by the save', () => {
+  // MB1188-031 changed the validator to MAX_SPREADSHEET_PROJECTS and left this
+  // guard on MAX_SPREADSHEET_SHEETS. Once that rose to 60 the 26th project
+  // sailed past, the card appeared, and the SAVE threw — after
+  // _ssCommitSplitWorkbook had already written and synced the new project's
+  // document, leaving it orphaned on both Macs with no index entry naming it.
+  const create = declaration('ssNewProject');
+  assert.match(create, /_ssData\.projects\.length >= MAX_SPREADSHEET_PROJECTS/,
+    'projects are gated on the project ceiling');
+  assert.match(create, /totalSheets >= MAX_SPREADSHEET_SHEETS/,
+    'and sheets on the sheet ceiling');
+  assert.doesNotMatch(create, /projects\.length >= MAX_SPREADSHEET_SHEETS/,
+    'never the other way round');
+  assert.match(create, /at most \$\{MAX_SPREADSHEET_PROJECTS\} projects/);
+});
+
+test('MB1188-040: capacity measures the project ceiling and can say so', () => {
+  const projects = [];
+  for (let i = 0; i < 25; i += 1) {
+    projects.push({ id: `p${i}`, name: `P${i}`, activeId: `p${i}s`, sheets: [
+      { id: `p${i}s`, name: 'S', rows: 5, cols: 3, colWidths: [100, 100, 100], cells: {} },
+    ] });
+  }
+  const { api } = capacityApi({ activeProject: 'p0', projects });
+  assert.equal(api.capacity().projects.used, 25);
+  assert.equal(api.capacity().projects.limit, 25);
+  assert.match(api.refusal({ projects: 1 }) || '', /26 projects/,
+    'and adding one is refused with the arithmetic');
+  assert.equal(api.refusal({}), null, 'sitting exactly at the limit is not a refusal');
+  // Like sheets, a workbook-wide count must not dominate the "how full" reading.
+  assert.notEqual(api.capacity().tightest.label, 'projects');
+});
+
+test('MB1188-043: a tab deleted in Google stops being held', () => {
+  // The loop `continue`s on a missing tab before reaching _ssClearHeldTab, so
+  // the banner row survived and NEITHER button could clear it — both skipped
+  // the tab and both reported failure, for ever. There is no Google copy left
+  // to reconcile against, so the hold protects nothing.
+  const pull = declaration('ssPullFromGoogle');
+  const missingBranch = pull.slice(pull.indexOf('missing += 1;'));
+  assert.match(missingBranch.slice(0, 800), /_ssClearHeldTab\(projectId, sheetId\);/,
+    'the hold is released in the same branch that counts the tab as gone');
+});
+
+test('MB1188-044: taking Google\'s copy takes Google\'s merge geometry too', () => {
+  // Merged regions are normally restated only when Google's own structure
+  // moved, so a merge made here survives an ordinary sync. Applied to "take
+  // Google's" that rule blanked every cell a local-only merged region covered —
+  // eight of Google's cells from one 3x3 — while the toast said the tab now
+  // matched Google, and the checkpoint then recorded the blanks.
+  const pull = declaration('ssPullFromGoogle');
+  assert.match(pull, /const mergesToApply = override\s*\n?\s*\? \(override === 'google' \? \(remote\.merges \|\| \[\]\) : _ssMergesOf\(existing\)\)/);
+  assert.match(pull, /_ssApplyImportedMerges\(cells, mergesToApply, rowsThatFit, colsThatFit\);/);
+});
+
+test('MB1188-045: resolving a held tab is not reported as "nothing happened"', () => {
+  // Neither choice counts as "updated from Google", so a successful resolution
+  // fell through to the empty-summary branch and fired "Already up to date with
+  // Google." immediately before the success toast — two contradictory messages,
+  // the first calling a destructive, irreversible action a no-op.
+  const pull = declaration('ssPullFromGoogle');
+  assert.match(pull, /let resolved = 0;/);
+  // MB1188-051: tallied per tab, so a tab the capacity guard refuses does not
+  // announce a resolution it never made.
+  assert.match(pull, /tabResolved \+= 1;/);
+  assert.match(pull, /resolved \+= tabResolved;/);
+  assert.match(pull, /missing \|\| held \|\| resolved \|\| !silent/,
+    'a resolution is enough to say something');
+  assert.match(pull, /\$\{resolved\} held tab\$\{resolved === 1 \? '' : 's'\} resolved/);
+});
+
+test('MB1188-048: a Google tab that would not fit is held, not saved and thrown', () => {
+  // The pull is the only path that grows a workbook without asking whether it
+  // fits. Survivable while it only brought text; not once dropdown import began
+  // materialising a stored cell for every cell Google reports a RULE on, empty
+  // ones included. The save threw from inside the loop, the catch reported
+  // "Sync from Google failed", and ssGoHome() dropped whoever was working out
+  // of the project — every time they opened it, because the checkpoint never
+  // advanced.
+  const pull = declaration('ssPullFromGoogle');
+  const guard = pull.slice(pull.indexOf('const wouldNotFit'), pull.indexOf('target.cells = cells;'));
+  assert.match(guard, /_ssCapacityRefusal\(_ssData, \{/);
+  assert.match(guard, /target\.rows = priorRows;/, 'and the grid is put back');
+  assert.match(guard, /target\.cols = priorCols;/);
+  assert.match(guard, /if \(priorWidths\) target\.colWidths = priorWidths;/);
+  assert.match(guard, /_ssRecordHeldTab\(projectId, sheetId, readTitle, wouldNotFit\);/,
+    'refused the way a held tab is refused, so it is named on screen');
+  assert.match(guard, /continue;/, 'and the checkpoint does not advance');
+  // Before the cells are written, so nothing is half-applied.
+  assert.ok(pull.indexOf('const wouldNotFit') < pull.indexOf('target.cells = cells;'));
+});
+
+test('MB1188-049: the option-list cap falls the same way on both Macs', () => {
+  // _mergeSpreadsheetEdits unions two Macs' lists with a spread, and the
+  // resulting enumeration order differs between them. Once the union exceeded
+  // the cap, `break` kept the first 24 in THAT order — so the two Macs kept
+  // different halves and cells silently lost their dropdown depending on which
+  // had saved last.
+  const norm = declaration('normalizeSpreadsheetWorkbook');
+  assert.match(norm, /const listEntries = Object\.entries\(sheet\.lists\)\s*\n\s*\.sort\(/,
+    'enumerated in key order, which is a digest and therefore machine-independent');
+  assert.match(norm, /for \(const \[listKey, list\] of listEntries\) \{/);
+});
+
+test('MB1188-050: leaving the Spreadsheets page stops checking Google', () => {
+  // The timer was started when a project was opened and cleared only by
+  // ssGoHome(), so navigating away by any other route left it running for the
+  // rest of the session — the one thing in the app that acts on its own with
+  // nobody looking at the page it belongs to.
+  const nav = declaration('navigate');
+  assert.match(nav, /if \(page !== 'spreadsheets'\) \{ try \{ ssStopAutoSync\(\); \} catch \(_\) \{\} \}/);
+});
+
+test('MB1188-051: a tab the capacity guard refuses leaves the live workbook untouched', () => {
+  // `cells` is a candidate that may still be thrown away, and BOTH
+  // _ssApplyImportedMerges and the dropdown restatement mutate cell objects in
+  // place. Aliasing them to target.cells meant a refused tab still left a merge
+  // span clipped to the READ width sitting against the restored, narrower cols
+  // — after which every save of that project threw "invalid merged-cell span",
+  // reverted to durable, discarded the staged batch and called ssGoHome(). The
+  // guard caused the exact eject it was added to prevent.
+  const pull = declaration('ssPullFromGoogle');
+  assert.match(pull, /if \(existing\[key\]\) cells\[key\] = \{ \.\.\.existing\[key\] \};/);
+  assert.match(pull, /if \(incomingCell\) cells\[key\] = \{ \.\.\.incomingCell \};/);
+  assert.match(pull, /if \(outcome\.cell\) cells\[key\] = \{ \.\.\.outcome\.cell \};/);
+  // Nothing may hand a live object into the candidate.
+  assert.doesNotMatch(pull, /cells\[key\] = existing\[key\];/);
+  assert.doesNotMatch(pull, /cells\[key\] = incomingCell;/);
+  assert.doesNotMatch(pull, /cells\[key\] = outcome\.cell;/);
+});
+
+test('MB1188-051: a refused tab reports no conflicts and no resolutions', () => {
+  // Counted straight into the totals, a refused tab announced conflicts that
+  // were never stored — and produced the contradictory pair MB1188-045 exists
+  // to prevent, in one toast: "1 tab NOT merged ... 1 held tab resolved."
+  const pull = declaration('ssPullFromGoogle');
+  assert.match(pull, /let tabClashes = 0;/);
+  assert.match(pull, /let tabResolved = 0;/);
+  assert.match(pull, /tabClashes \+= 1;/);
+  assert.match(pull, /tabResolved \+= 1;/);
+  // Folded in only after the guard has let the tab through.
+  const fold = pull.indexOf('clashes += tabClashes;');
+  assert.notEqual(fold, -1);
+  assert.ok(pull.indexOf('if (wouldNotFit) {') < fold, 'the guard runs first');
+  assert.ok(pull.indexOf('target.cells = cells;') < fold, 'and the tab is written first');
+  assert.match(pull, /resolved \+= tabResolved;/);
+});
+
+test('MB1188-051: the pull is measured against the project it is pulling', () => {
+  // Under split storage _ssCapacity measures ONE project and defaults to the
+  // open one. Every other caller acts on what is on screen; the pull does not —
+  // the home card's "Sync now" fires it for a project that is not active. The
+  // same pull was refused or accepted purely on which card had been opened
+  // last, and the refusal told the studio to delete projects.
+  const refusal = declaration('_ssCapacityRefusal');
+  assert.match(refusal, /function _ssCapacityRefusal\(workbook, extra = \{\}, projectId = workbook\?\.activeProject\)/);
+  assert.match(refusal, /const capacity = _ssCapacity\(workbook, projectId\);/);
+  assert.match(declaration('ssPullFromGoogle'), /\}, projectId\);/,
+    'and the pull says which project it means');
+
+  // Executed: the same change, measured against two different projects.
+  const big = { id: 'big', name: 'Big', activeId: 'b1', sheets: [{ id: 'b1', name: 'S', rows: 100, cols: 100, colWidths: [], cells: {} }] };
+  for (let i = 0; i < 9900; i += 1) big.sheets[0].cells[`${Math.floor(i / 100)},${i % 100}`] = { v: 'x', bg: '', tc: '', b: false };
+  const small = { id: 'small', name: 'Small', activeId: 's1', sheets: [{ id: 's1', name: 'S', rows: 20, cols: 8, colWidths: [], cells: {} }] };
+  const { api } = capacityApi({ activeProject: 'big', projects: [big, small] });
+  assert.notEqual(api.refusal({ cells: 200 }), null, 'the big project has no room');
+  // The legacy fixture is workbook-wide, so this asserts the plumbing, not the
+  // split scoping — which spreadsheet-split.test.js covers.
+  assert.equal(typeof api.refusal({ cells: 200 }), 'string');
 });

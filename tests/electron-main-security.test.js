@@ -2024,3 +2024,63 @@ test('a client ID of the wrong length is saved with a warning, not silently', ()
   assert.match(renderer, /result\.lengthWarning/, 'and the operator is shown it');
 });
 
+
+test('MB1188-052: the published directory can never exceed what a Mac will accept', async () => {
+  // _applyStaffDirectory throws over MAX_DIRECTORY_ENTRIES and nothing bounded
+  // what _buildStaffDirectory emitted, so enough lifetime removals made every
+  // other Mac refuse the whole directory — silently, sync badge still green.
+  // Since MB1188-047 that refusal also blocks publishing, turning a stale list
+  // into a permanent studio-wide lockout that blames the connection.
+  const source = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  const start = source.indexOf('function _buildStaffDirectory()');
+  assert.notEqual(start, -1);
+  const body = source.slice(start, source.indexOf('\nfunction _validDirectoryEntry', start));
+  assert.match(body, /if \(entries\.length > MAX_DIRECTORY_ENTRIES\) \{/);
+  assert.match(body, /entry\._deleted !== true/, 'live profiles are never dropped — they ARE the directory');
+  assert.match(body, /_deletedAt \|\| ''\)\.localeCompare/, 'and the oldest tombstone goes first');
+  assert.match(body, /let entries = _allAppProfiles\(\)/, 'the list is reassignable');
+
+  // Executed: the trim keeps every live profile and lands exactly on the cap.
+  const trimLine = body.slice(body.indexOf('if (entries.length > MAX_DIRECTORY_ENTRIES) {'));
+  const trim = new Function('entries', 'MAX_DIRECTORY_ENTRIES',
+    trimLine.slice(0, trimLine.indexOf('\n\n')) + '\n  return entries;');
+  const built = [];
+  for (let i = 0; i < 40; i += 1) built.push({ id: `l${i}`, name: `Live ${i}` });
+  for (let i = 0; i < 40; i += 1) {
+    built.push({ id: `d${i}`, name: `Gone ${i}`, _deleted: true, _deletedAt: `2026-0${1 + (i % 9)}-01T00:00:00.000Z` });
+  }
+  const trimmed = trim(built, 66);
+  assert.equal(trimmed.length, 66, 'exactly at the ceiling');
+  assert.equal(trimmed.filter(e => e._deleted !== true).length, 40, 'every live profile survives');
+  const kept = trimmed.filter(e => e._deleted === true).map(e => e._deletedAt);
+  assert.deepEqual(kept, [...kept].sort().reverse(), 'the newest tombstones are the ones kept');
+  // A directory that already fits is returned untouched.
+  const small = [{ id: 'a', name: 'A' }, { id: 'b', name: 'B', _deleted: true, _deletedAt: 'x' }];
+  assert.deepEqual(trim(small.slice(), 66), small);
+});
+
+test('MB1188-052: the directory ceiling is sized to the real worst case', () => {
+  // '+ 16' sounds generous and is not: the document also carries a removal
+  // TOMBSTONE for every profile ever deleted, bounded at 200, so about 62
+  // lifetime removals made every other Mac refuse the whole thing. The trim
+  // bounds it either way, but a trim is not free — dropping a removal record
+  // means the id appears on one side only at the next CAS rebase, and
+  // _mergeTombstonedRecordLists reads presence on one side as creation, so the
+  // removed profile comes back. Sized properly, the trim never fires.
+  const source = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  assert.match(source,
+    /const MAX_DIRECTORY_ENTRIES =\s*\n\s*Object\.keys\(APP_PROFILE_ROLES\)\.length \* 2 \+ MAX_CUSTOM_STAFF_PROFILES \+ 200;/);
+  assert.doesNotMatch(source, /MAX_DIRECTORY_ENTRIES = MAX_CUSTOM_STAFF_PROFILES \+ 16;/);
+
+  // The arithmetic, against the file's own constants.
+  const builtIns = (source.match(/const APP_PROFILE_ROLES = Object\.freeze\(\{([\s\S]*?)\}\);/) || [])[1];
+  const builtInCount = (builtIns.match(/^\s*'[^']+':/gm) || []).length;
+  const maxCustom = Number((source.match(/const MAX_CUSTOM_STAFF_PROFILES = (\d+);/) || [])[1]);
+  const ceiling = builtInCount * 2 + maxCustom + 200;
+  // live + every tombstone either list can hold, and the tombstone lists are
+  // capped at 200 (custom) and the built-in count.
+  const worstCase = builtInCount + maxCustom + builtInCount + 200;
+  assert.ok(ceiling >= worstCase,
+    `the ceiling (${ceiling}) must cover the worst document this app can build (${worstCase})`);
+  assert.match(source, /\]\.slice\(-200\);/, 'the custom removal list really is bounded at 200');
+});
