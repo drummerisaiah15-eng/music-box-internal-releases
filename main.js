@@ -56,6 +56,12 @@ function _safeRendererSend(channel, payload) {
 // notifier starts an untracked download promise and its default notification
 // incorrectly promises install-on-exit, which this app intentionally disables.
 autoUpdater.autoDownload = false;
+// MB1188-062: a feed that regresses — rolled back, mis-published, or tampered
+// with — must not be able to walk the studio backwards onto a build whose bugs
+// are already fixed. electron-updater defaults this to false, but it is left
+// implicit, and the whole point of a guard is that it does not depend on a
+// default staying put.
+autoUpdater.allowDowngrade = false;
 // Installation is explicit: ordinary quit must never apply an update the user
 // chose to defer, and Restart to Install first waits for pending saves.
 autoUpdater.autoInstallOnAppQuit = false;
@@ -478,7 +484,10 @@ function createWindow() {
       callback({ cancel: !(isAppDocument || isVendorScript) });
     }
   );
-  mainWindow.loadFile(htmlPath);
+  // MB1188-062: ERR_ABORTED on a reload rejects this, and it was floating.
+  mainWindow.loadFile(htmlPath).catch(error => {
+    console.warn('[main] loadFile:', error?.message || error);
+  });
   mainWindow.webContents.on('did-start-navigation', (_event, _url, _isInPlace, isMainFrame) => {
     if (isMainFrame) _resetAppSession();
   });
@@ -545,6 +554,18 @@ if (!gotTheLock) {
   app.on('second-instance', () => {
     if (mainWindow) { mainWindow.show(); mainWindow.focus(); }
   });
+
+  // MB1188-062: an unhandled rejection in main terminates the process under
+  // Node's default, taking unsaved renderer work with it because no flush runs.
+  // Logged instead: nothing here is a corruption signal, and losing the day's
+  // typing to a transient failure is far worse than carrying on.
+  process.on('unhandledRejection', reason => {
+    console.warn('[main] unhandled rejection:', reason?.message || reason);
+  });
+  // Deliberately NOT uncaughtException. A rejected promise is usually a
+  // transport failure this app already handles; a thrown exception that nothing
+  // caught means main is in a state it does not understand, and carrying on
+  // there risks writing something wrong. The test suite pins that distinction.
 
   app.whenReady().then(() => {
     createWindow();
@@ -1620,7 +1641,14 @@ function _customStaffProfilesFromVault(vault) {
   if (!Array.isArray(stored) || stored.length > MAX_CUSTOM_STAFF_PROFILES) {
     throw new Error('The protected staff-profile list is invalid.');
   }
-  const seen = new Set(Object.keys(APP_PROFILE_ROLES).map(name => name.toLocaleLowerCase('en-US')));
+  // MB1188-060: a custom entry colliding with a BUILT-IN name is dropped, not
+  // fatal. The built-in is authoritative, so there is nothing to preserve — and
+  // throwing here is what bricked every sign-in on a Mac that had already been
+  // poisoned before MB1188-060 closed the way in. A vault written by an older
+  // build heals itself the first time this runs.
+  const builtInNames = new Set(
+    Object.keys(APP_PROFILE_ROLES).map(name => name.toLocaleLowerCase('en-US')));
+  const seen = new Set();
   return stored.map(profile => {
     if (!_isPlainObject(profile) ||
         !Object.keys(profile).every(key => ['name', 'role', 'createdAt'].includes(key)) ||
@@ -1631,10 +1659,11 @@ function _customStaffProfilesFromVault(vault) {
     }
     const name = _normalizeStaffProfileName(profile.name);
     const folded = name.toLocaleLowerCase('en-US');
+    if (builtInNames.has(folded)) return null;
     if (seen.has(folded)) throw new Error('The protected staff-profile list contains a duplicate name.');
     seen.add(folded);
     return { name, role: 'Front Desk', createdAt: profile.createdAt };
-  });
+  }).filter(Boolean);
 }
 
 // Owner-managed overrides layered on top of the shipped defaults, so any profile
@@ -1670,7 +1699,11 @@ function _profileRoleOverrides(vault) {
       throw new Error('The protected profile-role list is invalid.');
     }
   }
-  return stored;
+  // MB1188-062: a null-prototype copy, so a profile named `constructor` or
+  // `toString` resolves to its real role instead of inheriting a function from
+  // Object.prototype — which made the whole profile list uncloneable over IPC
+  // and stopped the login screen rendering.
+  return Object.assign(Object.create(null), stored);
 }
 
 function _removedBuiltInProfiles(vault) {
@@ -1681,6 +1714,19 @@ function _removedBuiltInProfiles(vault) {
     throw new Error('The protected removed-profile list is invalid.');
   }
   return stored;
+}
+
+// MB1188-062: re-read immediately before writing.
+//
+// Both owner-passcode paths held a vault snapshot across two PBKDF2 rounds
+// (~300-600ms) and then wrote the stale copy back, silently reverting anything
+// saved in that window — a refreshed Microsoft token, for instance, which would
+// disconnect the mailbox with no error. _saveMsTokenResult already re-reads for
+// exactly this reason.
+function _persistOwnerAuthRecord(record) {
+  const fresh = _loadSecretVault();
+  fresh[OWNER_AUTH_VAULT_KEY] = record;
+  _saveSecretVault(fresh);
 }
 
 function _allAppProfiles() {
@@ -1843,8 +1889,7 @@ _secureHandle('app-session-authenticate-owner', async (_, pin) => {
   // launch after upgrade.
   if (!record) {
     record = { version: 1, active: await _buildOwnerVerifier(pin), pending: null };
-    vault[OWNER_AUTH_VAULT_KEY] = record;
-    _saveSecretVault(vault);
+    _persistOwnerAuthRecord(record);
   } else {
     let matched = await _ownerPinMatches(pin, record.active);
     if (!matched && record.pending &&
@@ -1852,8 +1897,7 @@ _secureHandle('app-session-authenticate-owner', async (_, pin) => {
         await _ownerPinMatches(pin, record.pending.verifier)) {
       record.active = record.pending.verifier;
       record.pending = null;
-      vault[OWNER_AUTH_VAULT_KEY] = record;
-      _saveSecretVault(vault);
+      _persistOwnerAuthRecord(record);
       matched = true;
     }
     if (!matched) {
@@ -1887,6 +1931,42 @@ _secureHandle('app-session-add-staff-profile', async (_, requestedName) => {
     profile.name.toLocaleLowerCase('en-US') === folded
   );
   if (duplicate) throw new Error('A user with that name already exists.');
+
+  // MB1188-060: a name that belongs to a REMOVED built-in restores the built-in
+  // rather than creating a custom profile beside it.
+  //
+  // The duplicate check above reads _allAppProfiles(), which excludes removed
+  // built-ins — so "Ana Chaves" sailed through after Ana had been removed. But
+  // _customStaffProfilesFromVault seeds its duplicate set from EVERY built-in
+  // name including removed ones, so the next read of the vault threw. That is
+  // list-profiles, start-staff, add, remove and export-directory: every staff
+  // sign-in on this Mac failed, and the renderer swallowed the error and went
+  // on drawing login buttons that could not work. Two ordinary clicks weeks
+  // apart — somebody removes a departed built-in, somebody later types that
+  // name into Add user — and the Mac stopped letting anyone in.
+  //
+  // Restored at Front Desk, not at the built-in's shipped role: this channel
+  // has no session gate, so it may lower privilege but must never grant it.
+  // The owner can re-role afterwards through the gated channel.
+  const suppressedBuiltIn = Object.keys(APP_PROFILE_ROLES).find(
+    builtInName => builtInName.toLocaleLowerCase('en-US') === folded
+  );
+  if (suppressedBuiltIn) {
+    const stillRemoved = _removedBuiltInProfiles(vault)
+      .filter(entry => entry !== suppressedBuiltIn);
+    if (stillRemoved.length) vault[REMOVED_BUILTIN_PROFILES_VAULT_KEY] = stillRemoved;
+    else delete vault[REMOVED_BUILTIN_PROFILES_VAULT_KEY];
+    if (APP_PROFILE_ROLES[suppressedBuiltIn] !== 'Front Desk') {
+      const roles = { ..._profileRoleOverrides(vault) };
+      roles[suppressedBuiltIn] = 'Front Desk';
+      vault[PROFILE_ROLE_OVERRIDES_VAULT_KEY] = roles;
+    }
+    const builtInMeta = _directoryMeta(vault);
+    delete builtInMeta[_directoryEntryId(suppressedBuiltIn)];
+    vault[DIRECTORY_META_VAULT_KEY] = builtInMeta;
+    _saveSecretVault(vault);
+    return { ok: true, profile: { name: suppressedBuiltIn, role: 'Front Desk', builtIn: true } };
+  }
   if (profiles.length >= MAX_CUSTOM_STAFF_PROFILES) {
     throw new Error(`This Mac already has the maximum of ${MAX_CUSTOM_STAFF_PROFILES} added users.`);
   }
@@ -2112,10 +2192,58 @@ function _validDirectoryEntry(entry) {
 }
 
 // Apply a directory published by the owner's Mac to this Mac's vault.
+// MB1188-061: reconcile an incoming directory with what this Mac already holds.
+//
+// Grouped by id. A tombstone beats a live record of the same generation,
+// because a deletion must not be undone by a copy that has not heard about it;
+// otherwise the higher version wins, and an equal version breaks on `updated`
+// so both Macs land on the same answer. An id only ONE side knows about is
+// kept — that is the whole point.
+function _mergeDirectoryEntries(local, incoming) {
+  const byId = new Map();
+  const consider = entry => {
+    if (!_isPlainObject(entry) || !_boundedString(entry.id, 200)) return;
+    const held = byId.get(entry.id);
+    if (!held) { byId.set(entry.id, entry); return; }
+    const heldDead = held._deleted === true;
+    const nextDead = entry._deleted === true;
+    const heldVersion = Number.isSafeInteger(held.version) ? held.version : 1;
+    const nextVersion = Number.isSafeInteger(entry.version) ? entry.version : 1;
+    if (nextVersion > heldVersion) { byId.set(entry.id, entry); return; }
+    if (nextVersion < heldVersion) return;
+    if (heldDead !== nextDead) { if (nextDead) byId.set(entry.id, entry); return; }
+    // Same generation and both alive: the incoming copy wins, because it is
+    // considered second. That keeps this identical to the old behaviour for
+    // every id the document actually names — the change here is only that an id
+    // it does NOT name survives. Tie-breaking on `updated` was tried and is
+    // wrong: the local side is stamped at apply time, so it would always look
+    // newer and a published role change would never land.
+    byId.set(entry.id, entry);
+  };
+  for (const entry of local) consider(entry);
+  for (const entry of incoming) consider(entry);
+  return [...byId.values()];
+}
+
 function _applyStaffDirectory(entries) {
   if (!Array.isArray(entries) || entries.length > MAX_DIRECTORY_ENTRIES) {
     throw new Error('The staff directory is invalid.');
   }
+  // MB1188-061: rebuild from the MERGE of both sides, not from the argument.
+  //
+  // This used to rebuild the vault from the incoming list alone, so any profile
+  // only this Mac held was destroyed — and the destruction was reported as
+  // success and then republished. No attacker and no stale document required:
+  // a profile added at the login screen cannot publish (that is owner-only), so
+  // the moment the other Mac published anything, the addition was gone. Role
+  // changes made while Firebase was down were reverted the same way.
+  //
+  // Genuine removals still delete, because they travel as tombstones.
+  //
+  // Built FIRST: _buildStaffDirectory stamps the version metadata and saves the
+  // vault, so the vault must be read after it rather than before.
+  const localEntries = _buildStaffDirectory();
+  entries = _mergeDirectoryEntries(localEntries, entries);
   const vault = _loadSecretVault();
   const custom = [];
   const overrides = {};
@@ -2737,8 +2865,7 @@ _secureHandle('app-session-stage-owner-pin', async (_, request) => {
     createdAt: Date.now(),
     verifier: await _buildOwnerVerifier(request.newPin),
   };
-  vault[OWNER_AUTH_VAULT_KEY] = record;
-  _saveSecretVault(vault);
+  _persistOwnerAuthRecord(record);
   return { ok: true, rotationId };
 });
 
@@ -3404,13 +3531,23 @@ _secureHandle('ringcentral-send-sms', async (_, request) => {
   const vault = _loadSecretVault();
   const from = _normalizeRcPhone(vault[RC_SECRET_KEYS.myPhone]);
   if (!from) return { ok: false, error: 'Add your RingCentral number in Settings first.' };
-  rcSendTimestamps.push(Date.now());
+  // MB1188-062: the slot is RESERVED here and given back if the send fails.
+  //
+  // Counting on attempt meant a flaky connection could exhaust the limit
+  // without a single message going out; counting only on success would let
+  // concurrent attempts slip past the check. Reserve, then refund.
+  const rcReservedAt = Date.now();
+  rcSendTimestamps.push(rcReservedAt);
   const result = await _ringCentralAuthedRequest(
     'POST',
     '/restapi/v1.0/account/~/extension/~/sms',
     { from: { phoneNumber: from }, to: [{ phoneNumber: phone }], text }
   );
-  if (!result.ok) return { ok: false, error: result.error || 'RingCentral could not send the message.' };
+  if (!result.ok) {
+    const reserved = rcSendTimestamps.lastIndexOf(rcReservedAt);
+    if (reserved !== -1) rcSendTimestamps.splice(reserved, 1);
+    return { ok: false, error: result.error || 'RingCentral could not send the message.' };
+  }
   const message = _normalizeRcMessage(result.data, 'outbound') || {
     id: String(Date.now()),
     from,
@@ -4362,14 +4499,20 @@ _secureHandle('microsoft-send-mail', async (_, request) => {
   if (msSendTimestamps.length >= 30) {
     return { ok: false, error: 'Email rate limit reached. Wait before sending again.' };
   }
-  msSendTimestamps.push(Date.now());
+  // MB1188-062: reserved, then refunded on failure. See the RingCentral note.
+  const msReservedAt = Date.now();
+  msSendTimestamps.push(msReservedAt);
   const result = await _microsoftAuthedGraphRequest(
     request.accountId,
     'POST',
     '/v1.0/me/sendMail',
     { message: request.message, saveToSentItems: true },
   );
-  if (!result.ok) return { ok: false, status: result.status, error: result.error };
+  if (!result.ok) {
+    const reserved = msSendTimestamps.lastIndexOf(msReservedAt);
+    if (reserved !== -1) msSendTimestamps.splice(reserved, 1);
+    return { ok: false, status: result.status, error: result.error };
+  }
   return { ok: true };
 });
 

@@ -2391,3 +2391,85 @@ test('MB1188-026: per-Mac link state round-trips and drops empties', () => {
 // that actually works for this class is exercising the path: see the P0-01
 // staging tests in sync-persistence, which run the real save pipeline and
 // assert what reached durable storage.
+
+// ── MB1188-063..067: what the final pass found in the comms hubs ───────────
+
+test('MB1188-063: an email carries a durable id, not its row number', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  assert.match(source, /id: acct\.id \+ '_' \+ \(m\.id \|\| i\),/);
+  assert.doesNotMatch(source, /id: acct\.id \+ '_' \+ i,/,
+    'the array index was persisted and SYNCED as a durable identity');
+});
+
+test('MB1188-063: stored flags and read marks are applied to the real emails', () => {
+  // This iterated DEMO_EMAILS — `const DEMO_EMAILS = []` — so the Flagged tab
+  // has never worked, and read_emails_* was written on every open and never
+  // read back at all.
+  const apply = namedFunctionSource('applyStoredEmailFlags');
+  assert.match(apply, /\(_msEmails \|\| \[\]\)\.forEach\(email => \{/);
+  assert.match(apply, /email\.flagged = flagged\.has\(email\.id\);/);
+  assert.match(apply, /if \(readToday\.has\(email\.id\)\) email\.unread = false;/);
+  assert.doesNotMatch(apply, /DEMO_EMAILS/);
+});
+
+test('MB1188-064: a failed fetch is never drawn as an empty inbox', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  assert.match(source, /let _msFetchError = null;/);
+  assert.match(source, /let _rcFetchError = null;/);
+  // Recorded on failure, cleared on success.
+  assert.match(namedFunctionSource('fetchRingCentralData'), /_rcFetchError = String\(/);
+  assert.match(namedFunctionSource('fetchRingCentralData'), /_rcFetchError = null;/);
+  // And rendered instead of the empty state.
+  assert.match(source, /_msEmails === null && _msFetchError/);
+  assert.match(source, /_rcConversations === null && _rcFetchError/);
+  assert.match(source, /_rcVoicemails === null && _rcFetchError/);
+  assert.match(namedFunctionSource('_commFailureNotice'), /This is not an empty inbox/);
+});
+
+test('MB1188-064: the auto-refresh fetches rather than only re-rendering', () => {
+  // It called refreshAll() alone, so after the first load nothing new arrived
+  // on its own, and after a failed first load the hub sat on "Connect
+  // Microsoft 365" for the rest of the session even once Graph recovered.
+  const work = namedFunctionSource('_runAutoRefreshWork');
+  assert.match(work, /await Promise\.allSettled\(\[/);
+  assert.match(work, /fetchMsEmails\(\)/);
+  assert.match(work, /fetchRingCentralData\(\)/);
+  assert.ok(work.indexOf('Promise.allSettled') < work.indexOf('refreshAll(true)'),
+    'fetch first, then draw');
+});
+
+test('MB1188-065: the AI scan never clears what somebody has handled', () => {
+  const analyze = namedFunctionSource('commAnalyzeAndAddTodos');
+  const reset = analyze.slice(analyze.indexOf('auto-reset'), analyze.indexOf('// Sweep'));
+  assert.match(reset, /STORE\.replace\('comm_analyzed_ids'/);
+  assert.doesNotMatch(reset, /STORE\.replace\('comm_handled_ids'/,
+    'comm_handled_ids is the only record that a voicemail or text was dealt with');
+});
+
+test('MB1188-065: message read status merges instead of overwriting', () => {
+  const mark = namedFunctionSource('markRcConvRead');
+  assert.match(mark, /STORE\.mutate\('rc_read_convs'/);
+  assert.doesNotMatch(mark, /persistInBackground\('rc_read_convs'/,
+    'the whole-value write let each Mac erase the other\'s read marks');
+});
+
+test('MB1188-066: one press sends one message', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  assert.match(source, /const _commSendInFlight = new Set\(\);/);
+  const sms = namedFunctionSource('sendRcSms');
+  assert.match(sms, /if \(_commSendInFlight\.has\(sendKey\)\) return;/);
+  assert.match(sms, /finally \{\s*\n\s*_commSendInFlight\.delete\(sendKey\);/);
+  const reply = namedFunctionSource('sendReply');
+  assert.match(reply, /if \(_commSendInFlight\.has\(sendKey\)\) return false;/);
+  assert.match(reply, /return await _sendReplyOnce\(emailId, box\);/);
+  assert.match(reply, /finally \{\s*\n\s*_commSendInFlight\.delete\(sendKey\);/);
+});
+
+test('MB1188-067: a typed reply survives the list being rebuilt', () => {
+  const render = namedFunctionSource('renderEmailList');
+  assert.match(render, /const draftedReply = openReply \? openReply\.value : null;/);
+  assert.match(render, /if \(rebuilt && !rebuilt\.value\) rebuilt\.value = draftedReply;/);
+  // Captured before the innerHTML write, restored after it.
+  assert.ok(render.indexOf('const draftedReply') < render.indexOf('container.innerHTML'));
+  assert.ok(render.indexOf('container.innerHTML') < render.indexOf('rebuilt.value = draftedReply'));
+});

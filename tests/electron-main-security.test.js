@@ -276,8 +276,24 @@ test('added profile validation is Unicode-safe, duplicate-safe, and role-fixed',
   assert.throws(() => profilesFromVault({
     app_staff_profiles_v1: [{ name: 'Quinn Owner', role: 'Owner', createdAt: 1 }],
   }));
-  assert.throws(() => profilesFromVault({
+  // MB1188-060: a custom entry carrying a BUILT-IN name is DROPPED, not fatal.
+  //
+  // This used to throw, and throwing is what bricked a Mac: the duplicate check
+  // on add reads _allAppProfiles(), which excludes removed built-ins, so
+  // "Ana Chaves" could be added after Ana had been removed — and from then on
+  // every read of the vault threw, which is list-profiles, start-staff, add,
+  // remove and export-directory. No staff could sign in. The built-in is
+  // authoritative, so there is nothing in the custom entry worth preserving,
+  // and dropping it heals a vault an older build already poisoned.
+  assert.deepEqual(JSON.parse(JSON.stringify(profilesFromVault({
     app_staff_profiles_v1: [{ name: 'Ana Chaves', role: 'Front Desk', createdAt: 1 }],
+  }))), []);
+  // A genuine duplicate among CUSTOM entries is still fatal.
+  assert.throws(() => profilesFromVault({
+    app_staff_profiles_v1: [
+      { name: 'Dana Reed', role: 'Front Desk', createdAt: 1 },
+      { name: 'dana  reed', role: 'Front Desk', createdAt: 2 },
+    ],
   }));
 });
 
@@ -851,6 +867,7 @@ function directoryHarness({ role = 'Owner', signedInAs = 'Elizabeth Chaves', vau
     ${sliceFunction(main, '_directoryMeta')}
     ${sliceFunction(main, '_directoryEntryDigest')}
     ${sliceFunction(main, '_stampDirectoryEntry')}
+    ${sliceFunction(main, '_mergeDirectoryEntries')}
     ${sliceFunction(main, '_buildStaffDirectory')}
     ${sliceFunction(main, '_validDirectoryEntry')}
     ${sliceFunction(main, '_applyStaffDirectory')}
@@ -2083,4 +2100,132 @@ test('MB1188-052: the directory ceiling is sized to the real worst case', () => 
   assert.ok(ceiling >= worstCase,
     `the ceiling (${ceiling}) must cover the worst document this app can build (${worstCase})`);
   assert.match(source, /\]\.slice\(-200\);/, 'the custom removal list really is bounded at 200');
+});
+
+// ── MB1188-060..062: what the final pass found in the main process ─────────
+
+test('MB1188-060: re-adding a removed built-in restores it instead of colliding', () => {
+  const add = main.slice(
+    main.indexOf("_secureHandle('app-session-add-staff-profile'"),
+    main.indexOf("_secureHandle('app-session-remove-staff-profile'"));
+  assert.ok(add.length > 200, 'the add handler was found');
+  assert.match(add, /const suppressedBuiltIn = Object\.keys\(APP_PROFILE_ROLES\)\.find\(/);
+  assert.match(add, /REMOVED_BUILTIN_PROFILES_VAULT_KEY\] = stillRemoved;/);
+  // Restored at Front Desk: this channel has no session gate, so it may lower
+  // privilege but must never grant it.
+  assert.match(add, /roles\[suppressedBuiltIn\] = 'Front Desk';/);
+  assert.match(add, /builtIn: true \}/, 'and it is reported as the built-in it is');
+});
+
+test('MB1188-060: a vault poisoned by an older build heals itself', () => {
+  // The collision used to throw from _customStaffProfilesFromVault, which is
+  // reached by list-profiles, start-staff, add, remove AND export-directory —
+  // so no staff could sign in on that Mac, and the renderer swallowed it.
+  const normalizeStart = main.indexOf('function _normalizeStaffProfileName');
+  const normalizeEnd = main.indexOf('\nfunction ', normalizeStart + 1);
+  const box = { console };
+  vm.runInNewContext(
+    `${main.slice(normalizeStart, normalizeEnd)}; this.normalize = _normalizeStaffProfileName;`,
+    box
+  );
+  const profilesFromVault = loadFunction('_customStaffProfilesFromVault', {
+    STAFF_PROFILES_VAULT_KEY: 'app_staff_profiles_v1',
+    MAX_CUSTOM_STAFF_PROFILES: 50,
+    APP_PROFILE_ROLES: Object.freeze({
+      'Elizabeth Chaves': 'Owner',
+      'Carrie Gass': 'Operations & Events',
+      'Ana Chaves': 'Front Desk',
+      'Emma Minnetto': 'Front Desk',
+    }),
+    _isPlainObject: value => !!value && typeof value === 'object' && !Array.isArray(value),
+    _normalizeStaffProfileName: box.normalize,
+  });
+  const plain = value => JSON.parse(JSON.stringify(value));
+  assert.deepEqual(plain(profilesFromVault({
+    app_staff_profiles_v1: [
+      { name: 'Ana Chaves', role: 'Front Desk', createdAt: 1 },
+      { name: 'Dana Reed', role: 'Front Desk', createdAt: 2 },
+    ],
+  })), [{ name: 'Dana Reed', role: 'Front Desk', createdAt: 2 }]);
+  // Spacing and case variants of a built-in name are caught too, because the
+  // check runs after normalization.
+  assert.deepEqual(plain(profilesFromVault({
+    app_staff_profiles_v1: [{ name: '  ana   CHAVES ', role: 'Front Desk', createdAt: 1 }],
+  })), []);
+});
+
+test('MB1188-061: an incoming directory cannot delete what it does not name', () => {
+  const owner = directoryHarness();
+  const peer = directoryHarness();
+  // The peer holds a profile the owner has never heard of — exactly what a
+  // login-screen add produces, since publishing is owner-only.
+  peer.state.vault.app_staff_profiles_v1 = [
+    { name: 'Dana Reed', role: 'Front Desk', createdAt: 2 },
+  ];
+  assert.ok([...peer.api.profiles()].includes('Dana Reed:Front Desk'), 'precondition');
+
+  peer.api.apply(dirEntries(owner));
+
+  assert.ok([...peer.api.profiles()].includes('Dana Reed:Front Desk'),
+    'silence is not a deletion — this used to destroy Dana and report success');
+});
+
+test('MB1188-061: a genuine tombstone still deletes', () => {
+  const owner = directoryHarness();
+  delete owner.state.vault.app_staff_profiles_v1;
+  owner.state.vault.app_removed_custom_v1 = [{ name: 'Dana Reed', at: '2026-08-05T00:00:00.000Z' }];
+  const peer = directoryHarness();
+  peer.state.vault.app_staff_profiles_v1 = [
+    { name: 'Dana Reed', role: 'Front Desk', createdAt: 2 },
+  ];
+
+  peer.api.apply(dirEntries(owner));
+
+  assert.ok(![...peer.api.profiles()].some(p => p.startsWith('Dana Reed:')),
+    'removals travel as tombstones and must still land');
+});
+
+test('MB1188-061: the merge rule is tombstone-then-version, incoming on a tie', () => {
+  const merge = sliceFunction(main, '_mergeDirectoryEntries');
+  assert.match(merge, /if \(nextVersion > heldVersion\)/);
+  assert.match(merge, /if \(heldDead !== nextDead\) \{ if \(nextDead\)/,
+    'a deletion is not undone by a copy that has not heard about it');
+  assert.doesNotMatch(merge, /entry\.updated \|\| ''\) > String\(held\.updated/,
+    'tie-breaking on updated is wrong here: local is stamped at apply time');
+  // Built before the vault is read, because _buildStaffDirectory saves the meta.
+  const apply = sliceFunction(main, '_applyStaffDirectory');
+  assert.ok(apply.indexOf('const localEntries = _buildStaffDirectory();')
+    < apply.indexOf('const vault = _loadSecretVault();'));
+});
+
+test('MB1188-062: an owner-passcode write re-reads the vault first', () => {
+  // Both paths held a snapshot across two PBKDF2 rounds and wrote it back,
+  // silently reverting anything saved in that window — a refreshed Microsoft
+  // token, for instance, which disconnects the mailbox with no error.
+  assert.match(main, /function _persistOwnerAuthRecord\(record\) \{\s*\n\s*const fresh = _loadSecretVault\(\);/);
+  const stage = main.slice(main.indexOf("_secureHandle('app-session-stage-owner-pin'"),
+    main.indexOf("_secureHandle('app-session-commit-owner-pin'"));
+  assert.match(stage, /_persistOwnerAuthRecord\(record\);/);
+  assert.doesNotMatch(stage, /vault\[OWNER_AUTH_VAULT_KEY\] = record;/);
+});
+
+test('MB1188-062: role overrides do not inherit Object.prototype', () => {
+  // A profile named `constructor` resolved to a function, which made the whole
+  // profile list uncloneable over IPC and stopped the login screen rendering.
+  assert.match(main, /return Object\.assign\(Object\.create\(null\), stored\);/);
+});
+
+test('MB1188-062: a failed send refunds its rate-limit slot', () => {
+  assert.match(main, /const rcReservedAt = Date\.now\(\);/);
+  assert.match(main, /rcSendTimestamps\.splice\(reserved, 1\);/);
+  assert.match(main, /const msReservedAt = Date\.now\(\);/);
+  assert.match(main, /msSendTimestamps\.splice\(reserved, 1\);/);
+});
+
+test('MB1188-062: the updater refuses to walk backwards, and main survives a stray rejection', () => {
+  assert.match(main, /autoUpdater\.allowDowngrade = false;/);
+  assert.match(main, /process\.on\('unhandledRejection'/);
+  // Still deliberately NOT uncaughtException — see the test above.
+  assert.doesNotMatch(main, /process\.on\(['"]uncaughtException/);
+  assert.match(main, /mainWindow\.loadFile\(htmlPath\)\.catch\(/);
 });

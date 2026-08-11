@@ -8263,6 +8263,10 @@ const DEMO_EMAILS = [];
 
 // Real emails fetched from Microsoft Graph (null = not yet fetched)
 let _msEmails = null;
+// MB1188-064: why the last fetch failed, so a broken connection is never drawn
+// as an empty inbox or as "not connected".
+let _msFetchError = null;
+let _rcFetchError = null;
 
 const DEMO_CLIENTS = [];
 
@@ -16185,7 +16189,9 @@ function refreshDashboard() {
     const dashEmailsEl = document.getElementById('dashboard-emails');
     if (dashEmailsEl) {
       if (dashEmails.length === 0) {
-        dashEmailsEl.innerHTML = '<div style="padding:12px;color:var(--text-muted);font-size:13px">' + (_msEmails === null ? 'Connect Microsoft 365 in Settings to see emails.' : 'No emails.') + '</div>';
+        dashEmailsEl.innerHTML = (_msEmails === null && _msFetchError)
+          ? '<div style="padding:12px;color:var(--danger);font-size:13px">' + escHtml(_msFetchError) + '</div>'
+          : '<div style="padding:12px;color:var(--text-muted);font-size:13px">' + (_msEmails === null ? 'Connect Microsoft 365 in Settings to see emails.' : 'No emails.') + '</div>';
       } else {
         dashEmailsEl.innerHTML = dashEmails.map(e => { try { return renderDashboardEmailItem(e); } catch(_) { return ''; } }).join('');
       }
@@ -16865,9 +16871,22 @@ async function refreshEmails() {
   showToast('Emails refreshed.');
 }
 
+// MB1188-063: applied to the emails that actually exist.
+//
+// This iterated DEMO_EMAILS, which is `const DEMO_EMAILS = []` — an empty array
+// left behind when the demo data was removed. It was the only restore path, so
+// the Flagged tab has never worked: fetchMsEmails hardcodes `flagged: false`,
+// and nothing ever put a flag back. Read state was worse — read_emails_* was
+// written on every open and never read back at all, so reading an email in the
+// app left it unread everywhere, and getUnrespondedEmails() went on treating it
+// as needing a reply for ever.
 function applyStoredEmailFlags() {
-  const flagged = STORE.get('flagged_emails', []);
-  DEMO_EMAILS.forEach(e => { e.flagged = flagged.includes(e.id); });
+  const flagged = new Set(STORE.get('flagged_emails', []));
+  const readToday = new Set(STORE.get('read_emails_' + _todayLocal(), []));
+  (_msEmails || []).forEach(email => {
+    email.flagged = flagged.has(email.id);
+    if (readToday.has(email.id)) email.unread = false;
+  });
 }
 
 async function toggleEmailFlag(id) {
@@ -16978,6 +16997,8 @@ async function fetchMsEmails() {
         limit: 75,
       });
       if (!result?.ok) {
+        // MB1188-064: remember WHY, so the hub can say so.
+        _msFetchError = String(result?.error || 'Microsoft 365 could not be reached.');
         if (result?.status === 401 ||
             /expired|reconnect/i.test(String(result?.error || ''))) {
           await _loadMsSecrets();
@@ -16986,9 +17007,20 @@ async function fetchMsEmails() {
         return;
       }
       anyFetched = true;
+      _msFetchError = null;
       (result.value || []).forEach((m, i) => {
         allEmails.push({
-          id: acct.id + '_' + i,
+          // MB1188-063: the message's own id, not its position in the array.
+          //
+          // This was `acct.id + '_' + i`, and that ephemeral row number was then
+          // persisted and SYNCED as a durable identity by flagged_emails,
+          // comm_analyzed_ids and read_emails_*. So a flag survived a refresh
+          // only to point at whatever message happened to land in that row; the
+          // AI scanner saturated after about eight runs because there are only
+          // ~75 distinct row numbers and it thought it had seen every message;
+          // and the unread badge could never clear. One line, because every
+          // consumer was already keying off `id`.
+          id: acct.id + '_' + (m.id || i),
           msId: m.id,
           accountId: acct.id,
           accountLabel: acct.label,
@@ -17191,6 +17223,12 @@ async function loadEmails() {
 
 function renderEmailList() {
   const container = document.getElementById('email-list');
+  // MB1188-067: the reply box lives inside this container, so rebuilding its
+  // innerHTML threw away whatever somebody had typed. The thread stayed open
+  // afterwards, so it looked like nothing had happened — and the 10-minute
+  // auto-refresh does this on its own, as does any sync from the other Mac.
+  const openReply = document.getElementById('email-reply-box');
+  const draftedReply = openReply ? openReply.value : null;
   if (emailTab === 'sent') {
     const localSent = STORE.get('sent_emails', []);
     const msSent = STORE.get('ms_sent_emails', []);
@@ -17245,7 +17283,8 @@ function renderEmailList() {
   if (emailTab === 'spam') {
     let spamList = _msEmails !== null ? _msEmails.filter(e => e.spam) : [];
     container.innerHTML = spamList.length === 0
-      ? '<div class="empty-state" style="padding:30px"><p>' + (_msEmails === null ? 'Connect Microsoft 365 in Settings to see emails.' : 'No spam here.') + '</p></div>'
+      ? ((_msEmails === null && _msFetchError) ? _commFailureNotice(_msFetchError)
+        : '<div class="empty-state" style="padding:30px"><p>' + (_msEmails === null ? 'Connect Microsoft 365 in Settings to see emails.' : 'No spam here.') + '</p></div>')
       : spamList.map(e => {
           const isOpen = openEmailId != null && String(e.id) === String(openEmailId);
           return `<div data-email-id="${escAttr(String(e.id))}">
@@ -17277,7 +17316,8 @@ function renderEmailList() {
     .sort((a, b) => new Date(b.msgs[b.msgs.length - 1].receivedAt || 0) - new Date(a.msgs[a.msgs.length - 1].receivedAt || 0));
 
   container.innerHTML = _conversations.length === 0
-    ? '<div class="empty-state" style="padding:30px"><p>' + (_msEmails === null ? 'Connect Microsoft 365 in Settings to see emails.' : 'No emails here.') + '</p></div>'
+    ? ((_msEmails === null && _msFetchError) ? _commFailureNotice(_msFetchError)
+      : '<div class="empty-state" style="padding:30px"><p>' + (_msEmails === null ? 'Connect Microsoft 365 in Settings to see emails.' : 'No emails here.') + '</p></div>')
     : _conversations.map((conv, i) => {
         const isOpen = openEmailId === 'conv_' + i;
         return `<div>
@@ -17285,6 +17325,14 @@ function renderEmailList() {
           ${isOpen ? renderConversationThread(conv.msgs, i) : ''}
         </div>`;
       }).join('');
+  // MB1188-067: put the draft back into the freshly built box. Only when there
+  // was one and the new markup still offers somewhere to put it — a thread that
+  // closed or scrolled out of the list has nowhere, and silently dropping it
+  // there is no worse than the close itself.
+  if (draftedReply) {
+    const rebuilt = document.getElementById('email-reply-box');
+    if (rebuilt && !rebuilt.value) rebuilt.value = draftedReply;
+  }
 }
 
 function renderInlineEmailDetail(email) {
@@ -17549,6 +17597,18 @@ async function autoCompleteEmailTodos(sentEmail) {
 async function sendReply(emailId) {
   const box = document.getElementById('email-reply-box');
   if (!box || !box.value.trim()) { showToast('Please write a reply first.', 'warning'); return; }
+  // MB1188-066: a double-click on Send used to hand Graph the message twice.
+  const sendKey = 'mail:' + emailId;
+  if (_commSendInFlight.has(sendKey)) return false;
+  _commSendInFlight.add(sendKey);
+  try {
+    return await _sendReplyOnce(emailId, box);
+  } finally {
+    _commSendInFlight.delete(sendKey);
+  }
+}
+
+async function _sendReplyOnce(emailId, box) {
   const body = box.value.trim();
   const source = (_msEmails || []);
   // eslint-disable-next-line eqeqeq
@@ -18522,7 +18582,21 @@ let _rcMsgFilter   = '';
 function getRcReadConvs() { return new Set(STORE.get('rc_read_convs', [])); }
 function markRcConvRead(phone) {
   const s = getRcReadConvs(); s.add(phone);
-  persistInBackground('rc_read_convs', [...s], 'Message read status');
+  // MB1188-065: merged into the reconciled base, not written whole.
+  //
+  // persistInBackground goes through the authoritative whole-value write, which
+  // that function's own docblock forbids for read-modify-write — it hands the cloud
+  // this Mac's entire view, so whichever Mac wrote last erased the other's read
+  // marks and threads went unread again on the machine that had read them.
+  // flagged_emails and comm_handled_ids were both moved off this pattern; this
+  // key was missed.
+  void STORE.mutate('rc_read_convs', current => {
+    const merged = new Set(Array.isArray(current) ? current : []);
+    merged.add(phone);
+    return [...merged];
+  }, []).catch(error => {
+    console.warn('[messages] read status was not saved:', error?.message || error);
+  });
 }
 
 async function loadRcMessagesHub() {
@@ -18603,7 +18677,9 @@ function renderRcConvList() {
   }
   const readConvs = getRcReadConvs();
   if (!convs.length) {
-    el.innerHTML = '<div class="empty-state" style="padding:30px"><p>No conversations yet.</p></div>';
+    el.innerHTML = (_rcConversations === null && _rcFetchError)
+      ? _commFailureNotice(_rcFetchError)
+      : '<div class="empty-state" style="padding:30px"><p>No conversations yet.</p></div>';
     return;
   }
   el.innerHTML = convs.map(c => {
@@ -18709,10 +18785,20 @@ function rcReplyKeydown(e, phone) {
   }
 }
 
+// MB1188-066: what is currently in flight, so a second press cannot send a
+// second copy. Neither Send path had a guard: the button is never disabled, the
+// textarea is only cleared after the network returns, and Enter sends. Two
+// presses 50ms apart handed RingCentral two identical texts and showed two
+// success toasts — to a customer, irreversibly.
+const _commSendInFlight = new Set();
+
 async function sendRcSms(phone) {
   const box  = document.getElementById('rc-reply-box');
   const body = box?.value?.trim();
   if (!body) return;
+  const sendKey = 'sms:' + phone;
+  if (_commSendInFlight.has(sendKey)) return;
+  _commSendInFlight.add(sendKey);
   try {
     if (!window.electronRingCentral?.sendSms) {
       throw new Error('Secure RingCentral messaging is unavailable in this build.');
@@ -18733,6 +18819,8 @@ async function sendRcSms(phone) {
     showToast('Message sent!', 'success');
   } catch(e) {
     showToast('Send error: ' + (e?.message || e), 'error');
+  } finally {
+    _commSendInFlight.delete(sendKey);
   }
 }
 
@@ -21686,6 +21774,19 @@ function _runAutoRefreshWork({ refreshData = false, showDailyBriefing = false } 
     _autoRefreshNeedsBriefing = false;
     if (shouldRefreshData) {
       if (shouldShowBriefing) setupDates();
+      // MB1188-064: re-fetch, not just re-render.
+      //
+      // This called refreshAll() alone, which only redraws what is already in
+      // memory — so after the first successful load nothing new ever arrived on
+      // its own, and after a failed first load the hub sat on "Connect
+      // Microsoft 365 in Settings" for the rest of the session even once the
+      // service came back. Only the ↻ button fetched. Failures are swallowed on
+      // purpose: each provider records its own reason and the hubs render it.
+      await Promise.allSettled([
+        (typeof fetchMsEmails === 'function' ? fetchMsEmails() : null),
+        (typeof fetchRingCentralData === 'function' ? fetchRingCentralData() : null),
+      ]);
+      try { applyStoredEmailFlags(); } catch (_) {}
       refreshAll(true);
       if (shouldShowBriefing) setTimeout(showBriefing, 800);
     }
@@ -22286,6 +22387,7 @@ async function fetchRingCentralData() {
     if (!_rcConfigured || !window.electronRingCentral?.fetchData) return false;
     const result = await window.electronRingCentral.fetchData();
     if (!result?.ok) throw new Error(result?.error || 'RingCentral refresh failed.');
+    _rcFetchError = null;
     const data = result.data || {};
     _rcMessages = Array.isArray(data.messages) ? data.messages.slice(0, 100) : [];
     _rcVoicemails = Array.isArray(data.voicemails) ? data.voicemails.slice(0, 30) : [];
@@ -22293,8 +22395,23 @@ async function fetchRingCentralData() {
     return true;
   } catch(e) {
     console.error('RingCentral fetch error:', e);
+    // MB1188-064: a swallowed failure used to render as "No voicemails yet"
+    // with the connect banner hidden, because RingCentral IS configured. For a
+    // studio that is a missed customer presented as a quiet day.
+    _rcFetchError = String(e?.message || e || 'RingCentral could not be reached.');
     return false;
   }
+}
+
+// MB1188-064: the message a hub shows instead of its empty state when the last
+// fetch failed. Nothing loaded plus a recorded failure is not "nothing here".
+function _commFailureNotice(error) {
+  if (!error) return '';
+  return '<div class="empty-state" style="padding:30px">'
+    + '<p style="color:var(--danger);font-weight:600;margin:0 0 6px">Could not reach the service</p>'
+    + '<p style="margin:0">' + escHtml(error) + '</p>'
+    + '<p style="margin:8px 0 0;color:var(--text-muted);font-size:13px">'
+    + 'This is not an empty inbox — nothing could be loaded. Press ↻ to try again.</p></div>';
 }
 
 // Returns the start of business 5 business days ago (Mon–Fri)
@@ -22512,7 +22629,9 @@ function renderVoicemailHub() {
   if (vms.length === 0) {
     list.innerHTML = `<div style="padding:30px 0;text-align:center;color:var(--text-muted)">
       <div style="font-size:32px;margin-bottom:8px">📞</div>
-      <div style="font-size:13px">${_vmHubTab === 'unhandled' ? 'No unhandled voicemails' : 'No voicemails yet'}</div>
+      <div style="font-size:13px">${_rcVoicemails === null && _rcFetchError
+        ? escHtml(_rcFetchError) + ' — this is not an empty list. Press \u21bb to try again.'
+        : (_vmHubTab === 'unhandled' ? 'No unhandled voicemails' : 'No voicemails yet')}</div>
     </div>`;
     return;
   }
@@ -22694,12 +22813,19 @@ async function commAnalyzeAndAddTodos() {
   if (!await _loadAnthropicSecret()) return;
 
   // If all AI todos have been cleared, auto-reset so we re-scan fresh
+  //
+  // MB1188-065: comm_handled_ids is NOT reset here any more.
+  //
+  // It is the only record that a voicemail or text was dealt with, and this
+  // runs at every launch. Deleting one AI to-do — the ✕ offered on every one of
+  // them — was enough to make the list empty, and the next launch then wiped
+  // every "Done" mark in the studio and regenerated the same to-dos, forever.
+  // The write is authoritative, so it propagated to the other Mac too, and each
+  // pass re-sent the same client emails to the model and re-billed for them.
+  // Re-scanning is bookkeeping; what somebody has already handled is not.
   if (getTodos().filter(t => t.aiAdded).length === 0) {
     try {
-      await Promise.all([
-        STORE.replace('comm_analyzed_ids', [], { authoritative: 'explicit reset' }),
-        STORE.replace('comm_handled_ids', [], { authoritative: 'explicit reset' }),
-      ]);
+      await STORE.replace('comm_analyzed_ids', [], { authoritative: 'explicit reset' });
     } catch (error) {
       console.warn('[AI todo] reset markers were not saved:', error?.message || error);
       return false;
