@@ -3874,6 +3874,50 @@ async function _commitProtectedLocalDataKey(key, protection) {
   localStorage.setItem(LOCAL_PIN_KDF_KEY, String(protection.pinIterations));
 }
 
+// MB1188-068: local keys written by features this app no longer has.
+//
+// A new Mac could not be set up at all: signing in threw "Setting the value of
+// 'tmb_online_inquiries' exceeded the quota" under the passcode keypad, and
+// because the staging bundle survives a failed replay, every retry threw the
+// same thing. The Mac was permanently un-signable-into.
+//
+// The migration re-encrypts everything _fillCache() found, and _fillCache reads
+// every tmb_ key including ones left behind by removed features. So dead data
+// was being carried through a transaction that briefly needs DOUBLE the space —
+// originals plus the staged bundle — against Chromium's ~5MB localStorage
+// ceiling. `online_inquiries` (web-form submissions) is the largest of them and
+// is the one that tipped it over.
+//
+// Nothing in this build reads these keys; grep returns zero hits outside this
+// list. The same reasoning and the same treatment as the retired MindBody
+// check-out records above, and the studio's real data is in Firebase and iCloud
+// either way.
+const RETIRED_LOCAL_KEYS = Object.freeze(['online_inquiries']);
+
+function _retireUnusedLocalKeys() {
+  const removed = [];
+  for (const name of RETIRED_LOCAL_KEYS) {
+    let freed = 0;
+    for (const suffix of ['', '_revision', '_local_ts', '_cloud_deferred']) {
+      const key = 'tmb_' + name + suffix;
+      let value = null;
+      try { value = localStorage.getItem(key); } catch (_) { continue; }
+      if (value === null) continue;
+      freed += key.length + value.length;
+      try { localStorage.removeItem(key); } catch (_) {}
+    }
+    try { localStorage.removeItem(_pendingSyncStorageKey(name)); } catch (_) {}
+    try { delete _decCache[name]; } catch (_) {}
+    try { _durableStoreSnapshots.delete(name); } catch (_) {}
+    try { _lockedStorageKeys.delete(name); } catch (_) {}
+    if (freed) removed.push(`${name} (${Math.round(freed / 1024)} KB)`);
+  }
+  if (removed.length) {
+    console.warn(`Retired ${removed.length} local record(s) whose feature no longer exists: ${removed.join(', ')}`);
+  }
+  return removed;
+}
+
 async function _recoverLocalKeyMigration(pin) {
   const bundle = _parseLocalKeyMigration();
   if (!bundle) return false;
@@ -3893,8 +3937,31 @@ async function _recoverLocalKeyMigration(pin) {
 
   // This replay is intentionally idempotent. If a write/quota failure occurs
   // midway, the bundle remains and the next owner login safely replays it.
-  for (const [name, ciphertext] of Object.entries(bundle.entries)) {
-    localStorage.setItem('tmb_' + name, ciphertext);
+  //
+  // MB1188-068: which is only true if the retry can ever succeed. An uncaught
+  // quota failure here threw out of initEncryption, sign-in failed, the bundle
+  // survived, and the next attempt hit the identical wall — a Mac nobody could
+  // get into. Retired keys are dropped and the replay is tried once more before
+  // giving up, and the key pointer is still only committed when every canonical
+  // value is durable, so a partial write can never leave the vault unreadable.
+  const replay = () => {
+    for (const [name, ciphertext] of Object.entries(bundle.entries)) {
+      if (RETIRED_LOCAL_KEYS.includes(name)) continue;
+      localStorage.setItem('tmb_' + name, ciphertext);
+    }
+  };
+  try {
+    replay();
+  } catch (error) {
+    if (error?.name !== 'QuotaExceededError') throw error;
+    const freed = _retireUnusedLocalKeys();
+    if (!freed.length) {
+      throw new Error(
+        'This Mac has run out of local storage, so the encryption upgrade could '
+        + 'not finish. Nothing was changed and your data is safe in the cloud. '
+        + 'Free some space and sign in again.');
+    }
+    replay();
   }
   await _commitProtectedLocalDataKey(key, bundle.protection);
   localStorage.setItem('tmb__local_key_model', 'random-dek-v1');
@@ -3915,6 +3982,10 @@ async function _recoverLocalKeyMigration(pin) {
 
 async function initEncryption(pin) {
   _activePin = pin;
+  // MB1188-068: before anything reads localStorage into _decCache, so dead
+  // records are never re-encrypted, never staged, and never counted against the
+  // quota this migration has to fit inside.
+  _retireUnusedLocalKeys();
 
   if (localStorage.getItem(LOCAL_KEY_MIGRATION_STORAGE_KEY)) {
     await _recoverLocalKeyMigration(pin);

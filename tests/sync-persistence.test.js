@@ -5292,3 +5292,43 @@ test('MB1188-051: one failed import does not lock publishing out for good', () =
   assert.ok(retry.indexOf('flushPendingDirectoryImport()') < retry.indexOf('publishStaffDirectory()'),
     'the button retries both halves, in the safe order');
 });
+
+test('MB1188-068: a retired key is dropped before the migration reads storage', () => {
+  // A new Mac could not be set up: signing in threw "Setting the value of
+  // 'tmb_online_inquiries' exceeded the quota" under the passcode keypad, and
+  // because the staging bundle survives a failed replay, every retry threw the
+  // same thing. The Mac was permanently un-signable-into.
+  const source = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  assert.match(source, /const RETIRED_LOCAL_KEYS = Object\.freeze\(\['online_inquiries'\]\);/);
+  // Nothing in the build may actually READ a key it retires — the only
+  // occurrences outside the list and its own explanation are none.
+  assert.doesNotMatch(source, /STORE\.(get|set|mutate|replace)\('online_inquiries'/);
+  assert.doesNotMatch(source, /getItem\('tmb_online_inquiries'\)/);
+  const init = declaration('initEncryption');
+  assert.match(init, /_retireUnusedLocalKeys\(\);/);
+  assert.ok(init.indexOf('_retireUnusedLocalKeys()') < init.indexOf('_fillCache()'),
+    'retired before anything loads localStorage into _decCache');
+});
+
+test('MB1188-068: a quota failure frees space and retries instead of bricking sign-in', () => {
+  const recover = declaration('_recoverLocalKeyMigration');
+  assert.match(recover, /if \(RETIRED_LOCAL_KEYS\.includes\(name\)\) continue;/);
+  assert.match(recover, /if \(error\?\.name !== 'QuotaExceededError'\) throw error;/);
+  assert.match(recover, /const freed = _retireUnusedLocalKeys\(\);/);
+  assert.match(recover, /Free some space and sign in again/);
+  // The key pointer is still committed only after every value is durable, so a
+  // partial write can never leave the vault unreadable.
+  assert.ok(recover.indexOf('replay();') < recover.indexOf('_commitProtectedLocalDataKey'));
+});
+
+test('MB1188-068: retiring a key clears every trace of it', () => {
+  const retire = declaration('_retireUnusedLocalKeys');
+  for (const suffix of ['_revision', '_local_ts', '_cloud_deferred']) {
+    assert.ok(retire.includes(suffix), `${suffix} is cleared too`);
+  }
+  assert.match(retire, /_pendingSyncStorageKey\(name\)/, 'and any queued delivery');
+  assert.match(retire, /delete _decCache\[name\]/);
+  assert.match(retire, /_durableStoreSnapshots\.delete\(name\)/);
+  // Reported, not silent — this is data leaving the Mac.
+  assert.match(retire, /console\.warn\(/);
+});
