@@ -13,6 +13,7 @@ TWO_MAC_TEST_SCRIPT.md
 CLAUDE_*.md
 CODEX_*.md
 PENTEST_*.md
+HANDOFF.md
 
 # Generated package artifacts
 *.asar
