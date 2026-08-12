@@ -845,7 +845,7 @@ function directoryHarness({ role = 'Owner', signedInAs = 'Elizabeth Chaves', vau
     const STAFF_PROFILES_VAULT_KEY = 'app_staff_profiles_v1';
     const PROFILE_ROLE_OVERRIDES_VAULT_KEY = 'app_profile_roles_v1';
     const REMOVED_BUILTIN_PROFILES_VAULT_KEY = 'app_removed_builtins_v1';
-    const ASSIGNABLE_PROFILE_ROLES = Object.freeze(['Operations & Events', 'Front Desk']);
+    const ASSIGNABLE_PROFILE_ROLES = Object.freeze(['Operations Manager', 'Operations & Events', 'Front Desk']);
     const MAX_CUSTOM_STAFF_PROFILES = 50;
     const MAX_DIRECTORY_ENTRIES = MAX_CUSTOM_STAFF_PROFILES + 16;
     let appSession = ${JSON.stringify({ name: signedInAs, role })};
@@ -871,7 +871,18 @@ function directoryHarness({ role = 'Owner', signedInAs = 'Elizabeth Chaves', vau
     ${sliceFunction(main, '_buildStaffDirectory')}
     ${sliceFunction(main, '_validDirectoryEntry')}
     ${sliceFunction(main, '_applyStaffDirectory')}
-    var PROFILE_ROLE_RANK = { 'Front Desk': 1, 'Operations & Events': 1, 'Operations Manager': 2 };
+    ${main.slice(main.indexOf('const PROFILE_ROLE_RANK'), main.indexOf('function _profileRoleOverrides'))}
+    // MB1188-081: the real IPC handler body, so a two-Mac exchange can be
+    // driven end to end rather than asserted from source.
+    globalThis.importDirectory = directory => {
+      const deferred = [];
+      const profiles = _applyStaffDirectory(directory, {
+        elevate: appSession ? new Set(['Owner']).has(appSession.role) : false,
+        deferred,
+      });
+      return { ok: true, profiles, deferred, applied: deferred.length === 0 };
+    };
+    globalThis.roleOf = name => _roleForAppProfile(name);
     globalThis.build = () => _buildStaffDirectory();
     // MB1188-073: these harness cases are the OWNER publishing/importing, which
     // is the path that may still set roles. The non-elevating path has its own
@@ -2771,4 +2782,84 @@ test("P0-2: Operations Manager removal is Isaiah's decision, not an oversight", 
     'granting a role is Owner-only');
   // The half that actually closed the escalation chain.
   assert.match(main, /elevate: _appSessionHasRole\(new Set\(\['Owner'\]\)\)/);
+});
+
+// ── P0-3 / MB1188-081: a two-Mac directory exchange, executed ────────────────
+//
+// Not a source-pattern test. Mac A publishes through the real
+// _buildStaffDirectory; Mac B applies it through the real handler body under
+// each possible signed-in role, and the resulting vault is read back.
+
+test('P0-3: an owner-published elevation is never silently dropped', () => {
+  const A = directoryHarness({ role: 'Owner', vault: { app_profile_roles_v1: { 'Ana Chaves': 'Operations Manager' } } });
+  const published = JSON.parse(JSON.stringify(A.api.build()));
+  assert.equal(A.api.roleOf('Ana Chaves'), 'Operations Manager', 'Mac A promoted Ana');
+
+  const outcomes = {};
+  for (const role of ['Front Desk', 'Operations & Events', 'Operations Manager', 'Owner']) {
+    const B = directoryHarness({ role, signedInAs: 'Somebody', vault: {} });
+    assert.equal(B.api.roleOf('Ana Chaves'), 'Front Desk', 'Mac B starts behind');
+    const result = B.api.importDirectory(published);
+    outcomes[role] = { role: B.api.roleOf('Ana Chaves'), applied: result.applied, deferred: result.deferred.length };
+  }
+
+  // Only an Owner session may apply the elevation...
+  assert.deepEqual(outcomes.Owner, { role: 'Operations Manager', applied: true, deferred: 0 });
+  // ...and every other session must say so rather than claiming success. This
+  // is the defect: the role was dropped AND applied was true, so the sync layer
+  // marked the revision consumed and never delivered it again.
+  for (const role of ['Front Desk', 'Operations & Events', 'Operations Manager']) {
+    assert.deepEqual(outcomes[role], { role: 'Front Desk', applied: false, deferred: 1 },
+      `${role} defers rather than silently discarding`);
+  }
+});
+
+test('P0-3: a lateral move to Operations & Events is an elevation too', () => {
+  // Equal rank made this a "non-elevating" change, so a Front Desk session
+  // could grant Operations & Events access without an Owner anywhere.
+  const A = directoryHarness({ role: 'Owner', vault: { app_profile_roles_v1: { 'Ana Chaves': 'Operations & Events' } } });
+  const published = JSON.parse(JSON.stringify(A.api.build()));
+
+  const front = directoryHarness({ role: 'Front Desk', signedInAs: 'Somebody', vault: {} });
+  const held = front.api.importDirectory(published);
+  assert.equal(front.api.roleOf('Ana Chaves'), 'Front Desk', 'not granted');
+  assert.equal(held.applied, false, 'and reported as not applied');
+
+  const owner = directoryHarness({ role: 'Owner', vault: {} });
+  const applied = owner.api.importDirectory(published);
+  assert.equal(owner.api.roleOf('Ana Chaves'), 'Operations & Events');
+  assert.equal(applied.applied, true);
+});
+
+test('P0-3: a demotion applies under any session, because it grants nothing', () => {
+  // The gate is about ELEVATION. Revoking access must not wait for an Owner —
+  // that would leave somebody holding authority the studio has taken away.
+  const A = directoryHarness({ role: 'Owner', vault: { app_profile_roles_v1: { 'Carrie Gass': 'Front Desk' } } });
+  const published = JSON.parse(JSON.stringify(A.api.build()));
+  const B = directoryHarness({ role: 'Front Desk', signedInAs: 'Somebody', vault: {} });
+  assert.equal(B.api.roleOf('Carrie Gass'), 'Operations & Events', 'starts with the shipped role');
+  const result = B.api.importDirectory(published);
+  assert.equal(B.api.roleOf('Carrie Gass'), 'Front Desk', 'the demotion lands immediately');
+  assert.equal(result.applied, true, 'and is a complete apply');
+});
+
+test('P0-3: retrying the same directory after an Owner signs in settles it', () => {
+  // The pending marker exists so the held-back change is re-applied later. This
+  // proves the second attempt actually converges rather than deferring forever.
+  const A = directoryHarness({ role: 'Owner', vault: { app_profile_roles_v1: { 'Ana Chaves': 'Operations Manager' } } });
+  const published = JSON.parse(JSON.stringify(A.api.build()));
+
+  const B = directoryHarness({ role: 'Front Desk', signedInAs: 'Somebody', vault: {} });
+  assert.equal(B.api.importDirectory(published).applied, false);
+  assert.equal(B.api.roleOf('Ana Chaves'), 'Front Desk');
+
+  // Same Mac, same stored directory, Owner now signed in.
+  const owner = directoryHarness({ role: 'Owner', vault: B.state.vault });
+  const retry = owner.api.importDirectory(published);
+  assert.equal(retry.applied, true, 'the retry completes');
+  assert.equal(owner.api.roleOf('Ana Chaves'), 'Operations Manager');
+  // Idempotent: applying again changes nothing and still reports complete.
+  const again = owner.api.importDirectory(published);
+  assert.equal(again.applied, true);
+  assert.equal(owner.api.roleOf('Ana Chaves'), 'Operations Manager');
 });

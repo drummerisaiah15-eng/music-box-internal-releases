@@ -1953,3 +1953,171 @@ test('P1-01: a Google mirror write is not credited to whoever is signed in', () 
   assert.equal(human.projects[0].sheets[0].editedBy['0,0'].by, 'Carrie Gass',
     'and a real edit still credits the person who made it');
 });
+
+// ── P0-1 / MB1188-078+080: interrupted commit, killed, relaunched ────────────
+//
+// A real restart test. The commit is driven through the intent + document +
+// index sequence, a failure is injected at a chosen boundary, the "process" is
+// discarded, and a FRESH sandbox is built over the same storage — the way a
+// relaunch actually works. Firebase is absent throughout, which is the
+// condition the original defect depended on.
+
+function crashHarness(storage, failAt = null) {
+  const context = vm.createContext({
+    console: { warn() {}, error() {}, log() {} },
+    performance: { now: () => 0 },
+    _ssPerfRecord: () => 0,
+  });
+  vm.runInContext(`
+    var SPREADSHEET_PROJECT_ID_PATTERN = /^[A-Za-z0-9_-]{1,100}$/;
+    var LS = ${JSON.stringify(storage)};
+    var FAIL = ${JSON.stringify(failAt)};
+    var localStorage = {
+      getItem: k => (k in LS ? LS[k] : null),
+      setItem: (k, v) => {
+        if (FAIL === 'intent' && k === 'tmb__ss_commit_intent') throw new Error('quota exceeded');
+        LS[k] = String(v);
+      },
+      removeItem: k => { delete LS[k]; },
+    };
+    // Durable storage survives the "crash"; the caches do not.
+    var _durableStoreSnapshots = new Map(Object.entries(LS.__durable ? JSON.parse(LS.__durable) : {}));
+    var _decCache = {};
+    var _ssDirtyWorkbook = null, _ssEditCell = null;
+    function _cloneJson(v) { return JSON.parse(JSON.stringify(v)); }
+    function _ssProjectSyncKey(id) { return 'spreadsheet_' + id; }
+    function _ssStorageMode(v) { return v == null ? 'empty' : (Array.isArray(v.projects) ? 'split' : 'legacy'); }
+    function normalizeSpreadsheetIndex(v) {
+      return { schema: 2, activeProject: v.activeProject || null,
+        projects: (v.projects || []).map(p => ({ id: String(p.id), name: p.name || '',
+          updatedAt: p.updatedAt || '', version: p.version || 1,
+          ...(p._deleted ? { _deleted: true } : {}) })) };
+    }
+    function normalizeSpreadsheetProject(v) { if (!v || !v.id) throw new Error('bad'); return v; }
+    async function _serializeKeyMutation(k, fn) { return fn(); }
+    function _newOperationId() { return 'op'; }
+    function showToast() {}
+    function ssLoad() { globalThis.__reloaded = true; }
+    function ssGoHome() {}
+    var document = { getElementById: () => null };
+    async function _commitEncryptedSnapshot(k, serialized, snapshot) {
+      if (FAIL === 'index' && k === 'spreadsheets') throw new Error('simulated index disk failure');
+      _durableStoreSnapshots.set(k, _cloneJson(snapshot));
+      _decCache[k] = snapshot;
+      LS.__durable = JSON.stringify(Object.fromEntries(_durableStoreSnapshots));
+    }
+    ${declaration('_ssDurableStoreValue')}
+    ${declaration('_ssReadCommitIntent')}
+    ${declaration('_ssWriteCommitIntent')}
+    ${declaration('_ssClearCommitIntent')}
+    ${declaration('_ssRecoverInterruptedSplitCommit')}
+    globalThis.commit = async (projectId, doc, nextIndex) => {
+      if (!_ssWriteCommitIntent([projectId])) throw new Error('intent refused');
+      await _commitEncryptedSnapshot(_ssProjectSyncKey(projectId), '', doc);
+      await _commitEncryptedSnapshot('spreadsheets', '', nextIndex);
+      _ssClearCommitIntent();
+    };
+    globalThis.recover = () => _ssRecoverInterruptedSplitCommit();
+    globalThis.snapshot = () => ({
+      storage: LS,
+      index: _ssDurableStoreValue('spreadsheets'),
+      intent: _ssReadCommitIntent(),
+      reloaded: !!globalThis.__reloaded,
+    });
+  `, context);
+  return context;
+}
+
+const startIndex = { schema: 2, activeProject: 'proj_a', projects: [{ id: 'proj_a', name: 'A', version: 1 }] };
+const nextIndex = { schema: 2, activeProject: 'proj_a', projects: [
+  { id: 'proj_a', name: 'A', version: 1 }, { id: 'proj_b', name: 'B', version: 1 }] };
+const sentinelDoc = { id: 'proj_b', name: 'B', sentinel: 'SECOND SPREADSHEET SENTINEL' };
+const freshStorage = () => ({ __durable: JSON.stringify({ spreadsheets: startIndex }) });
+
+test('P0-1: index write fails, process dies, relaunch offline recovers the project', async () => {
+  const dying = crashHarness(freshStorage(), 'index');
+  await assert.rejects(() => vm.runInContext(
+    `commit('proj_b', ${JSON.stringify(sentinelDoc)}, ${JSON.stringify(nextIndex)})`, dying));
+  const mid = vm.runInContext('snapshot()', dying);
+  assert.ok(JSON.parse(mid.storage.__durable).spreadsheet_proj_b, 'the document is durable');
+  assert.ok(!(mid.index.projects || []).some(p => p.id === 'proj_b'), 'the index does not name it');
+  assert.ok(mid.intent, 'and the intent survives to say so');
+
+  // --- the process is gone. A brand new one opens the same storage. ---
+  const relaunched = crashHarness(mid.storage, null);
+  const result = await vm.runInContext('recover()', relaunched);
+  const after = vm.runInContext('snapshot()', relaunched);
+  assert.equal(result.recovered, 1);
+  assert.ok((after.index.projects || []).some(p => p.id === 'proj_b'), 'the project is visible again');
+  assert.equal(after.intent, null, 'and the intent is cleared');
+  assert.ok(after.reloaded, 'the workbook on screen is refreshed, not left stale');
+  // The cell the person actually typed is still there.
+  assert.equal(JSON.parse(after.storage.__durable).spreadsheet_proj_b.sentinel,
+    'SECOND SPREADSHEET SENTINEL');
+});
+
+test('P0-1: recovery is idempotent across repeated relaunches', async () => {
+  const dying = crashHarness(freshStorage(), 'index');
+  await assert.rejects(() => vm.runInContext(
+    `commit('proj_b', ${JSON.stringify(sentinelDoc)}, ${JSON.stringify(nextIndex)})`, dying));
+  let storage = vm.runInContext('snapshot()', dying).storage;
+
+  for (let launch = 1; launch <= 3; launch++) {
+    const app = crashHarness(storage, null);
+    const result = await vm.runInContext('recover()', app);
+    const after = vm.runInContext('snapshot()', app);
+    assert.equal(result.recovered, launch === 1 ? 1 : 0, `launch ${launch} recovers only what is owed`);
+    const named = (after.index.projects || []).filter(p => p.id === 'proj_b');
+    assert.equal(named.length, 1, 'never duplicated');
+    storage = after.storage;
+  }
+});
+
+test('P0-1: dying before the intent lands leaves nothing to recover', async () => {
+  const dying = crashHarness(freshStorage(), 'intent');
+  await assert.rejects(() => vm.runInContext(
+    `commit('proj_b', ${JSON.stringify(sentinelDoc)}, ${JSON.stringify(nextIndex)})`, dying));
+  const mid = vm.runInContext('snapshot()', dying);
+  assert.ok(!JSON.parse(mid.storage.__durable).spreadsheet_proj_b, 'no document was written');
+  const relaunched = crashHarness(mid.storage, null);
+  assert.equal((await vm.runInContext('recover()', relaunched)).recovered, 0);
+});
+
+test('P0-1: an intent whose document never landed fabricates nothing', async () => {
+  const storage = freshStorage();
+  storage.tmb__ss_commit_intent = JSON.stringify({ projectIds: ['proj_ghost'], at: 'then' });
+  const app = crashHarness(storage, null);
+  const result = await vm.runInContext('recover()', app);
+  const after = vm.runInContext('snapshot()', app);
+  assert.equal(result.recovered, 0);
+  assert.ok(!(after.index.projects || []).some(p => p.id === 'proj_ghost'));
+  assert.equal(after.intent, null, 'the stale intent is cleared rather than retried forever');
+});
+
+test('P0-1: a project the index tombstones is never resurrected', async () => {
+  const storage = {
+    __durable: JSON.stringify({
+      spreadsheets: { schema: 2, activeProject: 'proj_a', projects: [
+        { id: 'proj_a', name: 'A', version: 1 },
+        { id: 'proj_b', name: 'B', version: 2, _deleted: true }] },
+      spreadsheet_proj_b: sentinelDoc,
+    }),
+    tmb__ss_commit_intent: JSON.stringify({ projectIds: ['proj_b'], at: 'then' }),
+  };
+  const app = crashHarness(storage, null);
+  const result = await vm.runInContext('recover()', app);
+  const after = vm.runInContext('snapshot()', app);
+  assert.equal(result.recovered, 0, 'a deliberate deletion is not an orphan');
+  assert.equal((after.index.projects || []).find(p => p.id === 'proj_b')._deleted, true);
+});
+
+test('P0-1: a project already named by the index is not duplicated', async () => {
+  const storage = {
+    __durable: JSON.stringify({ spreadsheets: nextIndex, spreadsheet_proj_b: sentinelDoc }),
+    tmb__ss_commit_intent: JSON.stringify({ projectIds: ['proj_b'], at: 'then' }),
+  };
+  const app = crashHarness(storage, null);
+  assert.equal((await vm.runInContext('recover()', app)).recovered, 0);
+  const after = vm.runInContext('snapshot()', app);
+  assert.equal((after.index.projects || []).filter(p => p.id === 'proj_b').length, 1);
+});
