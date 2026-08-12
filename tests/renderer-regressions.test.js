@@ -1936,7 +1936,10 @@ test('MB161-040: the merge base is a workbook, never the index', () => {
     'a failed save must not overwrite the live workbook with the durable one');
 
   const helper = namedFunctionSource('_ssDurableWorkbook');
-  assert.match(helper, /_ssReadStoredWorkbook\(\)/, 'it assembles rather than reading a snapshot');
+  // MB1188-072: still assembles rather than reading the raw snapshot — but in
+  // DURABLE mode, so every value it assembles comes from _durableStoreSnapshots
+  // instead of _decCache, which the live workbook aliases.
+  assert.match(helper, /_ssReadStoredWorkbook\(true\)/, 'it assembles rather than reading a snapshot');
   assert.match(helper, /catch \(_\) \{\s*\n?\s*return null;/,
     'and a workbook that will not assemble is "no base", not an exception');
 });
@@ -2613,4 +2616,141 @@ test('MB1188-071: a passcode that saved locally is not reported as failed', () =
   const clear = namedFunctionSource('_clearStaffPasscode');
   assert.match(clear, /_shareStaffPasscodeRecord\(result\.name, result\.record, 'Passcode removed\.'\)/);
   assert.doesNotMatch(clear, /await _persistStaffPasscodeRecord\(/);
+});
+
+// ── Codex 1.3.12 audit: verified findings, and what stops each recurring ─────
+
+test('P0-1 / MB1188-072: the durable workbook is never aliased to live state', () => {
+  // _commitEncryptedSnapshot clones into _durableStoreSnapshots but stores the
+  // caller's object in _decCache by reference. The spreadsheet save hands it
+  // the live workbook, so STORE.get('spreadsheets') — a clone of _decCache —
+  // returned the unsaved edit as though it were durable. _stageDirtySpreadsheetSave
+  // takes its merge base from here, so no operation could be derived and the
+  // edit was written away silently, with the save reported clean.
+  const durable = namedFunctionSource('_ssDurableStoreValue');
+  assert.match(durable, /_durableStoreSnapshots\.has\(key\)/);
+  assert.match(durable, /_cloneJson\(_durableStoreSnapshots\.get\(key\)\)/);
+
+  const reader = namedFunctionSource('_ssReadStoredWorkbook');
+  assert.match(reader, /function _ssReadStoredWorkbook\(durable = false\)/);
+  assert.match(reader, /const read = durable\s*\n?\s*\? \(key\) => _ssDurableStoreValue\(key\)/);
+  // Both the index AND each project document must go through it; reading one
+  // durably and the other from the cache would reintroduce the same skew.
+  assert.match(reader, /const stored = read\('spreadsheets'\);/);
+  assert.match(reader, /const doc = read\(key\);/);
+  // STORE.get appears exactly once — as the LIVE half of the selector. A second
+  // one would mean some value still bypasses the durable/live choice.
+  assert.equal((reader.match(/STORE\.get\(/g) || []).length, 1,
+    'nothing inside the reader bypasses the durable/live selector');
+
+  const helper = namedFunctionSource('_ssDurableWorkbook');
+  assert.match(helper, /_ssReadStoredWorkbook\(true\)/);
+  // A baseline read must not rewrite what the LIVE workbook is waiting for.
+  assert.match(helper, /const pending = _ssPendingProjectIds;/);
+  assert.match(helper, /_ssPendingProjectIds = pending;/);
+});
+
+test('P0-2 / MB1188-078: a split commit records its intent before it writes', () => {
+  const commit = namedFunctionSource('_ssCommitSplitWorkbook');
+  const firstDocWrite = commit.indexOf("await _commitEncryptedSnapshot(key,");
+  const intentWrite = commit.indexOf('_ssWriteCommitIntent(intentIds)');
+  assert.ok(intentWrite !== -1 && intentWrite < firstDocWrite,
+    'the intent is durable before the first document write');
+  // An unrecordable intent refuses the save. Writing anyway is precisely the
+  // state that produced invisible orphans.
+  assert.match(commit, /could not record the save safely/);
+  const clear = commit.lastIndexOf('_ssClearCommitIntent();');
+  assert.ok(clear > commit.indexOf("_commitEncryptedSnapshot('spreadsheets'"),
+    'and is cleared only once the index naming those documents is durable');
+});
+
+test('P0-2 / MB1188-078: recovery completes an interrupted commit but never resurrects', () => {
+  const recover = namedFunctionSource('_ssRecoverInterruptedSplitCommit');
+  assert.match(recover, /_ssDurableStoreValue\('spreadsheets'\)/,
+    'reads the durable index, not the cache it may be mid-write on');
+  // A tombstoned project is a deliberate deletion. `named` holds every id the
+  // index mentions, live or tombstoned, and anything named is skipped.
+  assert.match(recover, /const named = new Set\(\(index\.projects \|\| \[\]\)\.map\(entry => String\(entry\.id\)\)\);/);
+  assert.match(recover, /if \(named\.has\(id\)\) continue;/);
+  assert.match(recover, /if \(!doc\) continue;/, 'a document that never landed is not invented');
+  assert.match(recover, /_ssClearCommitIntent\(\);/);
+  // Runs before anything reads or publishes the workbook.
+  const whole = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const at = whole.indexOf('_ssRecoverInterruptedSplitCommit()');
+  assert.ok(at !== -1 && at < whole.indexOf('await flushPendingDirectoryPublication()'),
+    'recovery runs before publication');
+});
+
+test('P0-3 / MB1188-074: a passcode that could not be applied is remembered and retried', () => {
+  // _refreshForSyncKey fired the apply once; main refuses it when nobody is
+  // signed in; the renderer reduced that to `false` and forgot. And the remote
+  // revision is persisted BEFORE the apply, so reconciliation short-circuits
+  // and it is never retried. Exactly the MB1188-047 shape, for passcodes.
+  const whole = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  assert.match(whole, /\.then\(ok => _setPasscodeApplyPending\(!ok\)\)/);
+  assert.match(whole, /\.catch\(\(\) => _setPasscodeApplyPending\(true\)\)/);
+  const flush = namedFunctionSource('flushPendingPasscodeApply');
+  assert.match(flush, /if \(!_passcodeApplyPending\(\)\) return true;/);
+  assert.match(flush, /_setPasscodeApplyPending\(!applied\);/);
+  assert.match(flush, /refreshProtectedLoginProfiles\(\)/, 'the login cache is refreshed after');
+  // Settled at login, before anything publishes.
+  const at = whole.indexOf('await flushPendingPasscodeApply();');
+  assert.ok(at !== -1 && at < whole.indexOf('await flushPendingDirectoryPublication();'));
+});
+
+test('P0-3 / MB1188-074: an unapplied passcode is not a way in', () => {
+  const blocks = namedFunctionSource('_passcodeApplyBlocksLogin');
+  assert.match(blocks, /if \(!_passcodeApplyPending\(\)\) return false;/);
+  // Only the person the pending record concerns is held back. A blanket block
+  // would lock out the whole studio over one unapplied record.
+  assert.match(blocks, /stored\[String\(name\)\.toLocaleLowerCase\('en-US'\)\]/);
+  assert.match(blocks, /record\.cleared !== true/, 'a removal is not a reason to block');
+  const select = namedFunctionSource('selectLoginUser');
+  assert.match(select, /_passcodeApplyBlocksLogin\(name\)/);
+  assert.match(select, /Ask Elizabeth to sign in here once/, 'and it says what to do about it');
+});
+
+test('P0-3 / MB1188-074: "shared" is claimed only after the cloud takes it', () => {
+  const persist = namedFunctionSource('_persistStaffPasscodeRecord');
+  assert.match(persist, /includeSync: true, requireSync: true/,
+    'a local flush proves only that this Mac stored it');
+});
+
+test('P1-2 / MB1188-076: an interrupted Google pull is deferred, not successful', () => {
+  const pull = namedFunctionSource('ssPullFromGoogle');
+  assert.match(pull, /let deferredByEditing = false;/);
+  assert.match(pull, /deferredByEditing = true; break;/);
+  const guard = pull.indexOf('if (deferredByEditing) {');
+  assert.ok(guard !== -1, 'the deferred case returns before the success tail');
+  // Everything the success tail does must be after the guard: no pulledAt, no
+  // cleared error, no "Already up to date".
+  assert.ok(guard < pull.indexOf('pulledAt: new Date().toISOString()'));
+  // lastIndexOf: the phrase also appears in a comment earlier in the function.
+  // The toast itself is the thing that must be unreachable when deferred.
+  assert.ok(guard < pull.lastIndexOf("'Already up to date with Google.'"));
+  assert.match(pull, /Google sync paused because you started editing/);
+  assert.match(pull.slice(guard, guard + 700), /return false;/);
+});
+
+test('P1-3 / MB1188-077: a mistyped passcode cannot lock somebody out', () => {
+  const save = namedFunctionSource('saveStaffPasscode');
+  assert.match(save, /const confirm = document\.getElementById\('staff-pin-confirm'\)/);
+  assert.match(save, /if \(next !== confirm\)/);
+  // Checked before main is called, so a typo never reaches the vault.
+  assert.ok(save.indexOf('if (next !== confirm)') < save.indexOf('setStaffPasscode('));
+  const whole = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  assert.match(whole, /id="staff-pin-confirm"/);
+});
+
+test('P1-3 / MB1188-077: the Electron wrapper is stripped, the message is not', () => {
+  const plain = namedFunctionSource('_plainIpcMessage');
+  assert.match(plain, /Error invoking remote method/);
+  const context = vm.createContext({});
+  vm.runInContext(plain + '; this.f = _plainIpcMessage;', context);
+  const f = context.f;
+  assert.equal(
+    f(new Error("Error invoking remote method 'app-session-set-staff-passcode': Error: Your current passcode did not match.")),
+    'Your current passcode did not match.');
+  assert.equal(f(new Error('Choose a 4-digit passcode.')), 'Choose a 4-digit passcode.');
+  assert.equal(f('plain string'), 'plain string');
 });

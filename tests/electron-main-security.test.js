@@ -871,8 +871,12 @@ function directoryHarness({ role = 'Owner', signedInAs = 'Elizabeth Chaves', vau
     ${sliceFunction(main, '_buildStaffDirectory')}
     ${sliceFunction(main, '_validDirectoryEntry')}
     ${sliceFunction(main, '_applyStaffDirectory')}
+    var PROFILE_ROLE_RANK = { 'Front Desk': 1, 'Operations & Events': 1, 'Operations Manager': 2 };
     globalThis.build = () => _buildStaffDirectory();
-    globalThis.apply = d => _applyStaffDirectory(d);
+    // MB1188-073: these harness cases are the OWNER publishing/importing, which
+    // is the path that may still set roles. The non-elevating path has its own
+    // tests below.
+    globalThis.apply = (d, opts = { elevate: true }) => _applyStaffDirectory(d, opts);
     globalThis.profiles = () => _allAppProfiles().map(p => p.name + ':' + p.role);
     globalThis.session = () => appSession;
   `, context);
@@ -998,22 +1002,29 @@ test('directory: export is owner-only, import is validated in main', () => {
   const exportBody = extractHandlerBody(main, 'app-session-export-directory');
   assert.match(exportBody, /_requireAppRole\(new Set\(\['Owner'\]\)\)/,
     'only the owner publishes');
-  const apply = extractFunction(main, '_applyStaffDirectory');
+  const apply = main.slice(main.indexOf('function _applyStaffDirectory'),
+                           main.indexOf("_secureHandle('app-session-export-directory'"));
   assert.match(apply, /vault\[STAFF_PROFILES_VAULT_KEY\] = custom/,
     'import REPLACES the custom profile list — absence really is deletion here');
   assert.match(apply, /else delete vault\[PROFILE_ROLE_OVERRIDES_VAULT_KEY\]/,
     'and an absent role override is a demotion, not a no-op');
-  // Widening the publisher is only safe once these two stop being true.
-  for (const handler of ['app-session-remove-staff-profile', 'app-session-set-profile-role']) {
-    const start = main.indexOf(`_secureHandle('${handler}'`);
-    assert.match(main.slice(start, start + 200), /_requireAppRole\(OPERATIONS_MANAGER_ROLES\)/,
-      `${handler} is Operations-Manager-gated, NOT owner-gated — do not claim otherwise`);
-  }
+  // MB1188-073 broke the escalation chain this warning describes, from both
+  // ends: changing a role is Owner-only, and an import performed by anybody
+  // other than an Owner cannot raise a role at all. Removal stays with the
+  // Operations Manager — it is onboarding work, not privilege.
+  const removeBody = main.slice(main.indexOf("_secureHandle('app-session-remove-staff-profile'"));
+  assert.match(removeBody.slice(0, 200), /_requireAppRole\(OPERATIONS_MANAGER_ROLES\)/,
+    'removal is still Operations-Manager-gated');
+  const roleBody = main.slice(main.indexOf("_secureHandle('app-session-set-profile-role'"));
+  assert.match(roleBody.slice(0, 300), /_requireAppRole\(new Set\(\['Owner'\]\)\)/,
+    'granting a role is Owner-only');
   assert.match(main, /ASSIGNABLE_PROFILE_ROLES = Object\.freeze\(\['Operations Manager'/,
-    'and Operations Manager is grantable by import, so it is not a trust root');
+    'Operations Manager is still grantable by an OWNER import, so it is not a trust root');
   const importBody = extractHandlerBody(main, 'app-session-import-directory');
-  assert.match(importBody, /_applyStaffDirectory\(directory\)/,
+  assert.match(importBody, /_applyStaffDirectory\(directory, \{/,
     'import runs through the validating applier, not a raw vault write');
+  assert.match(importBody, /elevate: _appSessionHasRole\(new Set\(\['Owner'\]\)\)/,
+    'and only an Owner session lets that import raise anybody');
   assert.match(preload,
     /exportDirectory:\s+\(\) => ipcRenderer\.invoke\('app-session-export-directory'\)/);
   assert.match(preload,
@@ -1767,8 +1778,13 @@ test('MB161-031: the owner keeps everything that is about ownership or secrets',
   // guard of its own, and adding one here would silently restrict who can add a
   // profile, which nobody asked for. It defaults every new profile to Front Desk
   // regardless of who creates it.
+  //
+  // MB1188-073 splits what MB161-031 moved. Adding and removing profiles is
+  // routine onboarding and stays with the Operations Manager. Changing a ROLE
+  // is granting privilege, and went back to the Owner — it is the step that
+  // made the import-directory escalation chain worth walking.
   for (const handler of [
-    'app-session-remove-staff-profile', 'app-session-set-profile-role',
+    'app-session-remove-staff-profile',
     'google-set-credentials', 'google-oauth-begin', 'google-oauth-complete',
     'google-disconnect',
   ]) {
@@ -1777,6 +1793,9 @@ test('MB161-031: the owner keeps everything that is about ownership or secrets',
     assert.match(body, /_requireAppRole\(OPERATIONS_MANAGER_ROLES\)/,
       `${handler} is available to an Operations Manager`);
   }
+  const roleBody = main.slice(main.indexOf("_secureHandle('app-session-set-profile-role'"));
+  assert.match(roleBody.slice(0, 600), /_requireAppRole\(new Set\(\['Owner'\]\)\)/,
+    'changing a role is Owner-only');
 });
 
 test('MB161-045: no handler spells out the role list instead of using the set', () => {
@@ -2396,9 +2415,10 @@ test('MB1188-069: the sync delivery channel needs a signed-in session', () => {
 test('MB1188-069: wrong passcodes are rate-limited, and a right one clears the count', () => {
   const region = main.slice(main.indexOf("_secureHandle('app-session-start-staff'"));
   const handler = region.slice(0, region.indexOf('// Which profiles are passcode-protected'));
-  assert.match(handler, /if \(Date\.now\(\) < \(staffAuthLockedUntil\.get\(key\) \|\| 0\)\)/);
+  assert.match(handler, /const lockedUntil = staffAuthLockedUntil\.get\(key\) \|\| 0;/);
+  assert.match(handler, /if \(Date\.now\(\) < lockedUntil\)/);
   assert.match(handler, /_recordStaffAuthFailure\(key\);/);
-  assert.match(handler, /staffAuthFailures\.delete\(key\);/);
+  assert.match(handler, /_clearStaffAuthFailures\(key\);/);
   assert.match(extractFunction(main, '_recordStaffAuthFailure'), /failures >= 5/);
 });
 
@@ -2533,4 +2553,135 @@ test('MB1188-069: removing a passcode is clamped, never refused', () => {
   // prevent, reintroduced by the cap itself.
   assert.match(handler, /Math\.min\(existing\.version \+ 1, MAX_STAFF_AUTH_VERSION\)/);
   assert.doesNotMatch(handler, /if \(!_validStaffAuthRecord\(record\)\)/);
+});
+
+// ── Codex 1.3.12 audit: P0-4 authorization, P1-1 lockout durability ──────────
+
+test('P0-4 / MB1188-073: the authorization matrix, read off the handlers', () => {
+  // Isaiah's ruling on the handoff: adding and removing profiles is routine
+  // onboarding and stays with the Operations Manager; changing a ROLE is
+  // granting privilege and went back to the Owner.
+  const gate = channel => {
+    const start = main.indexOf(`_secureHandle('${channel}'`);
+    assert.notEqual(start, -1, `${channel} exists`);
+    const body = main.slice(start, start + 600);
+    if (/_requireAppRole\(new Set\(\['Owner'\]\)\)/.test(body)) return 'Owner';
+    if (/_requireAppRole\(OPERATIONS_MANAGER_ROLES\)/.test(body)) return 'Owner+OpsManager';
+    if (/_requireAppRole\(COMMUNICATION_ROLES\)/.test(body)) return 'any signed-in';
+    if (/_requireAppRole\(STAFF_PASSCODE_ROLES\)/.test(body)) return 'OpsManager';
+    return 'ungated';
+  };
+  assert.equal(gate('app-session-set-profile-role'), 'Owner');
+  assert.equal(gate('app-session-export-directory'), 'Owner');
+  assert.equal(gate('app-session-remove-staff-profile'), 'Owner+OpsManager');
+  assert.equal(gate('app-session-set-staff-passcode'), 'OpsManager');
+  // Clearing is COMMUNICATION_ROLES at the gate and then self-or-Owner inside,
+  // which is what lets a manager clear their own with their current passcode.
+  assert.equal(gate('app-session-clear-staff-passcode'), 'any signed-in');
+});
+
+test('P0-4 / MB1188-073: an import cannot hand out privilege unless an Owner ran it', () => {
+  const context = vm.createContext({ Object, Set, Array, String, Number, JSON });
+  vm.runInContext(`
+    var PROFILE_ROLE_RANK = { 'Front Desk': 1, 'Operations & Events': 1, 'Operations Manager': 2 };
+    var ASSIGNABLE_PROFILE_ROLES = ['Operations Manager', 'Operations & Events', 'Front Desk'];
+    var APP_PROFILE_ROLES = { 'Elizabeth Chaves': 'Owner', 'Ana Chaves': 'Front Desk' };
+    var HELD = { 'ana chaves': 'Front Desk' };
+    function _roleForAppProfile(n){ return HELD[String(n).toLowerCase()] || APP_PROFILE_ROLES[n] || null; }
+    // The exact decision from _applyStaffDirectory, in isolation.
+    this.resolve = (incomingRole, name, elevate) => {
+      let role = ASSIGNABLE_PROFILE_ROLES.includes(incomingRole) ? incomingRole : 'Front Desk';
+      if (!elevate && role !== 'Owner') {
+        const held = _roleForAppProfile(name) || APP_PROFILE_ROLES[name] || 'Front Desk';
+        if (PROFILE_ROLE_RANK[role] > (PROFILE_ROLE_RANK[held] ?? 0)) role = held;
+      }
+      return role;
+    };
+  `, context);
+  const { resolve } = context;
+  // The escalation the code's own comment describes: an imported directory
+  // promotes somebody, who could then act on everybody but the Owner.
+  assert.equal(resolve('Operations Manager', 'Ana Chaves', false), 'Front Desk',
+    'a non-Owner import cannot raise Ana');
+  assert.equal(resolve('Operations Manager', 'Ana Chaves', true), 'Operations Manager',
+    'an Owner import still can');
+  // Lateral and downward moves are not escalation and still apply, so ordinary
+  // synchronization is unaffected.
+  assert.equal(resolve('Operations & Events', 'Ana Chaves', false), 'Operations & Events');
+  assert.equal(resolve('Front Desk', 'Ana Chaves', false), 'Front Desk');
+  assert.equal(resolve('nonsense', 'Ana Chaves', false), 'Front Desk');
+});
+
+test('P1-1 / MB1188-075: the passcode lockout survives quitting the app', () => {
+  // Five wrong attempts started a five-minute lock held in a process Map, so
+  // quitting cleared it — which is exactly what somebody guessing would do.
+  const sandbox = vm.createContext({ Buffer, console: { warn() {} } });
+  vm.runInContext(`
+    var MAX_STAFF_LOCKOUT_MS = 24 * 60 * 60 * 1000;
+    var STAFF_AUTH_LOCKOUT_VAULT_KEY = 'app_staff_auth_lockout_v1';
+    var VAULT = {};
+    var staffAuthFailures = new Map(), staffAuthLockedUntil = new Map();
+    function _loadSecretVault(){ return VAULT; }
+    function _saveSecretVault(v){ VAULT = v; }
+    ${extractFunction(main, '_isPlainObject')}
+    ${extractFunction(main, '_boundedString')}
+    ${extractFunction(main, '_loadStaffAuthLockouts')}
+    ${extractFunction(main, '_saveStaffAuthLockouts')}
+    ${extractFunction(main, '_recordStaffAuthFailure')}
+    ${extractFunction(main, '_clearStaffAuthFailures')}
+    this.api = {
+      fail: k => _recordStaffAuthFailure(k),
+      clear: k => _clearStaffAuthFailures(k),
+      lockedUntil: k => staffAuthLockedUntil.get(k) || 0,
+      vault: () => VAULT,
+      // A relaunch: the Maps are gone, the vault is not.
+      relaunch: () => { staffAuthFailures.clear(); staffAuthLockedUntil.clear(); _loadStaffAuthLockouts(); },
+      poison: v => { VAULT[STAFF_AUTH_LOCKOUT_VAULT_KEY] = v; },
+    };
+  `, sandbox);
+  const api = sandbox.api;
+
+  for (let i = 0; i < 5; i++) api.fail('megan');
+  const locked = api.lockedUntil('megan');
+  assert.ok(locked > Date.now(), 'five wrong attempts lock the profile');
+  assert.ok(api.vault().app_staff_auth_lockout_v1, 'and it is written to the vault');
+
+  api.relaunch();
+  assert.equal(api.lockedUntil('megan'), locked, 'the lock survives a full restart');
+
+  api.clear('megan');
+  assert.equal(api.lockedUntil('megan'), 0, 'a correct passcode releases it');
+  api.relaunch();
+  assert.equal(api.lockedUntil('megan'), 0, 'and it stays released');
+});
+
+test('P1-1 / MB1188-075: a corrupt lockout record cannot lock somebody out forever', () => {
+  const sandbox = vm.createContext({ Buffer, console: { warn() {} } });
+  vm.runInContext(`
+    var MAX_STAFF_LOCKOUT_MS = 24 * 60 * 60 * 1000;
+    var STAFF_AUTH_LOCKOUT_VAULT_KEY = 'app_staff_auth_lockout_v1';
+    var VAULT = {};
+    var staffAuthFailures = new Map(), staffAuthLockedUntil = new Map();
+    function _loadSecretVault(){ return VAULT; }
+    function _saveSecretVault(v){ VAULT = v; }
+    ${extractFunction(main, '_isPlainObject')}
+    ${extractFunction(main, '_boundedString')}
+    ${extractFunction(main, '_loadStaffAuthLockouts')}
+    this.load = stored => {
+      staffAuthFailures.clear(); staffAuthLockedUntil.clear();
+      VAULT = { app_staff_auth_lockout_v1: stored };
+      _loadStaffAuthLockouts();
+      return { until: staffAuthLockedUntil.get('megan') || 0, fails: staffAuthFailures.get('megan') || 0 };
+    };
+  `, sandbox);
+  const load = sandbox.load;
+  const year3000 = Date.parse('3000-01-01T00:00:00Z');
+  assert.equal(load({ megan: { failures: 5, until: year3000 } }).until, 0,
+    'a lock a thousand years out is corrupt, not honoured');
+  assert.equal(load({ megan: { failures: 5, until: Date.now() - 1000 } }).until, 0,
+    'an expired lock is simply gone');
+  assert.equal(load({ megan: { failures: 'many', until: 'soon' } }).fails, 0);
+  assert.equal(load({ megan: null }).until, 0);
+  assert.equal(load('not an object').until, 0);
+  assert.equal(load([]).until, 0);
 });

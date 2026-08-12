@@ -3525,10 +3525,14 @@ test('MB1188-055: the index is built and validated before any document is writte
 
 test('MB1188-056: a pull that returns while somebody types changes nothing', () => {
   const pull = declaration('ssPullFromGoogle');
-  assert.match(pull, /if \(_ssEditCell \|\| _ssDirtyWorkbook\) break;/,
+  // MB1188-076: still a BREAK so no checkpoint advances — and now it records
+  // that the pull was deferred, so the shared success tail cannot claim the
+  // tabs it never read were already up to date.
+  assert.match(pull, /if \(_ssEditCell \|\| _ssDirtyWorkbook\) \{ deferredByEditing = true; break; \}/,
     'rechecked after the awaits, and BREAK so no checkpoint advances');
   // After the live re-acquire, so the tab is known to still exist.
-  assert.ok(pull.indexOf('if (!liveLink) break;') < pull.indexOf('if (_ssEditCell || _ssDirtyWorkbook) break;'));
+  assert.ok(pull.indexOf('if (!liveLink) break;')
+    < pull.indexOf('if (_ssEditCell || _ssDirtyWorkbook) { deferredByEditing = true; break; }'));
   assert.match(pull, /if \(!_ssEditCell\) ssRender\(\);/,
     'and the grid is never rebuilt under a live caret');
 });

@@ -2454,6 +2454,8 @@
                    minlength="4" maxlength="4" placeholder="Current" style="width:110px;letter-spacing:.12em;display:none" />
             <input type="password" id="staff-pin-new" class="form-input" inputmode="numeric"
                    minlength="4" maxlength="4" placeholder="New 4-digit" style="width:140px;letter-spacing:.12em" />
+            <input type="password" id="staff-pin-confirm" class="form-input" inputmode="numeric"
+                   minlength="4" maxlength="4" placeholder="Confirm" style="width:120px;letter-spacing:.12em" />
             <button class="btn btn-outline btn-sm" onclick="saveStaffPasscode()">Save Passcode</button>
             <button class="btn btn-ghost btn-sm" id="staff-pin-remove" style="display:none;color:var(--danger,#c0392b)"
                     onclick="removeMyStaffPasscode()">Remove Passcode</button>
@@ -2799,11 +2801,51 @@ const DIRECTORY_PUBLISH_PENDING_KEY = 'tmb__directory_publish_pending';
 // applied. Same storage and the same reasoning: it has to survive a restart and
 // be readable before the vault is unlocked, because being locked is what
 // creates it.
+// MB1188-074: staff_passcodes needs the same debt-and-settle machinery the
+// directory got in MB1188-047, for the identical reason. _refreshForSyncKey
+// fires _applyStaffPasscodes once; main refuses it when nobody is signed in;
+// the renderer reduces that to `false` and forgets. And because
+// _persistRemoteValue writes the revision BEFORE the apply runs,
+// _reconcileRemoteSnapshot short-circuits on `remoteRevision === localRevision`
+// from then on — so the rejected record is never retried. The synced store and
+// the main vault then disagree about who is protected, permanently and quietly.
+const PASSCODE_APPLY_PENDING_KEY = 'tmb__passcode_apply_pending';
 const DIRECTORY_IMPORT_PENDING_KEY = 'tmb__directory_import_pending';
 
 function _directoryImportPending() {
   try { return localStorage.getItem(DIRECTORY_IMPORT_PENDING_KEY) === '1'; }
   catch (_) { return false; }
+}
+
+function _passcodeApplyPending() {
+  try { return localStorage.getItem(PASSCODE_APPLY_PENDING_KEY) === '1'; }
+  catch (_) { return false; }
+}
+
+function _setPasscodeApplyPending(pending) {
+  try {
+    if (pending) localStorage.setItem(PASSCODE_APPLY_PENDING_KEY, '1');
+    else localStorage.removeItem(PASSCODE_APPLY_PENDING_KEY);
+  } catch (_) {}
+}
+
+// Settles the debt above. Runs as post-login maintenance, before anything is
+// published, so the vault can never be behind the shared copy at publish time.
+async function flushPendingPasscodeApply() {
+  if (!_passcodeApplyPending()) return true;
+  const stored = STORE.get('staff_passcodes', null);
+  if (!stored || typeof stored !== 'object' || Array.isArray(stored)) {
+    // The marker describes a document that is no longer here to apply.
+    _setPasscodeApplyPending(false);
+    return true;
+  }
+  const applied = await _applyStaffPasscodes(stored);
+  _setPasscodeApplyPending(!applied);
+  if (applied) {
+    // The login screen decides from a cached list; it has just gone stale.
+    try { await refreshProtectedLoginProfiles(); } catch (_) {}
+  }
+  return applied;
 }
 
 function _setDirectoryImportPending(pending) {
@@ -3036,6 +3078,22 @@ async function _persistStaffPasscodeRecord(name, record) {
     return next;
   }, {});
   await STORE.flush(['staff_passcodes']);
+  // MB1188-074: the local flush above proves only that this Mac stored it.
+  // Claiming "shared with the other Mac" needs the cloud to have taken it, so
+  // the caller distinguishes the two by whether THIS throws.
+  await STORE.flush(['staff_passcodes'], { includeSync: true, requireSync: true });
+}
+
+// MB1188-074: a passcode that arrived but could not be applied to this Mac's
+// vault must not simply be ignored — main would let that person straight in
+// without the passcode the other Mac is enforcing. Blocks only the person the
+// pending record actually concerns; everybody else signs in normally.
+function _passcodeApplyBlocksLogin(name) {
+  if (!_passcodeApplyPending()) return false;
+  const stored = STORE.get('staff_passcodes', null);
+  if (!stored || typeof stored !== 'object' || Array.isArray(stored)) return false;
+  const record = stored[String(name).toLocaleLowerCase('en-US')];
+  return !!record && record.cleared !== true;
 }
 
 async function importStaffDirectory(directory) {
@@ -3176,6 +3234,18 @@ async function renderStaffPasscodeSection() {
   if (remove) remove.style.display = has ? '' : 'none';
   const next = document.getElementById('staff-pin-new');
   if (next) next.value = '';
+  const confirm = document.getElementById('staff-pin-confirm');
+  if (confirm) confirm.value = '';
+}
+
+// MB1188-077: main's errors arrive wrapped by Electron as
+// "Error invoking remote method 'app-session-...': Error: <the real message>".
+// Only the wrapper is removed, never the message — the actionable part is what
+// main wrote, and inventing a friendlier one loses the reason.
+function _plainIpcMessage(error) {
+  const raw = String(error?.message || error || '');
+  const unwrapped = raw.replace(/^Error invoking remote method '[^']*':\s*/, '');
+  return unwrapped.replace(/^(?:Uncaught\s+)?Error:\s*/, '') || raw;
 }
 
 // MB1188-071: main has already written the vault by the time this runs, so the
@@ -3197,9 +3267,17 @@ async function _shareStaffPasscodeRecord(name, record, appliedMessage) {
 
 async function saveStaffPasscode() {
   const next = document.getElementById('staff-pin-new')?.value?.trim() || '';
+  const confirm = document.getElementById('staff-pin-confirm')?.value?.trim() || '';
   const current = document.getElementById('staff-pin-current')?.value?.trim() || '';
   if (!/^\d{4}$/.test(next)) {
     showToast('Choose a 4-digit passcode.', 'warning');
+    return false;
+  }
+  // MB1188-077: a typo here is not recoverable by the person who made it —
+  // they would be locked out by a passcode they never knowingly chose, and only
+  // Elizabeth could clear it. Checked before main is called at all.
+  if (next !== confirm) {
+    showToast('The two passcodes do not match. Type it again to confirm.', 'warning');
     return false;
   }
   if (!window.electronSession?.setStaffPasscode) {
@@ -3218,7 +3296,7 @@ async function saveStaffPasscode() {
     await _shareStaffPasscodeRecord(result.name, result.record,
       'Passcode saved. You will be asked for it next time you sign in.');
   } catch (error) {
-    showToast(String(error?.message || error), 'danger');
+    showToast(_plainIpcMessage(error), 'danger');
     return false;
   }
   await renderStaffPasscodeSection();
@@ -3262,7 +3340,7 @@ async function _clearStaffPasscode(name, currentPin) {
       showToast('Passcode removed.', 'success');
     }
   } catch (error) {
-    showToast(String(error?.message || error), 'danger');
+    showToast(_plainIpcMessage(error), 'danger');
     return false;
   }
   await renderStaffPasscodeSection();
@@ -3542,6 +3620,16 @@ function selectLoginUser(name, role) {
     _openStaffPasscodeKeypad(name);
     return;
   }
+  if (name !== 'Elizabeth Chaves' && _passcodeApplyBlocksLogin(name)) {
+    // Actionable on purpose: the person reading it cannot fix this themselves,
+    // and "access settings are still syncing" with no next step is how somebody
+    // ends up restarting the app ten times.
+    showToast(
+      `${name} has a passcode set on the other Mac that this one has not finished applying. ` +
+      'Ask Elizabeth to sign in here once so access settings finish syncing.',
+      'danger');
+    return;
+  }
   _pinMode = 'owner';
   _pinStaffName = null;
   if (name === 'Elizabeth Chaves') {
@@ -3629,7 +3717,7 @@ async function _checkStaffPin() {
   } catch (err) {
     // Main distinguishes a wrong passcode from a lockout from a real failure,
     // and its wording is the accurate one.
-    if (error) error.textContent = String(err?.message || err);
+    if (error) error.textContent = _plainIpcMessage(err);
   }
 }
 
@@ -6961,6 +7049,12 @@ async function _initFirebaseInner() {
     // MB1188-047: apply first, publish second. Both orders "work"; only this
     // one cannot publish a vault that is known to be behind the shared copy.
     void (async () => {
+      // MB1188-078: finish any interrupted spreadsheet commit before anything
+      // else reads or publishes the workbook, so an orphaned project is put
+      // back rather than being read as "not there" and tombstoned later.
+      try { await _ssRecoverInterruptedSplitCommit(); }
+      catch (error) { console.warn('[spreadsheets] interrupted-save recovery failed:', error?.message || error); }
+      await flushPendingPasscodeApply();
       await flushPendingDirectoryImport();
       await flushPendingDirectoryPublication();
     })().catch(error => {
@@ -7419,7 +7513,11 @@ function _refreshForSyncKey(key, value) {
     // MB1188-069: main is the authority — start-staff checks the vault copy, so
     // an arriving record has to be delivered into it. Merged by version there,
     // so a stale Mac can never restore a passcode somebody removed.
-    void _applyStaffPasscodes(value);
+    try {
+      void _applyStaffPasscodes(value)
+        .then(ok => _setPasscodeApplyPending(!ok))
+        .catch(() => _setPasscodeApplyPending(true));
+    } catch (_) { _setPasscodeApplyPending(true); }
   }
   if (key === 'staff_directory') {
     // V159-005: another Mac published a profile change; apply it locally.
@@ -9376,17 +9474,47 @@ let _ssPendingProjectIds = [];
 //
 // Assembling from the project documents costs a little more than reading a
 // snapshot, and it is the only thing that is actually a workbook.
+// MB1188-072: the one authoritative reader of what is actually DURABLE.
+//
+// STORE.get returns a clone of _decCache — and _commitEncryptedSnapshot stores
+// the caller's object in _decCache by reference (`_decCache[k] = snapshot`)
+// while cloning only into _durableStoreSnapshots. The spreadsheet save hands it
+// the live workbook, so _decCache and _ssData are the SAME object: every
+// keystroke edited the "durable" value too.
+//
+// _stageDirtySpreadsheetSave captures its merge base from here. With the base
+// already containing the edit, no operation could be derived from it, and the
+// save wrote back a value without the change — silently, and reported clean.
+//
+// _durableStoreSnapshots is a clone at every commit and is filled for every key
+// when the cache is populated, so it is the correct source. It is only missing
+// before the first sign-in, where falling back to the cache is all there is.
+function _ssDurableStoreValue(key) {
+  if (_durableStoreSnapshots.has(key)) return _cloneJson(_durableStoreSnapshots.get(key));
+  if (key in _decCache) return _decCache[key] == null ? null : _cloneJson(_decCache[key]);
+  return null;
+}
+
 function _ssDurableWorkbook() {
+  // Reading a baseline must not disturb feature state: _ssReadStoredWorkbook
+  // rewrites _ssPendingProjectIds, which describes what the LIVE workbook is
+  // still waiting for, not what some historical snapshot was waiting for.
+  const pending = _ssPendingProjectIds;
   try {
-    const assembled = _ssReadStoredWorkbook();
+    const assembled = _ssReadStoredWorkbook(true);
     return assembled ? _cloneJson(assembled) : null;
   } catch (_) {
     return null;
+  } finally {
+    _ssPendingProjectIds = pending;
   }
 }
 
-function _ssReadStoredWorkbook() {
-  const stored = STORE.get('spreadsheets', null);
+function _ssReadStoredWorkbook(durable = false) {
+  const read = durable
+    ? (key) => _ssDurableStoreValue(key)
+    : (key) => STORE.get(key, null);
+  const stored = read('spreadsheets');
   const mode = _ssStorageMode(stored);
   _ssPendingProjectIds = [];
   if (mode === 'empty') return null;
@@ -9399,7 +9527,7 @@ function _ssReadStoredWorkbook() {
   for (const entry of index.projects) {
     if (entry._deleted) continue;
     const key = _ssProjectSyncKey(entry.id);
-    const doc = STORE.get(key, null);
+    const doc = read(key);
     if (doc === null || doc === undefined) {
       // Not arrived yet. NOT a deletion — _ssIndexAfterEdit is written so this
       // cannot turn into a tombstone.
@@ -9421,6 +9549,102 @@ function _ssReadStoredWorkbook() {
 // Write the projects an edit session touched, then the index. Each project is
 // its own document with its own compare-and-set, so two Macs editing different
 // projects no longer contend at all.
+// ── MB1188-078: crash consistency for the split commit ──────────────────────
+//
+// _ssCommitSplitWorkbook writes project documents and then the index. Nothing
+// connected the two, so a failure in between — quota, disk, or the process
+// dying — left a project document durable while the index named nothing. Under
+// fault injection that produced `documentDurable: true, indexListsProject:
+// false`: a project that exists, survives relaunch, and is invisible on both
+// Macs forever.
+//
+// Reversing the order only moves the window, so this records an INTENT before
+// the first document write and clears it only once the index that names those
+// documents is durable. If the intent survives a launch, the commit was
+// interrupted and _ssRecoverInterruptedSplitCommit finishes it.
+//
+// The record holds project IDs only — no cell content — so it stays outside the
+// encrypted store deliberately: recovery has to run before anything is decoded.
+
+function _ssReadCommitIntent() {
+  try {
+    const raw = localStorage.getItem('tmb__ss_commit_intent');
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.projectIds)) return null;
+    return parsed;
+  } catch (_) { return null; }
+}
+
+function _ssWriteCommitIntent(projectIds) {
+  try {
+    localStorage.setItem('tmb__ss_commit_intent', JSON.stringify({
+      projectIds: projectIds.filter(id => SPREADSHEET_PROJECT_ID_PATTERN.test(id)).slice(0, 200),
+      at: new Date().toISOString(),
+    }));
+    return true;
+  } catch (error) {
+    // Storage is full or unavailable. Refusing the whole save is the honest
+    // answer: without the intent we cannot promise to finish what we start.
+    console.warn('[spreadsheets] commit intent was not recorded:', error?.message || error);
+    return false;
+  }
+}
+
+function _ssClearCommitIntent() {
+  try { localStorage.removeItem('tmb__ss_commit_intent'); } catch (_) {}
+}
+
+// Finishes an interrupted commit. Called at load, before the workbook is read.
+//
+// A project document that is durable but that the index does not mention AT ALL
+// is an orphan from the interrupted write, and is put back. A project the index
+// tombstones is NOT — that is a deletion somebody performed on purpose, and
+// resurrecting it would trade one silent bug for a worse one.
+async function _ssRecoverInterruptedSplitCommit() {
+  const intent = _ssReadCommitIntent();
+  if (!intent) return { recovered: 0 };
+  const stored = _ssDurableStoreValue('spreadsheets');
+  if (_ssStorageMode(stored) !== 'split') { _ssClearCommitIntent(); return { recovered: 0 }; }
+
+  let index;
+  try { index = normalizeSpreadsheetIndex(stored); }
+  catch (_) { _ssClearCommitIntent(); return { recovered: 0 }; }
+
+  const named = new Set((index.projects || []).map(entry => String(entry.id)));
+  const orphans = [];
+  for (const id of intent.projectIds) {
+    if (named.has(id)) continue;                       // already named, live or tombstoned
+    const doc = _ssDurableStoreValue(_ssProjectSyncKey(id));
+    if (!doc) continue;                                // never landed: nothing to recover
+    let normalized;
+    try { normalized = normalizeSpreadsheetProject(doc); } catch (_) { continue; }
+    orphans.push({ id, doc: normalized });
+  }
+  if (!orphans.length) { _ssClearCommitIntent(); return { recovered: 0 }; }
+
+  const nextIndex = _cloneJson(index);
+  for (const orphan of orphans) {
+    nextIndex.projects.push({
+      id: orphan.id,
+      name: orphan.doc?.name || 'Recovered project',
+      updatedAt: new Date().toISOString(),
+      version: 1,
+    });
+  }
+  await _serializeKeyMutation('spreadsheets', async () => {
+    await _commitEncryptedSnapshot(
+      'spreadsheets', JSON.stringify(normalizeSpreadsheetIndex(nextIndex)),
+      normalizeSpreadsheetIndex(nextIndex), { sync: true, operationId: _newOperationId() });
+  });
+  _ssClearCommitIntent();
+  console.warn(`[spreadsheets] recovered ${orphans.length} project(s) from an interrupted save`);
+  showToast(
+    `${orphans.length} project${orphans.length === 1 ? '' : 's'} from an interrupted save ${orphans.length === 1 ? 'was' : 'were'} recovered.`,
+    'warning');
+  return { recovered: orphans.length };
+}
+
 async function _ssCommitSplitWorkbook(dirtyBase, dirty, stagedActor) {
   const at = new Date().toISOString();
   const written = [];
@@ -9454,6 +9678,17 @@ async function _ssCommitSplitWorkbook(dirtyBase, dirty, stagedActor) {
     ? normalizeSpreadsheetIndex(storedIndex)
     : null;
   const nextIndex = _ssIndexAfterEdit(currentIndex, dirtyBase, dirty, at, [..._ssDeletedProjectIds]);
+
+  // MB1188-078: recorded BEFORE the first document write and cleared only once
+  // the index naming those documents is durable. Refusing when it cannot be
+  // written is deliberate — an unrecorded commit is exactly the state that
+  // produced invisible orphans, and a refusal keeps the edit on screen.
+  const intentIds = (dirty?.projects || [])
+    .map(project => String(project?.id ?? ''))
+    .filter(id => SPREADSHEET_PROJECT_ID_PATTERN.test(id));
+  if (intentIds.length && !_ssWriteCommitIntent(intentIds)) {
+    throw new Error('This Mac could not record the save safely, so nothing was written. Free some space and try again.');
+  }
 
   for (const project of (dirty?.projects || [])) {
     const id = String(project?.id ?? '');
@@ -9510,6 +9745,10 @@ async function _ssCommitSplitWorkbook(dirtyBase, dirty, stagedActor) {
     });
     written.push('spreadsheets');
   }
+  // Every document written above is now named by a durable index — or the index
+  // did not need to change, which means it already named them. Either way the
+  // pair is consistent and there is nothing left to finish.
+  _ssClearCommitIntent();
 
   // Only forget a deletion once its tombstone is in the index that was written.
   // Clearing on attempt rather than on success is how a failed write turns into
@@ -13920,6 +14159,7 @@ async function ssPullFromGoogle(projectId, options) {
     return false;
   }
   try {
+    let deferredByEditing = false;
     let changed = 0;
     let dropped = 0;
     let clashes = 0;
@@ -14026,7 +14266,7 @@ async function ssPullFromGoogle(projectId, options) {
       // grid under a live caret and staged Google's cells into the human's open
       // dirty batch. BREAK, not continue: nothing has been written for this tab
       // and no checkpoint advances, so the next tick redoes it from scratch.
-      if (_ssEditCell || _ssDirtyWorkbook) break;
+      if (_ssEditCell || _ssDirtyWorkbook) { deferredByEditing = true; break; }
       // A tab that grew in Google returns more rows than the sheet has. Writing
       // them anyway produces an out-of-range cell, which the workbook validator
       // refuses outright — the sync would appear to work and then quarantine the
@@ -14333,6 +14573,24 @@ async function ssPullFromGoogle(projectId, options) {
     // MB1188-012: a tab added in Google after the import used to be invisible
     // forever. Recorded on the link so the project card can say so, rather
     // than only appearing in a toast nobody was watching for.
+    // MB1188-076: an interrupted pull is DEFERRED, not done.
+    //
+    // The break above correctly refuses to rebuild the grid under a live caret,
+    // but it fell through to the shared success tail: a fresh `pulledAt`, the
+    // last error cleared, `true` returned, and "Already up to date with
+    // Google." — for tabs that were never read. The card then said it had
+    // checked seconds ago, so nothing looked wrong and nothing retried.
+    if (deferredByEditing) {
+      if (!_ssEditCell) ssRender();
+      ssRenderHomeView();
+      if (!silent) {
+        showToast(
+          'Google sync paused because you started editing. It will pick up again once your changes are saved.',
+          'warning');
+      }
+      return false;
+    }
+
     const finalProject = (_ssData?.projects || []).find(entry => entry.id === projectId);
     if (finalProject?.googleLink) {
       const linkedTitles = new Set(

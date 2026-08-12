@@ -4469,7 +4469,7 @@ test('MB1188-008: publication is a post-login maintenance job with a manual retr
     'maintenance runs before initFirebase(), so the debt cannot be settled there');
   const whole = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
   const bootstrapIndex = whole.indexOf('_syncBootstrapComplete = true;');
-  assert.match(whole.slice(bootstrapIndex, bootstrapIndex + 1500),
+  assert.match(whole.slice(bootstrapIndex, bootstrapIndex + 3000),
     /flushPendingDirectoryPublication\(\)/,
     'owner login must settle the debt once the cloud is reachable');
   assert.match(declaration('renderManageProfiles'), /retryDirectoryPublication\(\)/,
@@ -5194,7 +5194,7 @@ test('MB1188-028: the pending publication runs after sync bootstrap, not before 
   const script = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
   const bootstrapIndex = script.indexOf('_syncBootstrapComplete = true;');
   assert.ok(bootstrapIndex > 0, 'sync bootstrap completion is where this belongs');
-  const afterBootstrap = script.slice(bootstrapIndex, bootstrapIndex + 1500);
+  const afterBootstrap = script.slice(bootstrapIndex, bootstrapIndex + 3000);
   assert.match(afterBootstrap, /flushPendingDirectoryPublication\(\)/,
     'the flush runs once the cloud can actually be reached');
 });

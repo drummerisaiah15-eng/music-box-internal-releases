@@ -993,6 +993,19 @@ function wiringApi({ store = {}, durable = {}, awaiting = false } = {}) {
     ${declaration('_ssAssembleWorkbook')}
     ${declaration('_ssStorageMode')}
     ${declaration('_ssReadStoredWorkbook')}
+    // MB1188-078: the commit records a durable intent before its first write
+    // and clears it once the index is durable. The wiring cases here exercise
+    // the write ordering, so a real in-memory localStorage is enough; the
+    // crash-recovery behaviour has its own tests.
+    var __intent = {};
+    var localStorage = {
+      getItem: k => (k in __intent ? __intent[k] : null),
+      setItem: (k, v) => { __intent[k] = String(v); },
+      removeItem: k => { delete __intent[k]; },
+    };
+    ${declaration('_ssReadCommitIntent')}
+    ${declaration('_ssWriteCommitIntent')}
+    ${declaration('_ssClearCommitIntent')}
     ${declaration('_ssCommitSplitWorkbook')}
     ${declaration('_ssMigrateToSplitStorage')}
     var currentUser = () => 'Tester';
@@ -1003,6 +1016,7 @@ function wiringApi({ store = {}, durable = {}, awaiting = false } = {}) {
       read: () => _ssReadStoredWorkbook(),
       pending: () => _ssPendingProjectIds,
       commit: (base, next) => _ssCommitSplitWorkbook(base, next),
+      intent: () => _ssReadCommitIntent(),
       migrate: () => _ssMigrateToSplitStorage(),
       store: () => _storeBacking,
     };

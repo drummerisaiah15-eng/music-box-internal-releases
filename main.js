@@ -1687,6 +1687,13 @@ function _removedCustomProfiles(vault) {
 // owner identity. Granting Owner to another name would create a profile that
 // cannot actually sign in.
 const ASSIGNABLE_PROFILE_ROLES = Object.freeze(['Operations Manager', 'Operations & Events', 'Front Desk']);
+// MB1188-073: how much authority a role carries, for comparison only. Owner is
+// absent because it is never assignable — it is proved by the owner passcode.
+const PROFILE_ROLE_RANK = Object.freeze({
+  'Front Desk': 1,
+  'Operations & Events': 1,
+  'Operations Manager': 2,
+});
 
 function _profileRoleOverrides(vault) {
   const stored = vault[PROFILE_ROLE_OVERRIDES_VAULT_KEY];
@@ -1891,8 +1898,54 @@ const STAFF_PASSCODE_ROLES = new Set([STAFF_AUTH_ROLE]);
 // integer, which would make every future set and clear invalid — and the vault
 // unreadable with it.
 const MAX_STAFF_AUTH_VERSION = 1000000000;
+// MB1188-075: the lockout has to survive a relaunch.
+//
+// Five wrong attempts correctly start a five-minute lock, but as process memory
+// it was erased by quitting the app — which anybody guessing would do on the
+// sixth try. Persisted in the protected vault, which is main-owned and local:
+// it deliberately does NOT sync, because a lockout is about one keyboard.
+const STAFF_AUTH_LOCKOUT_VAULT_KEY = 'app_staff_auth_lockout_v1';
+const MAX_STAFF_LOCKOUT_MS = 24 * 60 * 60 * 1000;
 const staffAuthFailures = new Map();
 const staffAuthLockedUntil = new Map();
+
+// Malformed or absurd values are dropped rather than trusted: a corrupt record
+// must not be able to lock somebody out for a thousand years.
+function _loadStaffAuthLockouts() {
+  if (staffAuthFailures.size || staffAuthLockedUntil.size) return;
+  let stored;
+  try { stored = _loadSecretVault()[STAFF_AUTH_LOCKOUT_VAULT_KEY]; } catch (_) { return; }
+  if (!_isPlainObject(stored)) return;
+  const now = Date.now();
+  for (const [name, record] of Object.entries(stored)) {
+    if (!_boundedString(name, 120) || !_isPlainObject(record)) continue;
+    const failures = Number.isSafeInteger(record.failures) ? record.failures : 0;
+    const until = Number.isSafeInteger(record.until) ? record.until : 0;
+    if (failures > 0 && failures < 1000) staffAuthFailures.set(name, failures);
+    // A time in the past has expired; one absurdly far ahead is a corrupt or
+    // clock-skewed record and is ignored rather than honoured.
+    if (until > now && until - now <= MAX_STAFF_LOCKOUT_MS) staffAuthLockedUntil.set(name, until);
+  }
+}
+
+function _saveStaffAuthLockouts() {
+  const record = {};
+  const now = Date.now();
+  for (const [name, failures] of staffAuthFailures) {
+    const until = staffAuthLockedUntil.get(name) || 0;
+    if (failures > 0 || until > now) record[name] = { failures, until };
+  }
+  try {
+    const vault = _loadSecretVault();
+    if (Object.keys(record).length) vault[STAFF_AUTH_LOCKOUT_VAULT_KEY] = record;
+    else delete vault[STAFF_AUTH_LOCKOUT_VAULT_KEY];
+    _saveSecretVault(vault);
+  } catch (error) {
+    // Never fatal: a lockout that cannot be written is a weaker lockout, not a
+    // reason to refuse a sign-in that is otherwise correct.
+    console.warn('[staff-auth] lockout state was not persisted:', error?.message || error);
+  }
+}
 
 function _validStaffPin(pin) {
   return typeof pin === 'string' && /^\d{4}$/.test(pin);
@@ -1968,6 +2021,13 @@ function _recordStaffAuthFailure(key) {
   if (failures >= 5) {
     staffAuthLockedUntil.set(key, Date.now() + (failures >= 10 ? 30 * 60 * 1000 : 5 * 60 * 1000));
   }
+  _saveStaffAuthLockouts();
+}
+
+function _clearStaffAuthFailures(key) {
+  staffAuthFailures.delete(key);
+  staffAuthLockedUntil.delete(key);
+  _saveStaffAuthLockouts();
 }
 
 function _recordOwnerAuthFailure() {
@@ -2027,17 +2087,19 @@ _secureHandle('app-session-start-staff', async (_, request) => {
   const vault = _loadSecretVault();
   const record = _activeStaffAuthRecord(vault, requested);
   if (record) {
+    _loadStaffAuthLockouts();
     const key = _staffAuthName(requested);
-    if (Date.now() < (staffAuthLockedUntil.get(key) || 0)) {
-      throw new Error('Too many passcode attempts. Try again later.');
+    const lockedUntil = staffAuthLockedUntil.get(key) || 0;
+    if (Date.now() < lockedUntil) {
+      const minutes = Math.max(1, Math.ceil((lockedUntil - Date.now()) / 60000));
+      throw new Error(`Too many passcode attempts. Try again in ${minutes} minute${minutes === 1 ? '' : 's'}.`);
     }
     if (!_validStaffPin(pin)) throw new Error('Enter your 4-digit passcode.');
     if (!await _ownerPinMatches(pin, record.active)) {
       _recordStaffAuthFailure(key);
       throw new Error('That passcode did not match.');
     }
-    staffAuthFailures.delete(key);
-    staffAuthLockedUntil.delete(key);
+    _clearStaffAuthFailures(key);
   }
   return _setAppSession(_normalizeStaffProfileName(requested), role);
 });
@@ -2091,8 +2153,7 @@ _secureHandle('app-session-set-staff-passcode', async (_, request) => {
   const fresh = _loadSecretVault();
   fresh[STAFF_AUTH_VAULT_KEY] = { ...records };
   _saveSecretVault(fresh);
-  staffAuthFailures.delete(key);
-  staffAuthLockedUntil.delete(key);
+  _clearStaffAuthFailures(key);
   // Handed back so the renderer can put it in the synced store. The passcode
   // itself never leaves the keypad.
   return { ok: true, name, record };
@@ -2130,8 +2191,7 @@ _secureHandle('app-session-clear-staff-passcode', async (_, request) => {
   const fresh = _loadSecretVault();
   fresh[STAFF_AUTH_VAULT_KEY] = { ...records };
   _saveSecretVault(fresh);
-  staffAuthFailures.delete(key);
-  staffAuthLockedUntil.delete(key);
+  _clearStaffAuthFailures(key);
   return { ok: true, name, record };
 });
 
@@ -2471,7 +2531,16 @@ function _mergeDirectoryEntries(local, incoming) {
   return [...byId.values()];
 }
 
-function _applyStaffDirectory(entries) {
+// MB1188-073: `elevate` is false unless an Owner session asked for this.
+//
+// The import path has to stay callable by any signed-in session, because it is
+// how a profile added on one Mac reaches the others, and product rule 7 says a
+// new profile appears everywhere after synchronization. But a directory is also
+// a list of ROLES, and applying it is the one way a non-Owner session can hand
+// out privilege. So a non-Owner import may create, remove and keep profiles —
+// it simply cannot raise anybody above Front Desk. Roles already held locally
+// are preserved; only an INCREASE arriving from outside is refused.
+function _applyStaffDirectory(entries, { elevate = false } = {}) {
   if (!Array.isArray(entries) || entries.length > MAX_DIRECTORY_ENTRIES) {
     throw new Error('The staff directory is invalid.');
   }
@@ -2513,9 +2582,14 @@ function _applyStaffDirectory(entries) {
     }
     // Owner is never granted by import: it is proved by the owner passcode and
     // belongs only to the built-in owner identity.
-    const role = (raw.role === 'Owner' && isBuiltIn && APP_PROFILE_ROLES[name] === 'Owner')
+    let role = (raw.role === 'Owner' && isBuiltIn && APP_PROFILE_ROLES[name] === 'Owner')
       ? 'Owner'
       : (ASSIGNABLE_PROFILE_ROLES.includes(raw.role) ? raw.role : 'Front Desk');
+    if (!elevate && role !== 'Owner') {
+      // What this Mac already believes, which an import may confirm but not raise.
+      const held = _roleForAppProfile(name) || APP_PROFILE_ROLES[name] || 'Front Desk';
+      if (PROFILE_ROLE_RANK[role] > (PROFILE_ROLE_RANK[held] ?? 0)) role = held;
+    }
     if (role !== 'Owner' && APP_PROFILE_ROLES[name] !== role) overrides[name] = role;
     if (!isBuiltIn) {
       if (custom.length >= MAX_CUSTOM_STAFF_PROFILES) continue;
@@ -2574,7 +2648,10 @@ _secureHandle('app-session-export-directory', async () => {
 
 _secureHandle('app-session-import-directory', async (_, directory) => {
   _requireAppRole(COMMUNICATION_ROLES);
-  const profiles = _applyStaffDirectory(directory);
+  // MB1188-073: only an Owner session may let an import raise a role.
+  const profiles = _applyStaffDirectory(directory, {
+    elevate: _appSessionHasRole(new Set(['Owner'])),
+  });
   return { ok: true, profiles };
 });
 
@@ -3038,8 +3115,17 @@ function _googleReadFailure(error) {
 // Owner-only role assignment. Any profile, built-in included, can be moved
 // between the assignable roles — so Operations & Events is not limited to one
 // person. Owner is not assignable; see ASSIGNABLE_PROFILE_ROLES.
+// MB1188-073: changing a role is OWNER-ONLY.
+//
+// MB161-031 gave Operations Manager the whole of "managing staff profiles".
+// Splitting that: adding and removing profiles is routine onboarding work and
+// stays with the Operations Manager; changing a ROLE is granting privilege and
+// is the step that closes the escalation chain the comment above
+// app-session-import-directory already describes — an imported directory
+// promotes somebody to Operations Manager, who can then re-role everybody
+// except the Owner. With this Owner-gated, that chain has no payoff.
 _secureHandle('app-session-set-profile-role', async (_, request) => {
-  _requireAppRole(OPERATIONS_MANAGER_ROLES);
+  _requireAppRole(new Set(['Owner']));
   if (!_isPlainObject(request)) throw new Error('Invalid role change request.');
   const name = _normalizeStaffProfileName(request.name);
   const role = request.role;
