@@ -4302,7 +4302,7 @@ function _retireUnusedLocalKeys() {
   const removed = [];
   for (const name of RETIRED_LOCAL_KEYS) {
     let freed = 0;
-    for (const suffix of ['', '_revision', '_local_ts', '_cloud_deferred']) {
+    for (const suffix of ['', '_revision', '_local_ts', '_cloud_deferred', '_journal_seq']) {
       const key = 'tmb_' + name + suffix;
       let value = null;
       try { value = localStorage.getItem(key); } catch (_) { continue; }
@@ -4386,6 +4386,13 @@ async function _recoverLocalKeyMigration(pin) {
 
 async function initEncryption(pin) {
   _activePin = pin;
+  // MB1188-085: FIRST, before anything reads localStorage at all.
+  //
+  // If the process was killed after a save was acknowledged but before Chromium
+  // flushed it, localStorage comes back missing that write and the journal on
+  // disk is the only copy. Putting it back here means _fillCache, the
+  // migration and every later read all see the record that actually survived.
+  await _recoverFromJournal();
   // MB1188-068: before anything reads localStorage into _decCache, so dead
   // records are never re-encrypted, never staged, and never counted against the
   // quota this migration has to fit inside.
@@ -5525,6 +5532,99 @@ async function _drainPendingSyncWrites(keys = null) {
   return true;
 }
 
+// MB1188-085: hand the ciphertext to main and wait for it to hit the disk.
+//
+// The journal is a BACKSTOP, not the read path: localStorage still holds the
+// value and still serves every read. So a journal that is unavailable — an
+// older build, a broken bridge — must not stop somebody saving; it degrades to
+// exactly the durability the app had before. What it must never do is stay
+// quiet about a real refusal, because "too large to journal" means this record
+// is not crash-safe and the person should know.
+// `typeof` rather than `window.` — an undeclared binding throws a ReferenceError
+// that optional chaining does not catch, and this runs inside the save path.
+function _journalBridge() {
+  try { return (typeof window !== 'undefined' && window.electronJournal) || null; }
+  catch (_) { return null; }
+}
+
+async function _journalCommit(key, ciphertext) {
+  const bridge = _journalBridge();
+  if (!bridge?.put) {
+    if (!_journalCommit._warned) {
+      _journalCommit._warned = true;
+      console.warn('[journal] unavailable in this build; saves are not crash-protected');
+    }
+    return false;
+  }
+  try {
+    const result = await bridge.put({ key, ciphertext });
+    if (result?.ok !== true) throw new Error('the journal did not acknowledge the write');
+    try { localStorage.setItem('tmb_' + key + '_journal_seq', String(result.seq)); } catch (_) {}
+    return true;
+  } catch (error) {
+    // Not fatal: the value IS in localStorage, which is where every read comes
+    // from. Louder than a console line would be wrong for a transient blip, and
+    // quieter would hide a record that is genuinely not crash-safe.
+    console.warn(`[journal] ${key} was saved but not crash-protected:`, error?.message || error);
+    return false;
+  }
+}
+
+// Runs before the cache is filled. If the disk holds a record newer than what
+// localStorage came back with, localStorage lost a write and the journal is the
+// survivor — so it is put back before anything reads it.
+async function _recoverFromJournal() {
+  const bridge = _journalBridge();
+  if (!bridge?.read) return { restored: 0 };
+  let records;
+  try {
+    const result = await bridge.read();
+    records = Array.isArray(result?.records) ? result.records : [];
+  } catch (error) {
+    console.warn('[journal] could not be read:', error?.message || error);
+    return { restored: 0 };
+  }
+  let restored = 0;
+  for (const record of records) {
+    const key = String(record?.key ?? '');
+    const ciphertext = String(record?.ciphertext ?? '');
+    if (!key || !ciphertext.startsWith('E:')) continue;
+    // MB1188-086: a key whose feature no longer exists must not be restored.
+    //
+    // Recovery runs BEFORE _retireUnusedLocalKeys, so without this a retired
+    // record would be written back on every single launch and swept again
+    // moments later — reinstating the quota pressure that stopped a new Mac
+    // finishing its first sign-in (MB1188-068).
+    if (RETIRED_LOCAL_KEYS.includes(key)) continue;
+    let seenSeq = 0;
+    try { seenSeq = Number(localStorage.getItem('tmb_' + key + '_journal_seq')) || 0; } catch (_) {}
+    // MB1188-086: `>=`, and a content comparison, NOT a strictly-newer test.
+    //
+    // The value and the sequence marker are two separate localStorage keys in
+    // the same LevelDB, so a crash can flush one without the other. With a
+    // strict `>`, a marker that reached disk while its value did not made the
+    // journal look already-applied — and the record it was holding was dropped,
+    // which is the exact loss this whole mechanism exists to prevent.
+    //
+    // Equal sequence with DIFFERENT content means precisely that split. Equal
+    // sequence with the same content means they agree, so there is nothing to
+    // do. A lower sequence means localStorage genuinely moved on.
+    if (record.seq < seenSeq) continue;
+    let current = null;
+    try { current = localStorage.getItem('tmb_' + key); } catch (_) {}
+    if (current === ciphertext) continue;
+    try {
+      localStorage.setItem('tmb_' + key, ciphertext);
+      localStorage.setItem('tmb_' + key + '_journal_seq', String(record.seq));
+      restored += 1;
+      console.warn(`[journal] restored ${key} from disk after an incomplete shutdown`);
+    } catch (error) {
+      console.warn(`[journal] ${key} could not be restored:`, error?.message || error);
+    }
+  }
+  return { restored };
+}
+
 async function _commitEncryptedSnapshot(k, serialized, snapshot, options = {}) {
   const {
     sync = true,
@@ -5565,6 +5665,14 @@ async function _commitEncryptedSnapshot(k, serialized, snapshot, options = {}) {
       // before the overwrite above. That is the base a rebase needs.
       _writePendingSyncRecord(k, operationId, enc, mergeBaseCiphertext || prior.ciphertext);
     }
+    // MB1188-085: the on-disk commit, awaited.
+    //
+    // Everything above this line is localStorage, which acknowledges before
+    // Chromium has necessarily flushed anything — a save could be reported
+    // complete and still be gone after a hard kill. This waits for main to
+    // fsync the ciphertext, so by the time the caller is told the write
+    // succeeded, it survives the power going out.
+    await _journalCommit(k, enc);
     _lockedStorageKeys.delete(k);
     _storeWriteErrors.delete(k);
     _durableStoreSnapshots.set(k, _cloneJson(snapshot));

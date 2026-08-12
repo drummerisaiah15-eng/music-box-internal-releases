@@ -75,6 +75,12 @@ contextBridge.exposeInMainWorld('electronFirebase', {
 });
 
 // iCloud Drive sync bridge — reads/writes sync.json in iCloud Drive
+// MB1188-085: the durability backstop. Ciphertext only — see main.
+contextBridge.exposeInMainWorld('electronJournal', {
+  put:  (request) => ipcRenderer.invoke('durable-journal-put', request),
+  read: ()        => ipcRenderer.invoke('durable-journal-read'),
+});
+
 contextBridge.exposeInMainWorld('electronSync', {
   read:  ()     => ipcRenderer.invoke('read-sync-file'),
   write: (data) => ipcRenderer.invoke('write-sync-file', data),

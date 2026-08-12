@@ -60,6 +60,8 @@ function contextWith(values = {}) {
 // MB1188-083: the spreadsheet hot paths record timing samples.
     performance: { now: () => 0 },
     _ssPerfRecord: () => 0,
+    // MB1188-085: the durability journal is a backstop; harnesses run without it.
+    _journalCommit: async () => false,
     // Declared beside the functions in index.html, so some declaration()
     // slices carry them and some do not. Supplying them as context globals
     // works either way: a lexical declaration in the script simply shadows it.
@@ -5485,4 +5487,165 @@ test('MB1188-069: a passcode map passes the sync validator that refused it', () 
   // The shape that was actually being sent when it failed.
   assert.throws(() => context.normalize('staff_passcodes', [value]),
     /staff_passcodes expected object data/, 'a list is refused, with the honest message');
+});
+
+// ── P1-2 / MB1188-085: the durability journal, crashed and restarted ─────────
+//
+// The reported defect: a save returned success, its encrypted value was
+// readable in the running process, and an immediate SIGKILL left the key absent
+// after restart. localStorage acknowledges before Chromium flushes. These
+// simulate exactly that — the journal is written to a store that SURVIVES the
+// kill, localStorage to one that does not.
+
+function journalHarness({ disk = {}, localStore = {}, bridge = 'ok' } = {}) {
+  const context = contextWith({
+    _decCache: {},
+    _journalCommit: undefined,
+    RETIRED_LOCAL_KEYS: ['online_inquiries'],
+    localStorage: new MemoryStorage(localStore),
+    window: {
+      electronJournal: bridge === 'none' ? undefined : {
+        put: async ({ key, ciphertext }) => {
+          if (bridge === 'refuse') throw new Error('This record is too large to journal.');
+          disk.seq = (disk.seq || 0) + 1;
+          disk[key] = { key, seq: disk.seq, ciphertext };
+          return { ok: true, seq: disk.seq };
+        },
+        read: async () => ({
+          ok: true,
+          records: Object.values(disk).filter(v => v && typeof v === 'object'),
+        }),
+      },
+    },
+  });
+  vm.runInContext(`
+    ${declaration('_journalBridge')}
+    ${declaration('_journalCommit')}
+    ${declaration('_recoverFromJournal')}
+    globalThis.commit = (key, ciphertext) => _journalCommit(key, ciphertext);
+    globalThis.recover = () => _recoverFromJournal();
+    globalThis.read = key => localStorage.getItem('tmb_' + key);
+    globalThis.seqOf = key => localStorage.getItem('tmb_' + key + '_journal_seq');
+  `, context);
+  return context;
+}
+
+test('MB1188-085: a save that localStorage lost is restored from disk', async () => {
+  const disk = {};
+  // --- the running process: the save is acknowledged ---
+  const before = journalHarness({ disk });
+  assert.equal(await vm.runInContext(`commit('assigned_tasks', 'E:brand-new-task')`, before), true,
+    'the journal acknowledged the on-disk commit');
+
+  // --- SIGKILL. localStorage never flushed; the journal did. ---
+  const after = journalHarness({ disk, localStore: {} });
+  assert.equal(vm.runInContext(`read('assigned_tasks')`, after), null, 'localStorage lost it');
+  const result = await vm.runInContext('recover()', after);
+  assert.equal(result.restored, 1);
+  assert.equal(vm.runInContext(`read('assigned_tasks')`, after), 'E:brand-new-task',
+    'and the record the person actually created is back');
+});
+
+test('MB1188-085: a journal record older than localStorage never overwrites it', async () => {
+  // The dangerous direction. localStorage moved on; the journal is behind.
+  const disk = { logs: { key: 'logs', seq: 1, ciphertext: 'E:old' } };
+  const app = journalHarness({ disk, localStore: { tmb_logs: 'E:newer', tmb_logs_journal_seq: '4' } });
+  const result = await vm.runInContext('recover()', app);
+  assert.equal(result.restored, 0);
+  assert.equal(vm.runInContext(`read('logs')`, app), 'E:newer', 'the newer value stands');
+});
+
+test('MB1188-085: an equal sequence means they agree, so nothing is rewritten', async () => {
+  const disk = { logs: { key: 'logs', seq: 3, ciphertext: 'E:same' } };
+  const app = journalHarness({ disk, localStore: { tmb_logs: 'E:same', tmb_logs_journal_seq: '3' } });
+  assert.equal((await vm.runInContext('recover()', app)).restored, 0);
+});
+
+test('MB1188-085: only encrypted text is ever restored', async () => {
+  // Plaintext on disk is a bug, not a record. Main refuses to write it; this
+  // refuses to read it back even if something else put it there.
+  const disk = {
+    logs: { key: 'logs', seq: 9, ciphertext: 'plaintext, somehow' },
+    staff_notes: { key: 'staff_notes', seq: 9, ciphertext: 'E:proper' },
+  };
+  const app = journalHarness({ disk, localStore: {} });
+  assert.equal((await vm.runInContext('recover()', app)).restored, 1);
+  assert.equal(vm.runInContext(`read('logs')`, app), null, 'the plaintext entry is ignored');
+  assert.equal(vm.runInContext(`read('staff_notes')`, app), 'E:proper');
+});
+
+test('MB1188-085: a save still succeeds when the journal cannot take it', async () => {
+  // The journal is a BACKSTOP. Refusing the save because the backstop is
+  // unavailable would discard the edit — the failure this app exists to avoid.
+  for (const bridge of ['none', 'refuse']) {
+    const app = journalHarness({ disk: {}, bridge });
+    assert.equal(await vm.runInContext(`commit('logs', 'E:value')`, app), false,
+      `${bridge}: reported as not crash-protected`);
+  }
+  // And recovery is a no-op rather than a crash when the bridge is absent.
+  const app = journalHarness({ disk: {}, bridge: 'none' });
+  // Cross-realm object: compare the value, not the reference.
+  assert.equal((await vm.runInContext('recover()', app)).restored, 0);
+});
+
+test('MB1188-085: the commit awaits the journal before reporting success', () => {
+  const commit = declaration('_commitEncryptedSnapshot');
+  const journal = commit.indexOf('await _journalCommit(k, enc);');
+  assert.ok(journal !== -1, 'the on-disk commit is awaited');
+  assert.ok(journal < commit.indexOf('return enc;'), 'before the caller is told it worked');
+  // Recovery runs before anything reads localStorage into the cache.
+  const init = declaration('initEncryption');
+  assert.ok(init.indexOf('await _recoverFromJournal();') < init.indexOf('_retireUnusedLocalKeys();'),
+    'and a lost write is restored before the cache is filled');
+});
+
+test('MB1188-086: a flushed sequence marker with an unflushed value still recovers', async () => {
+  // Found by pentesting the journal itself. The value and the marker are two
+  // separate localStorage keys in one LevelDB, so a crash can flush the marker
+  // and lose the value. A strictly-newer test then read the journal as already
+  // applied and dropped the only surviving copy.
+  const disk = { logs: { key: 'logs', seq: 6, ciphertext: 'E:the-new-entry' } };
+  const app = journalHarness({
+    disk,
+    localStore: { tmb_logs: 'E:the-old-entry', tmb_logs_journal_seq: '6' },
+  });
+  const result = await vm.runInContext('recover()', app);
+  assert.equal(result.restored, 1, 'the split is detected');
+  assert.equal(vm.runInContext(`read('logs')`, app), 'E:the-new-entry');
+});
+
+test('MB1188-086: matching content at the same sequence is left alone', async () => {
+  const disk = { logs: { key: 'logs', seq: 6, ciphertext: 'E:same' } };
+  const app = journalHarness({
+    disk, localStore: { tmb_logs: 'E:same', tmb_logs_journal_seq: '6' },
+  });
+  assert.equal((await vm.runInContext('recover()', app)).restored, 0,
+    'no needless rewrite when the two already agree');
+});
+
+test('MB1188-086: a journal behind localStorage never claws a value back', async () => {
+  // The dangerous direction: this must not resurrect an older record over a
+  // newer one just because the contents differ.
+  const disk = { logs: { key: 'logs', seq: 5, ciphertext: 'E:older' } };
+  const app = journalHarness({
+    disk, localStore: { tmb_logs: 'E:newer', tmb_logs_journal_seq: '9' },
+  });
+  assert.equal((await vm.runInContext('recover()', app)).restored, 0);
+  assert.equal(vm.runInContext(`read('logs')`, app), 'E:newer');
+});
+
+test('MB1188-086: a retired key is never restored from the journal', async () => {
+  // Found by pentesting the journal. Recovery runs BEFORE the retire sweep, so
+  // a dead key would be written back on every launch and swept again — exactly
+  // the quota pressure that stopped a new Mac finishing its first sign-in.
+  const disk = {
+    online_inquiries: { key: 'online_inquiries', seq: 4, ciphertext: 'E:dead-feature-data' },
+    logs: { key: 'logs', seq: 5, ciphertext: 'E:real' },
+  };
+  const app = journalHarness({ disk, localStore: {} });
+  const result = await vm.runInContext('recover()', app);
+  assert.equal(result.restored, 1, 'only the live key comes back');
+  assert.equal(vm.runInContext(`read('online_inquiries')`, app), null,
+    'the retired key stays gone');
+  assert.equal(vm.runInContext(`read('logs')`, app), 'E:real');
 });

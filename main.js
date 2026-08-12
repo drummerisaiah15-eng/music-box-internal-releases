@@ -4181,6 +4181,109 @@ _secureHandle('read-sync-file', async () => {
 });
 
 
+// ── MB1188-085: the durability journal ───────────────────────────────────────
+//
+// The renderer stores everything in localStorage and treats setItem as an
+// acknowledgement. It is not one: Chromium buffers LevelDB writes, so a save
+// could be reported complete, be readable in the running process, and still be
+// absent after a hard kill. A graceful quit was safe; sudden power loss or a
+// crash was not. A timeout is not a durability contract, so this is a real
+// on-disk commit instead.
+//
+// Deliberately narrow. localStorage stays the read path and the cache; this is
+// a write-behind backstop that answers one question at startup: "is there a
+// record on disk newer than what the cache came back with?"
+//
+// What crosses the boundary is CIPHERTEXT the renderer has already encrypted —
+// main never sees plaintext human data, and never gains the ability to.
+const JOURNAL_DIR = () => path.join(app.getPath('userData'), 'journal-v1');
+const JOURNAL_KEY_PATTERN = /^[A-Za-z0-9_-]{1,120}$/;
+// The largest legitimate record is a spreadsheet project document, capped at
+// 600 KB of plaintext by MAX_SPREADSHEET_SYNC_JSON_BYTES — roughly 840 KB once
+// encrypted. 2 MB leaves generous headroom while halving what a compromised
+// renderer could put on the disk.
+const MAX_JOURNAL_BYTES = 2 * 1024 * 1024;
+const MAX_JOURNAL_ENTRIES = 200;
+let _journalSeq = 0;
+
+function _journalPath(key) {
+  return path.join(JOURNAL_DIR(), `${key}.jrn`);
+}
+
+// The sequence has to survive a restart or a recovered record could look older
+// than the stale one it is meant to replace. Derived from what is already on
+// disk rather than stored separately, so there is no second thing to corrupt.
+function _journalHighestSeq() {
+  let highest = 0;
+  let entries;
+  try { entries = fs.readdirSync(JOURNAL_DIR()); } catch (_) { return 0; }
+  for (const name of entries) {
+    if (!name.endsWith('.jrn')) continue;
+    try {
+      const parsed = JSON.parse(fs.readFileSync(path.join(JOURNAL_DIR(), name), 'utf8'));
+      if (Number.isSafeInteger(parsed?.seq) && parsed.seq > highest) highest = parsed.seq;
+    } catch (_) { /* an unreadable entry cannot contribute a sequence */ }
+  }
+  return highest;
+}
+
+_secureHandle('durable-journal-put', async (_, request) => {
+  _requireAppRole(COMMUNICATION_ROLES);
+  if (!_isPlainObject(request)) throw new Error('Invalid journal write.');
+  const key = String(request.key ?? '');
+  const ciphertext = request.ciphertext;
+  // `__proto__` and `constructor` match the pattern and are never real store
+  // keys. Refusing them costs nothing and keeps a class of surprise off disk.
+  if (!JOURNAL_KEY_PATTERN.test(key) || key === '__proto__' || key === 'constructor') {
+    throw new Error('Invalid journal key.');
+  }
+  if (typeof ciphertext !== 'string' || !ciphertext.length) {
+    throw new Error('The journal takes encrypted text only.');
+  }
+  if (Buffer.byteLength(ciphertext, 'utf8') > MAX_JOURNAL_BYTES) {
+    throw new Error('This record is too large to journal.');
+  }
+  // Refuse plaintext outright. Every value the renderer commits is prefixed by
+  // its own encryption; anything else is a bug that must not reach disk.
+  if (!ciphertext.startsWith('E:')) throw new Error('The journal takes encrypted text only.');
+
+  fs.mkdirSync(JOURNAL_DIR(), { recursive: true, mode: 0o700 });
+  if (!_journalSeq) _journalSeq = _journalHighestSeq();
+  // A bounded directory: one entry per key, and a ceiling so a runaway key set
+  // cannot fill the disk.
+  let existing = [];
+  try { existing = fs.readdirSync(JOURNAL_DIR()).filter(n => n.endsWith('.jrn')); } catch (_) {}
+  if (existing.length >= MAX_JOURNAL_ENTRIES && !fs.existsSync(_journalPath(key))) {
+    throw new Error('The journal is full.');
+  }
+  const seq = ++_journalSeq;
+  // _atomicWriteFileSync fsyncs the data, renames, then fsyncs the directory,
+  // so this returns only once the bytes are genuinely on disk. That is the
+  // whole point: the renderer awaits this before calling a save complete.
+  _atomicWriteFileSync(_journalPath(key), JSON.stringify({ key, seq, ciphertext }), 0o600);
+  return { ok: true, seq };
+});
+
+_secureHandle('durable-journal-read', async () => {
+  const records = [];
+  let entries;
+  try { entries = fs.readdirSync(JOURNAL_DIR()); } catch (_) { return { ok: true, records }; }
+  for (const name of entries) {
+    if (!name.endsWith('.jrn')) continue;
+    try {
+      const parsed = JSON.parse(fs.readFileSync(path.join(JOURNAL_DIR(), name), 'utf8'));
+      // A half-written or corrupt entry is DROPPED, never repaired and never
+      // fatal: it can only ever be a copy of something localStorage may still
+      // hold, and refusing to start over it would be the worse failure.
+      if (!_isPlainObject(parsed) || !JOURNAL_KEY_PATTERN.test(String(parsed.key ?? '')) ||
+          !Number.isSafeInteger(parsed.seq) || typeof parsed.ciphertext !== 'string' ||
+          !parsed.ciphertext.startsWith('E:')) continue;
+      records.push({ key: parsed.key, seq: parsed.seq, ciphertext: parsed.ciphertext });
+    } catch (_) { continue; }
+  }
+  return { ok: true, records };
+});
+
 _secureHandle('write-sync-file', async (_, data) => {
   if (!_isPlainObject(data)) return { ok: false, error: 'The iCloud backup has an invalid format.' };
   let serialized;
