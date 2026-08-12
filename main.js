@@ -1864,6 +1864,112 @@ function _ownerAuthRecord(vault) {
   return record;
 }
 
+// ── MB1188-069: an optional passcode for Operations Managers ───────────────
+//
+// Deliberately narrow. It is OPT-IN — an Operations Manager who has not set one
+// signs in exactly as before, so nobody can be locked out by this existing. It
+// applies to the Operations Manager role ONLY: Operations & Events and Step Up
+// stay passwordless by product rule, Front Desk is unchanged, and the Owner has
+// its own passcode which also wraps that Mac's data key.
+//
+// The verifier travels in the SYNCED store so both Macs enforce it, but main is
+// the authority: the vault holds the copy that start-staff checks, and the
+// renderer can only deliver updates into it. Records carry a version so a
+// clear made on one Mac propagates to the other without a stale copy putting
+// the passcode back.
+//
+// Only ever the PBKDF2 verifier — the passcode itself is never stored, synced,
+// or written anywhere.
+const STAFF_AUTH_VAULT_KEY = 'app_staff_auth_v1';
+const STAFF_AUTH_ROLE = 'Operations Manager';
+// Named rather than written out at the call site: three hand-written copies of
+// a role list have already gone stale in this file (MB161-045).
+const STAFF_PASSCODE_ROLES = new Set([STAFF_AUTH_ROLE]);
+// A record's version only ever increments by one per change, so a real one will
+// never approach this. It exists so a record cannot be PINNED at the top of the
+// integer range: at MAX_SAFE_INTEGER the next `version + 1` stops being a safe
+// integer, which would make every future set and clear invalid — and the vault
+// unreadable with it.
+const MAX_STAFF_AUTH_VERSION = 1000000000;
+const staffAuthFailures = new Map();
+const staffAuthLockedUntil = new Map();
+
+function _validStaffPin(pin) {
+  return typeof pin === 'string' && /^\d{4}$/.test(pin);
+}
+
+function _staffAuthName(name) {
+  return _normalizeStaffProfileName(name).toLocaleLowerCase('en-US');
+}
+
+function _validStaffAuthRecord(value) {
+  if (!_isPlainObject(value)) return false;
+  if (!Number.isSafeInteger(value.version) ||
+      value.version < 1 || value.version > MAX_STAFF_AUTH_VERSION) return false;
+  if (value.cleared === true) return value.active === undefined || value.active === null;
+  return _validOwnerVerifier(value.active);
+}
+
+// MB1188-069: a malformed entry is DROPPED, not fatal.
+//
+// This is the same lesson MB1188-060 learned one screen down in
+// _customStaffProfilesFromVault: throwing here does not protect anything, it
+// just takes the Mac down. start-staff reads this list, so a single bad record
+// — belonging to somebody else entirely — meant no Operations Manager could
+// sign in on that Mac ever again, with no way to clear it from inside the app.
+//
+// Dropping cannot weaken a passcode that is actually set: a VALID record is
+// still enforced. It only discards entries that were already unusable, and the
+// next set or clear writes the cleaned list back, so the vault heals itself.
+function _staffAuthRecords(vault) {
+  const stored = vault[STAFF_AUTH_VAULT_KEY];
+  if (stored === undefined) return Object.create(null);
+  const records = Object.create(null);
+  if (!_isPlainObject(stored)) {
+    console.warn('[staff-auth] the stored passcode list was not an object; ignoring it');
+    return records;
+  }
+  let dropped = 0;
+  for (const [name, record] of Object.entries(stored)) {
+    if (!_boundedString(name, 120) || !_validStaffAuthRecord(record)) { dropped += 1; continue; }
+    records[name] = record;
+  }
+  if (dropped) console.warn(`[staff-auth] ignored ${dropped} unusable passcode record(s)`);
+  return records;
+}
+
+// A record only counts while the profile still HOLDS the role. Demoting someone
+// must not leave them standing at a passcode prompt they can no longer change.
+function _activeStaffAuthRecord(vault, name) {
+  if (_roleForAppProfile(name) !== STAFF_AUTH_ROLE) return null;
+  const record = _staffAuthRecords(vault)[_staffAuthName(name)];
+  if (!record || record.cleared === true) return null;
+  return record;
+}
+
+// MB1188-069: which of two records for the same profile survives. The renderer
+// runs the identical rule when it merges the synced key (_mergeVersionedRecordMaps);
+// if the two ever disagree the Macs stop converging, so keep them in step.
+// Higher version wins; on a tie a removal beats a set, because a passcode
+// nobody chose is a lockout and an absent one is a second's work to restore.
+function _incomingStaffAuthRecordWins(incoming, held) {
+  if (!held) return true;
+  const heldVersion = Number.isSafeInteger(held.version) ? held.version : 0;
+  if (incoming.version !== heldVersion) return incoming.version > heldVersion;
+  const incomingCleared = incoming.cleared === true;
+  const heldCleared = held.cleared === true;
+  if (incomingCleared !== heldCleared) return incomingCleared;
+  return JSON.stringify(incoming) > JSON.stringify(held);
+}
+
+function _recordStaffAuthFailure(key) {
+  const failures = (staffAuthFailures.get(key) || 0) + 1;
+  staffAuthFailures.set(key, failures);
+  if (failures >= 5) {
+    staffAuthLockedUntil.set(key, Date.now() + (failures >= 10 ? 30 * 60 * 1000 : 5 * 60 * 1000));
+  }
+}
+
 function _recordOwnerAuthFailure() {
   ownerAuthFailures += 1;
   if (ownerAuthFailures >= 5) {
@@ -1911,10 +2017,150 @@ _secureHandle('app-session-authenticate-owner', async (_, pin) => {
   return _setAppSession('Elizabeth Chaves', APP_PROFILE_ROLES['Elizabeth Chaves']);
 });
 
-_secureHandle('app-session-start-staff', async (_, name) => {
-  const role = _roleForAppProfile(name);
+_secureHandle('app-session-start-staff', async (_, request) => {
+  // MB1188-069: still accepts a bare name. A profile with no passcode signs in
+  // exactly as it always did.
+  const requested = _isPlainObject(request) ? request.name : request;
+  const pin = _isPlainObject(request) ? request.pin : null;
+  const role = _roleForAppProfile(requested);
   if (!role || role === 'Owner') throw new Error('Unknown staff profile.');
-  return _setAppSession(name, role);
+  const vault = _loadSecretVault();
+  const record = _activeStaffAuthRecord(vault, requested);
+  if (record) {
+    const key = _staffAuthName(requested);
+    if (Date.now() < (staffAuthLockedUntil.get(key) || 0)) {
+      throw new Error('Too many passcode attempts. Try again later.');
+    }
+    if (!_validStaffPin(pin)) throw new Error('Enter your 4-digit passcode.');
+    if (!await _ownerPinMatches(pin, record.active)) {
+      _recordStaffAuthFailure(key);
+      throw new Error('That passcode did not match.');
+    }
+    staffAuthFailures.delete(key);
+    staffAuthLockedUntil.delete(key);
+  }
+  return _setAppSession(_normalizeStaffProfileName(requested), role);
+});
+
+// Which profiles are passcode-protected. Ungated on purpose: the login screen
+// has to know before any session exists, and it reveals only what that screen
+// already shows — never a verifier, a salt or an iteration count.
+_secureHandle('app-session-staff-passcode-status', async () => {
+  // One decrypt, not one per profile: this runs on every paint of the login
+  // screen and _loadSecretVault reads and decrypts the file each call.
+  const vault = _loadSecretVault();
+  return {
+    ok: true,
+    protectedProfiles: _allAppProfiles()
+      .filter(profile => _activeStaffAuthRecord(vault, profile.name))
+      .map(profile => profile.name),
+  };
+});
+
+// Set or change your OWN passcode. Never somebody else's — an owner who needs
+// to help resets it with the clear handler below, which cannot set a new one.
+_secureHandle('app-session-set-staff-passcode', async (_, request) => {
+  _requireAppRole(STAFF_PASSCODE_ROLES);
+  if (!_isPlainObject(request)) throw new Error('Invalid passcode change.');
+  const name = _normalizeStaffProfileName(appSession.name);
+  if (_roleForAppProfile(name) !== STAFF_AUTH_ROLE) {
+    throw new Error('Only an Operations Manager can set a passcode.');
+  }
+  if (!_validStaffPin(request.newPin)) {
+    throw new Error('Choose a 4-digit passcode.');
+  }
+  const vault = _loadSecretVault();
+  const existing = _activeStaffAuthRecord(vault, name);
+  if (existing && !await _ownerPinMatches(request.currentPin, existing.active)) {
+    throw new Error('Your current passcode did not match.');
+  }
+  const records = _staffAuthRecords(vault);
+  const key = _staffAuthName(name);
+  const previous = records[key];
+  const record = {
+    version: (Number.isSafeInteger(previous?.version) ? previous.version : 0) + 1,
+    active: await _buildOwnerVerifier(request.newPin),
+  };
+  // Fail before saving, not after. A record this handler refuses to read back
+  // would be dropped on the next load, silently leaving the passcode unset
+  // while the person believes they have one.
+  if (!_validStaffAuthRecord(record)) {
+    throw new Error('This passcode could not be saved. Ask the owner to remove your current one, then set a new one.');
+  }
+  records[key] = record;
+  const fresh = _loadSecretVault();
+  fresh[STAFF_AUTH_VAULT_KEY] = { ...records };
+  _saveSecretVault(fresh);
+  staffAuthFailures.delete(key);
+  staffAuthLockedUntil.delete(key);
+  // Handed back so the renderer can put it in the synced store. The passcode
+  // itself never leaves the keypad.
+  return { ok: true, name, record };
+});
+
+// Remove a passcode: your own with the current one, or the owner clearing it
+// for somebody who has forgotten theirs. The owner cannot CHOOSE a passcode,
+// only remove it, so nobody else can ever know what it is.
+_secureHandle('app-session-clear-staff-passcode', async (_, request) => {
+  _requireAppRole(COMMUNICATION_ROLES);
+  const wanted = _isPlainObject(request) ? request.name : request;
+  const name = _normalizeStaffProfileName(wanted);
+  const isOwner = _appSessionHasRole(new Set(['Owner']));
+  const isSelf = appSession && _staffAuthName(appSession.name) === _staffAuthName(name);
+  if (!isOwner && !isSelf) {
+    throw new Error('Only the owner can remove somebody else\'s passcode.');
+  }
+  const vault = _loadSecretVault();
+  const records = _staffAuthRecords(vault);
+  const key = _staffAuthName(name);
+  const existing = records[key];
+  if (!existing || existing.cleared === true) return { ok: true, name, record: null };
+  if (!isOwner && !await _ownerPinMatches(
+    _isPlainObject(request) ? request.currentPin : null, existing.active)) {
+    throw new Error('Your current passcode did not match.');
+  }
+  // A TOMBSTONE, not a deletion: the other Mac still holds the old record, and
+  // absence would let it put the passcode straight back on the next sync.
+  // Clamped, never refused. Removing a passcode is the escape hatch for the
+  // whole feature, so it has to work even from a record sitting at the ceiling:
+  // a tombstone AT the ceiling still beats everything at or below it, and beats
+  // a set at the same version by the tie-break both Macs share.
+  const record = { version: Math.min(existing.version + 1, MAX_STAFF_AUTH_VERSION), cleared: true };
+  records[key] = record;
+  const fresh = _loadSecretVault();
+  fresh[STAFF_AUTH_VAULT_KEY] = { ...records };
+  _saveSecretVault(fresh);
+  staffAuthFailures.delete(key);
+  staffAuthLockedUntil.delete(key);
+  return { ok: true, name, record };
+});
+
+// The renderer delivers what the synced store holds. Merged by version, so the
+// newer decision wins whichever Mac made it and a stale copy can never restore
+// a passcode that was removed.
+_secureHandle('app-session-apply-staff-passcodes', async (_, incoming) => {
+  // COMMUNICATION_ROLES is every role main defines, so this reads as "any
+  // signed-in session" — which is exactly the requirement. Sync only runs after
+  // sign-in, so nothing legitimate is turned away, and the login screen, which
+  // holds no session, can no longer post a tombstone that would strip a
+  // passcode before anybody has proved who they are.
+  _requireAppRole(COMMUNICATION_ROLES);
+  if (!_isPlainObject(incoming)) return { ok: true, applied: 0 };
+  const vault = _loadSecretVault();
+  const records = _staffAuthRecords(vault);
+  let applied = 0;
+  for (const [rawName, record] of Object.entries(incoming)) {
+    if (!_boundedString(rawName, 120) || !_validStaffAuthRecord(record)) continue;
+    const key = String(rawName).toLocaleLowerCase('en-US');
+    if (!_incomingStaffAuthRecordWins(record, records[key])) continue;
+    records[key] = record;
+    applied += 1;
+  }
+  if (applied) {
+    vault[STAFF_AUTH_VAULT_KEY] = { ...records };
+    _saveSecretVault(vault);
+  }
+  return { ok: true, applied };
 });
 
 _secureHandle('app-session-list-profiles', async () => ({

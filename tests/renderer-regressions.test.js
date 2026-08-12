@@ -2473,3 +2473,57 @@ test('MB1188-067: a typed reply survives the list being rebuilt', () => {
   assert.ok(render.indexOf('const draftedReply') < render.indexOf('container.innerHTML'));
   assert.ok(render.indexOf('container.innerHTML') < render.indexOf('rebuilt.value = draftedReply'));
 });
+
+// ── MB1188-069 pentest: the login screen must never dead-end ─────────────────
+//
+// `_protectedLoginProfiles` is a cache. renderLoginProfiles fills it with a
+// call it deliberately does not await, and refreshProtectedLoginProfiles keeps
+// the previous contents when the call fails. Executed against the real
+// functions, an Operations Manager who pressed her button before that call
+// returned was sent down the unprotected path, refused by main, and shown
+// "Could not unlock local data. Ask the owner to sign in again." — with no
+// keypad and no way through. Permanent, not just a race, whenever the status
+// call was failing.
+
+test('MB1188-069: main, not the cache, decides whether a passcode is demanded', () => {
+  const select = namedFunctionSource('selectLoginUser');
+  // The cache is still the fast path...
+  assert.match(select, /_loginProfileIsProtected\(name\)/);
+  assert.match(select, /_openStaffPasscodeKeypad\(name\);/);
+  // ...but main's refusal opens the keypad regardless of what it believed.
+  assert.match(select, /if \(_isStaffPasscodeDemand\(err\)\) \{/);
+  assert.match(select, /_openStaffPasscodeKeypad\(name\);\s*\n\s*return;\s*\n\s*\}/);
+  // And the cache is repaired so the next paint marks the profile correctly.
+  assert.match(select, /void refreshProtectedLoginProfiles\(\)\.then\(\(\) => renderLoginProfiles\(\)\);/);
+  // The misleading toast is now only for real unlock failures.
+  const fallback = select.indexOf('Could not unlock local data');
+  assert.ok(select.indexOf('_isStaffPasscodeDemand(err)') < fallback,
+    'the passcode case is handled before the generic message');
+});
+
+test('MB1188-069: the keypad opener is one function, used by both callers', () => {
+  const open = namedFunctionSource('_openStaffPasscodeKeypad');
+  assert.match(open, /_pinMode = 'staff';/);
+  assert.match(open, /_pinStaffName = name;/);
+  assert.match(open, /_pinTargetLength = 4;/);
+  assert.match(open, /_pinBuffer = '';/);
+  // Two copies of this block would drift; that is how the dead end appeared.
+  assert.equal((script.match(/_pinMode = 'staff';/g) || []).length, 1);
+});
+
+test('MB1188-069: leaving the keypad disarms the staff flow', () => {
+  const back = namedFunctionSource('backToUserPick');
+  assert.match(back, /_pinMode = 'owner';/);
+  assert.match(back, /_pinStaffName = null;/);
+  // Otherwise clicking Elizabeth next would check her passcode against a staff
+  // record — or the reverse.
+  const check = namedFunctionSource('checkPin');
+  assert.match(check, /if \(_pinMode === 'staff'\) return _checkStaffPin\(\);/);
+});
+
+test('MB1188-069: the passcode demand is recognised by main’s own wording', () => {
+  const recognise = namedFunctionSource('_isStaffPasscodeDemand');
+  assert.match(recognise, /Enter your 4-digit passcode/);
+  assert.match(mainSource, /throw new Error\('Enter your 4-digit passcode\.'\);/,
+    'main still says exactly this — the two are matched by string');
+});

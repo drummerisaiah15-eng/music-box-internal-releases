@@ -1201,10 +1201,11 @@
       </div>
     </div>
 
-    <!-- PIN entry (Elizabeth only) -->
+    <!-- MB1188-069: the keypad serves the owner AND an Operations Manager who
+         has set an optional 4-digit passcode, so the name is filled in. -->
     <div id="pin-screen">
       <span class="pin-back" onclick="backToUserPick()">← Back</span>
-      <div class="pin-name">Elizabeth Chaves</div>
+      <div class="pin-name" id="pin-user-name">Elizabeth Chaves</div>
       <div class="pin-label" id="pin-label">Enter your passcode</div>
       <div class="pin-dots">
         <div class="pin-dot" id="pd0"></div>
@@ -2439,6 +2440,25 @@
             <button class="btn btn-outline btn-sm" onclick="changePin()">Update Passcode</button>
           </div>
         </div>
+        <!-- MB1188-069: optional, and only for an Operations Manager. -->
+        <div id="staff-pin-section" style="margin-top:20px;padding-top:16px;border-top:1px solid var(--divider);display:none">
+          <div style="font-size:13px;font-weight:600;margin-bottom:6px;color:var(--text-secondary)">Your Passcode</div>
+          <div style="font-size:11.5px;color:var(--text-muted);margin-bottom:10px;line-height:1.5;max-width:640px">
+            Optional. Set a 4-digit passcode and Music Box will ask for it when you
+            sign in, on this Mac and the other one. Nobody else can see it — if you
+            forget it, Elizabeth can remove it and you can set a new one.
+          </div>
+          <div id="staff-pin-state" style="font-size:12.5px;margin-bottom:10px"></div>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <input type="password" id="staff-pin-current" class="form-input" inputmode="numeric"
+                   minlength="4" maxlength="4" placeholder="Current" style="width:110px;letter-spacing:.12em;display:none" />
+            <input type="password" id="staff-pin-new" class="form-input" inputmode="numeric"
+                   minlength="4" maxlength="4" placeholder="New 4-digit" style="width:140px;letter-spacing:.12em" />
+            <button class="btn btn-outline btn-sm" onclick="saveStaffPasscode()">Save Passcode</button>
+            <button class="btn btn-ghost btn-sm" id="staff-pin-remove" style="display:none;color:var(--danger,#c0392b)"
+                    onclick="removeMyStaffPasscode()">Remove Passcode</button>
+          </div>
+        </div>
         <div id="manage-profiles-section" style="margin-top:20px;padding-top:16px;border-top:1px solid var(--divider);display:none">
           <div style="font-size:13px;font-weight:600;margin-bottom:6px;color:var(--text-secondary)">Manage Users (Elizabeth only)</div>
           <div style="font-size:11.5px;color:var(--text-muted);margin-bottom:10px;line-height:1.5;max-width:640px">
@@ -2733,10 +2753,26 @@ function renderLoginProfiles() {
       <div class="login-user-avatar" style="background:${_profileAvatarColor(profile, index)}">${escHtml(_profileInitials(profile.name))}</div>
       <div style="text-align:left">
         <div>${escHtml(profile.name)}</div>
-        <div class="login-user-role">${escHtml(profile.role)}</div>
+        <div class="login-user-role">${escHtml(profile.role)}${
+          profile.name === 'Elizabeth Chaves' || _loginProfileIsProtected(profile.name)
+            ? ' · passcode' : ''}</div>
       </div>
     </button>
   `).join('');
+  // MB1188-069: refreshed after the buttons are drawn, then drawn again if the
+  // answer changed. The list must never be BLOCKED on this — a profile whose
+  // status has not arrived yet is simply not marked, and main still demands the
+  // passcode when the button is pressed.
+  void refreshProtectedLoginProfiles().then(() => {
+    const marked = container.querySelectorAll('.login-user-role');
+    let stale = false;
+    _loginProfiles.forEach((profile, index) => {
+      const wants = profile.name === 'Elizabeth Chaves' || _loginProfileIsProtected(profile.name);
+      const shown = (marked[index]?.textContent || '').includes('· passcode');
+      if (wants !== shown) stale = true;
+    });
+    if (stale) renderLoginProfiles();
+  });
 }
 
 function populateProfileSelects() {
@@ -2955,6 +2991,53 @@ async function retryDirectoryPublication() {
 
 // Applies a directory that arrived from another Mac. Main re-validates every
 // field, so a tampered payload cannot grant Owner or invent roles.
+// MB1188-069: which profiles are passcode-protected, as of the last check.
+// The login screen needs this before any session exists.
+let _protectedLoginProfiles = new Set();
+
+async function _applyStaffPasscodes(records) {
+  if (!window.electronSession?.applyStaffPasscodes) return false;
+  try {
+    const payload = (records && typeof records === 'object' && !Array.isArray(records))
+      ? records : {};
+    const result = await window.electronSession.applyStaffPasscodes(payload);
+    return result?.ok === true;
+  } catch (error) {
+    console.warn('[passcode] records were not applied:', error?.message || error);
+    return false;
+  }
+}
+
+async function refreshProtectedLoginProfiles() {
+  if (!window.electronSession?.staffPasscodeStatus) return _protectedLoginProfiles;
+  try {
+    const result = await window.electronSession.staffPasscodeStatus();
+    if (result?.ok && Array.isArray(result.protectedProfiles)) {
+      _protectedLoginProfiles = new Set(
+        result.protectedProfiles.map(name => String(name).toLocaleLowerCase('en-US')));
+    }
+  } catch (error) {
+    console.warn('[passcode] status unavailable:', error?.message || error);
+  }
+  return _protectedLoginProfiles;
+}
+
+function _loginProfileIsProtected(name) {
+  return _protectedLoginProfiles.has(String(name).toLocaleLowerCase('en-US'));
+}
+
+// Written to the synced store so the other Mac enforces the same decision.
+async function _persistStaffPasscodeRecord(name, record) {
+  const key = String(name).toLocaleLowerCase('en-US');
+  await STORE.mutate('staff_passcodes', current => {
+    const next = (current && typeof current === 'object' && !Array.isArray(current))
+      ? { ...current } : {};
+    if (record) next[key] = record;
+    return next;
+  }, {});
+  await STORE.flush(['staff_passcodes']);
+}
+
 async function importStaffDirectory(directory) {
   if (!Array.isArray(directory) || !window.electronSession?.importDirectory) return false;
   try {
@@ -3043,6 +3126,10 @@ function renderManageProfiles() {
           ? '<span style="color:var(--text-muted);font-size:11px"> · built-in</span>' : ''}
       </span>
       ${roleCell}
+      ${_loginProfileIsProtected(profile.name)
+        ? `<button class="btn btn-ghost btn-sm" title="Remove this person's sign-in passcode so they can set a new one"
+             onclick="clearStaffPasscodeFor(${jsArg(profile.name)})">Reset passcode</button>`
+        : ''}
       ${removable
         ? `<button class="btn btn-ghost btn-sm" style="color:var(--danger,#c0392b)"
              onclick="removeLoginUser(${jsArg(profile.name)})">Remove</button>`
@@ -3063,6 +3150,104 @@ function renderManageProfiles() {
     ${_loginProfiles.length} profile${_loginProfiles.length === 1 ? '' : 's'} on this Mac.
     Owner is set by the owner passcode and cannot be reassigned.
   </div>` + pendingBanner;
+}
+
+// ── MB1188-069: the Operations Manager passcode, self-service ─────────────
+
+async function renderStaffPasscodeSection() {
+  const section = document.getElementById('staff-pin-section');
+  if (!section) return;
+  const name = currentUser();
+  const mine = name && getUserRole(name) === 'Operations Manager';
+  section.style.display = mine ? '' : 'none';
+  if (!mine) return;
+  await refreshProtectedLoginProfiles();
+  const has = _loginProfileIsProtected(name);
+  const state = document.getElementById('staff-pin-state');
+  if (state) {
+    state.textContent = has
+      ? 'A passcode is set. You will be asked for it when you sign in.'
+      : 'No passcode set. You sign in without one.';
+    state.style.color = has ? 'var(--text-secondary)' : 'var(--text-muted)';
+  }
+  const current = document.getElementById('staff-pin-current');
+  if (current) { current.style.display = has ? '' : 'none'; current.value = ''; }
+  const remove = document.getElementById('staff-pin-remove');
+  if (remove) remove.style.display = has ? '' : 'none';
+  const next = document.getElementById('staff-pin-new');
+  if (next) next.value = '';
+}
+
+async function saveStaffPasscode() {
+  const next = document.getElementById('staff-pin-new')?.value?.trim() || '';
+  const current = document.getElementById('staff-pin-current')?.value?.trim() || '';
+  if (!/^\d{4}$/.test(next)) {
+    showToast('Choose a 4-digit passcode.', 'warning');
+    return false;
+  }
+  if (!window.electronSession?.setStaffPasscode) {
+    showToast('Secure passcode controls are unavailable in this build.', 'danger');
+    return false;
+  }
+  try {
+    const result = await window.electronSession.setStaffPasscode({
+      currentPin: current || null,
+      newPin: next,
+    });
+    if (result?.ok !== true) throw new Error('The passcode was not saved.');
+    // Written to the synced store SECOND. Main already holds it, so a failure
+    // here leaves this Mac protected and the other one not — annoying, and far
+    // better than the reverse.
+    await _persistStaffPasscodeRecord(result.name, result.record);
+    showToast('Passcode saved. You will be asked for it next time you sign in.', 'success');
+  } catch (error) {
+    showToast(String(error?.message || error), 'danger');
+    return false;
+  }
+  await renderStaffPasscodeSection();
+  return true;
+}
+
+async function removeMyStaffPasscode() {
+  const current = document.getElementById('staff-pin-current')?.value?.trim() || '';
+  if (!/^\d{4}$/.test(current)) {
+    showToast('Enter your current passcode to remove it.', 'warning');
+    return false;
+  }
+  return _clearStaffPasscode(currentUser(), current);
+}
+
+async function clearStaffPasscodeFor(name) {
+  if (!isElizabeth()) {
+    showToast('Only the owner can reset somebody else\'s passcode.', 'warning');
+    return false;
+  }
+  if (!window.confirm(
+    `Remove ${name}'s sign-in passcode?\n\n` +
+    'They will sign in without one until they set a new one themselves. ' +
+    'Nobody can see what the old one was.')) {
+    return false;
+  }
+  return _clearStaffPasscode(name, null);
+}
+
+async function _clearStaffPasscode(name, currentPin) {
+  if (!window.electronSession?.clearStaffPasscode) {
+    showToast('Secure passcode controls are unavailable in this build.', 'danger');
+    return false;
+  }
+  try {
+    const result = await window.electronSession.clearStaffPasscode({ name, currentPin });
+    if (result?.ok !== true) throw new Error('The passcode was not removed.');
+    if (result.record) await _persistStaffPasscodeRecord(result.name, result.record);
+    showToast('Passcode removed.', 'success');
+  } catch (error) {
+    showToast(String(error?.message || error), 'danger');
+    return false;
+  }
+  await renderStaffPasscodeSection();
+  try { renderManageProfiles(); } catch (_) {}
+  return true;
 }
 
 async function setProfileRole(name, role) {
@@ -3194,6 +3379,11 @@ function getUserRole(name) {
 let _pinBuffer = '';
 let _pinTargetLength = 6;
 let _firstRunPinConfirmation = null;
+// MB1188-069: the keypad is shared. 'owner' is the passcode that also unlocks
+// this Mac's data key; 'staff' is an Operations Manager's optional 4-digit one,
+// which is only an access gate.
+let _pinMode = 'owner';
+let _pinStaffName = null;
 
 function _storedPinLength() {
   const explicit = Number(localStorage.getItem('tmb__pin_length'));
@@ -3289,6 +3479,35 @@ async function _pinMatchesHashState(pin, state) {
   return _constantTimeEquals(await _hashPin(pin, salt, state.iterations), state.hash);
 }
 
+// MB1188-069: the passcode keypad for a staff profile.
+//
+// Reachable from two places on purpose. `_protectedLoginProfiles` is a CACHE
+// filled by an async call that renderLoginProfiles deliberately does not wait
+// for, and which silently keeps its old contents if the status call fails. So
+// the cache is a fast path, never the authority — main is. When main says a
+// passcode is required, we come here regardless of what the cache believed.
+function _openStaffPasscodeKeypad(name) {
+  _pinMode = 'staff';
+  _pinStaffName = name;
+  _pinTargetLength = 4;
+  _pinBuffer = '';
+  _firstRunPinConfirmation = null;
+  document.getElementById('user-pick-screen').style.display = 'none';
+  document.getElementById('pin-screen').style.display = 'block';
+  updatePinDots();
+  document.getElementById('pin-error').textContent = '';
+  const staffName = document.getElementById('pin-user-name');
+  if (staffName) staffName.textContent = name;
+  const staffLabel = document.getElementById('pin-label');
+  if (staffLabel) staffLabel.textContent = 'Enter your 4-digit passcode';
+}
+
+// Main's wording for "this profile has a passcode and you did not send one".
+// Matched rather than parsed: it is one string in one file.
+function _isStaffPasscodeDemand(error) {
+  return String(error?.message || error || '').includes('Enter your 4-digit passcode');
+}
+
 function selectLoginUser(name, role) {
   const profile = _loginProfile(name);
   if (!profile || profile.role !== role) {
@@ -3297,7 +3516,17 @@ function selectLoginUser(name, role) {
   }
   name = profile.name;
   role = profile.role;
+  // MB1188-069: an Operations Manager who has set a passcode is asked for it.
+  // Everyone else, and anyone who has not set one, is unaffected.
+  if (name !== 'Elizabeth Chaves' && _loginProfileIsProtected(name)) {
+    _openStaffPasscodeKeypad(name);
+    return;
+  }
+  _pinMode = 'owner';
+  _pinStaffName = null;
   if (name === 'Elizabeth Chaves') {
+    const ownerName = document.getElementById('pin-user-name');
+    if (ownerName) ownerName.textContent = 'Elizabeth Chaves';
     document.getElementById('user-pick-screen').style.display = 'none';
     document.getElementById('pin-screen').style.display = 'block';
     _pinBuffer = '';
@@ -3332,10 +3561,55 @@ function selectLoginUser(name, role) {
         if (!completeLogin(name, role)) await window.electronSession.end();
       })
       .catch(err => {
-        console.error('[login] error during login:', err);
         btns.forEach(b => { b.disabled = false; b.style.opacity = ''; });
+        // MB1188-069: the cache said this profile was unprotected and main
+        // disagreed. That happens on the first paint, before the status call
+        // returns, and permanently if the status call is failing. Showing the
+        // generic toast here left the person staring at "ask the owner to sign
+        // in again" with no keypad and no way through.
+        if (_isStaffPasscodeDemand(err)) {
+          void refreshProtectedLoginProfiles().then(() => renderLoginProfiles());
+          _openStaffPasscodeKeypad(name);
+          return;
+        }
+        console.error('[login] error during login:', err);
         showToast('Could not unlock local data. Ask the owner to sign in again.', 'danger');
       });
+  }
+}
+
+async function _checkStaffPin() {
+  const name = _pinStaffName;
+  const pin = _pinBuffer;
+  _pinBuffer = '';
+  updatePinDots();
+  const error = document.getElementById('pin-error');
+  const profile = _loginProfile(name);
+  if (!profile) {
+    if (error) error.textContent = 'That user profile is not available.';
+    return;
+  }
+  try {
+    const unlocked = await loadEncKeyFromSession();
+    if (!unlocked) {
+      if (error) {
+        error.textContent =
+          'The owner must sign in once on this Mac before staff can access encrypted data.';
+      }
+      return;
+    }
+    if (!window.electronSession?.startStaff) {
+      throw new Error('Secure app-session authorization is unavailable.');
+    }
+    const session = await window.electronSession.startStaff({ name: profile.name, pin });
+    if (!session?.ok || session.role !== profile.role) {
+      throw new Error('The staff profile could not be authorized.');
+    }
+    if (!completeLogin(profile.name, profile.role)) await window.electronSession.end();
+  } catch (err) {
+    // Main distinguishes a wrong passcode from a lockout from a real failure,
+    // and its wording is the accurate one.
+    if (error) error.textContent = String(err?.message || err);
   }
 }
 
@@ -3343,6 +3617,11 @@ function backToUserPick() {
   document.getElementById('pin-screen').style.display = 'none';
   document.getElementById('user-pick-screen').style.display = 'block';
   _pinBuffer = '';
+  // MB1188-069: leaving the keypad returns it to the owner flow, so a staff
+  // attempt cannot be left half-armed behind the profile list.
+  _pinMode = 'owner';
+  _pinStaffName = null;
+  _pinTargetLength = _storedPinLength();
   updatePinDots();
 }
 
@@ -3370,6 +3649,10 @@ function updatePinDots() {
 }
 
 async function checkPin() {
+  // MB1188-069: the staff passcode is checked in main, which owns the verifier
+  // and the attempt lockout. Nothing about the owner flow below is reused —
+  // that one also unwraps this Mac's data key, and this one must not.
+  if (_pinMode === 'staff') return _checkStaffPin();
   try {
     const lockRemaining = _pinLockRemainingMs();
     if (lockRemaining > 0) {
@@ -4481,6 +4764,14 @@ const SYNC_MERGE_STRATEGIES = Object.freeze({
   // MB161-012: the index is a record list of which projects exist. Content
   // lives in spreadsheet_<projectId>, which uses the operation merge below.
   spreadsheets: 'spreadsheet-index',
+  // MB1188-069: passcode records meet the same bar the comment above sets. They
+  // are keyed by the normalized profile name (a stable id), each carries a
+  // monotonic `version`, and a removal is written as a `cleared: true`
+  // tombstone rather than as absence — so a union can never resurrect a
+  // passcode somebody deleted. Without this the key was whole-value, and a Mac
+  // that had been offline would publish its copy over the other's: one Mac
+  // would stop enforcing a passcode that was still set on the other.
+  staff_passcodes: 'versioned-record-map',
 });
 const MAX_SYNC_MERGE_ATTEMPTS = 3;
 
@@ -4519,6 +4810,9 @@ function _mergeSyncValuesForKey(key, { localValue, remoteValue, baseValue }) {
   }
   if (strategy === 'spreadsheet-index') {
     return _mergeSpreadsheetIndexes(localValue, remoteValue);
+  }
+  if (strategy === 'versioned-record-map') {
+    return _mergeVersionedRecordMaps(localValue, remoteValue);
   }
   if (strategy === 'spreadsheet-operations') {
     if (!baseValue) {
@@ -4751,6 +5045,36 @@ function _compareSyncRecords(a, b) {
 }
 
 // Deterministic and symmetric: merge(a, b) always equals merge(b, a).
+// MB1188-069: union of two name-keyed maps whose records carry a monotonic
+// `version`. Higher version wins. Equal versions mean the two Macs decided
+// independently while apart, so the tie has to break the SAME WAY on both or
+// they never converge:
+//   1. a removal beats a set. This is an opt-in passcode — being unexpectedly
+//      unprotected is recoverable in a second, being locked out of a role by a
+//      passcode nobody chose is not.
+//   2. otherwise the larger serialization wins. Arbitrary, but identical on
+//      both Macs, which is the whole requirement.
+function _mergeVersionedRecordMaps(localMap, remoteMap) {
+  const asMap = value => (value && typeof value === 'object' && !Array.isArray(value)) ? value : {};
+  const local = asMap(localMap);
+  const remote = asMap(remoteMap);
+  const merged = {};
+  for (const key of new Set([...Object.keys(remote), ...Object.keys(local)])) {
+    const a = local[key];
+    const b = remote[key];
+    if (a === undefined) { merged[key] = _cloneJson(b); continue; }
+    if (b === undefined) { merged[key] = _cloneJson(a); continue; }
+    const av = Number.isSafeInteger(a?.version) ? a.version : 0;
+    const bv = Number.isSafeInteger(b?.version) ? b.version : 0;
+    if (av !== bv) { merged[key] = _cloneJson(av > bv ? a : b); continue; }
+    const aCleared = a?.cleared === true;
+    const bCleared = b?.cleared === true;
+    if (aCleared !== bCleared) { merged[key] = _cloneJson(aCleared ? a : b); continue; }
+    merged[key] = _cloneJson(JSON.stringify(a) >= JSON.stringify(b) ? a : b);
+  }
+  return merged;
+}
+
 function _mergeTombstonedRecordLists(localList, remoteList) {
   const local = Array.isArray(localList) ? localList : [];
   const remote = Array.isArray(remoteList) ? remoteList : [];
@@ -5556,6 +5880,9 @@ const SYNC_BASE_KEYS = Object.freeze([
   'spreadsheets', 'step_up_receipts', 'flagged_emails',
   'comm_analyzed_ids', 'comm_handled_ids', 'rc_read_convs', 'policies',
   'staff_dir_overrides', 'removed_staff_dir',
+  // MB1188-069: PBKDF2 verifiers for Operations Manager passcodes, so a
+  // passcode set on one Mac is enforced on the other. Never the passcode.
+  'staff_passcodes',
   // V159-005: owner-published staff directory so profile adds, removals and
   // role changes reach every Mac.
   'staff_directory',
@@ -7051,6 +7378,12 @@ function _refreshForSyncKey(key, value) {
         else ssGoHome();
       }
     } catch {}
+  }
+  if (key === 'staff_passcodes') {
+    // MB1188-069: main is the authority — start-staff checks the vault copy, so
+    // an arriving record has to be delivered into it. Merged by version there,
+    // so a stale Mac can never restore a passcode somebody removed.
+    void _applyStaffPasscodes(value);
   }
   if (key === 'staff_directory') {
     // V159-005: another Mac published a profile change; apply it locally.
@@ -15382,6 +15715,9 @@ async function loadSettings() {
 
   const manageSec = document.getElementById('manage-profiles-section');
   if (manageSec) manageSec.style.display = isElizabeth() ? '' : 'none';
+  // MB1188-069: the passcode card belongs to whoever is signed in, and only
+  // when they hold the role it applies to.
+  await renderStaffPasscodeSection();
   renderManageProfiles();
 
   // Load saved API config (display status only – don't expose stored keys)

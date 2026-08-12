@@ -5332,3 +5332,92 @@ test('MB1188-068: retiring a key clears every trace of it', () => {
   // Reported, not silent — this is data leaving the Mac.
   assert.match(retire, /console\.warn\(/);
 });
+
+// ── MB1188-069: the optional Operations Manager passcode, across two Macs ─────
+//
+// The verifier travels in the synced `staff_passcodes` key so both Macs enforce
+// the same decision. That only holds if the key MERGES: whole-value was the
+// original shape, and a Mac that had been offline would publish its copy over
+// the other's, leaving one Mac not enforcing a passcode the other still had.
+
+function passcodeMerge() {
+  const context = vm.createContext({
+    console: { warn() {}, error() {}, log() {} },
+    Object, JSON, Number, Set, Array, String, Boolean,
+    _cloneJson: value => JSON.parse(JSON.stringify(value)),
+  });
+  vm.runInContext(declaration('_mergeVersionedRecordMaps') +
+    '\nglobalThis.round = (a, b) => _mergeVersionedRecordMaps(a, b);', context);
+  return (a, b) => JSON.parse(JSON.stringify(context.round(a, b)));
+}
+
+const set = (version) => ({ version, active: { salt: 's', hash: 'h' + version, iterations: 310000 } });
+const cleared = (version) => ({ version, cleared: true });
+
+test('MB1188-069: staff_passcodes is a merged key, not a whole value', () => {
+  assert.match(script, /staff_passcodes: 'versioned-record-map'/,
+    'the strategy is registered, so _canAutoMergeSyncKey is true for it');
+  assert.match(script, /if \(strategy === 'versioned-record-map'\) \{\s*\n\s*return _mergeVersionedRecordMaps/,
+    'and the dispatcher actually routes to it');
+  assert.match(script, /'staff_passcodes',/, 'and it is a synced base key');
+});
+
+test('MB1188-069: a passcode set on one Mac survives the other publishing', () => {
+  const merge = passcodeMerge();
+  // Mac A set Carrie's passcode while Mac B was offline holding an older map.
+  const merged = merge({ 'ana chaves': set(1) }, { 'carrie gass': set(1) });
+  assert.deepEqual(Object.keys(merged).sort(), ['ana chaves', 'carrie gass']);
+});
+
+test('MB1188-069: removing a passcode is never undone by a stale Mac', () => {
+  const merge = passcodeMerge();
+  // The removal is version 2 against the set at version 1, on either side.
+  assert.equal(merge({ carrie: cleared(2) }, { carrie: set(1) }).carrie.cleared, true);
+  assert.equal(merge({ carrie: set(1) }, { carrie: cleared(2) }).carrie.cleared, true);
+});
+
+test('MB1188-069: the newer decision wins in both directions', () => {
+  const merge = passcodeMerge();
+  assert.equal(merge({ carrie: set(3) }, { carrie: set(2) }).carrie.active.hash, 'h3');
+  assert.equal(merge({ carrie: set(2) }, { carrie: set(3) }).carrie.active.hash, 'h3');
+});
+
+test('MB1188-069: two Macs deciding at the same version converge on one answer', () => {
+  const merge = passcodeMerge();
+  // The split-brain case: both apart, both at version 2. Whatever survives, it
+  // has to be the SAME record whichever Mac performs the merge — otherwise the
+  // two never agree and one of them enforces a passcode the person never chose.
+  const a = { carrie: set(2) };
+  const b = { carrie: { version: 2, active: { salt: 'z', hash: 'other', iterations: 310000 } } };
+  assert.deepEqual(merge(a, b), merge(b, a));
+});
+
+test('MB1188-069: at an equal version a removal beats a set', () => {
+  const merge = passcodeMerge();
+  // Being unexpectedly unprotected costs one person one minute. Being held out
+  // of a role by a passcode nobody in the studio knows costs a working day, and
+  // this passcode is opt-in precisely so nobody can be locked out by it.
+  assert.equal(merge({ carrie: cleared(2) }, { carrie: set(2) }).carrie.cleared, true);
+  assert.equal(merge({ carrie: set(2) }, { carrie: cleared(2) }).carrie.cleared, true);
+});
+
+test('MB1188-069: rubbish on either side does not take the merge down', () => {
+  const merge = passcodeMerge();
+  assert.deepEqual(merge(null, { carrie: set(1) }), { carrie: set(1) });
+  assert.deepEqual(merge({ carrie: set(1) }, undefined), { carrie: set(1) });
+  assert.deepEqual(merge([], 'nonsense'), {});
+});
+
+test('MB1188-069: the merge returns copies, not the caller’s objects', () => {
+  const context = vm.createContext({
+    console: { warn() {}, error() {}, log() {} },
+    Object, JSON, Number, Set, Array, String, Boolean,
+    _cloneJson: value => JSON.parse(JSON.stringify(value)),
+  });
+  vm.runInContext(declaration('_mergeVersionedRecordMaps') +
+    '\nglobalThis.round = (a, b) => _mergeVersionedRecordMaps(a, b);', context);
+  const local = { carrie: set(2) };
+  const merged = context.round(local, {});
+  merged.carrie.version = 99;
+  assert.equal(local.carrie.version, 2, 'the live map is not aliased by the merged one');
+});

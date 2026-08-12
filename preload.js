@@ -19,7 +19,8 @@ contextBridge.exposeInMainWorld('electronKeychain', {
 // main; added profiles are persisted by main and are always Front Desk role.
 contextBridge.exposeInMainWorld('electronSession', {
   authenticateOwner: (pin) => ipcRenderer.invoke('app-session-authenticate-owner', pin),
-  startStaff:        (name) => ipcRenderer.invoke('app-session-start-staff', name),
+  // Accepts a bare name, or { name, pin } when the profile is passcode-protected.
+  startStaff:        (request) => ipcRenderer.invoke('app-session-start-staff', request),
   listProfiles:      () => ipcRenderer.invoke('app-session-list-profiles'),
   addStaffProfile:   (name) => ipcRenderer.invoke('app-session-add-staff-profile', name),
   removeStaffProfile:(name) => ipcRenderer.invoke('app-session-remove-staff-profile', name),
@@ -30,6 +31,12 @@ contextBridge.exposeInMainWorld('electronSession', {
   importDirectory:   (directory) => ipcRenderer.invoke('app-session-import-directory', directory),
   end:               () => ipcRenderer.invoke('app-session-end'),
   status:            () => ipcRenderer.invoke('app-session-status'),
+  // MB1188-069: an optional 4-digit passcode for Operations Managers. Only the
+  // PBKDF2 verifier ever crosses this bridge; the passcode itself does not.
+  staffPasscodeStatus: () => ipcRenderer.invoke('app-session-staff-passcode-status'),
+  setStaffPasscode:   (request) => ipcRenderer.invoke('app-session-set-staff-passcode', request),
+  clearStaffPasscode: (request) => ipcRenderer.invoke('app-session-clear-staff-passcode', request),
+  applyStaffPasscodes:(records) => ipcRenderer.invoke('app-session-apply-staff-passcodes', records),
   stageOwnerPin:     (request) => ipcRenderer.invoke('app-session-stage-owner-pin', request),
   commitOwnerPin:    (rotationId) => ipcRenderer.invoke('app-session-commit-owner-pin', rotationId),
   cancelOwnerPin:    (rotationId) => ipcRenderer.invoke('app-session-cancel-owner-pin', rotationId),

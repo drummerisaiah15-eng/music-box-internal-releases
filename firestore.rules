@@ -60,7 +60,8 @@ service cloud.firestore {
         'staff_dir_overrides',
         'removed_staff_dir',
         'staff_directory',
-        'ai_spend'
+        'ai_spend',
+        'staff_passcodes'
       ];
     }
 

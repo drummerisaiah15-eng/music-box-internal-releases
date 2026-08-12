@@ -223,7 +223,7 @@ test('added login users are main-owned and can only receive Front Desk authority
   );
   assert.match(
     main,
-    /_secureHandle\('app-session-start-staff'[\s\S]*const role = _roleForAppProfile\(name\)[\s\S]*role === 'Owner'/
+    /_secureHandle\('app-session-start-staff'[\s\S]*const role = _roleForAppProfile\(requested\)[\s\S]*!role \|\| role === 'Owner'\) throw/
   );
   assert.doesNotMatch(
     main,
@@ -2228,4 +2228,309 @@ test('MB1188-062: the updater refuses to walk backwards, and main survives a str
   // Still deliberately NOT uncaughtException — see the test above.
   assert.doesNotMatch(main, /process\.on\(['"]uncaughtException/);
   assert.match(main, /mainWindow\.loadFile\(htmlPath\)\.catch\(/);
+});
+
+// ── MB1188-069: the optional Operations Manager passcode ─────────────────────
+//
+// Two failure modes matter and they pull against each other. A bypass makes the
+// feature pointless; a LOCKOUT is worse than not having it, because the whole
+// point of making it opt-in was that nobody could be shut out by its existence.
+// Most of what follows is about the second one.
+
+function staffAuthApi() {
+  const sandbox = {
+    Object, JSON, Number, Buffer, Array, String, Boolean, Set, Map, Date, RegExp,
+  };
+  vm.runInNewContext(`
+    var OWNER_AUTH_ITERATIONS = 310000;
+    var MAX_STAFF_AUTH_VERSION = 1000000000;
+    ${extractFunction(main, '_isPlainObject')}
+    ${extractFunction(main, '_validOwnerVerifier')}
+    ${extractFunction(main, '_validStaffAuthRecord')}
+    ${extractFunction(main, '_incomingStaffAuthRecordWins')}
+    ${extractFunction(main, '_validStaffPin')}
+    this.valid = _validStaffAuthRecord;
+    this.wins = _incomingStaffAuthRecordWins;
+    this.validPin = _validStaffPin;
+  `, sandbox);
+  return sandbox;
+}
+
+const b64 = bytes => Buffer.alloc(bytes, 7).toString('base64');
+const staffSet = version => ({
+  version,
+  active: { iterations: 310000, salt: b64(16), verifier: b64(32) },
+});
+const staffCleared = version => ({ version, cleared: true });
+
+test('MB1188-069: only a real 4-digit passcode is accepted', () => {
+  const { validPin } = staffAuthApi();
+  for (const good of ['0000', '1234', '9999']) assert.equal(validPin(good), true, good);
+  for (const bad of ['123', '12345', '12a4', '', '  12', '1234\n', 1234, null, undefined, {}]) {
+    assert.equal(validPin(bad), false, String(bad));
+  }
+});
+
+test('MB1188-069: a record has to carry a real verifier or be a real tombstone', () => {
+  const { valid } = staffAuthApi();
+  assert.equal(valid(staffSet(1)), true);
+  assert.equal(valid(staffCleared(4)), true);
+  // A tombstone must not smuggle a verifier in beside `cleared`.
+  assert.equal(valid({ version: 2, cleared: true, active: staffSet(1).active }), false);
+  // Versions have to be usable as a monotonic counter.
+  assert.equal(valid({ ...staffSet(1), version: 0 }), false);
+  assert.equal(valid({ ...staffSet(1), version: 1.5 }), false);
+  assert.equal(valid({ ...staffSet(1), version: '2' }), false);
+  // A weakened verifier is not a verifier.
+  assert.equal(valid({ version: 1, active: { iterations: 1, salt: b64(16), verifier: b64(32) } }), false);
+  assert.equal(valid({ version: 1, active: { iterations: 310000, salt: b64(4), verifier: b64(32) } }), false);
+  assert.equal(valid(null), false);
+  assert.equal(valid([staffSet(1)]), false);
+});
+
+test('MB1188-069: an arriving record only replaces a held one when it is newer', () => {
+  const { wins } = staffAuthApi();
+  assert.equal(wins(staffSet(1), undefined), true, 'nothing held yet');
+  assert.equal(wins(staffSet(3), staffSet(2)), true);
+  assert.equal(wins(staffSet(2), staffSet(3)), false, 'a stale Mac cannot rewind');
+  // The one that actually bites: a Mac that has been off for a week still holds
+  // the passcode somebody removed on the other Mac. Its copy must not win.
+  assert.equal(wins(staffSet(1), staffCleared(2)), false);
+  assert.equal(wins(staffCleared(2), staffSet(1)), true);
+});
+
+test('MB1188-069: an equal-version tie breaks the same way on both Macs', () => {
+  const { wins } = staffAuthApi();
+  const a = staffSet(2);
+  const b = { version: 2, active: { iterations: 310000, salt: b64(16), verifier: Buffer.alloc(32, 9).toString('base64') } };
+  // Exactly one of the two directions wins, so both Macs land on one record.
+  assert.notEqual(wins(a, b), wins(b, a), 'the tie-break is antisymmetric, so it converges');
+  // And a removal beats a set at the same version, in either direction.
+  assert.equal(wins(staffCleared(2), staffSet(2)), true);
+  assert.equal(wins(staffSet(2), staffCleared(2)), false);
+});
+
+test('MB1188-069: the renderer merge and the main merge break ties identically', () => {
+  // If these two rules ever diverge the Macs stop converging: the store agrees
+  // on one record while the vault that start-staff actually checks holds
+  // another. Cheap to assert, and it is the kind of thing that rots.
+  const renderer = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  assert.match(renderer, /_mergeVersionedRecordMaps/);
+  assert.match(renderer, /if \(aCleared !== bCleared\) \{ merged\[key\] = _cloneJson\(aCleared \? a : b\); continue; \}/);
+  assert.match(main, /if \(incomingCleared !== heldCleared\) return incomingCleared;/);
+  assert.match(renderer, /JSON\.stringify\(a\) >= JSON\.stringify\(b\)/);
+  assert.match(main, /return JSON\.stringify\(incoming\) > JSON\.stringify\(held\);/);
+});
+
+test('MB1188-069: the passcode is opt-in, so an unprotected profile signs in as before', () => {
+  assert.match(main, /_secureHandle\('app-session-start-staff'[\s\S]*?const record = _activeStaffAuthRecord\(vault, requested\);\s*\n\s*if \(record\) \{/);
+  // No record -> no prompt, no throw, straight to _setAppSession.
+  assert.match(main, /_secureHandle\('app-session-start-staff'[\s\S]*?return _setAppSession\(_normalizeStaffProfileName\(requested\), role\)/);
+  assert.match(preload, /startStaff:\s*\(request\) => ipcRenderer\.invoke\('app-session-start-staff', request\)/);
+});
+
+test('MB1188-069: losing the role cannot leave somebody stuck at a passcode prompt', () => {
+  // _activeStaffAuthRecord refuses to report a record for a profile that no
+  // longer holds the role — otherwise a demoted Operations Manager would be
+  // asked for a passcode they can no longer change or clear themselves.
+  const active = extractFunction(main, '_activeStaffAuthRecord');
+  assert.match(active, /if \(_roleForAppProfile\(name\) !== STAFF_AUTH_ROLE\) return null;/);
+  assert.match(active, /if \(!record \|\| record\.cleared === true\) return null;/);
+});
+
+// The prose in this region explains WHICH roles stay passwordless, so it names
+// them. Assertions about what the code DOES have to read the code.
+function withoutComments(source) {
+  return source.split('\n').filter(line => !line.trim().startsWith('//')).join('\n');
+}
+
+test('MB1188-069: only Operations Manager is protected — everyone else stays passwordless', () => {
+  assert.match(main, /const STAFF_AUTH_ROLE = 'Operations Manager';/);
+  assert.match(main, /const STAFF_PASSCODE_ROLES = new Set\(\[STAFF_AUTH_ROLE\]\);/);
+  // Carrie's role and Step Up must never be reachable through this feature.
+  const region = withoutComments(
+    main.slice(main.indexOf('MB1188-069'), main.indexOf("_secureHandle('app-session-list-profiles'")));
+  assert.doesNotMatch(region, /'Operations & Events'/);
+  assert.doesNotMatch(region, /'Front Desk'/);
+  assert.doesNotMatch(region, /'Step Up'/);
+});
+
+test('MB1188-069: you set your own passcode and nobody else’s', () => {
+  const region = main.slice(main.indexOf("_secureHandle('app-session-set-staff-passcode'"));
+  const handler = region.slice(0, region.indexOf('// Remove a passcode'));
+  assert.match(handler, /_requireAppRole\(STAFF_PASSCODE_ROLES\)/);
+  // The target is the SIGNED-IN name. It is never taken from the request, so a
+  // request cannot name somebody else.
+  assert.match(handler, /const name = _normalizeStaffProfileName\(appSession\.name\);/);
+  assert.doesNotMatch(handler, /request\.name/);
+  // Changing one requires the current one.
+  assert.match(handler, /if \(existing && !await _ownerPinMatches\(request\.currentPin, existing\.active\)\)/);
+  // The verifier is rebuilt, never copied from the request.
+  assert.match(handler, /active: await _buildOwnerVerifier\(request\.newPin\)/);
+  assert.doesNotMatch(handler, /request\.(?:active|record|verifier)/);
+});
+
+test('MB1188-069: the owner can remove a forgotten passcode but cannot choose one', () => {
+  const region = main.slice(main.indexOf("_secureHandle('app-session-clear-staff-passcode'"));
+  const handler = region.slice(0, region.indexOf("_secureHandle('app-session-apply-staff-passcodes'"));
+  assert.match(handler, /if \(!isOwner && !isSelf\)/);
+  assert.match(handler, /if \(!isOwner && !await _ownerPinMatches\(/, 'clearing your own still needs your own');
+  // A tombstone, never a deletion — absence would let the other Mac put it back.
+  assert.match(handler, /const record = \{ version: Math\.min\(existing\.version \+ 1, MAX_STAFF_AUTH_VERSION\), cleared: true \};/);
+  // No path here can set a verifier, so a reset never hands anyone a passcode
+  // that somebody else knows.
+  assert.doesNotMatch(handler, /_buildOwnerVerifier/);
+});
+
+test('MB1188-069: the sync delivery channel needs a signed-in session', () => {
+  const region = main.slice(main.indexOf("_secureHandle('app-session-apply-staff-passcodes'"));
+  const handler = region.slice(0, region.indexOf("_secureHandle('app-session-list-profiles'"));
+  // Ungated, this was reachable from the login screen, where no session exists:
+  // post a high-version tombstone, and the passcode is gone before anybody has
+  // proved who they are.
+  assert.match(handler, /_requireAppRole\(COMMUNICATION_ROLES\);/);
+  assert.match(handler, /if \(!_boundedString\(rawName, 120\) \|\| !_validStaffAuthRecord\(record\)\) continue;/);
+  assert.match(handler, /if \(!_incomingStaffAuthRecordWins\(record, records\[key\]\)\) continue;/);
+});
+
+test('MB1188-069: wrong passcodes are rate-limited, and a right one clears the count', () => {
+  const region = main.slice(main.indexOf("_secureHandle('app-session-start-staff'"));
+  const handler = region.slice(0, region.indexOf('// Which profiles are passcode-protected'));
+  assert.match(handler, /if \(Date\.now\(\) < \(staffAuthLockedUntil\.get\(key\) \|\| 0\)\)/);
+  assert.match(handler, /_recordStaffAuthFailure\(key\);/);
+  assert.match(handler, /staffAuthFailures\.delete\(key\);/);
+  assert.match(extractFunction(main, '_recordStaffAuthFailure'), /failures >= 5/);
+});
+
+test('MB1188-069: the passcode itself is never stored, synced or returned', () => {
+  const region = main.slice(main.indexOf('MB1188-069'), main.indexOf("_secureHandle('app-session-list-profiles'"));
+  // What crosses the boundary back to the renderer is the record, which holds
+  // only the PBKDF2 verifier — the same shape the owner passcode uses.
+  assert.doesNotMatch(region, /pin:\s*(?:request\.|newPin|pin)/);
+  assert.doesNotMatch(region, /newPin:\s*/);
+  assert.match(region, /return \{ ok: true, name, record \};/);
+  const renderer = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  assert.match(renderer, /if \(record\) next\[key\] = record;/, 'the renderer syncs the record, not the passcode');
+});
+
+test('MB1188-069: the login screen learns who is protected before any session exists', () => {
+  const region = main.slice(main.indexOf("_secureHandle('app-session-staff-passcode-status'"));
+  const handler = region.slice(0, region.indexOf("_secureHandle('app-session-set-staff-passcode'"));
+  assert.doesNotMatch(handler, /_requireAppRole/, 'ungated on purpose: no session exists yet at the login screen');
+  // It reveals only the names the login screen already draws. The record is
+  // used as a boolean and never reaches the payload, so no verifier, salt or
+  // iteration count can leave through here.
+  assert.match(handler, /\.map\(profile => profile\.name\)/);
+  assert.doesNotMatch(withoutComments(handler), /\.salt|\.verifier|\.iterations|record\.active/);
+  // One decrypt per call, not one per profile.
+  assert.match(handler, /const vault = _loadSecretVault\(\);/);
+  assert.match(handler, /_activeStaffAuthRecord\(vault, profile\.name\)/);
+});
+
+// ── MB1188-069 pentest: one bad record must not lock a role out of a Mac ─────
+
+function staffRecordsApi() {
+  // The vm's OWN Object/Array, not the host's — passing the host globals in
+  // makes _isPlainObject reject every same-realm literal, which reads as
+  // "everything is refused" and hides real defects.
+  const sandbox = vm.createContext({ Buffer, console: { warn() {}, error() {}, log() {} } });
+  vm.runInContext(`
+    var OWNER_AUTH_ITERATIONS = 310000;
+    var MAX_STAFF_AUTH_VERSION = 1000000000;
+    var STAFF_AUTH_VAULT_KEY = 'app_staff_auth_v1';
+    var STAFF_AUTH_ROLE = 'Operations Manager';
+    var ROLES = { 'dana ops': 'Operations Manager', 'ana chaves': 'Front Desk' };
+    function _roleForAppProfile(name) {
+      try { return ROLES[_normalizeStaffProfileName(name).toLocaleLowerCase('en-US')] || null; }
+      catch (_) { return null; }
+    }
+    ${extractFunction(main, '_isPlainObject')}
+    ${extractFunction(main, '_validOwnerVerifier')}
+    // Stubbed, not extracted: the real one contains a regex holding an
+    // apostrophe, and extractFunction is quote-aware but not regex-aware, so it
+    // runs past the end of the function. The name-folding behaviour it stands in
+    // for is covered by the round-trip assertions further down.
+    function _normalizeStaffProfileName(value) {
+      if (typeof value !== 'string') throw new Error('Enter a staff name.');
+      return value.trim().replace(/\\s+/g, ' ');
+    }
+    ${extractFunction(main, '_boundedString')}
+    ${extractFunction(main, '_validStaffAuthRecord')}
+    ${extractFunction(main, '_staffAuthRecords')}
+    ${extractFunction(main, '_staffAuthName')}
+    ${extractFunction(main, '_activeStaffAuthRecord')}
+    this.records = _staffAuthRecords;
+    this.active = _activeStaffAuthRecord;
+    this.valid = _validStaffAuthRecord;
+  `, sandbox);
+  // Inputs have to be built INSIDE the vm. _isPlainObject compares against
+  // Object.prototype, so a value constructed out here is rejected by every
+  // check — which would read as "the record was dropped" no matter what the
+  // code does, and hide a real regression behind a passing-looking failure.
+  sandbox.into = value => vm.runInContext(`(${JSON.stringify(value)})`, sandbox);
+  return sandbox;
+}
+
+const realRecord = {
+  version: 1,
+  active: { iterations: 310000, salt: Buffer.alloc(16, 7).toString('base64'), verifier: Buffer.alloc(32, 7).toString('base64') },
+};
+
+test('MB1188-069: a malformed record is dropped, and the valid ones still enforce', () => {
+  const { records, active, into } = staffRecordsApi();
+  const vault = into({ app_staff_auth_v1: { 'dana ops': realRecord, 'someone else': { version: 1, active: { iterations: 5 } } } });
+  // The bug this replaces: _staffAuthRecords threw, start-staff calls it, so a
+  // bad record belonging to somebody ELSE stopped every Operations Manager
+  // signing in on that Mac — with no way to clear it from inside the app.
+  // Exactly what MB1188-060 fixed one screen down for the profile list.
+  assert.doesNotThrow(() => records(vault));
+  assert.deepEqual(Object.keys(records(vault)), ['dana ops']);
+  // Dropping never weakens a passcode that IS set.
+  assert.equal(JSON.stringify(active(vault, 'Dana Ops')), JSON.stringify(realRecord));
+});
+
+test('MB1188-069: no shape of stored list can throw on the sign-in path', () => {
+  const { records, into } = staffRecordsApi();
+  for (const stored of [
+    { ['x'.repeat(121)]: realRecord },
+    { '': realRecord },
+    { a: { version: 0, active: realRecord.active } },
+    { a: { version: 1, active: { iterations: 310000, salt: Buffer.alloc(16, 7).toString('base64'), verifier: 'AAA=' } } },
+    { a: null },
+    { a: { version: 2, cleared: true, active: realRecord.active } },
+    [], 'nope', 42, true,
+  ]) {
+    assert.doesNotThrow(() => records(into({ app_staff_auth_v1: stored })), JSON.stringify(stored));
+  }
+  // Spread first: the real one is a null-prototype object on purpose.
+  assert.deepEqual({ ...records(into({})) }, {}, 'an absent list is simply empty');
+});
+
+test('MB1188-069: a record cannot be pinned at the top of the integer range', () => {
+  const { valid, into } = staffRecordsApi();
+  // At MAX_SAFE_INTEGER the next `version + 1` stops being a safe integer, so
+  // every future set and clear would be invalid — and with the drop above, the
+  // passcode would silently vanish instead. Capping keeps `version + 1` real.
+  assert.equal(valid(into({ ...realRecord, version: 1000000000 })), true, 'the ceiling itself is usable');
+  assert.equal(valid(into({ ...realRecord, version: 1000000001 })), false);
+  assert.equal(valid(into({ ...realRecord, version: Number.MAX_SAFE_INTEGER })), false);
+  assert.match(main, /const MAX_STAFF_AUTH_VERSION = 1000000000;/);
+});
+
+test('MB1188-069: setting refuses rather than writing a record it cannot read back', () => {
+  const region = main.slice(main.indexOf("_secureHandle('app-session-set-staff-passcode'"));
+  const handler = region.slice(0, region.indexOf('// Remove a passcode'));
+  assert.match(handler, /if \(!_validStaffAuthRecord\(record\)\) \{/);
+  assert.ok(handler.indexOf('_validStaffAuthRecord(record)') < handler.indexOf('_saveSecretVault(fresh)'),
+    'validated BEFORE the vault is written, not after');
+});
+
+test('MB1188-069: removing a passcode is clamped, never refused', () => {
+  const region = main.slice(main.indexOf("_secureHandle('app-session-clear-staff-passcode'"));
+  const handler = region.slice(0, region.indexOf("_secureHandle('app-session-apply-staff-passcodes'"));
+  // Removal is the escape hatch for the whole feature. If it could fail, a
+  // record at the ceiling would be permanent — the lockout the cap exists to
+  // prevent, reintroduced by the cap itself.
+  assert.match(handler, /Math\.min\(existing\.version \+ 1, MAX_STAFF_AUTH_VERSION\)/);
+  assert.doesNotMatch(handler, /if \(!_validStaffAuthRecord\(record\)\)/);
 });
