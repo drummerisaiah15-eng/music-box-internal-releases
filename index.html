@@ -4277,13 +4277,24 @@ async function initEncryption(pin) {
 
   if (await loadEncKeyFromSession()) {
     // Existing random DEK: only migrate any newly-discovered plaintext records.
+    const migrated = [];
     for (const [key, value] of Object.entries(_decCache)) {
       const raw = localStorage.getItem('tmb_' + key);
       if (raw !== null && !raw.startsWith('E:')) {
+        migrated.push(key);
         await _queueEncryptedWrite(key, value, { sync: false, preserveTimestamp: true });
       }
     }
-    await STORE.flush();
+    // MB1188-070: flush WHAT WE WROTE, not everything.
+    //
+    // STORE.flush(null) throws if any key anywhere holds a write error, and
+    // this runs inside checkPin. So a single unrelated bad key — staff_passcodes
+    // declared with the wrong shape, in the case that found this — surfaced on
+    // the passcode screen as "Error: staff_passcodes: ..." and stopped Elizabeth
+    // signing in at all. Nothing is being risked by narrowing it: these are the
+    // only writes this branch issued, and a genuine failure among them still
+    // throws.
+    await STORE.flush(migrated);
     return true;
   }
 
@@ -6525,8 +6536,13 @@ function _expectedSyncType(key) {
   // MB161-037: `ai_spend` is { month, devices } — an object, not a list. Adding
   // a synced key without declaring its shape here means it falls through to the
   // default of 'array' and every write is refused, which is what happened.
+  // MB1188-069: `staff_passcodes` is { <name>: record } — a map keyed by
+  // profile name, not a list. It has to be a map: the merge picks a winner per
+  // NAME, and a list would need an identity field that duplicates the key.
+  // Left undeclared it fell through to 'array' and every write was refused with
+  // "staff_passcodes expected array data", exactly as the note above describes.
   if (['room_overrides', 'room_by_instructor', 'room_time_rules', 'spreadsheets',
-       'ai_spend'].includes(key)) return 'object';
+       'ai_spend', 'staff_passcodes'].includes(key)) return 'object';
   return 'array';
 }
 

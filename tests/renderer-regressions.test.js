@@ -1857,18 +1857,45 @@ test('MB161-037: a synced key must declare its shape, or every write is refused'
   // `ai_spend` is { month, devices } — an object. _expectedSyncType defaults to
   // 'array', so adding the key without listing it here made every write throw
   // "ai_spend expected array data", including on the login screen.
-  const expected = namedFunctionSource('_expectedSyncType');
-  assert.match(expected, /'ai_spend'\]\.includes\(key\)\) return 'object'/);
+  //
+  // MB1188-069 then did exactly the same thing with `staff_passcodes`, and this
+  // test did not catch it: it only ever asserted `ai_spend`. So it now walks the
+  // real key list against an explicit table. A new synced key that is not in the
+  // table fails here, which forces the shape to be a decision rather than a
+  // default — the whole point of the original finding.
+  const SHAPES = {
+    logs: 'array', staff_notes: 'array', todo_items: 'array',
+    assigned_tasks: 'array', staff: 'array', deleted_emails: 'array',
+    sent_emails: 'array', ms_sent_emails: 'array', ms_sent_conv_ids: 'array',
+    custom_staff: 'array', room_excluded: 'array', step_up_receipts: 'array',
+    flagged_emails: 'array', comm_analyzed_ids: 'array', comm_handled_ids: 'array',
+    rc_read_convs: 'array', policies: 'array', staff_dir_overrides: 'array',
+    removed_staff_dir: 'array', staff_directory: 'array',
+    room_overrides: 'object', room_by_instructor: 'object',
+    room_time_rules: 'object', spreadsheets: 'object', ai_spend: 'object',
+    staff_passcodes: 'object',
+  };
 
-  // Every synced key is either declared as an object or genuinely a list. This
-  // is the check that would have caught it.
+  const expected = namedFunctionSource('_expectedSyncType');
   const keys = script.match(/const SYNC_BASE_KEYS = Object\.freeze\(\[([\s\S]*?)\]\)/)[1]
     .match(/'([a-z_]+)'/g).map(k => k.replace(/'/g, ''));
   const objectKeys = expected.match(/\[([^\]]*)\]\.includes\(key\)/)[1]
     .match(/'([a-z_]+)'/g).map(k => k.replace(/'/g, ''));
-  assert.ok(keys.includes('ai_spend'));
-  assert.ok(objectKeys.includes('ai_spend'),
-    'ai_spend is synced, so its shape has to be declared');
+
+  const undeclared = keys.filter(key => !(key in SHAPES));
+  assert.deepEqual(undeclared, [],
+    'a new synced key must declare its shape here and in _expectedSyncType');
+
+  for (const key of keys) {
+    const isObject = objectKeys.includes(key);
+    assert.equal(isObject ? 'object' : 'array', SHAPES[key],
+      `${key} is declared ${SHAPES[key]} but _expectedSyncType says ` +
+      `${isObject ? 'object' : 'array'} — every write of it would be refused`);
+  }
+
+  // And the two that have actually bitten, named outright.
+  assert.ok(objectKeys.includes('ai_spend'), 'ai_spend is synced, so its shape has to be declared');
+  assert.ok(objectKeys.includes('staff_passcodes'), 'and so is staff_passcodes');
 });
 
 test('MB161-038: a task you gave yourself can be ticked off and removed', () => {
@@ -2526,4 +2553,35 @@ test('MB1188-069: the passcode demand is recognised by main’s own wording', ()
   assert.match(recognise, /Enter your 4-digit passcode/);
   assert.match(mainSource, /throw new Error\('Enter your 4-digit passcode\.'\);/,
     'main still says exactly this — the two are matched by string');
+});
+
+// ── MB1188-070: one bad key must not stop anybody signing in ─────────────────
+//
+// Found on real hardware, not in the suite. `staff_passcodes` was declared with
+// the wrong shape, so its write was refused and the error was recorded. That
+// alone would have been a contained, per-key failure — except initEncryption
+// flushed EVERY key, STORE.flush throws if any key holds an error, and it runs
+// inside checkPin. The owner's passcode screen showed
+// "Error: staff_passcodes: staff_passcodes expected array data" and login
+// stopped there. Nobody could get into the app on that Mac.
+
+test('MB1188-070: initEncryption flushes only the keys it migrated', () => {
+  const init = namedFunctionSource('initEncryption');
+  assert.match(init, /const migrated = \[\];/);
+  assert.match(init, /migrated\.push\(key\);/);
+  assert.match(init, /await STORE\.flush\(migrated\);/);
+  // The unscoped flush inside the session-resume branch is what did the damage.
+  const branch = init.slice(init.indexOf('if (await loadEncKeyFromSession())'));
+  const resume = branch.slice(0, branch.indexOf('// One-time v1.0.52 migration'));
+  assert.doesNotMatch(resume, /await STORE\.flush\(\);/,
+    'no unscoped flush on the sign-in path');
+});
+
+test('MB1188-070: an empty migration set cannot throw on somebody else’s error', () => {
+  // flush(keys) filters recorded errors to `keys`, so an empty list is a no-op
+  // rather than a whole-store check. That is the property the fix relies on.
+  const flush = script.slice(script.indexOf('flush: async (keys = null, options = {})'));
+  const body = flush.slice(0, flush.indexOf('\n  },'));
+  assert.match(body, /const wanted = keys \? new Set\(keys\) : null;/);
+  assert.match(body, /\.filter\(\(\[key\]\) => !wanted \|\| wanted\.has\(key\)\)/);
 });

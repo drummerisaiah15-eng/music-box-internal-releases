@@ -5421,3 +5421,65 @@ test('MB1188-069: the merge returns copies, not the caller’s objects', () => {
   merged.carrie.version = 99;
   assert.equal(local.carrie.version, 2, 'the live map is not aliased by the merged one');
 });
+
+// ── Every synced key must declare its shape. No exceptions, no whitelist. ────
+//
+// This is the third time a key has been added without declaring its shape.
+// MB161-037 was `ai_spend`; the note in _expectedSyncType describes it exactly
+// ("every write is refused, which is what happened"). MB1188-069 did it again
+// with `staff_passcodes`, and the whole feature failed on real hardware with
+// "staff_passcodes expected array data" while 798 tests passed.
+//
+// The reason the suite missed it twice is that the identity test above checks a
+// HAND-WRITTEN list of keys, so a new key is invisible to it. This one walks
+// the real key list instead, so the next new key cannot slip through.
+
+test('MB1188-069: the passcode map is declared an object, not a list', () => {
+  const context = contextWith({});
+  vm.runInContext(`
+    var MAX_SYNC_PLAINTEXT_BYTES = 600000;
+    ${declaration('_ssIsProjectSyncKey')}
+    ${declaration('_expectedSyncType')}
+    globalThis.probe = {
+      typeOf: key => _expectedSyncType(key),
+      source: () => _expectedSyncType.toString(),
+    };
+  `, context);
+  const { typeOf, source } = context.probe;
+  assert.equal(typeOf('staff_passcodes'), 'object');
+  assert.match(source(), /'staff_passcodes'/,
+    'named in the object list, not left to the array default');
+  // Read from the file rather than the vm: SYNC_BASE_KEYS is declared far from
+  // these functions, so the slice does not carry it.
+  assert.match(script, /const SYNC_BASE_KEYS = Object\.freeze\(\[[\s\S]*?'staff_passcodes',/,
+    'and it is actually synced');
+  // The other object-shaped keys are still declared — this list is the thing
+  // that goes stale, and ai_spend (MB161-037) proved what happens when it does.
+  for (const key of ['room_overrides', 'room_by_instructor', 'room_time_rules',
+                     'spreadsheets', 'ai_spend']) {
+    assert.equal(typeOf(key), 'object', key);
+  }
+});
+
+test('MB1188-069: a passcode map passes the sync validator that refused it', () => {
+  const context = contextWith({});
+  vm.runInContext(`
+    var MAX_SYNC_PLAINTEXT_BYTES = 600000;
+    ${declaration('_ssIsProjectSyncKey')}
+    ${declaration('_estimateJsonBytes')}
+    ${declaration('_expectedSyncType')}
+    ${declaration('_validateSyncRecordList')}
+    ${declaration('normalizeSpreadsheetProject')}
+    globalThis.normalize = (key, value) => _normalizeSyncValue(key, value);
+    ${declaration('_normalizeSyncValue')}
+  `, context);
+  const value = {
+    'megan': { version: 1, active: { iterations: 310000, salt: 'AAAA', verifier: 'BBBB' } },
+    'dana ops': { version: 3, cleared: true },
+  };
+  const out = context.normalize('staff_passcodes', value);
+  assert.deepEqual(JSON.parse(JSON.stringify(out)), value, 'it survives the round trip untouched');
+  // The shape that was actually being sent when it failed.
+  assert.throws(() => context.normalize('staff_passcodes', [value]),
+    /staff_passcodes expected object data/, 'a list is refused, with the honest message');
+});
