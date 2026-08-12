@@ -3103,6 +3103,19 @@ async function importStaffDirectory(directory) {
     if (result?.ok !== true) return false;
     await refreshLoginProfiles();
     try { applyRolePermissions(); } catch (_) {}
+    // MB1188-081: main applied what it was allowed to. If it had to hold a role
+    // change back because no Owner is signed in, this import is NOT complete —
+    // returning true here marks the directory consumed, and the sync layer will
+    // never deliver that revision again. Reporting it as pending is what makes
+    // flushPendingDirectoryImport retry it at the next Owner sign-in.
+    if (Array.isArray(result.deferred) && result.deferred.length) {
+      const names = result.deferred.map(entry => entry?.name).filter(Boolean);
+      console.warn('[profiles] role changes held until an owner signs in:', names.join(', '));
+      showToast(
+        `Access changes for ${names.join(', ')} are waiting for Elizabeth to sign in on this Mac.`,
+        'warning');
+      return false;
+    }
     return true;
   } catch (error) {
     console.warn('[profiles] directory was not applied:', error?.message || error);
@@ -7049,11 +7062,9 @@ async function _initFirebaseInner() {
     // MB1188-047: apply first, publish second. Both orders "work"; only this
     // one cannot publish a vault that is known to be behind the shared copy.
     void (async () => {
-      // MB1188-078: finish any interrupted spreadsheet commit before anything
-      // else reads or publishes the workbook, so an orphaned project is put
-      // back rather than being read as "not there" and tombstoned later.
-      try { await _ssRecoverInterruptedSplitCommit(); }
-      catch (error) { console.warn('[spreadsheets] interrupted-save recovery failed:', error?.message || error); }
+      // MB1188-080: recovery is NOT here any more. It ran only when Firebase
+      // came up, which is the one condition it must not depend on. It is a
+      // post-login maintenance job now — see runPostLoginMaintenance.
       await flushPendingPasscodeApply();
       await flushPendingDirectoryImport();
       await flushPendingDirectoryPublication();
@@ -9511,6 +9522,7 @@ function _ssDurableWorkbook() {
 }
 
 function _ssReadStoredWorkbook(durable = false) {
+  const _perfStart = performance.now();
   const read = durable
     ? (key) => _ssDurableStoreValue(key)
     : (key) => STORE.get(key, null);
@@ -9543,7 +9555,10 @@ function _ssReadStoredWorkbook(durable = false) {
       _ssPendingProjectIds.push(entry.id);
     }
   }
-  return _ssAssembleWorkbook(index, documents);
+  const assembled = _ssAssembleWorkbook(index, documents);
+  _ssPerfRecord(durable ? 'assemble:durable' : 'assemble', performance.now() - _perfStart,
+    `${index.projects.length} project(s), ${documents.size} document(s)`);
+  return assembled;
 }
 
 // Write the projects an edit session touched, then the index. Each project is
@@ -9595,7 +9610,10 @@ function _ssClearCommitIntent() {
   try { localStorage.removeItem('tmb__ss_commit_intent'); } catch (_) {}
 }
 
-// Finishes an interrupted commit. Called at load, before the workbook is read.
+// Finishes an interrupted commit. MB1188-080: runs as the FIRST post-login
+// maintenance job — after the encrypted store is hydrated, before Firebase is
+// started, and before anybody can reach Spreadsheets. It needs no network, no
+// credentials and no bootstrap.
 //
 // A project document that is durable but that the index does not mention AT ALL
 // is an orphan from the interrupted write, and is put back. A project the index
@@ -9639,6 +9657,21 @@ async function _ssRecoverInterruptedSplitCommit() {
   });
   _ssClearCommitIntent();
   console.warn(`[spreadsheets] recovered ${orphans.length} project(s) from an interrupted save`);
+  // MB1188-080: converge rather than rely on ordering.
+  //
+  // Recovery is the first post-login maintenance job, so it normally finishes
+  // long before anybody opens Spreadsheets. But maintenance is not awaited by
+  // the page, so ordering alone is not a guarantee — this makes the repair show
+  // up whenever it lands. Never over a live edit: an unsaved workbook on screen
+  // outranks a cosmetic refresh, and the repair is already durable either way.
+  if (!_ssDirtyWorkbook && !_ssEditCell) {
+    try {
+      ssLoad();
+      if (document.getElementById('page-spreadsheets')?.classList.contains('active')) ssGoHome();
+    } catch (error) {
+      console.warn('[spreadsheets] recovered, but the view did not refresh:', error?.message || error);
+    }
+  }
   showToast(
     `${orphans.length} project${orphans.length === 1 ? '' : 's'} from an interrupted save ${orphans.length === 1 ? 'was' : 'were'} recovered.`,
     'warning');
@@ -9646,6 +9679,7 @@ async function _ssRecoverInterruptedSplitCommit() {
 }
 
 async function _ssCommitSplitWorkbook(dirtyBase, dirty, stagedActor) {
+  const _perfStart = performance.now();
   const at = new Date().toISOString();
   const written = [];
 
@@ -9756,6 +9790,10 @@ async function _ssCommitSplitWorkbook(dirtyBase, dirty, stagedActor) {
   for (const record of nextIndex.projects || []) {
     if (record?._deleted) _ssDeletedProjectIds.delete(String(record.id));
   }
+
+  // MB1188-083: the encrypted durable commit, counted by how many documents
+  // it wrote — never by what is in them.
+  _ssPerfRecord('commit', performance.now() - _perfStart, `${written.length} document(s)`);
 
   if (_syncReady && _syncBootstrapComplete) {
     for (const key of written) _scheduleSyncDrain(key).catch(() => {});
@@ -11639,6 +11677,7 @@ function initSpreadsheet() {
       _ssPaletteBuilt = true;
     }
   }
+  _ssStartLoopDelayProbe();
   ssLoad();
   _ssSelR = 0; _ssSelC = 0; _ssSelR2 = 0; _ssSelC2 = 0;
   _ssEditCell = null;
@@ -12333,6 +12372,23 @@ function _ssPerfRecord(phase, ms, detail) {
       ssPerfReport());
   }
   return ms;
+}
+
+// MB1188-083: event-loop delay, sampled rather than computed from a stall.
+//
+// A long render blocks the main thread, which is what "the app froze" actually
+// means. Comparing a 500ms timer against the wall clock costs nothing and
+// catches stalls no single phase timer would attribute.
+let _ssLoopProbeAt = 0;
+function _ssStartLoopDelayProbe() {
+  if (_ssLoopProbeAt) return;
+  _ssLoopProbeAt = performance.now();
+  setInterval(() => {
+    const now = performance.now();
+    const drift = now - _ssLoopProbeAt - 500;
+    _ssLoopProbeAt = now;
+    if (drift > 0) _ssPerfRecord('event-loop delay', drift);
+  }, 500);
 }
 
 // Exposed for support: ask somebody to run this and read the numbers back.
@@ -18679,6 +18735,15 @@ function renderLogs() {
     }
   }
 
+  // MB1188-082: recovery is drawn BEFORE the empty-state return.
+  //
+  // A deleted log whose concurrent edit was preserved is recoverable, and this
+  // is the only place to recover it from. It was rendered after the early
+  // return, so it vanished exactly when it mattered most: when every live log
+  // was deleted, or when a search happened to match none. The record was safe
+  // the whole time; the way back to it was not.
+  _renderDeletedLogRecovery();
+
   if (filtered.length === 0) {
     document.getElementById('log-entries').innerHTML = `
       <div class="empty-state">
@@ -18689,7 +18754,6 @@ function renderLogs() {
     return;
   }
 
-  _renderDeletedLogRecovery();
   document.getElementById('log-entries').innerHTML = visibleLogs.map(l => {
     const bodyHtml   = _logHighlight(escHtml(l.body), terms);
     const authorHtml = _logHighlight(escHtml(l.author), terms);
@@ -22425,6 +22489,20 @@ async function pruneOldLogs() {
 let _postLoginMaintenancePromise = Promise.resolve(true);
 async function runPostLoginMaintenance() {
   const jobs = [
+    // MB1188-080: FIRST, and deliberately here rather than in the Firebase
+    // bootstrap where it used to sit.
+    //
+    // The old call site was after `await _bootstrapSync()` inside initFirebase,
+    // downstream of Firebase auth. So a Mac that was offline, unconfigured, or
+    // refused by auth never recovered an interrupted commit at all: the project
+    // document and the intent both survived, and the project stayed invisible
+    // through every restart. The comment on the function claimed it ran at load
+    // before the workbook was read, which was simply not true.
+    //
+    // This job runs after the encrypted store is hydrated and before
+    // completeLogin starts Firebase, so it needs no network, no credentials and
+    // no bootstrap — and it finishes before the workbook is first assembled.
+    ['interrupted spreadsheet save recovery', _ssRecoverInterruptedSplitCommit],
     ['legacy demo cleanup', _purgeLegacyDemoDataOnce],
     ['room-data migration', migrateRoomData],
     ['retention cleanup', pruneOldLogs],

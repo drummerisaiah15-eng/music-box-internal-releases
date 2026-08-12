@@ -43,6 +43,9 @@ function splitApi() {
     console: { warn() {}, error() {}, log() {} },
     Date, Object, Map, Set, Array, JSON, Number, String, Boolean, Math, TextEncoder,
     _cloneJson: value => JSON.parse(JSON.stringify(value)),
+// MB1188-083: the spreadsheet hot paths record timing samples.
+    performance: { now: () => 0 },
+    _ssPerfRecord: () => 0,
   });
   vm.runInContext(`
     var SPREADSHEET_INDEX_SCHEMA = 2;
@@ -538,6 +541,9 @@ function routingApi(decCache = {}) {
     console: { warn() {}, error() {}, log() {} },
     Date, Object, Map, Set, Array, JSON, Number, String, Boolean, Math, TextEncoder,
     _cloneJson: value => JSON.parse(JSON.stringify(value)),
+// MB1188-083: the spreadsheet hot paths record timing samples.
+    performance: { now: () => 0 },
+    _ssPerfRecord: () => 0,
     _decCache: decCache,
     _estimateJsonBytes: value => JSON.stringify(value).length,
   });
@@ -665,6 +671,9 @@ function indexMergeApi() {
     console: { warn() {}, error() {}, log() {} },
     Date, Object, Map, Set, Array, JSON, Number, String, Boolean, TextEncoder,
     _cloneJson: value => JSON.parse(JSON.stringify(value)),
+// MB1188-083: the spreadsheet hot paths record timing samples.
+    performance: { now: () => 0 },
+    _ssPerfRecord: () => 0,
   });
   vm.runInContext(`
     var SPREADSHEET_INDEX_SCHEMA = 2;
@@ -937,6 +946,9 @@ function wiringApi({ store = {}, durable = {}, awaiting = false } = {}) {
     console: { warn() {}, error() {}, log() {}, info() {} },
     Date, Object, Map, Set, Array, JSON, Number, String, Boolean, Math, TextEncoder, Promise,
     _cloneJson: value => JSON.parse(JSON.stringify(value)),
+// MB1188-083: the spreadsheet hot paths record timing samples.
+    performance: { now: () => 0 },
+    _ssPerfRecord: () => 0,
     showToast: message => toasts.push(message),
     _newOperationId: () => 'op_' + committed.length,
     _serializeKeyMutation: (key, task) => task(),
@@ -1485,6 +1497,9 @@ function mergeApi() {
     currentUser: () => 'Emma Minnetto',
     _ssMirroringFromGoogle: false,
     _cloneJson: value => JSON.parse(JSON.stringify(value)),
+// MB1188-083: the spreadsheet hot paths record timing samples.
+    performance: { now: () => 0 },
+    _ssPerfRecord: () => 0,
   });
   vm.runInContext(`
     var MAX_SPREADSHEET_CELL_CHARS = 50000, MAX_SPREADSHEET_SHEETS = 25,
@@ -1677,6 +1692,9 @@ function normalizeApi() {
     Date, Object, Map, Set, Array, JSON, Number, String, Boolean, Math, TextEncoder,
     showToast() {},
     _cloneJson: value => JSON.parse(JSON.stringify(value)),
+// MB1188-083: the spreadsheet hot paths record timing samples.
+    performance: { now: () => 0 },
+    _ssPerfRecord: () => 0,
   });
   vm.runInContext(`
     var MAX_SPREADSHEET_CELL_CHARS = 50000, MAX_SPREADSHEET_SHEETS = 25,

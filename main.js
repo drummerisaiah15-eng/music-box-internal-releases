@@ -1047,12 +1047,42 @@ _secureHandle('quit-and-install', async () => {
 // read once, re-protected via safeStorage, then deleted.
 let _cachedStoreKey = null;
 
+// MB1188-084: atomic AND durable.
+//
+// write-to-temp plus rename gives atomicity — a reader never sees half a file.
+// It does NOT give durability: without fsync the bytes can still be in the
+// page cache when the power goes, and the rename can land before the contents.
+// The audit found the same gap one layer up, in the renderer; this closes it
+// for everything main owns, which is the vault — profiles, roles, tombstones,
+// passcode verifiers and lockouts.
+//
+// Three syncs, in the only order that is sound: the DATA first, so the file has
+// contents before anything points at it; then the rename; then the DIRECTORY,
+// so the rename itself survives. A failure to sync is a failure to write.
 function _atomicWriteFileSync(targetPath, data, mode = 0o600) {
   const tmpPath = `${targetPath}.tmp-${process.pid}-${crypto.randomBytes(6).toString('hex')}`;
+  let handle = null;
   try {
-    fs.writeFileSync(tmpPath, data, { mode });
+    handle = fs.openSync(tmpPath, 'w', mode);
+    fs.writeFileSync(handle, data);
+    fs.fsyncSync(handle);
+    fs.closeSync(handle);
+    handle = null;
     fs.renameSync(tmpPath, targetPath);
+    // Durability of the rename lives in the parent directory, not the file.
+    // Not fatal on the platforms that refuse it: the data is already synced,
+    // and refusing the whole write here would be worse than the residual risk.
+    let dir = null;
+    try {
+      dir = fs.openSync(path.dirname(targetPath), 'r');
+      fs.fsyncSync(dir);
+    } catch (error) {
+      console.warn('[storage] directory sync unavailable:', error?.message || error);
+    } finally {
+      if (dir !== null) { try { fs.closeSync(dir); } catch (_) {} }
+    }
   } catch (error) {
+    if (handle !== null) { try { fs.closeSync(handle); } catch (_) {} }
     try { fs.unlinkSync(tmpPath); } catch (_) {}
     throw error;
   }
@@ -1689,10 +1719,16 @@ function _removedCustomProfiles(vault) {
 const ASSIGNABLE_PROFILE_ROLES = Object.freeze(['Operations Manager', 'Operations & Events', 'Front Desk']);
 // MB1188-073: how much authority a role carries, for comparison only. Owner is
 // absent because it is never assignable — it is proved by the owner passcode.
+// MB1188-081: Operations & Events outranks Front Desk.
+//
+// Giving them the same rank made a "non-elevating" import able to move somebody
+// from Front Desk to Operations & Events laterally, which is a grant of access
+// they did not have. Rank is about AUTHORITY, not about how the roles feel:
+// anything that adds reach has to sit above what it adds reach to.
 const PROFILE_ROLE_RANK = Object.freeze({
   'Front Desk': 1,
-  'Operations & Events': 1,
-  'Operations Manager': 2,
+  'Operations & Events': 2,
+  'Operations Manager': 3,
 });
 
 function _profileRoleOverrides(vault) {
@@ -2540,7 +2576,7 @@ function _mergeDirectoryEntries(local, incoming) {
 // out privilege. So a non-Owner import may create, remove and keep profiles —
 // it simply cannot raise anybody above Front Desk. Roles already held locally
 // are preserved; only an INCREASE arriving from outside is refused.
-function _applyStaffDirectory(entries, { elevate = false } = {}) {
+function _applyStaffDirectory(entries, { elevate = false, deferred = [] } = {}) {
   if (!Array.isArray(entries) || entries.length > MAX_DIRECTORY_ENTRIES) {
     throw new Error('The staff directory is invalid.');
   }
@@ -2588,7 +2624,17 @@ function _applyStaffDirectory(entries, { elevate = false } = {}) {
     if (!elevate && role !== 'Owner') {
       // What this Mac already believes, which an import may confirm but not raise.
       const held = _roleForAppProfile(name) || APP_PROFILE_ROLES[name] || 'Front Desk';
-      if (PROFILE_ROLE_RANK[role] > (PROFILE_ROLE_RANK[held] ?? 0)) role = held;
+      if (PROFILE_ROLE_RANK[role] > (PROFILE_ROLE_RANK[held] ?? 0)) {
+        // MB1188-081: RECORDED, not swallowed.
+        //
+        // This used to drop the elevation and report success. The sync layer
+        // persists the revision before calling this, so the directory was
+        // marked consumed and never delivered again — two Macs left permanently
+        // disagreeing about somebody's role, decided by nothing more than who
+        // happened to be signed in when it arrived.
+        deferred.push({ name, requested: role, held });
+        role = held;
+      }
     }
     if (role !== 'Owner' && APP_PROFILE_ROLES[name] !== role) overrides[name] = role;
     if (!isBuiltIn) {
@@ -2649,10 +2695,15 @@ _secureHandle('app-session-export-directory', async () => {
 _secureHandle('app-session-import-directory', async (_, directory) => {
   _requireAppRole(COMMUNICATION_ROLES);
   // MB1188-073: only an Owner session may let an import raise a role.
+  // MB1188-081: and whatever that refused is reported back, so the renderer can
+  // keep the debt and settle it the next time an Owner signs in. A partial
+  // apply that claims success is how two Macs disagree forever.
+  const deferred = [];
   const profiles = _applyStaffDirectory(directory, {
     elevate: _appSessionHasRole(new Set(['Owner'])),
+    deferred,
   });
-  return { ok: true, profiles };
+  return { ok: true, profiles, deferred, applied: deferred.length === 0 };
 });
 
 // ── MB161-014: Google Sheets, read-only ─────────────────────────────────────

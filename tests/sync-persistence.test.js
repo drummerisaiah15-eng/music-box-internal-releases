@@ -57,6 +57,9 @@ function contextWith(values = {}) {
     BigInt,
     showToast() {},
     _decCache: {},
+// MB1188-083: the spreadsheet hot paths record timing samples.
+    performance: { now: () => 0 },
+    _ssPerfRecord: () => 0,
     // Declared beside the functions in index.html, so some declaration()
     // slices carry them and some do not. Supplying them as context globals
     // works either way: a lexical declaration in the script simply shadows it.

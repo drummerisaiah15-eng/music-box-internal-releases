@@ -2685,3 +2685,90 @@ test('P1-1 / MB1188-075: a corrupt lockout record cannot lock somebody out forev
   assert.equal(load('not an object').until, 0);
   assert.equal(load([]).until, 0);
 });
+
+// ── 1.3.14 audit: durability and the role-rank hole ─────────────────────────
+
+test('P1-2 / MB1188-084: the vault write is durable, not merely atomic', () => {
+  const write = extractFunction(main, '_atomicWriteFileSync');
+  // rename alone gives atomicity. Durability needs the DATA synced before the
+  // rename, and the DIRECTORY synced after it, or a power loss can land the
+  // rename without the contents.
+  const dataSync = write.indexOf('fs.fsyncSync(handle)');
+  const rename = write.indexOf('fs.renameSync(tmpPath, targetPath)');
+  const dirSync = write.indexOf('fs.fsyncSync(dir)');
+  assert.ok(dataSync !== -1 && rename !== -1 && dirSync !== -1, 'all three steps exist');
+  assert.ok(dataSync < rename, 'the file is synced before anything points at it');
+  assert.ok(rename < dirSync, 'the directory is synced after the rename');
+  // A failed data sync must fail the write; only the directory sync is tolerated.
+  assert.match(write, /catch \(error\) \{[\s\S]*?directory sync unavailable/);
+  assert.match(write, /try \{ fs\.unlinkSync\(tmpPath\); \} catch \(_\) \{\}/,
+    'a failed write leaves no temp file behind');
+  assert.match(write, /if \(handle !== null\) \{ try \{ fs\.closeSync\(handle\); \}/,
+    'and no leaked descriptor');
+});
+
+test('P1-2 / MB1188-084: a real crash-order check on the durable write', () => {
+  // Executed, not asserted from source: the sequence of syscalls is the whole
+  // guarantee, so it is recorded and checked in order.
+  const calls = [];
+  const fakeFs = {
+    openSync: (p, mode) => { calls.push(`open:${String(p).includes('.tmp-') ? 'tmp' : 'dir'}`); return 7; },
+    writeFileSync: () => calls.push('write'),
+    fsyncSync: () => calls.push('fsync'),
+    closeSync: () => calls.push('close'),
+    renameSync: () => calls.push('rename'),
+    unlinkSync: () => calls.push('unlink'),
+  };
+  const sandbox = vm.createContext({
+    fs: fakeFs,
+    path: { dirname: () => '/dir' },
+    crypto: { randomBytes: () => ({ toString: () => 'abc123' }) },
+    process: { pid: 1 },
+    console: { warn() {} },
+  });
+  vm.runInContext(`${extractFunction(main, '_atomicWriteFileSync')}; this.write = _atomicWriteFileSync;`, sandbox);
+  sandbox.write('/dir/vault.bin', 'data');
+  assert.deepEqual(calls,
+    ['open:tmp', 'write', 'fsync', 'close', 'rename', 'open:dir', 'fsync', 'close'],
+    'data synced, then renamed, then the directory synced');
+});
+
+test('P0-3 / MB1188-081: Operations & Events outranks Front Desk', () => {
+  // Equal rank meant a "non-elevating" import could move somebody from Front
+  // Desk to Operations & Events — a grant of access they did not have.
+  const sandbox = vm.createContext({ Object });
+  vm.runInContext(`${main.slice(main.indexOf('const PROFILE_ROLE_RANK'),
+    main.indexOf('function _profileRoleOverrides'))}; this.rank = PROFILE_ROLE_RANK;`, sandbox);
+  const rank = sandbox.rank;
+  assert.ok(rank['Operations & Events'] > rank['Front Desk'],
+    'moving up to Operations & Events is an elevation');
+  assert.ok(rank['Operations Manager'] > rank['Operations & Events']);
+  assert.equal(rank.Owner, undefined, 'Owner is never assignable, so it has no rank');
+});
+
+test('P0-3 / MB1188-081: main reports what it refused to apply', () => {
+  const apply = main.slice(main.indexOf('function _applyStaffDirectory'),
+                           main.indexOf("_secureHandle('app-session-export-directory'"));
+  assert.match(apply, /function _applyStaffDirectory\(entries, \{ elevate = false, deferred = \[\] \} = \{\}\)/);
+  assert.match(apply, /deferred\.push\(\{ name, requested: role, held \}\);/);
+  const handler = extractHandlerBody(main, 'app-session-import-directory');
+  assert.match(handler, /const deferred = \[\];/);
+  assert.match(handler, /return \{ ok: true, profiles, deferred, applied: deferred\.length === 0 \};/,
+    'the caller can tell a complete apply from a partial one');
+});
+
+test("P0-2: Operations Manager removal is Isaiah's decision, not an oversight", () => {
+  // Two audits have now called this a defect. It is not: asked directly on
+  // 2026-08-12, Isaiah chose to split what MB161-031 granted — adding and
+  // removing profiles is routine onboarding and stays with the Operations
+  // Manager; changing a ROLE is granting privilege and went back to the Owner.
+  // Recorded here so the next audit argues with the decision, not the code.
+  const removeBody = main.slice(main.indexOf("_secureHandle('app-session-remove-staff-profile'"));
+  assert.match(removeBody.slice(0, 200), /_requireAppRole\(OPERATIONS_MANAGER_ROLES\)/,
+    'removal is deliberately available to an Operations Manager');
+  const roleBody = main.slice(main.indexOf("_secureHandle('app-session-set-profile-role'"));
+  assert.match(roleBody.slice(0, 300), /_requireAppRole\(new Set\(\['Owner'\]\)\)/,
+    'granting a role is Owner-only');
+  // The half that actually closed the escalation chain.
+  assert.match(main, /elevate: _appSessionHasRole\(new Set\(\['Owner'\]\)\)/);
+});

@@ -2674,11 +2674,21 @@ test('P0-2 / MB1188-078: recovery completes an interrupted commit but never resu
   assert.match(recover, /if \(named\.has\(id\)\) continue;/);
   assert.match(recover, /if \(!doc\) continue;/, 'a document that never landed is not invented');
   assert.match(recover, /_ssClearCommitIntent\(\);/);
-  // Runs before anything reads or publishes the workbook.
+  // MB1188-080: it must NOT be reachable only through Firebase. The original
+  // call sat after `await _bootstrapSync()` inside initFirebase, so an offline
+  // or unauthenticated Mac never recovered at all.
   const whole = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
-  const at = whole.indexOf('_ssRecoverInterruptedSplitCommit()');
-  assert.ok(at !== -1 && at < whole.indexOf('await flushPendingDirectoryPublication()'),
-    'recovery runs before publication');
+  const jobs = whole.slice(whole.indexOf('async function runPostLoginMaintenance'));
+  assert.match(jobs.slice(0, 1200),
+    /\['interrupted spreadsheet save recovery', _ssRecoverInterruptedSplitCommit\]/,
+    'recovery is a post-login maintenance job, which runs before Firebase starts');
+  // And it is FIRST, so nothing else reads or publishes the workbook before it.
+  const list = jobs.slice(jobs.indexOf('const jobs = ['), jobs.indexOf('];'));
+  assert.ok(list.indexOf('interrupted spreadsheet save recovery') < list.indexOf('legacy demo cleanup'),
+    'and it runs first');
+  const fbBlock = whole.slice(whole.indexOf('_syncBootstrapComplete = true;'));
+  assert.doesNotMatch(fbBlock.slice(0, 2500), /await _ssRecoverInterruptedSplitCommit\(\)/,
+    'the Firebase-gated call is gone');
 });
 
 test('P0-3 / MB1188-074: a passcode that could not be applied is remembered and retried', () => {
@@ -2830,4 +2840,66 @@ test('P2 / MB1188-079: the hot paths are instrumented', () => {
   // The sample carries the shape, so a slow render can be told from a big sheet.
   assert.match(grid, /\$\{rows\}x\$\{cols\}, \$\{Object\.keys\(cells\)\.length\} cells/);
   assert.match(namedFunctionSource('ssPerfReport'), /medianMs/);
+});
+
+// ── 1.3.14 audit: verified findings ─────────────────────────────────────────
+
+test('P0-1 / MB1188-080: recovery does not depend on Firebase, and converges', () => {
+  const recover = namedFunctionSource('_ssRecoverInterruptedSplitCommit');
+  // It repairs durably first, then refreshes what is on screen — and never
+  // over a live edit, which outranks a cosmetic refresh.
+  assert.ok(recover.indexOf('_ssClearCommitIntent();') < recover.indexOf('ssLoad();'),
+    'the repair is durable before the view is touched');
+  assert.match(recover, /if \(!_ssDirtyWorkbook && !_ssEditCell\) \{/);
+  assert.match(recover, /catch \(error\) \{[\s\S]*?did not refresh/,
+    'a failed refresh does not undo a successful repair');
+  // The comment that made this defect hard to see is gone.
+  const whole = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  assert.doesNotMatch(whole, /Called at load, before the workbook is read/);
+});
+
+test('P0-3 / MB1188-081: a held-back role change is reported, not swallowed', () => {
+  const whole = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const importFn = namedFunctionSource('importStaffDirectory');
+  // Returning true marks the directory consumed; the sync layer never delivers
+  // that revision again. A partial apply must therefore report itself unapplied.
+  assert.match(importFn, /Array\.isArray\(result\.deferred\) && result\.deferred\.length/);
+  assert.ok(importFn.indexOf('result.deferred') < importFn.lastIndexOf('return true;'),
+    'the deferral is checked before success is returned');
+  assert.match(importFn, /return false;/);
+  assert.match(importFn, /waiting for Elizabeth to sign in/, 'and the person is told');
+  // The pending marker is what drives the retry, and publication stays blocked
+  // while it is set — otherwise this Mac would publish its stale vault.
+  assert.match(whole, /_setDirectoryImportPending\(!applied\);/);
+  assert.match(namedFunctionSource('publishStaffDirectory'), /if \(_directoryImportPending\(\)\) \{/);
+});
+
+test('P1-1 / MB1188-082: deleted-log recovery survives an empty view', () => {
+  const render = namedFunctionSource('renderLogs');
+  const recovery = render.indexOf('_renderDeletedLogRecovery();');
+  const emptyReturn = render.indexOf('if (filtered.length === 0) {');
+  assert.ok(recovery !== -1 && emptyReturn !== -1);
+  assert.ok(recovery < emptyReturn,
+    'recovery is drawn before the empty-state return, so a search that matches ' +
+    'nothing cannot hide the only way back to a deleted log');
+  // Exactly one call site — two would drift.
+  assert.equal((render.match(/_renderDeletedLogRecovery\(\);/g) || []).length, 1);
+});
+
+test('P2 / MB1188-083: instrumentation covers more than render, and leaks nothing', () => {
+  const whole = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  // The assemble sample names itself by mode, so match the whole argument.
+  const phases = [...whole.matchAll(/_ssPerfRecord\(\s*(?:durable \? '[a-z:]+' : )?'([a-z:\- ]+)'/g)]
+    .map(m => m[1]);
+  for (const phase of ['assemble', 'commit', 'render', 'event-loop delay']) {
+    assert.ok(phases.includes(phase), `${phase} is instrumented`);
+  }
+  // The detail string must never carry user content. Cell values, profile
+  // names and project ids are all out; counts and shapes are in.
+  const commit = namedFunctionSource('_ssCommitSplitWorkbook');
+  assert.match(commit, /`\$\{written\.length\} document\(s\)`/);
+  const assemble = namedFunctionSource('_ssReadStoredWorkbook');
+  assert.match(assemble, /project\(s\), \$\{documents\.size\} document\(s\)/);
+  const probe = namedFunctionSource('_ssStartLoopDelayProbe');
+  assert.match(probe, /if \(_ssLoopProbeAt\) return;/, 'one probe, not one per page visit');
 });
