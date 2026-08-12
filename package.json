@@ -1,6 +1,6 @@
 {
   "name": "music-box-internal",
-  "version": "1.3.13",
+  "version": "1.3.14",
   "description": "The Music Box — Internal Operations",
   "main": "main.js",
   "scripts": {
@@ -95,7 +95,7 @@
   "devDependencies": {
     "@electron/asar": "3.4.1",
     "@electron/fuses": "1.8.0",
-    "electron": "43.2.0",
+    "electron": "^43.4.0",
     "electron-builder": "26.15.7",
     "firebase": "12.15.0",
     "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"

@@ -12310,7 +12310,47 @@ function ssPickCellOption(r, c, option) {
   ssSave(); ssRenderGrid(); ssUpdateToolbar();
 }
 
+// MB1188-079: measure the spreadsheet hot paths, cheaply and always.
+//
+// The audit measured a cold 10,000-cell workbook at ~253ms to normalize, ~201ms
+// to merge and ~888ms to render, with the event loop blocked for ~316ms. None
+// of that was visible from inside the app, so nobody could tell a slow Mac from
+// a slow sheet. This records the last few samples per phase and says something
+// only when a single pass crosses a threshold a person would actually feel.
+const _ssPerfSamples = new Map();
+const SS_PERF_SLOW_MS = 250;
+
+function _ssPerfRecord(phase, ms, detail) {
+  let samples = _ssPerfSamples.get(phase);
+  if (!samples) { samples = []; _ssPerfSamples.set(phase, samples); }
+  samples.push(ms);
+  if (samples.length > 20) samples.shift();
+  if (ms >= SS_PERF_SLOW_MS) {
+    // The report comes with it: one slow pass on its own says nothing about
+    // whether this Mac is always slow or this sheet is unusual.
+    console.warn(
+      `[spreadsheets] ${phase} took ${Math.round(ms)}ms${detail ? ' — ' + detail : ''}`,
+      ssPerfReport());
+  }
+  return ms;
+}
+
+// Exposed for support: ask somebody to run this and read the numbers back.
+function ssPerfReport() {
+  const report = {};
+  for (const [phase, samples] of _ssPerfSamples) {
+    const sorted = [...samples].sort((a, b) => a - b);
+    report[phase] = {
+      samples: sorted.length,
+      medianMs: Math.round(sorted[Math.floor(sorted.length / 2)]),
+      maxMs: Math.round(sorted[sorted.length - 1]),
+    };
+  }
+  return report;
+}
+
 function ssRenderGrid() {
+  const _perfStart = performance.now();
   const sheet = ssActiveSheet();
   const table = document.getElementById('ss-grid');
   if (!sheet || !table) return;
@@ -12331,18 +12371,25 @@ function ssRenderGrid() {
   html += '</tr></thead><tbody>';
 
   // Build a set of cells that are covered by a merge (should be skipped during render)
+  //
+  // MB1188-079: walks the cells that EXIST, not every grid position. A sheet is
+  // 500x100 = 50,000 positions but holds at most 10,000 cells, and only a cell
+  // that exists can carry rs/cs — so the old full-grid sweep did five times the
+  // work to find the same merges, before a single row was emitted. Same set,
+  // same order of insertion for any given merge; only the scan is narrower.
   const skipped = new Set();
-  for (let r = 0; r < rows; r++) {
-    for (let c = 0; c < cols; c++) {
-      const cell = cells[ssKey(r,c)] || {};
-      if ((cell.rs > 1 || cell.cs > 1) && !cell._skip) {
-        const rSpan = cell.rs || 1, cSpan = cell.cs || 1;
-        for (let dr = 0; dr < rSpan; dr++) {
-          for (let dc = 0; dc < cSpan; dc++) {
-            if (dr === 0 && dc === 0) continue;
-            skipped.add(ssKey(r+dr, c+dc));
-          }
-        }
+  for (const key in cells) {
+    const cell = cells[key];
+    if (!cell || cell._skip || !(cell.rs > 1 || cell.cs > 1)) continue;
+    const comma = key.indexOf(',');
+    if (comma < 0) continue;
+    const r = +key.slice(0, comma), c = +key.slice(comma + 1);
+    if (!Number.isInteger(r) || !Number.isInteger(c)) continue;
+    const rSpan = cell.rs || 1, cSpan = cell.cs || 1;
+    for (let dr = 0; dr < rSpan; dr++) {
+      for (let dc = 0; dc < cSpan; dc++) {
+        if (dr === 0 && dc === 0) continue;
+        skipped.add(ssKey(r + dr, c + dc));
       }
     }
   }
@@ -12351,8 +12398,12 @@ function ssRenderGrid() {
     const rowSel = r>=r1 && r<=r2;
     html += `<tr><th class="ss-row-num${rowSel?' ss-hdr-sel':''}">${r+1}</th>`;
     for (let c = 0; c < cols; c++) {
-      if (skipped.has(ssKey(r,c))) continue;  // covered by a merged cell
-      const cell = cells[ssKey(r,c)] || {};
+      // MB1188-079: one key per cell, not two. This is the innermost statement
+      // of the innermost loop — at 50,000 positions the second concatenation
+      // was 50,000 avoidable strings per render.
+      const key = ssKey(r, c);
+      if (skipped.has(key)) continue;  // covered by a merged cell
+      const cell = cells[key] || {};
       const editing = _ssEditCell?.r===r && _ssEditCell?.c===c;
       const selected = r===_ssSelR && c===_ssSelC && !_ssEditCell;
       const inRange = r>=r1&&r<=r2&&c>=c1&&c<=c2;
@@ -12397,6 +12448,8 @@ function ssRenderGrid() {
   }
   html += '</tbody>';
   table.innerHTML = html;
+  _ssPerfRecord('render', performance.now() - _perfStart,
+    `${rows}x${cols}, ${Object.keys(cells).length} cells`);
 
   if (_ssEditCell) {
     const inp = document.getElementById('ss-inp');

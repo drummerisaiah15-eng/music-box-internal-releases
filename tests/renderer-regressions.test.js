@@ -2754,3 +2754,80 @@ test('P1-3 / MB1188-077: the Electron wrapper is stripped, the message is not', 
   assert.equal(f(new Error('Choose a 4-digit passcode.')), 'Choose a 4-digit passcode.');
   assert.equal(f('plain string'), 'plain string');
 });
+
+// ── P2 / MB1188-079: the large-workbook hot path ────────────────────────────
+
+test('P2 / MB1188-079: the merge pre-pass walks cells, not every grid position', () => {
+  const grid = namedFunctionSource('ssRenderGrid');
+  // A 500x100 sheet is 50,000 positions but holds at most 10,000 cells, and
+  // only a cell that EXISTS can carry rs/cs. The old sweep did the full grid
+  // before emitting a single row.
+  assert.match(grid, /for \(const key in cells\) \{/);
+  assert.doesNotMatch(grid.slice(0, grid.indexOf('for (let r = 0; r < rows; r++) {')),
+    /for \(let c = 0; c < cols; c\+\+\) \{\s*\n\s*const cell = cells\[ssKey\(r,c\)\]/,
+    'no full-grid sweep before the row loop');
+  // And one key per cell in the innermost loop, not two.
+  assert.match(grid, /const key = ssKey\(r, c\);\s*\n\s*if \(skipped\.has\(key\)\) continue;/);
+  assert.match(grid, /const cell = cells\[key\] \|\| \{\};/);
+});
+
+test('P2 / MB1188-079: the narrower scan finds exactly the same merged cells', () => {
+  // The optimization is only sound if the skip set is identical. Both versions
+  // are executed against the same sheets and compared.
+  const context = vm.createContext({});
+  vm.runInContext(`
+    function ssKey(r,c){ return r+','+c; }
+    function oldSkip(rows, cols, cells){
+      const skipped=new Set();
+      for(let r=0;r<rows;r++) for(let c=0;c<cols;c++){
+        const cell=cells[ssKey(r,c)]||{};
+        if((cell.rs>1||cell.cs>1)&&!cell._skip){
+          const rSpan=cell.rs||1,cSpan=cell.cs||1;
+          for(let dr=0;dr<rSpan;dr++) for(let dc=0;dc<cSpan;dc++){
+            if(dr===0&&dc===0) continue; skipped.add(ssKey(r+dr,c+dc)); } } }
+      return skipped;
+    }
+    function newSkip(rows, cols, cells){
+      const skipped=new Set();
+      for(const key in cells){
+        const cell=cells[key];
+        if(!cell||cell._skip||!(cell.rs>1||cell.cs>1)) continue;
+        const comma=key.indexOf(','); if(comma<0) continue;
+        const r=+key.slice(0,comma), c=+key.slice(comma+1);
+        if(!Number.isInteger(r)||!Number.isInteger(c)) continue;
+        const rSpan=cell.rs||1,cSpan=cell.cs||1;
+        for(let dr=0;dr<rSpan;dr++) for(let dc=0;dc<cSpan;dc++){
+          if(dr===0&&dc===0) continue; skipped.add(ssKey(r+dr,c+dc)); } }
+      return skipped;
+    }
+    this.compare = (rows, cols, cells) => {
+      const a = oldSkip(rows, cols, cells), b = newSkip(rows, cols, cells);
+      return a.size === b.size && [...a].every(k => b.has(k));
+    };
+  `, context);
+  const compare = context.compare;
+
+  assert.ok(compare(10, 10, {}), 'an empty sheet');
+  assert.ok(compare(10, 10, { '0,0': { v: 'a' }, '5,5': { v: 'b' } }), 'no merges');
+  assert.ok(compare(10, 10, { '0,0': { v: 'm', rs: 2, cs: 3 } }), 'one merge at the origin');
+  assert.ok(compare(10, 10, { '9,9': { v: 'm', rs: 3, cs: 3 } }), 'a merge running off the edge');
+  assert.ok(compare(10, 10, { '2,2': { v: 'm', rs: 2, cs: 2 }, '2,3': { _skip: true } }),
+    'a covered cell that is already marked _skip');
+  assert.ok(compare(10, 10, { '1,1': { v: 'm', rs: 4, cs: 1 }, '5,1': { v: 'n', cs: 4 } }),
+    'row-span and column-span together');
+  // Keys that could not come from ssKey must not throw or invent skips.
+  assert.ok(compare(10, 10, { 'nonsense': { rs: 2 }, '1,1': { v: 'a' } }), 'a malformed key');
+  assert.ok(compare(10, 10, { '1,1': null }), 'a null cell');
+});
+
+test('P2 / MB1188-079: the hot paths are instrumented', () => {
+  const record = namedFunctionSource('_ssPerfRecord');
+  assert.match(record, /samples\.length > 20/, 'bounded, so it cannot grow forever');
+  assert.match(record, /ms >= SS_PERF_SLOW_MS/, 'quiet unless a pass is actually slow');
+  const grid = namedFunctionSource('ssRenderGrid');
+  assert.match(grid, /const _perfStart = performance\.now\(\);/);
+  assert.match(grid, /_ssPerfRecord\('render', performance\.now\(\) - _perfStart/);
+  // The sample carries the shape, so a slow render can be told from a big sheet.
+  assert.match(grid, /\$\{rows\}x\$\{cols\}, \$\{Object\.keys\(cells\)\.length\} cells/);
+  assert.match(namedFunctionSource('ssPerfReport'), /medianMs/);
+});
