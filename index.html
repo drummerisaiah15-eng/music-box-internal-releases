@@ -3178,6 +3178,23 @@ async function renderStaffPasscodeSection() {
   if (next) next.value = '';
 }
 
+// MB1188-071: main has already written the vault by the time this runs, so the
+// passcode IS in force on this Mac. Reporting the sharing failure as a plain
+// failure was a lie in the worst direction: it tells somebody their passcode
+// was not set, moments before it starts being demanded of them. Say what is
+// actually true — set here, not yet shared.
+async function _shareStaffPasscodeRecord(name, record, appliedMessage) {
+  try {
+    await _persistStaffPasscodeRecord(name, record);
+    showToast(appliedMessage, 'success');
+  } catch (error) {
+    console.warn('[passcode] not shared with the other Mac:', error?.message || error);
+    showToast(
+      `${appliedMessage} It could not be shared with the other Mac yet, so only this one knows about it for now.`,
+      'warning');
+  }
+}
+
 async function saveStaffPasscode() {
   const next = document.getElementById('staff-pin-new')?.value?.trim() || '';
   const current = document.getElementById('staff-pin-current')?.value?.trim() || '';
@@ -3198,8 +3215,8 @@ async function saveStaffPasscode() {
     // Written to the synced store SECOND. Main already holds it, so a failure
     // here leaves this Mac protected and the other one not — annoying, and far
     // better than the reverse.
-    await _persistStaffPasscodeRecord(result.name, result.record);
-    showToast('Passcode saved. You will be asked for it next time you sign in.', 'success');
+    await _shareStaffPasscodeRecord(result.name, result.record,
+      'Passcode saved. You will be asked for it next time you sign in.');
   } catch (error) {
     showToast(String(error?.message || error), 'danger');
     return false;
@@ -3239,8 +3256,11 @@ async function _clearStaffPasscode(name, currentPin) {
   try {
     const result = await window.electronSession.clearStaffPasscode({ name, currentPin });
     if (result?.ok !== true) throw new Error('The passcode was not removed.');
-    if (result.record) await _persistStaffPasscodeRecord(result.name, result.record);
-    showToast('Passcode removed.', 'success');
+    if (result.record) {
+      await _shareStaffPasscodeRecord(result.name, result.record, 'Passcode removed.');
+    } else {
+      showToast('Passcode removed.', 'success');
+    }
   } catch (error) {
     showToast(String(error?.message || error), 'danger');
     return false;

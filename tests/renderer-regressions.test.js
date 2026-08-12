@@ -2585,3 +2585,32 @@ test('MB1188-070: an empty migration set cannot throw on somebody else’s error
   assert.match(body, /const wanted = keys \? new Set\(keys\) : null;/);
   assert.match(body, /\.filter\(\(\[key\]\) => !wanted \|\| wanted\.has\(key\)\)/);
 });
+
+// ── MB1188-071: a sharing failure is not a save failure ─────────────────────
+//
+// Main writes the vault first, so by the time the store write runs the passcode
+// is already in force on this Mac. Reporting the store failure as
+// "Missing or insufficient permissions" told the person their passcode was not
+// set — moments before it started being demanded of them at sign-in.
+
+test('MB1188-071: a passcode that saved locally is not reported as failed', () => {
+  const share = namedFunctionSource('_shareStaffPasscodeRecord');
+  assert.match(share, /await _persistStaffPasscodeRecord\(name, record\);/);
+  assert.match(share, /catch \(error\)/);
+  assert.match(share, /could not be shared with the other Mac yet/);
+  // A warning, not a danger: something real did happen. (namedFunctionSource
+  // slices to the next plain `function`, so this async one carries the next
+  // declaration too — assert on the sharing toast itself, not the whole slice.)
+  const notice = share.slice(share.indexOf('could not be shared') - 200,
+                             share.indexOf('could not be shared') + 200);
+  assert.match(notice, /'warning'\)/);
+  assert.doesNotMatch(notice, /'danger'/);
+
+  // Both callers go through it, so neither can drift back to the raw error.
+  const save = namedFunctionSource('saveStaffPasscode');
+  assert.match(save, /_shareStaffPasscodeRecord\(result\.name, result\.record,/);
+  assert.doesNotMatch(save, /await _persistStaffPasscodeRecord\(/);
+  const clear = namedFunctionSource('_clearStaffPasscode');
+  assert.match(clear, /_shareStaffPasscodeRecord\(result\.name, result\.record, 'Passcode removed\.'\)/);
+  assert.doesNotMatch(clear, /await _persistStaffPasscodeRecord\(/);
+});
