@@ -2428,6 +2428,7 @@
             <label class="form-label">Your Role</label>
             <select id="pref-role" class="form-select" disabled>
               <option>Owner</option>
+              <option>Operations Manager</option>
               <option>Operations &amp; Events</option>
               <option>Front Desk</option>
             </select>
@@ -2462,8 +2463,8 @@
           </div>
         </div>
         <div id="manage-profiles-section" style="margin-top:20px;padding-top:16px;border-top:1px solid var(--divider);display:none">
-          <div style="font-size:13px;font-weight:600;margin-bottom:6px;color:var(--text-secondary)">Manage Users (Elizabeth only)</div>
-          <div style="font-size:11.5px;color:var(--text-muted);margin-bottom:10px;line-height:1.5;max-width:640px">
+          <div id="manage-profiles-title" style="font-size:13px;font-weight:600;margin-bottom:6px;color:var(--text-secondary)">Manage Users</div>
+          <div id="manage-profiles-description" style="font-size:11.5px;color:var(--text-muted);margin-bottom:10px;line-height:1.5;max-width:640px">
             Change anyone's role, or remove their login from this Mac. Their past
             tasks and log entries are kept — only the login is removed. Owner is
             proved by the owner passcode, so it cannot be reassigned and the last
@@ -2895,7 +2896,26 @@ async function publishStaffDirectory() {
       _setDirectoryPublicationPending(true);
       return false;
     }
-    await STORE.replace('staff_directory', result.directory, { authoritative: 'owner-published directory snapshot' });
+    return await _persistAuthorizedDirectorySnapshot(result.directory);
+  } catch (error) {
+    console.warn('[profiles] directory was not published:', error?.message || error);
+    _setDirectoryPublicationPending(true);
+    return false;
+  }
+}
+
+// Main returns this snapshot only after it has authoritatively changed its
+// protected vault. Merge the versioned records semantically so an Operations
+// Manager removing one ordinary profile cannot erase a concurrent change to a
+// different profile on the other Mac.
+async function _persistAuthorizedDirectorySnapshot(directory) {
+  if (!Array.isArray(directory)) throw new Error('The protected profile update is invalid.');
+  try {
+    await STORE.mutate('staff_directory', current =>
+      _mergeTombstonedRecordLists(
+        Array.isArray(current) ? current : [],
+        directory,
+      ), []);
     // Clear the marker only once the write is durable. When Firebase is up we
     // also wait for it to take the record; when it is not, the write stays
     // durably pending and the post-bootstrap drain delivers it.
@@ -3171,15 +3191,19 @@ async function refreshLoginProfiles() {
 function renderManageProfiles() {
   const list = document.getElementById('manage-profiles-list');
   if (!list) return;
-  if (!isElizabeth()) { list.innerHTML = ''; return; }
+  const owner = isElizabeth();
+  const operationsManager = isOperationsManager();
+  if (!owner && !operationsManager) { list.innerHTML = ''; return; }
   const signedIn = currentUser();
   const ownerCount = _loginProfiles.filter(p => p.role === 'Owner').length;
   const rows = _loginProfiles.map(profile => {
     const isOwner = profile.role === 'Owner';
     const lastOwner = isOwner && ownerCount <= 1;
     // Owner is proved by the owner passcode, so it is not an assignable role.
-    const roleEditable = !isOwner;
-    const removable = profile.name !== signedIn && !lastOwner;
+    const roleEditable = owner && !isOwner;
+    const protectedFromManager = isOwner || profile.role === 'Operations Manager';
+    const removable = profile.name !== signedIn &&
+      (owner ? !lastOwner : !protectedFromManager);
     const why = profile.name === signedIn ? 'Signed in'
       : lastOwner ? 'Last owner' : '';
     const roleCell = roleEditable
@@ -3189,7 +3213,7 @@ function renderManageProfiles() {
              `<option value="${escAttr(r)}" ${r === profile.role ? 'selected' : ''}>${escHtml(r)}</option>`
            ).join('')}
          </select>`
-      : `<span style="width:190px;font-size:12.5px;color:var(--text-muted)">Owner</span>`;
+      : `<span style="width:190px;font-size:12.5px;color:var(--text-muted)">${escHtml(profile.role)}</span>`;
     return `<div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--divider);flex-wrap:wrap">
       <span style="flex:1;min-width:160px">
         <strong>${escHtml(profile.name)}</strong>
@@ -3197,7 +3221,7 @@ function renderManageProfiles() {
           ? '<span style="color:var(--text-muted);font-size:11px"> · built-in</span>' : ''}
       </span>
       ${roleCell}
-      ${_loginProfileIsProtected(profile.name)
+      ${owner && _loginProfileIsProtected(profile.name)
         ? `<button class="btn btn-ghost btn-sm" title="Remove this person's sign-in passcode so they can set a new one"
              onclick="clearStaffPasscodeFor(${jsArg(profile.name)})">Reset passcode</button>`
         : ''}
@@ -3214,12 +3238,16 @@ function renderManageProfiles() {
          <span style="flex:1;min-width:220px;font-size:12.5px">
            Profile changes made on this Mac have not been shared with the other Macs yet.
          </span>
-         <button class="btn btn-outline btn-sm" onclick="retryDirectoryPublication()">Share now</button>
+         ${owner
+           ? '<button class="btn btn-outline btn-sm" onclick="retryDirectoryPublication()">Share now</button>'
+           : '<span style="font-size:11.5px;color:var(--text-muted)">It will retry automatically when sync reconnects.</span>'}
        </div>`
     : '';
   list.innerHTML = rows + `<div style="font-size:11.5px;color:var(--text-muted);margin-top:8px">
     ${_loginProfiles.length} profile${_loginProfiles.length === 1 ? '' : 's'} on this Mac.
-    Owner is set by the owner passcode and cannot be reassigned.
+    ${owner
+      ? 'Owner is set by the owner passcode and cannot be reassigned.'
+      : 'You can remove Front Desk or Operations & Events profiles only.'}
   </div>` + pendingBanner;
 }
 
@@ -3374,11 +3402,17 @@ async function setProfileRole(name, role) {
     const result = await window.electronSession.setProfileRole({ name, role });
     if (result?.ok !== true) throw new Error(result?.error || 'The role was not changed.');
     await refreshLoginProfiles();
-    await publishStaffDirectory();
+    const shared = await publishStaffDirectory();
     renderManageProfiles();
     // Nav and page permissions are role-derived, so re-apply them immediately.
     try { applyRolePermissions(); } catch (_) {}
-    if (!result.unchanged) showToast(`${name} is now ${role}.`, 'success');
+    if (!result.unchanged) {
+      showToast(
+        shared
+          ? `${name} is now ${role}.`
+          : `${name} is now ${role} on this Mac; sharing with the other Macs is pending.`,
+        shared ? 'success' : 'warning');
+    }
     return true;
   } catch (error) {
     // Re-render so the dropdown snaps back to the actual stored role.
@@ -3389,8 +3423,16 @@ async function setProfileRole(name, role) {
 }
 
 async function removeLoginUser(name) {
-  if (!isElizabeth()) {
-    showToast('Only the owner can remove users.', 'warning');
+  const owner = isElizabeth();
+  const manager = isOperationsManager();
+  const target = _loginProfile(name);
+  if (!owner && !manager) {
+    showToast('Only the owner or an Operations Manager can remove users.', 'warning');
+    return false;
+  }
+  if (!target || target.name === currentUser() ||
+      (manager && !owner && ['Owner', 'Operations Manager'].includes(target.role))) {
+    showToast('That profile cannot be removed by this account.', 'warning');
     return false;
   }
   if (!window.electronSession?.removeStaffProfile) {
@@ -3405,9 +3447,16 @@ async function removeLoginUser(name) {
     const result = await window.electronSession.removeStaffProfile(name);
     if (result?.ok !== true) throw new Error(result?.error || 'The user was not removed.');
     await refreshLoginProfiles();
-    await publishStaffDirectory();
+    if (!Array.isArray(result.directory)) {
+      throw new Error('The protected user-profile update did not include its synchronization record.');
+    }
+    const shared = await _persistAuthorizedDirectorySnapshot(result.directory);
     renderManageProfiles();
-    showToast(`${name} was removed.`, 'success');
+    showToast(
+      shared
+        ? `${name} was removed and shared with the other Macs.`
+        : `${name} was removed on this Mac; sharing with the other Macs is pending.`,
+      shared ? 'success' : 'warning');
     return true;
   } catch (error) {
     showToast(`${name} was not removed: ${error?.message || error}`, 'danger');
@@ -3679,6 +3728,7 @@ function selectLoginUser(name, role) {
         if (!session?.ok || session.role !== role) {
           throw new Error('The staff profile could not be authorized.');
         }
+        await _prepareAuthorizedLoginData();
         if (!completeLogin(name, role)) await window.electronSession.end();
       })
       .catch(err => {
@@ -3726,6 +3776,7 @@ async function _checkStaffPin() {
     if (!session?.ok || session.role !== profile.role) {
       throw new Error('The staff profile could not be authorized.');
     }
+    await _prepareAuthorizedLoginData();
     if (!completeLogin(profile.name, profile.role)) await window.electronSession.end();
   } catch (err) {
     // Main distinguishes a wrong passcode from a lockout from a real failure,
@@ -3855,6 +3906,7 @@ async function checkPin() {
       if (!ownerSession?.ok || ownerSession.role !== 'Owner') {
         throw new Error('The protected owner session could not be established.');
       }
+      await _prepareAuthorizedLoginData();
       if (!completeLogin('Elizabeth Chaves', 'Owner')) await window.electronSession.end();
       _resumePendingPinRotation().catch(err => {
         console.warn('Pending passcode wrapper update could not resume:', err?.message || err);
@@ -4162,16 +4214,80 @@ const LOCAL_PIN_WRAPPED_KEY = 'tmb__local_pin_wrapped';
 const LOCAL_PIN_SALT_KEY = 'tmb__local_pin_salt';
 const LOCAL_PIN_KDF_KEY = 'tmb__local_pin_kdf_iterations';
 
+// Storage beside a data record is bookkeeping, never a second data record.
+// Keep this one classifier authoritative: cache hydration, key migration,
+// dynamic spreadsheet discovery, Firebase and iCloud all eventually ask
+// _isEncryptedDataStorageName() or _ssIsProjectSyncKey().
+const INTERNAL_STORAGE_METADATA_SUFFIXES = Object.freeze([
+  '_local_ts',
+  '_pending_op',
+  '_pending_sync',
+  '_pending_base_revision',
+  '_revision',
+  '_cloud_deferred',
+  '_journal_seq',
+]);
+
+function _isInternalStorageMetadataName(name) {
+  if (typeof name !== 'string' || !name) return false;
+  return name.startsWith('_') ||
+    name.startsWith('shared_') ||
+    name === 'owner_pin' ||
+    INTERNAL_STORAGE_METADATA_SUFFIXES.some(suffix => name.endsWith(suffix));
+}
+
 function _isEncryptedDataStorageName(name) {
-  return !!name &&
-    !name.startsWith('_') &&
-    !name.startsWith('shared_') &&
-    name !== 'owner_pin' &&
-    !name.endsWith('_local_ts') &&
-    !name.endsWith('_pending_op') &&
-    !name.endsWith('_pending_sync') &&
-    !name.endsWith('_revision') &&
-    !name.endsWith('_pending_base_revision');
+  return typeof name === 'string' && !!name && !_isInternalStorageMetadataName(name);
+}
+
+// Builds before 1.3.18 accidentally hydrated *_journal_seq as application
+// data, then encrypted the marker and even created transaction sidecars for
+// that fake record. Repair only names that are conclusively metadata. The
+// marker itself is retained when its encrypted JSON decodes to a safe integer;
+// otherwise it is removed, because journal lineage (not this hint) is the
+// recovery authority now.
+async function _repairJournalSequenceMarkers() {
+  const markerKeys = [];
+  for (let i = 0; i < localStorage.length; i++) {
+    const key = localStorage.key(i);
+    if (key?.startsWith('tmb_') && key.endsWith('_journal_seq')) markerKeys.push(key);
+  }
+  let repaired = 0;
+  let discarded = 0;
+  for (const storageKey of markerKeys) {
+    const metadataName = storageKey.slice(4);
+    let raw = null;
+    try { raw = localStorage.getItem(storageKey); } catch (_) { continue; }
+    let sequence = /^\d+$/.test(raw || '') ? Number(raw) : NaN;
+    if (!Number.isSafeInteger(sequence) && raw?.startsWith('E:') && _encKey) {
+      const plaintext = await _aesDecrypt(raw);
+      if (plaintext !== null) {
+        try { sequence = JSON.parse(plaintext); }
+        catch (_) { sequence = Number(plaintext); }
+      }
+    }
+    if (Number.isSafeInteger(sequence) && sequence >= 0) {
+      if (raw !== String(sequence)) {
+        localStorage.setItem(storageKey, String(sequence));
+        repaired += 1;
+      }
+    } else {
+      localStorage.removeItem(storageKey);
+      discarded += 1;
+    }
+
+    // Remove only sidecars belonging to the accidental fake data record. The
+    // canonical marker above is intentionally kept when valid.
+    for (const suffix of INTERNAL_STORAGE_METADATA_SUFFIXES) {
+      if (suffix === '_journal_seq') continue;
+      try { localStorage.removeItem('tmb_' + metadataName + suffix); } catch (_) {}
+    }
+    delete _decCache[metadataName];
+    _durableStoreSnapshots.delete(metadataName);
+    _lockedStorageKeys.delete(metadataName);
+    _storeWriteErrors.delete(metadataName);
+  }
+  return { repaired, discarded };
 }
 
 async function _fillCache() {
@@ -4431,7 +4547,9 @@ async function initEncryption(pin) {
   const legacySaltB64 = localStorage.getItem('tmb__es');
   const hasLegacyCiphertext = [...Array(localStorage.length)].some((_, index) => {
     const key = localStorage.key(index);
-    return key?.startsWith('tmb_') && localStorage.getItem(key)?.startsWith('E:');
+    if (!key?.startsWith('tmb_')) return false;
+    const name = key.slice(4);
+    return _isEncryptedDataStorageName(name) && localStorage.getItem(key)?.startsWith('E:');
   });
   if (legacySaltB64 && hasLegacyCiphertext) {
     const iterations = Number(localStorage.getItem('tmb__enc_kdf_iterations')) || LEGACY_PIN_KDF_ITERATIONS;
@@ -4539,6 +4657,28 @@ async function loadEncKeyFromSession() {
     console.warn('[storage] wrapped key could not be unlocked:', err?.message || err);
     return false;
   }
+}
+
+// The main-process identity is authoritative for journal access and profile
+// policy. Every successful login therefore passes this gate after main has
+// authenticated the session and after the data key is available, but before
+// completeLogin() renders a single synchronized feature or starts Firebase.
+async function _prepareAuthorizedLoginData() {
+  if (!_encKey) throw new Error('Encrypted storage is not unlocked.');
+  await _recoverFromJournal();
+  await _repairJournalSequenceMarkers();
+  await _fillCache();
+  if (_lockedStorageKeys.size) {
+    throw new Error(`The stored key could not decrypt ${_lockedStorageKeys.size} local record(s)`);
+  }
+  migrateSharedKeys();
+  await _loadPersistedSyncKey();
+  // A split-project intent is user data, not background cleanup. Finish it
+  // before the spreadsheet index can render or Firebase can bootstrap.
+  await _ssRecoverInterruptedSplitCommit();
+  // Recovery may have attached an orphan project and changed the cache.
+  await _fillCache();
+  return true;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -4816,6 +4956,18 @@ function _acknowledgePendingSyncRecord(key, opId, revision) {
   if (!current) return;
   if (current.opId === opId) {
     localStorage.removeItem(_pendingSyncStorageKey(key));
+    // Keep the fsynced journal capsule in step with cloud acknowledgement. If
+    // the process dies between the cloud commit and this call, replaying the
+    // same opId is idempotent; once this lands, future launches know that a
+    // missing pending record means delivered rather than lost.
+    try {
+      const bridge = _journalBridge();
+      if (bridge?.ack) {
+        bridge.ack({ key, opId }).catch(error => {
+          console.warn(`[journal] ${key} acknowledgement was not recorded:`, error?.message || error);
+        });
+      }
+    } catch (_) {}
     return;
   }
   if (current.supersededOpIds.includes(opId) && revision > current.baseRevision) {
@@ -5547,7 +5699,23 @@ function _journalBridge() {
   catch (_) { return null; }
 }
 
-async function _journalCommit(key, ciphertext) {
+const JOURNAL_CAPSULE_VERSION = 2;
+
+function _journalPendingRecord(key, raw, expectedCiphertext = null) {
+  if (typeof raw !== 'string' || !raw || raw.length > 4_000_000) return null;
+  try {
+    const record = _validatePendingSyncRecord(key, JSON.parse(raw));
+    if (expectedCiphertext && record.localCiphertext !== expectedCiphertext) return null;
+    return record;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function _journalCommit(key, ciphertext, capsule = {}) {
+  // This is both a safety guard and a regression tripwire: a sequence marker
+  // or pending record must never acquire its own journal record.
+  if (!_isEncryptedDataStorageName(key)) return false;
   const bridge = _journalBridge();
   if (!bridge?.put) {
     if (!_journalCommit._warned) {
@@ -5557,7 +5725,19 @@ async function _journalCommit(key, ciphertext) {
     return false;
   }
   try {
-    const result = await bridge.put({ key, ciphertext });
+    const request = {
+      key,
+      ciphertext,
+      schemaVersion: JOURNAL_CAPSULE_VERSION,
+      previousCiphertext: typeof capsule.previousCiphertext === 'string' &&
+          capsule.previousCiphertext.startsWith('E:')
+        ? capsule.previousCiphertext
+        : null,
+      pendingSync: typeof capsule.pendingSync === 'string' ? capsule.pendingSync : null,
+      revision: typeof capsule.revision === 'string' ? capsule.revision : null,
+      localTimestamp: typeof capsule.localTimestamp === 'string' ? capsule.localTimestamp : null,
+    };
+    const result = await bridge.put(request);
     if (result?.ok !== true) throw new Error('the journal did not acknowledge the write');
     try { localStorage.setItem('tmb_' + key + '_journal_seq', String(result.seq)); } catch (_) {}
     return true;
@@ -5570,9 +5750,35 @@ async function _journalCommit(key, ciphertext) {
   }
 }
 
-// Runs before the cache is filled. If the disk holds a record newer than what
-// localStorage came back with, localStorage lost a write and the journal is the
-// survivor — so it is put back before anything reads it.
+function _restorePendingFromJournal(key, ciphertext, record, allowSynthesis = false) {
+  if (!isSyncKey(key)) return false;
+  let current = null;
+  try { current = _readPendingSyncRecord(key); } catch (_) {}
+  if (current?.localCiphertext === ciphertext) return false;
+  const journalPending = _journalPendingRecord(key, record?.pendingSync, ciphertext);
+  if (journalPending) {
+    localStorage.setItem(_pendingSyncStorageKey(key), JSON.stringify(journalPending));
+    localStorage.removeItem('tmb_' + key + '_pending_op');
+    localStorage.removeItem('tmb_' + key + '_pending_base_revision');
+    return true;
+  }
+  if (!allowSynthesis) return false;
+  // Legacy journal entries do not carry an operation. Recreate one rather than
+  // leaving the restored edit local-only. The current revision is preserved,
+  // so Firebase CAS/rebase remains the authority when delivery resumes.
+  _writePendingSyncRecord(
+    key,
+    _newOperationId(),
+    ciphertext,
+    typeof record?.previousCiphertext === 'string' ? record.previousCiphertext : null,
+  );
+  return true;
+}
+
+// Runs before the cache is filled. A journal capsule may replace a differing
+// canonical value only when that value is the capsule's exact predecessor.
+// This lineage rule is what lets journal failure remain fail-open without an
+// old record rolling a later successful edit back on the next launch.
 async function _recoverFromJournal() {
   const bridge = _journalBridge();
   if (!bridge?.read) return { restored: 0 };
@@ -5585,10 +5791,11 @@ async function _recoverFromJournal() {
     return { restored: 0 };
   }
   let restored = 0;
+  let redelivered = 0;
   for (const record of records) {
     const key = String(record?.key ?? '');
     const ciphertext = String(record?.ciphertext ?? '');
-    if (!key || !ciphertext.startsWith('E:')) continue;
+    if (!key || !ciphertext.startsWith('E:') || !_isEncryptedDataStorageName(key)) continue;
     // MB1188-086: a key whose feature no longer exists must not be restored.
     //
     // Recovery runs BEFORE _retireUnusedLocalKeys, so without this a retired
@@ -5596,33 +5803,68 @@ async function _recoverFromJournal() {
     // moments later — reinstating the quota pressure that stopped a new Mac
     // finishing its first sign-in (MB1188-068).
     if (RETIRED_LOCAL_KEYS.includes(key)) continue;
-    let seenSeq = 0;
-    try { seenSeq = Number(localStorage.getItem('tmb_' + key + '_journal_seq')) || 0; } catch (_) {}
-    // MB1188-086: `>=`, and a content comparison, NOT a strictly-newer test.
-    //
-    // The value and the sequence marker are two separate localStorage keys in
-    // the same LevelDB, so a crash can flush one without the other. With a
-    // strict `>`, a marker that reached disk while its value did not made the
-    // journal look already-applied — and the record it was holding was dropped,
-    // which is the exact loss this whole mechanism exists to prevent.
-    //
-    // Equal sequence with DIFFERENT content means precisely that split. Equal
-    // sequence with the same content means they agree, so there is nothing to
-    // do. A lower sequence means localStorage genuinely moved on.
-    if (record.seq < seenSeq) continue;
     let current = null;
     try { current = localStorage.getItem('tmb_' + key); } catch (_) {}
-    if (current === ciphertext) continue;
+    let localPending = null;
+    try { localPending = _readPendingSyncRecord(key); } catch (_) {}
+    const predecessor = record?.schemaVersion === JOURNAL_CAPSULE_VERSION &&
+        typeof record.previousCiphertext === 'string' && record.previousCiphertext.startsWith('E:')
+      ? record.previousCiphertext
+      : null;
+
+    // A pending record is written in the same canonical transaction and names
+    // the exact ciphertext still awaiting delivery. If canonical storage was
+    // the part Chromium lost, this is a newer, more specific candidate than an
+    // unrelated older journal entry.
+    let candidate = ciphertext;
+    let candidateRecord = record;
+    let pendingBase = null;
+    if (typeof localPending?.baseCiphertext === 'string' &&
+        localPending.baseCiphertext.startsWith('E:')) {
+      pendingBase = localPending.baseCiphertext;
+    }
+    if (localPending?.localCiphertext?.startsWith('E:') &&
+        localPending.localCiphertext !== ciphertext &&
+        (!current || current === ciphertext || current === predecessor || current === pendingBase)) {
+      candidate = localPending.localCiphertext;
+      candidateRecord = null;
+    }
+
+    if (current === candidate) {
+      if (_restorePendingFromJournal(key, candidate, candidateRecord, false)) redelivered += 1;
+      continue;
+    }
+
+    const mayRestore = !current ||
+      (!candidateRecord &&
+        (current === ciphertext || current === predecessor || current === pendingBase)) ||
+      (candidate === ciphertext && predecessor && current === predecessor);
+    if (!mayRestore) {
+      console.warn(`[journal] skipped stale ${key}; its current value is not the recorded predecessor`);
+      continue;
+    }
     try {
-      localStorage.setItem('tmb_' + key, ciphertext);
-      localStorage.setItem('tmb_' + key + '_journal_seq', String(record.seq));
+      localStorage.setItem('tmb_' + key, candidate);
+      if (candidateRecord && Number.isSafeInteger(record.seq)) {
+        localStorage.setItem('tmb_' + key + '_journal_seq', String(record.seq));
+      }
+      if (candidateRecord?.revision !== null && /^\d+$/.test(candidateRecord?.revision || '')) {
+        localStorage.setItem('tmb_' + key + '_revision', candidateRecord.revision);
+      }
+      if (typeof candidateRecord?.localTimestamp === 'string' &&
+          candidateRecord.localTimestamp.length <= 100) {
+        localStorage.setItem('tmb_' + key + '_local_ts', candidateRecord.localTimestamp);
+      }
+      if (candidateRecord) {
+        if (_restorePendingFromJournal(key, candidate, candidateRecord, true)) redelivered += 1;
+      }
       restored += 1;
       console.warn(`[journal] restored ${key} from disk after an incomplete shutdown`);
     } catch (error) {
       console.warn(`[journal] ${key} could not be restored:`, error?.message || error);
     }
   }
-  return { restored };
+  return { restored, redelivered };
 }
 
 async function _commitEncryptedSnapshot(k, serialized, snapshot, options = {}) {
@@ -5672,7 +5914,12 @@ async function _commitEncryptedSnapshot(k, serialized, snapshot, options = {}) {
     // complete and still be gone after a hard kill. This waits for main to
     // fsync the ciphertext, so by the time the caller is told the write
     // succeeded, it survives the power going out.
-    await _journalCommit(k, enc);
+    await _journalCommit(k, enc, {
+      previousCiphertext: prior.ciphertext,
+      pendingSync: localStorage.getItem(prefix + '_pending_sync'),
+      revision: localStorage.getItem(prefix + '_revision'),
+      localTimestamp: localStorage.getItem(prefix + '_local_ts'),
+    });
     _lockedStorageKeys.delete(k);
     _storeWriteErrors.delete(k);
     _durableStoreSnapshots.set(k, _cloneJson(snapshot));
@@ -6771,7 +7018,7 @@ function _expectedSyncType(key) {
   // Left undeclared it fell through to 'array' and every write was refused with
   // "staff_passcodes expected array data", exactly as the note above describes.
   if (['room_overrides', 'room_by_instructor', 'room_time_rules', 'spreadsheets',
-       'ai_spend', 'staff_passcodes'].includes(key)) return 'object';
+       'ai_spend', 'staff_passcodes', 'staff_dir_overrides'].includes(key)) return 'object';
   return 'array';
 }
 
@@ -6840,6 +7087,30 @@ function _validateSyncRecordList(key, list) {
   });
 }
 
+function _validateStaffDirectoryOverrides(value) {
+  const entries = Object.entries(value);
+  if (entries.length > 200) throw new Error('staff_dir_overrides has too many records');
+  for (const [id, override] of entries) {
+    if (!/^b_\d{1,3}$/.test(id)) {
+      throw new Error(`staff_dir_overrides has an invalid built-in id "${id}"`);
+    }
+    if (!override || typeof override !== 'object' || Array.isArray(override)) {
+      throw new Error(`staff_dir_overrides ${id} is not a record`);
+    }
+    const fields = Object.keys(override);
+    if (!fields.length || fields.some(field => !['name', 'email', 'role'].includes(field))) {
+      throw new Error(`staff_dir_overrides ${id} has invalid fields`);
+    }
+    for (const [field, limit] of [['name', 120], ['email', 320], ['role', 200]]) {
+      if (override[field] !== undefined &&
+          (typeof override[field] !== 'string' || override[field].length > limit ||
+           /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/.test(override[field]))) {
+        throw new Error(`staff_dir_overrides ${id} has an invalid ${field}`);
+      }
+    }
+  }
+}
+
 function _normalizeSyncValue(key, value) {
   // MB161-012: a project document is validated by the workbook validator, so
   // the two can never disagree about what a sheet may contain.
@@ -6860,6 +7131,7 @@ function _normalizeSyncValue(key, value) {
       : typeof value === expected;
   if (!valid) throw new Error(`${key} expected ${expected} data`);
   if (expected === 'array') _validateSyncRecordList(key, value);
+  if (key === 'staff_dir_overrides') _validateStaffDirectoryOverrides(value);
   const serialized = JSON.stringify(value);
   if (serialized === undefined) throw new Error(`${key} is not JSON serializable`);
   const clone = JSON.parse(serialized);
@@ -9209,6 +9481,10 @@ function _ssProjectSyncKey(projectId) {
 
 function _ssIsProjectSyncKey(key) {
   if (typeof key !== 'string' || !key.startsWith(SPREADSHEET_PROJECT_KEY_PREFIX)) return false;
+  // `spreadsheet_<id>_journal_seq` used to pass the prefix test and enter the
+  // workbook as if it were a project document. Metadata is never a project,
+  // even when the part before its suffix happens to be a valid project id.
+  if (_isInternalStorageMetadataName(key)) return false;
   return SPREADSHEET_PROJECT_ID_PATTERN.test(key.slice(SPREADSHEET_PROJECT_KEY_PREFIX.length));
 }
 
@@ -9694,8 +9970,15 @@ function _ssReadCommitIntent() {
     const raw = localStorage.getItem('tmb__ss_commit_intent');
     if (!raw) return null;
     const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.projectIds)) return null;
-    return parsed;
+    if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.projectIds) ||
+        parsed.projectIds.length > 200 ||
+        parsed.projectIds.some(id => typeof id !== 'string' || !SPREADSHEET_PROJECT_ID_PATTERN.test(id))) {
+      return null;
+    }
+    return {
+      projectIds: [...new Set(parsed.projectIds)],
+      at: typeof parsed.at === 'string' && parsed.at.length <= 100 ? parsed.at : null,
+    };
   } catch (_) { return null; }
 }
 
@@ -9731,23 +10014,43 @@ async function _ssRecoverInterruptedSplitCommit() {
   const intent = _ssReadCommitIntent();
   if (!intent) return { recovered: 0 };
   const stored = _ssDurableStoreValue('spreadsheets');
-  if (_ssStorageMode(stored) !== 'split') { _ssClearCommitIntent(); return { recovered: 0 }; }
+  if (_ssStorageMode(stored) !== 'split') {
+    console.warn('[spreadsheets] interrupted save is waiting for a valid project index');
+    return { recovered: 0, pending: intent.projectIds.length };
+  }
 
   let index;
   try { index = normalizeSpreadsheetIndex(stored); }
-  catch (_) { _ssClearCommitIntent(); return { recovered: 0 }; }
+  catch (_) {
+    console.warn('[spreadsheets] interrupted save is waiting because its project index is invalid');
+    return { recovered: 0, pending: intent.projectIds.length };
+  }
 
-  const named = new Set((index.projects || []).map(entry => String(entry.id)));
+  const records = new Map((index.projects || []).map(entry => [String(entry.id), entry]));
   const orphans = [];
+  const blocked = [];
   for (const id of intent.projectIds) {
-    if (named.has(id)) continue;                       // already named, live or tombstoned
+    const existing = records.get(id);
+    if (existing?._deleted) continue;                  // intentional durable deletion
     const doc = _ssDurableStoreValue(_ssProjectSyncKey(id));
-    if (!doc) continue;                                // never landed: nothing to recover
+    if (existing && doc) continue;                     // complete, already visible
+    if (!doc) {
+      // An index that names a live document which is missing is inconsistent,
+      // not terminal. An unnamed/missing document may mean the write never
+      // started, but retaining the tiny intent costs nothing and lets journal
+      // recovery or a delayed Chromium flush settle it on the next launch.
+      blocked.push(id);
+      continue;
+    }
     let normalized;
-    try { normalized = normalizeSpreadsheetProject(doc); } catch (_) { continue; }
+    try { normalized = normalizeSpreadsheetProject(doc); }
+    catch (_) { blocked.push(id); continue; }
     orphans.push({ id, doc: normalized });
   }
-  if (!orphans.length) { _ssClearCommitIntent(); return { recovered: 0 }; }
+  if (!orphans.length) {
+    if (!blocked.length) _ssClearCommitIntent();
+    return { recovered: 0, pending: blocked.length };
+  }
 
   const nextIndex = _cloneJson(index);
   for (const orphan of orphans) {
@@ -9763,7 +10066,7 @@ async function _ssRecoverInterruptedSplitCommit() {
       'spreadsheets', JSON.stringify(normalizeSpreadsheetIndex(nextIndex)),
       normalizeSpreadsheetIndex(nextIndex), { sync: true, operationId: _newOperationId() });
   });
-  _ssClearCommitIntent();
+  if (!blocked.length) _ssClearCommitIntent();
   console.warn(`[spreadsheets] recovered ${orphans.length} project(s) from an interrupted save`);
   // MB1188-080: converge rather than rely on ordering.
   //
@@ -9783,7 +10086,7 @@ async function _ssRecoverInterruptedSplitCommit() {
   showToast(
     `${orphans.length} project${orphans.length === 1 ? '' : 's'} from an interrupted save ${orphans.length === 1 ? 'was' : 'were'} recovered.`,
     'warning');
-  return { recovered: orphans.length };
+  return { recovered: orphans.length, pending: blocked.length };
 }
 
 async function _ssCommitSplitWorkbook(dirtyBase, dirty, stagedActor) {
@@ -10991,6 +11294,23 @@ function _ssStampAttribution(sheet, target, op) {
   }
 }
 
+function _ssStampCreatedCells(structure, actor, at = new Date().toISOString()) {
+  if (!actor || !structure) return structure;
+  if (Array.isArray(structure.projects)) {
+    for (const project of structure.projects) _ssStampCreatedCells(project, actor, at);
+    return structure;
+  }
+  const sheets = Array.isArray(structure.sheets) ? structure.sheets : [structure];
+  for (const sheet of sheets) {
+    for (const [target, cell] of Object.entries(sheet?.cells || {})) {
+      if (_ssCellIsBlank(cell)) continue;
+      if (!sheet.editedBy) sheet.editedBy = {};
+      if (!sheet.editedBy[target]) sheet.editedBy[target] = { by: actor, at };
+    }
+  }
+  return structure;
+}
+
 // MB161-009: both of the hashes below used to be 32-bit djb2, and both decide
 // something irreversible.
 //
@@ -11256,7 +11576,18 @@ function _applySpreadsheetOperations(target, ops) {
 // typing. Instead, apply the diff the user actually made (dirtyBase -> dirty)
 // onto the base that is durable at commit time, which includes that remote edit.
 function _mergeSpreadsheetEdits(base, dirtyBase, dirty, stagedActor) {
-  if (!base || !dirtyBase || !dirty) return dirty;
+  const attributionActor = stagedActor === undefined ? _ssAttributionActor() : stagedActor;
+  const attributionTime = new Date().toISOString();
+  if (!dirty) return dirty;
+  // Split storage calls this per project. A newly-created project therefore
+  // has no durable project document and no per-project dirty base even though
+  // the enclosing workbook did have a base. Stamp its already-filled cells
+  // before the first durable write; returning it untouched here made those
+  // edits permanently anonymous.
+  if (!base || !dirtyBase) {
+    return _ssStampCreatedCells(
+      _cloneJson(dirty), attributionActor, attributionTime);
+  }
 
   // P0-1: the user's changes are derived as typed operations carrying the value
   // each was made against, then applied to the reconciled base. That comparison
@@ -11291,7 +11622,7 @@ function _mergeSpreadsheetEdits(base, dirtyBase, dirty, stagedActor) {
     }
   }
 
-  const ops = _deriveSpreadsheetOperations(dirtyBase, dirty, stagedActor);
+  const ops = _deriveSpreadsheetOperations(dirtyBase, dirty, attributionActor);
   const { workbook, conflicts } = _applySpreadsheetOperations(base, ops);
 
   // Projects created locally after the editor snapshot are additions, not edits.
@@ -11299,7 +11630,8 @@ function _mergeSpreadsheetEdits(base, dirtyBase, dirty, stagedActor) {
   const origin = new Set((dirtyBase.projects || []).map(p => p.id));
   for (const project of dirty.projects || []) {
     if (!known.has(project.id) && !origin.has(project.id)) {
-      workbook.projects.push(_cloneJson(project));
+      workbook.projects.push(_ssStampCreatedCells(
+        _cloneJson(project), attributionActor, attributionTime));
       known.add(project.id);
     }
   }
@@ -11317,7 +11649,8 @@ function _mergeSpreadsheetEdits(base, dirtyBase, dirty, stagedActor) {
     const present = new Set((project.sheets || []).map(s => s.id));
     for (const sheet of local.sheets || []) {
       if (!originSheets.has(sheet.id) && !present.has(sheet.id)) {
-        project.sheets.push(_cloneJson(sheet));
+        project.sheets.push(_ssStampCreatedCells(
+          _cloneJson(sheet), attributionActor, attributionTime));
         present.add(sheet.id);
         // P0-02: a sheet created on this Mac took this `continue` and never
         // reached the activeId line below, so the merge handed back the OLD
@@ -16225,7 +16558,16 @@ async function loadSettings() {
 
 
   const manageSec = document.getElementById('manage-profiles-section');
-  if (manageSec) manageSec.style.display = isElizabeth() ? '' : 'none';
+  const canRemoveProfiles = isElizabeth() || isOperationsManager();
+  if (manageSec) manageSec.style.display = canRemoveProfiles ? '' : 'none';
+  const manageTitle = document.getElementById('manage-profiles-title');
+  if (manageTitle) manageTitle.textContent = isElizabeth() ? 'Manage Users' : 'Remove Users';
+  const manageDescription = document.getElementById('manage-profiles-description');
+  if (manageDescription) {
+    manageDescription.textContent = isElizabeth()
+      ? 'Change roles or remove a login. Tasks and log entries are kept. Owner is protected by the owner passcode.'
+      : 'You may remove Front Desk and Operations & Events logins. You cannot add users, change roles, reset passcodes, or remove an Owner or Operations Manager.';
+  }
   // MB1188-069: the passcode card belongs to whoever is signed in, and only
   // when they hold the role it applies to.
   await renderStaffPasscodeSection();
@@ -19300,9 +19642,9 @@ async function saveStaffDirectoryMember() {
 
 async function removeStaffDirectoryMember(id) {
   if (!isElizabeth()) return false;
-  const list = STORE.get('custom_staff', []).filter(s => s.id !== id);
   try {
-    await STORE.replace('custom_staff', list, { authoritative: 'main-derived staff list' });
+    await STORE.mutate('custom_staff', current =>
+      (Array.isArray(current) ? current : []).filter(s => s.id !== id), []);
     renderStaff();
     showToast('Staff member removed.', 'success');
     return true;
@@ -19348,15 +19690,18 @@ async function saveEditStaffMember() {
   if (!name || !email) { showToast('Name and email are required.', 'warning'); return; }
   try {
     if (id.startsWith('b_')) {
-      const overrides = STORE.get('staff_dir_overrides', {});
-      overrides[id] = { name, email, role: role || '' };
-      await STORE.replace('staff_dir_overrides', overrides, { authoritative: 'main-derived staff list' });
+      await STORE.mutate('staff_dir_overrides', current => ({
+        ...((current && typeof current === 'object' && !Array.isArray(current)) ? current : {}),
+        [id]: { name, email, role: role || '' },
+      }), {});
     } else {
-      const list = STORE.get('custom_staff', []);
-      const idx = list.findIndex(s => s.id === id);
-      if (idx < 0) throw new Error('The staff member no longer exists.');
-      list[idx] = { ...list[idx], name, email, detail: role || 'Staff' };
-      await STORE.replace('custom_staff', list, { authoritative: 'main-derived staff list' });
+      await STORE.mutate('custom_staff', current => {
+        const list = Array.isArray(current) ? current.slice() : [];
+        const idx = list.findIndex(s => s.id === id);
+        if (idx < 0) throw new Error('The staff member no longer exists.');
+        list[idx] = { ...list[idx], name, email, detail: role || 'Staff' };
+        return list;
+      }, []);
     }
     document.getElementById('edit-staff-modal').classList.add('hidden');
     renderStaff();
@@ -19372,12 +19717,12 @@ async function deleteEditStaffMember() {
   if (!isElizabeth()) return false;
   const id = document.getElementById('edit-staff-id').value;
   if (id.startsWith('b_')) {
-    const removed = STORE.get('removed_staff_dir', []);
     try {
-      if (!removed.includes(id)) {
-        removed.push(id);
-        await STORE.replace('removed_staff_dir', removed, { authoritative: 'main-derived staff list' });
-      }
+      await STORE.mutate('removed_staff_dir', current => {
+        const removed = Array.isArray(current) ? current.slice() : [];
+        if (!removed.includes(id)) removed.push(id);
+        return removed;
+      }, []);
       document.getElementById('edit-staff-modal').classList.add('hidden');
       renderStaff();
       showToast('Staff member removed.', 'success');
@@ -22597,20 +22942,6 @@ async function pruneOldLogs() {
 let _postLoginMaintenancePromise = Promise.resolve(true);
 async function runPostLoginMaintenance() {
   const jobs = [
-    // MB1188-080: FIRST, and deliberately here rather than in the Firebase
-    // bootstrap where it used to sit.
-    //
-    // The old call site was after `await _bootstrapSync()` inside initFirebase,
-    // downstream of Firebase auth. So a Mac that was offline, unconfigured, or
-    // refused by auth never recovered an interrupted commit at all: the project
-    // document and the intent both survived, and the project stayed invisible
-    // through every restart. The comment on the function claimed it ran at load
-    // before the workbook was read, which was simply not true.
-    //
-    // This job runs after the encrypted store is hydrated and before
-    // completeLogin starts Firebase, so it needs no network, no credentials and
-    // no bootstrap — and it finishes before the workbook is first assembled.
-    ['interrupted spreadsheet save recovery', _ssRecoverInterruptedSplitCommit],
     ['legacy demo cleanup', _purgeLegacyDemoDataOnce],
     ['room-data migration', migrateRoomData],
     ['retention cleanup', pruneOldLogs],

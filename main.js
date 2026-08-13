@@ -1642,6 +1642,16 @@ function _requireNotOwnerTarget(target, action) {
   }
 }
 
+function _requireRemovableProfileTarget(target) {
+  if (_appSessionHasRole(new Set(['Owner']))) return;
+  if (!_appSessionHasRole(new Set(['Operations Manager']))) {
+    throw new Error('Only an Owner or Operations Manager can remove profiles.');
+  }
+  if (target?.role === 'Owner' || target?.role === 'Operations Manager') {
+    throw new Error('An Operations Manager cannot remove an Owner or Operations Manager profile.');
+  }
+}
+
 function _appSessionHasRole(allowed) {
   try { return !!appSession && allowed.has(appSession.role); } catch (_) { return false; }
 }
@@ -2347,8 +2357,10 @@ _secureHandle('app-session-remove-staff-profile', async (_, requestedName) => {
   // else (duplicate detection on add uses the same folding).
   const target = _findProfileByFoldedName(existing, name);
   if (!target) throw new Error('That user was not found on this Mac.');
-  // MB161-031: an Operations Manager administers everyone except the Owner.
-  _requireNotOwnerTarget(target, 'remove');
+  // Operations Manager is removal-only and cannot target either protected
+  // tier. This check is main-process authoritative; renderer visibility is
+  // only presentation.
+  _requireRemovableProfileTarget(target);
   // Removing the last Owner would leave nobody able to administer the app.
   if (target.role === 'Owner' && _ownerProfileCount(existing) <= 1) {
     throw new Error('The last Owner profile cannot be removed.');
@@ -2393,7 +2405,12 @@ _secureHandle('app-session-remove-staff-profile', async (_, requestedName) => {
   _saveSecretVault(vault);
   // Count from the freshly resolved list: `remaining` only exists on the custom
   // branch, and built-in removals are recorded as a suppression list instead.
-  return { ok: true, name: canonical, remaining: _allAppProfiles().length };
+  return {
+    ok: true,
+    name: canonical,
+    remaining: _allAppProfiles().length,
+    directory: _buildStaffDirectory(),
+  };
 });
 
 // ─── V159-005: synchronized staff directory ─────────────────────────────────
@@ -4203,11 +4220,25 @@ const JOURNAL_KEY_PATTERN = /^[A-Za-z0-9_-]{1,120}$/;
 // encrypted. 2 MB leaves generous headroom while halving what a compromised
 // renderer could put on the disk.
 const MAX_JOURNAL_BYTES = 2 * 1024 * 1024;
+const MAX_JOURNAL_CAPSULE_BYTES = 6 * 1024 * 1024;
 const MAX_JOURNAL_ENTRIES = 200;
 let _journalSeq = 0;
 
 function _journalPath(key) {
   return path.join(JOURNAL_DIR(), `${key}.jrn`);
+}
+
+function _readJournalFile(fullPath, expectedKey = null) {
+  try {
+    const stat = fs.statSync(fullPath);
+    if (!stat.isFile() || stat.size <= 0 || stat.size > MAX_JOURNAL_CAPSULE_BYTES) return null;
+    const parsed = JSON.parse(fs.readFileSync(fullPath, 'utf8'));
+    if (!_isPlainObject(parsed)) return null;
+    if (expectedKey !== null && parsed.key !== expectedKey) return null;
+    return parsed;
+  } catch (_) {
+    return null;
+  }
 }
 
 // The sequence has to survive a restart or a recovered record could look older
@@ -4219,16 +4250,15 @@ function _journalHighestSeq() {
   try { entries = fs.readdirSync(JOURNAL_DIR()); } catch (_) { return 0; }
   for (const name of entries) {
     if (!name.endsWith('.jrn')) continue;
-    try {
-      const parsed = JSON.parse(fs.readFileSync(path.join(JOURNAL_DIR(), name), 'utf8'));
-      if (Number.isSafeInteger(parsed?.seq) && parsed.seq > highest) highest = parsed.seq;
-    } catch (_) { /* an unreadable entry cannot contribute a sequence */ }
+    const fileKey = name.slice(0, -4);
+    if (!JOURNAL_KEY_PATTERN.test(fileKey) || fileKey === '__proto__' || fileKey === 'constructor') continue;
+    const parsed = _readJournalFile(path.join(JOURNAL_DIR(), name), fileKey);
+    if (Number.isSafeInteger(parsed?.seq) && parsed.seq > highest) highest = parsed.seq;
   }
   return highest;
 }
 
 _secureHandle('durable-journal-put', async (_, request) => {
-  _requireAppRole(COMMUNICATION_ROLES);
   if (!_isPlainObject(request)) throw new Error('Invalid journal write.');
   const key = String(request.key ?? '');
   const ciphertext = request.ciphertext;
@@ -4247,6 +4277,37 @@ _secureHandle('durable-journal-put', async (_, request) => {
   // its own encryption; anything else is a bug that must not reach disk.
   if (!ciphertext.startsWith('E:')) throw new Error('The journal takes encrypted text only.');
 
+  const schemaVersion = request.schemaVersion === 2 ? 2 : 1;
+  const previousCiphertext = request.previousCiphertext === null || request.previousCiphertext === undefined
+    ? null
+    : request.previousCiphertext;
+  if (previousCiphertext !== null &&
+      (typeof previousCiphertext !== 'string' || !previousCiphertext.startsWith('E:') ||
+       Buffer.byteLength(previousCiphertext, 'utf8') > MAX_JOURNAL_BYTES)) {
+    throw new Error('The journal predecessor is invalid.');
+  }
+  const pendingSync = request.pendingSync === null || request.pendingSync === undefined
+    ? null
+    : request.pendingSync;
+  if (pendingSync !== null &&
+      (typeof pendingSync !== 'string' || Buffer.byteLength(pendingSync, 'utf8') > 4 * 1024 * 1024)) {
+    throw new Error('The journal pending operation is invalid.');
+  }
+  const revision = request.revision === null || request.revision === undefined
+    ? null
+    : request.revision;
+  if (revision !== null && (typeof revision !== 'string' || !/^\d+$/.test(revision) ||
+      !Number.isSafeInteger(Number(revision)) || Number(revision) < 0)) {
+    throw new Error('The journal revision is invalid.');
+  }
+  const localTimestamp = request.localTimestamp === null || request.localTimestamp === undefined
+    ? null
+    : request.localTimestamp;
+  if (localTimestamp !== null && (typeof localTimestamp !== 'string' || localTimestamp.length > 100 ||
+      !Number.isFinite(Date.parse(localTimestamp)))) {
+    throw new Error('The journal timestamp is invalid.');
+  }
+
   fs.mkdirSync(JOURNAL_DIR(), { recursive: true, mode: 0o700 });
   if (!_journalSeq) _journalSeq = _journalHighestSeq();
   // A bounded directory: one entry per key, and a ceiling so a runaway key set
@@ -4257,11 +4318,48 @@ _secureHandle('durable-journal-put', async (_, request) => {
     throw new Error('The journal is full.');
   }
   const seq = ++_journalSeq;
+  const entry = {
+    key,
+    seq,
+    ciphertext,
+    schemaVersion,
+    previousCiphertext,
+    pendingSync,
+    revision,
+    localTimestamp,
+  };
+  const serialized = JSON.stringify(entry);
+  if (Buffer.byteLength(serialized, 'utf8') > MAX_JOURNAL_CAPSULE_BYTES) {
+    throw new Error('This journal capsule is too large.');
+  }
   // _atomicWriteFileSync fsyncs the data, renames, then fsyncs the directory,
   // so this returns only once the bytes are genuinely on disk. That is the
   // whole point: the renderer awaits this before calling a save complete.
-  _atomicWriteFileSync(_journalPath(key), JSON.stringify({ key, seq, ciphertext }), 0o600);
+  _atomicWriteFileSync(_journalPath(key), serialized, 0o600);
   return { ok: true, seq };
+});
+
+_secureHandle('durable-journal-ack', async (_, request) => {
+  if (!_isPlainObject(request)) throw new Error('Invalid journal acknowledgement.');
+  const key = String(request.key ?? '');
+  const opId = String(request.opId ?? '');
+  if (!JOURNAL_KEY_PATTERN.test(key) || key === '__proto__' || key === 'constructor' ||
+      opId.length < 8 || opId.length > 512) {
+    throw new Error('Invalid journal acknowledgement.');
+  }
+  const parsed = _readJournalFile(_journalPath(key), key);
+  if (!parsed) return { ok: true, unchanged: true };
+  if (!_isPlainObject(parsed) || parsed.schemaVersion !== 2 || parsed.pendingSync === null) {
+    return { ok: true, unchanged: true };
+  }
+  let pending;
+  try { pending = JSON.parse(parsed.pendingSync); } catch (_) { return { ok: true, unchanged: true }; }
+  if (!_isPlainObject(pending) || pending.opId !== opId) {
+    return { ok: true, unchanged: true };
+  }
+  parsed.pendingSync = null;
+  _atomicWriteFileSync(_journalPath(key), JSON.stringify(parsed), 0o600);
+  return { ok: true };
 });
 
 _secureHandle('durable-journal-read', async () => {
@@ -4270,15 +4368,39 @@ _secureHandle('durable-journal-read', async () => {
   try { entries = fs.readdirSync(JOURNAL_DIR()); } catch (_) { return { ok: true, records }; }
   for (const name of entries) {
     if (!name.endsWith('.jrn')) continue;
+    const fileKey = name.slice(0, -4);
+    if (!JOURNAL_KEY_PATTERN.test(fileKey) || fileKey === '__proto__' || fileKey === 'constructor') continue;
     try {
-      const parsed = JSON.parse(fs.readFileSync(path.join(JOURNAL_DIR(), name), 'utf8'));
+      const parsed = _readJournalFile(path.join(JOURNAL_DIR(), name), fileKey);
       // A half-written or corrupt entry is DROPPED, never repaired and never
       // fatal: it can only ever be a copy of something localStorage may still
       // hold, and refusing to start over it would be the worse failure.
-      if (!_isPlainObject(parsed) || !JOURNAL_KEY_PATTERN.test(String(parsed.key ?? '')) ||
-          !Number.isSafeInteger(parsed.seq) || typeof parsed.ciphertext !== 'string' ||
-          !parsed.ciphertext.startsWith('E:')) continue;
-      records.push({ key: parsed.key, seq: parsed.seq, ciphertext: parsed.ciphertext });
+      if (!parsed || !Number.isSafeInteger(parsed.seq) || parsed.seq <= 0 ||
+          typeof parsed.ciphertext !== 'string' || !parsed.ciphertext.startsWith('E:') ||
+          Buffer.byteLength(parsed.ciphertext, 'utf8') > MAX_JOURNAL_BYTES) continue;
+      const record = { key: parsed.key, seq: parsed.seq, ciphertext: parsed.ciphertext };
+      if (parsed.schemaVersion === 2) {
+        const predecessorValid = parsed.previousCiphertext === null ||
+          (typeof parsed.previousCiphertext === 'string' && parsed.previousCiphertext.startsWith('E:') &&
+           Buffer.byteLength(parsed.previousCiphertext, 'utf8') <= MAX_JOURNAL_BYTES);
+        const pendingValid = parsed.pendingSync === null ||
+          (typeof parsed.pendingSync === 'string' && Buffer.byteLength(parsed.pendingSync, 'utf8') <= 4 * 1024 * 1024);
+        const revisionValid = parsed.revision === null ||
+          (typeof parsed.revision === 'string' && /^\d+$/.test(parsed.revision) &&
+           Number.isSafeInteger(Number(parsed.revision)) && Number(parsed.revision) >= 0);
+        const timestampValid = parsed.localTimestamp === null ||
+          (typeof parsed.localTimestamp === 'string' && parsed.localTimestamp.length <= 100 &&
+           Number.isFinite(Date.parse(parsed.localTimestamp)));
+        if (!predecessorValid || !pendingValid || !revisionValid || !timestampValid) continue;
+        Object.assign(record, {
+          schemaVersion: 2,
+          previousCiphertext: parsed.previousCiphertext,
+          pendingSync: parsed.pendingSync,
+          revision: parsed.revision,
+          localTimestamp: parsed.localTimestamp,
+        });
+      }
+      records.push(record);
     } catch (_) { continue; }
   }
   return { ok: true, records };

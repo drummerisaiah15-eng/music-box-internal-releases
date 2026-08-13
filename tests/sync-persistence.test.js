@@ -60,6 +60,7 @@ function contextWith(values = {}) {
 // MB1188-083: the spreadsheet hot paths record timing samples.
     performance: { now: () => 0 },
     _ssPerfRecord: () => 0,
+    _ssStampCreatedCells: structure => structure,
     // MB1188-085: the durability journal is a backstop; harnesses run without it.
     _journalCommit: async () => false,
     // Declared beside the functions in index.html, so some declaration()
@@ -357,6 +358,7 @@ test('spreadsheet typing in A1 preserves an unrelated remote edit in B1', async 
     ${declaration('_ssSheetOf')}
     ${declaration('_ssCellsOf')}
     ${declaration('_ssStampAttribution')}
+    ${declaration('_ssStampCreatedCells')}
     var MAX_SPREADSHEET_ATTRIBUTIONS = 200;
     ${declaration('_ssConflictId')}
     var currentUser = () => 'Test Editor';
@@ -2056,6 +2058,7 @@ test('H-08: _mergeSpreadsheetEdits throws an explicit conflict when a locally-ch
     ${declaration('_ssSheetOf')}
     ${declaration('_ssCellsOf')}
     ${declaration('_ssStampAttribution')}
+    ${declaration('_ssStampCreatedCells')}
     var MAX_SPREADSHEET_ATTRIBUTIONS = 200;
     ${declaration('_ssConflictId')}
     var currentUser = () => 'Test Editor';
@@ -2846,6 +2849,7 @@ function ssOpsApi() {
     ${declaration('_ssSheetOf')}
     ${declaration('_ssCellsOf')}
     ${declaration('_ssStampAttribution')}
+    ${declaration('_ssStampCreatedCells')}
     var MAX_SPREADSHEET_ATTRIBUTIONS = 200;
     ${declaration('_ssConflictId')}
     var currentUser = () => 'Test Editor';
@@ -2857,13 +2861,13 @@ function ssOpsApi() {
     ${declaration('_mergeResolvedConflictIds')}
     ${declaration('_mergeSpreadsheetEdits')}
     globalThis.api = {
-      merge: (b, db, d) => _mergeSpreadsheetEdits(b, db, d),
+      merge: (b, db, d, actor) => _mergeSpreadsheetEdits(b, db, d, actor),
       derive: (b, n) => _deriveSpreadsheetOperations(b, n),
       apply: (t, o) => _applySpreadsheetOperations(t, o),
     };
   `, context);
   return {
-    merge: (b, db, d) => JSON.parse(JSON.stringify(context.api.merge(b, db, d))),
+    merge: (b, db, d, actor) => JSON.parse(JSON.stringify(context.api.merge(b, db, d, actor))),
     derive: (b, n) => JSON.parse(JSON.stringify(context.api.derive(b, n))),
     apply: (t, o) => JSON.parse(JSON.stringify(context.api.apply(t, o))),
   };
@@ -3071,6 +3075,63 @@ test('P0-2: an edit records who made it', () => {
   assert.equal(ssAt(merged, '0,0'), 'new');
   assert.equal(ssStamp(merged, '0,0').by, 'Test Editor');
   assert.ok(!Number.isNaN(Date.parse(ssStamp(merged, '0,0').at)), 'and when');
+});
+
+test('P2-1: filled cells created inside a new project or sheet are attributed', () => {
+  const api = ssOpsApi();
+  const base = ssBook({});
+
+  const withProject = JSON.parse(JSON.stringify(base));
+  withProject.projects.push({
+    id: 'p2', name: 'New Project', activeId: 'p2s1',
+    sheets: [{
+      id: 'p2s1', name: 'Sheet 1', rows: 2, cols: 2, colWidths: [100, 100],
+      cells: { '0,0': ssCell('typed while creating'), '0,1': ssCell('') },
+    }],
+  });
+  const projectMerged = api.merge(base, base, withProject);
+  const projectSheet = projectMerged.projects.find(project => project.id === 'p2').sheets[0];
+  assert.equal(projectSheet.editedBy['0,0'].by, 'Test Editor');
+  assert.equal(projectSheet.editedBy['0,1'], undefined, 'blank structural cells are not credited');
+
+  // The production split-store save operates on one project document. For a
+  // brand-new project both per-project bases are null, even though the whole
+  // workbook existed before the project was added.
+  const firstProjectSave = api.merge(null, null, {
+    activeProject: 'p2',
+    projects: [withProject.projects.find(project => project.id === 'p2')],
+  }, 'Test Editor');
+  assert.equal(firstProjectSave.projects[0].sheets[0].editedBy['0,0'].by, 'Test Editor',
+    'the exact split-project first-save path records the editor too');
+
+  const withSheet = JSON.parse(JSON.stringify(base));
+  withSheet.projects[0].sheets.push({
+    id: 's2', name: 'Sheet 2', rows: 2, cols: 2, colWidths: [100, 100],
+    cells: { '1,1': ssCell('typed immediately') },
+  });
+  withSheet.projects[0].activeId = 's2';
+  const sheetMerged = api.merge(base, base, withSheet);
+  const newSheet = sheetMerged.projects[0].sheets.find(sheet => sheet.id === 's2');
+  assert.equal(newSheet.editedBy['1,1'].by, 'Test Editor');
+});
+
+test('P2-1: Google-created project cells remain system-originated', () => {
+  const api = ssOpsApi();
+  const base = ssBook({});
+  const imported = JSON.parse(JSON.stringify(base));
+  imported.projects.push({
+    id: 'google_project', name: 'Google Import', activeId: 'google_sheet',
+    sheets: [{ id: 'google_sheet', name: 'Tab', rows: 2, cols: 2, colWidths: [100, 100],
+      cells: { '0,0': ssCell('from Google') } }],
+  });
+  const merged = api.merge(base, base, imported, null);
+  assert.equal(merged.projects.find(project => project.id === 'google_project')
+    .sheets[0].editedBy, undefined);
+  const splitFirstSave = api.merge(null, null, {
+    activeProject: 'google_project', projects: [imported.projects[1]],
+  }, null);
+  assert.equal(splitFirstSave.projects[0].sheets[0].editedBy, undefined,
+    'the split-project first-save path still treats Google as a system source');
 });
 
 test('P0-2: attribution never turns a clean merge into a conflict', () => {
@@ -4363,8 +4424,14 @@ function directoryPublishApi(overrides = {}) {
     isElizabeth: () => overrides.owner === true,
     showToast: (message, tone) => published.push({ toast: message, tone }),
     renderManageProfiles: () => {},
+    _mergeTombstonedRecordLists: (current, incoming) => [...current, ...incoming],
     STORE: {
       replace: async (key, value) => { published.push({ key, value }); return true; },
+      mutate: async (key, mutator, fallback) => {
+        const value = mutator(fallback);
+        published.push({ key, value });
+        return value;
+      },
       flush: async () => {
         if (overrides.flushFails) throw new Error('Firebase is not connected');
         return true;
@@ -4385,6 +4452,7 @@ function directoryPublishApi(overrides = {}) {
     ${declaration('_directoryPublicationPending')}
     ${declaration('_setDirectoryPublicationPending')}
     ${declaration('publishStaffDirectory')}
+    ${declaration('_persistAuthorizedDirectorySnapshot')}
     ${declaration('flushPendingDirectoryPublication')}
     ${declaration('retryDirectoryPublication')}
     globalThis.api = {
@@ -4629,6 +4697,41 @@ test('MB1188-018: an envelope with nothing deferred is consumed as before', asyn
   assert.equal(api.watermark(), ENVELOPE_AT);
 });
 
+test('P0-6: iCloud restore applies a split spreadsheet index and its project document together', async () => {
+  const index = {
+    schema: 2,
+    activeProject: 'proj_real',
+    projects: [{ id: 'proj_real', name: 'Schedule', version: 4 }],
+  };
+  const projectDocument = {
+    id: 'proj_real',
+    name: 'Schedule',
+    activeId: 's1',
+    sheets: [{
+      id: 's1', name: 'Thursday', rows: 2, cols: 2,
+      colWidths: [100, 100],
+      cells: { '0,0': { v: 'RECOVERY SENTINEL', bg: '', tc: '', b: false } },
+    }],
+  };
+  const api = icloudLoadApi({
+    envelope: { lastUpdated: ENVELOPE_AT },
+    decoded: new Map([
+      ['spreadsheets', { value: index, revision: 4, updated: ENVELOPE_AT }],
+      ['spreadsheet_proj_real', {
+        value: projectDocument, revision: 4, updated: ENVELOPE_AT,
+      }],
+    ]),
+    pending: new Set(),
+  });
+  await api.load();
+  assert.deepEqual(api.applied.map(entry => entry.name), [
+    'spreadsheets', 'spreadsheet_proj_real',
+  ]);
+  assert.equal(api.applied[1].value.sheets[0].cells['0,0'].v, 'RECOVERY SENTINEL');
+  assert.equal(api.watermark(), ENVELOPE_AT,
+    'the envelope is consumed only after both split records have been applied');
+});
+
 // ── MB1188-013: a malformed cloud record is refused, not stored ─────────────
 
 function syncValidatorApi() {
@@ -4764,7 +4867,12 @@ test('MB1188-025: a rules rejection is reported as a rejection, not as pending',
   vm.runInContext(`
     var SPREADSHEET_PROJECT_KEY_PREFIX = 'spreadsheet_';
     var SPREADSHEET_PROJECT_ID_PATTERN = /^[A-Za-z0-9_-]{1,100}$/;
+    var INTERNAL_STORAGE_METADATA_SUFFIXES = [
+      '_local_ts', '_pending_op', '_pending_sync', '_pending_base_revision',
+      '_revision', '_cloud_deferred', '_journal_seq'
+    ];
     const _syncPermissionNotified = new Set();
+    ${declaration('_isInternalStorageMetadataName')}
     ${declaration('_ssIsProjectSyncKey')}
     ${declaration('_surfaceSyncDeliveryError')}
     globalThis.surface = (key, err) => _surfaceSyncDeliveryError(key, err);
@@ -4976,7 +5084,7 @@ test('a directory publish that fails says so rather than only setting a flag', (
   // other Mac. The only trace was a banner inside Settings, and the top-bar
   // sync badge still said "Synced" — it describes delivery, not refusal. Hours
   // went into that.
-  const publish = declaration('publishStaffDirectory');
+  const publish = declaration('_persistAuthorizedDirectorySnapshot');
   assert.match(publish, /Profile changes were not shared with the other Macs/,
     'the operator is told at the moment it happens');
   assert.match(publish, /'danger'/);
@@ -5137,8 +5245,13 @@ function publishDirectoryHarness({ cloudReady }) {
     renderManageProfiles: () => {},
     showToast: () => {},
     isElizabeth: () => true,
+    _mergeTombstonedRecordLists: (current, incoming) => [...current, ...incoming],
     STORE: {
       replace: async (key, value) => { replaced.push({ key, value }); },
+      mutate: async (key, mutator, fallback) => {
+        const value = mutator(fallback);
+        replaced.push({ key, value });
+      },
       flush: async (keys, options) => { flushes.push({ keys, options }); },
     },
     window: {
@@ -5154,6 +5267,7 @@ function publishDirectoryHarness({ cloudReady }) {
     ${declaration('_directoryPublicationPending')}
     ${declaration('_setDirectoryPublicationPending')}
     ${declaration('publishStaffDirectory')}
+    ${declaration('_persistAuthorizedDirectorySnapshot')}
     globalThis.publish = () => publishStaffDirectory();
   `, context);
   return {
@@ -5489,6 +5603,38 @@ test('MB1188-069: a passcode map passes the sync validator that refused it', () 
     /staff_passcodes expected object data/, 'a list is refused, with the honest message');
 });
 
+test('P1-2: staff directory overrides round-trip strictly and reject malformed maps', () => {
+  const context = contextWith({
+    SYNC_RECORD_IDENTITY: {},
+    MAX_SYNC_RECORDS_PER_KEY: 20000,
+    MAX_SYNC_FIELD_CHARS: 200000,
+  });
+  vm.runInContext(`
+    var MAX_SYNC_PLAINTEXT_BYTES = 600000;
+    ${declaration('_ssIsProjectSyncKey')}
+    ${declaration('_estimateJsonBytes')}
+    ${declaration('_expectedSyncType')}
+    ${declaration('_validateSyncRecordList')}
+    ${declaration('_validateStaffDirectoryOverrides')}
+    ${declaration('normalizeSpreadsheetProject')}
+    globalThis.normalizeOverride = value => _normalizeSyncValue('staff_dir_overrides', value);
+    ${declaration('_normalizeSyncValue')}
+  `, context);
+  const value = {
+    b_0: { name: "Ana O'Neil", email: 'ana+front@example.com', role: 'Front Desk\nLead' },
+    b_12: { role: 'Substitute 🎹' },
+  };
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(context.normalizeOverride(value))),
+    value,
+    'valid Unicode and multiline human fields survive unchanged',
+  );
+  assert.throws(() => context.normalizeOverride([]), /expected object data/);
+  assert.throws(() => context.normalizeOverride({ person: { name: 'X' } }), /invalid built-in id/);
+  assert.throws(() => context.normalizeOverride({ b_1: { name: 'X', admin: true } }), /invalid fields/);
+  assert.throws(() => context.normalizeOverride({ b_1: { name: 'X\u0000' } }), /invalid name/);
+});
+
 // ── P1-2 / MB1188-085: the durability journal, crashed and restarted ─────────
 //
 // The reported defect: a save returned success, its encrypted value was
@@ -5498,18 +5644,51 @@ test('MB1188-069: a passcode map passes the sync validator that refused it', () 
 // kill, localStorage to one that does not.
 
 function journalHarness({ disk = {}, localStore = {}, bridge = 'ok' } = {}) {
+  let operationCounter = 0;
   const context = contextWith({
     _decCache: {},
     _journalCommit: undefined,
     RETIRED_LOCAL_KEYS: ['online_inquiries'],
+    JOURNAL_CAPSULE_VERSION: 2,
+    INTERNAL_STORAGE_METADATA_SUFFIXES: [
+      '_local_ts', '_pending_op', '_pending_sync', '_pending_base_revision',
+      '_revision', '_cloud_deferred', '_journal_seq',
+    ],
+    SYNC_PENDING_STORAGE_VERSION: 1,
+    MAX_SYNC_SUPERSEDED_OPS: 32,
+    isSyncKey: key => ['logs', 'staff_notes', 'todo_items', 'assigned_tasks', 'policies', 'spreadsheets']
+      .includes(key) || key.startsWith('spreadsheet_'),
+    _newOperationId: () => `recovered_operation_${String(++operationCounter).padStart(4, '0')}`,
+    _needsMergeBase: () => false,
+    _aesEncrypt: async serialized => 'E:' + serialized,
+    _cloneJson: value => JSON.parse(JSON.stringify(value)),
+    _durableStoreSnapshots: new Map(),
+    _lockedStorageKeys: new Set(),
+    _storeWriteErrors: new Map(),
     localStorage: new MemoryStorage(localStore),
     window: {
       electronJournal: bridge === 'none' ? undefined : {
-        put: async ({ key, ciphertext }) => {
-          if (bridge === 'refuse') throw new Error('This record is too large to journal.');
+        put: async request => {
+          const { key, ciphertext } = request;
+          if (['refuse', 'full', 'oversized', 'throw'].includes(bridge)) {
+            throw new Error(bridge === 'full'
+              ? 'The journal is full.'
+              : bridge === 'oversized'
+                ? 'This record is too large to journal.'
+                : 'The journal did not acknowledge the write.');
+          }
+          if (bridge === 'return-false') return { ok: false };
           disk.seq = (disk.seq || 0) + 1;
-          disk[key] = { key, seq: disk.seq, ciphertext };
+          disk[key] = { ...JSON.parse(JSON.stringify(request)), key, seq: disk.seq, ciphertext };
           return { ok: true, seq: disk.seq };
+        },
+        ack: async ({ key, opId }) => {
+          const record = disk[key];
+          if (!record?.pendingSync) return { ok: true, unchanged: true };
+          const pending = JSON.parse(record.pendingSync);
+          if (pending.opId !== opId) return { ok: true, unchanged: true };
+          record.pendingSync = null;
+          return { ok: true };
         },
         read: async () => ({
           ok: true,
@@ -5519,12 +5698,27 @@ function journalHarness({ disk = {}, localStore = {}, bridge = 'ok' } = {}) {
     },
   });
   vm.runInContext(`
+    ${declaration('_isInternalStorageMetadataName')}
+    ${declaration('_isEncryptedDataStorageName')}
+    ${declaration('_pendingSyncStorageKey')}
+    ${declaration('_localSyncRevision')}
+    ${declaration('_validatePendingSyncRecord')}
+    ${declaration('_readPendingSyncRecord')}
+    ${declaration('_writePendingSyncRecord')}
+    ${declaration('_acknowledgePendingSyncRecord')}
     ${declaration('_journalBridge')}
     ${declaration('_journalCommit')}
+    ${declaration('_journalPendingRecord')}
+    ${declaration('_restorePendingFromJournal')}
     ${declaration('_recoverFromJournal')}
-    globalThis.commit = (key, ciphertext) => _journalCommit(key, ciphertext);
+    ${declaration('_commitEncryptedSnapshot')}
+    globalThis.commit = (key, ciphertext, capsule) => _journalCommit(key, ciphertext, capsule);
     globalThis.recover = () => _recoverFromJournal();
+    globalThis.commitSnapshot = (key, value) =>
+      _commitEncryptedSnapshot(key, JSON.stringify(value), value);
     globalThis.read = key => localStorage.getItem('tmb_' + key);
+    globalThis.pending = key => _readPendingSyncRecord(key);
+    globalThis.acknowledge = (key, opId, revision) => _acknowledgePendingSyncRecord(key, opId, revision);
     globalThis.seqOf = key => localStorage.getItem('tmb_' + key + '_journal_seq');
   `, context);
   return context;
@@ -5590,7 +5784,7 @@ test('MB1188-085: a save still succeeds when the journal cannot take it', async 
 
 test('MB1188-085: the commit awaits the journal before reporting success', () => {
   const commit = declaration('_commitEncryptedSnapshot');
-  const journal = commit.indexOf('await _journalCommit(k, enc);');
+  const journal = commit.indexOf('await _journalCommit(k, enc, {');
   assert.ok(journal !== -1, 'the on-disk commit is awaited');
   assert.ok(journal < commit.indexOf('return enc;'), 'before the caller is told it worked');
   // Recovery runs before anything reads localStorage into the cache.
@@ -5599,12 +5793,15 @@ test('MB1188-085: the commit awaits the journal before reporting success', () =>
     'and a lost write is restored before the cache is filled');
 });
 
-test('MB1188-086: a flushed sequence marker with an unflushed value still recovers', async () => {
+test('MB1188-086: a journal candidate restores only over its proven predecessor', async () => {
   // Found by pentesting the journal itself. The value and the marker are two
   // separate localStorage keys in one LevelDB, so a crash can flush the marker
   // and lose the value. A strictly-newer test then read the journal as already
   // applied and dropped the only surviving copy.
-  const disk = { logs: { key: 'logs', seq: 6, ciphertext: 'E:the-new-entry' } };
+  const disk = { logs: {
+    key: 'logs', seq: 6, ciphertext: 'E:the-new-entry',
+    schemaVersion: 2, previousCiphertext: 'E:the-old-entry',
+  } };
   const app = journalHarness({
     disk,
     localStore: { tmb_logs: 'E:the-old-entry', tmb_logs_journal_seq: '6' },
@@ -5612,6 +5809,168 @@ test('MB1188-086: a flushed sequence marker with an unflushed value still recove
   const result = await vm.runInContext('recover()', app);
   assert.equal(result.restored, 1, 'the split is detected');
   assert.equal(vm.runInContext(`read('logs')`, app), 'E:the-new-entry');
+});
+
+test('P0-1: an old journal cannot roll back a newer fail-open save', async () => {
+  const disk = { logs: {
+    key: 'logs', seq: 4, schemaVersion: 2,
+    ciphertext: 'E:journal-old', previousCiphertext: 'E:older-still',
+  } };
+  const newerPending = {
+    version: 1,
+    opId: 'newer_operation_0001',
+    baseRevision: 7,
+    localCiphertext: 'E:canonical-new',
+    supersededOpIds: [],
+    createdAt: '2026-08-13T00:00:00.000Z',
+  };
+  const app = journalHarness({
+    disk,
+    localStore: {
+      tmb_logs: 'E:canonical-new',
+      tmb_logs_journal_seq: '4',
+      tmb_logs_pending_sync: JSON.stringify(newerPending),
+    },
+  });
+  const result = await vm.runInContext('recover()', app);
+  assert.equal(result.restored, 0);
+  assert.equal(vm.runInContext(`read('logs')`, app), 'E:canonical-new');
+  assert.equal(vm.runInContext(`pending('logs').localCiphertext`, app), 'E:canonical-new');
+});
+
+test('P0-1: the real encrypted save path stays new after a journal outage and restart', async () => {
+  const disk = {};
+  const first = journalHarness({ disk });
+  await vm.runInContext(`commitSnapshot('logs', [{id:'log-1', body:'JOURNAL OLD VALUE'}])`, first);
+  assert.match(disk.logs.ciphertext, /JOURNAL OLD VALUE/);
+
+  const afterFirst = Object.fromEntries(first.localStorage.values);
+  const failing = journalHarness({ disk, localStore: afterFirst, bridge: 'throw' });
+  await vm.runInContext(`commitSnapshot('logs', [{id:'log-1', body:'JOURNAL NEWER SUCCESSFUL VALUE'}])`, failing);
+  assert.match(vm.runInContext(`read('logs')`, failing), /JOURNAL NEWER SUCCESSFUL VALUE/);
+  assert.match(vm.runInContext(`pending('logs').localCiphertext`, failing), /JOURNAL NEWER SUCCESSFUL VALUE/);
+  assert.match(disk.logs.ciphertext, /JOURNAL OLD VALUE/, 'disk journal is deliberately stale');
+
+  const restarted = journalHarness({
+    disk,
+    localStore: Object.fromEntries(failing.localStorage.values),
+  });
+  assert.equal((await vm.runInContext('recover()', restarted)).restored, 0);
+  assert.match(vm.runInContext(`read('logs')`, restarted), /JOURNAL NEWER SUCCESSFUL VALUE/);
+  assert.match(vm.runInContext(`pending('logs').localCiphertext`, restarted), /JOURNAL NEWER SUCCESSFUL VALUE/);
+});
+
+test('P0-1/P0-4: a restored synchronized journal candidate recreates its exact pending operation', async () => {
+  const pendingRecord = {
+    version: 1,
+    opId: 'journal_operation_0001',
+    baseRevision: 9,
+    localCiphertext: 'E:journal-new',
+    supersededOpIds: ['journal_operation_0000'],
+    createdAt: '2026-08-13T00:00:00.000Z',
+  };
+  const disk = { logs: {
+    key: 'logs', seq: 8, schemaVersion: 2,
+    ciphertext: 'E:journal-new', previousCiphertext: 'E:journal-old',
+    pendingSync: JSON.stringify(pendingRecord),
+    revision: '9',
+    localTimestamp: '2026-08-13T00:00:00.000Z',
+  } };
+  const app = journalHarness({ disk, localStore: { tmb_logs: 'E:journal-old' } });
+  assert.equal((await vm.runInContext('recover()', app)).restored, 1);
+  assert.equal(vm.runInContext(`read('logs')`, app), 'E:journal-new');
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(vm.runInContext(`pending('logs')`, app))),
+    pendingRecord,
+  );
+  assert.equal(vm.runInContext(`localStorage.getItem('tmb_logs_revision')`, app), '9');
+});
+
+test('P0-1: a valid pending candidate outranks an older journal when canonical storage is absent', async () => {
+  const pendingRecord = {
+    version: 1,
+    opId: 'pending_operation_0001',
+    baseRevision: 12,
+    localCiphertext: 'E:pending-newest',
+    supersededOpIds: [],
+    createdAt: '2026-08-13T00:00:00.000Z',
+  };
+  const disk = { logs: {
+    key: 'logs', seq: 3, schemaVersion: 2,
+    ciphertext: 'E:journal-older', previousCiphertext: 'E:oldest',
+  } };
+  const app = journalHarness({
+    disk,
+    localStore: { tmb_logs_pending_sync: JSON.stringify(pendingRecord) },
+  });
+  assert.equal((await vm.runInContext('recover()', app)).restored, 1);
+  assert.equal(vm.runInContext(`read('logs')`, app), 'E:pending-newest');
+  assert.equal(vm.runInContext(`pending('logs').opId`, app), 'pending_operation_0001');
+});
+
+test('P0-1: pending lineage restores a newer value when only its old base reached canonical storage', async () => {
+  // Chromium may flush the pending-operation sidecar but leave the canonical
+  // value at the base from which that operation was computed. The sidecar
+  // names both ends, so this is recoverable without guessing.
+  const pendingRecord = {
+    version: 1,
+    opId: 'pending_operation_0002',
+    baseRevision: 13,
+    baseCiphertext: 'E:canonical-base',
+    localCiphertext: 'E:pending-newest',
+    supersededOpIds: [],
+    createdAt: '2026-08-13T00:00:00.000Z',
+  };
+  const disk = { logs: {
+    key: 'logs', seq: 3, schemaVersion: 2,
+    ciphertext: 'E:journal-older', previousCiphertext: 'E:oldest',
+  } };
+  const app = journalHarness({
+    disk,
+    localStore: {
+      tmb_logs: 'E:canonical-base',
+      tmb_logs_pending_sync: JSON.stringify(pendingRecord),
+    },
+  });
+  assert.equal((await vm.runInContext('recover()', app)).restored, 1);
+  assert.equal(vm.runInContext(`read('logs')`, app), 'E:pending-newest');
+  assert.equal(vm.runInContext(`pending('logs').opId`, app), 'pending_operation_0002');
+});
+
+test('P0-1: every journal outage shape stays fail-open', async () => {
+  for (const bridge of ['none', 'refuse', 'throw', 'return-false', 'full', 'oversized']) {
+    const app = journalHarness({ disk: {}, bridge });
+    assert.equal(await vm.runInContext(`commit('logs', 'E:value')`, app), false, bridge);
+  }
+});
+
+test('P0-4: cloud acknowledgement retires the pending operation inside the durable journal', async () => {
+  const pendingRecord = {
+    version: 1,
+    opId: 'delivered_operation_0001',
+    baseRevision: 2,
+    localCiphertext: 'E:delivered',
+    supersededOpIds: [],
+    createdAt: '2026-08-13T00:00:00.000Z',
+  };
+  const disk = { logs: {
+    key: 'logs', seq: 2, schemaVersion: 2, ciphertext: 'E:delivered',
+    previousCiphertext: 'E:before', pendingSync: JSON.stringify(pendingRecord),
+  } };
+  const app = journalHarness({
+    disk,
+    localStore: { tmb_logs_pending_sync: JSON.stringify(pendingRecord) },
+  });
+  vm.runInContext(`acknowledge('logs', 'delivered_operation_0001', 3)`, app);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(disk.logs.pendingSync, null);
+  assert.equal(vm.runInContext(`pending('logs')`, app), null);
+
+  // Relaunch: current canonical already matches and the journal now carries no
+  // undelivered operation, so recovery must not manufacture one.
+  const relaunched = journalHarness({ disk, localStore: { tmb_logs: 'E:delivered' } });
+  assert.equal((await vm.runInContext('recover()', relaunched)).redelivered, 0);
+  assert.equal(vm.runInContext(`pending('logs')`, relaunched), null);
 });
 
 test('MB1188-086: matching content at the same sequence is left alone', async () => {
@@ -5648,4 +6007,172 @@ test('MB1188-086: a retired key is never restored from the journal', async () =>
   assert.equal(vm.runInContext(`read('online_inquiries')`, app), null,
     'the retired key stays gone');
   assert.equal(vm.runInContext(`read('logs')`, app), 'E:real');
+});
+
+test('P0-2: transaction metadata cannot enter cache hydration or dynamic spreadsheet sync keys', async () => {
+  const localStorage = new MemoryStorage({
+    tmb_logs: JSON.stringify([{ id: 'log-1', body: 'real' }]),
+    tmb_logs_journal_seq: '7',
+    tmb_logs_cloud_deferred: '1',
+    tmb_spreadsheet_proj_real: JSON.stringify({ id: 'proj_real', sheets: [] }),
+    tmb_spreadsheet_proj_real_journal_seq: '11',
+  });
+  const context = contextWith({
+    localStorage,
+    _lockedStorageKeys: new Set(),
+    _durableStoreSnapshots: new Map(),
+    _replaceDurableStoreSnapshots: () => {},
+    _aesDecrypt: async () => null,
+    _decCache: {},
+    SYNC_BASE_KEYS: ['logs', 'spreadsheets'],
+    INTERNAL_STORAGE_METADATA_SUFFIXES: [
+      '_local_ts', '_pending_op', '_pending_sync', '_pending_base_revision',
+      '_revision', '_cloud_deferred', '_journal_seq',
+    ],
+  });
+  vm.runInContext(`
+    ${declaration('_isInternalStorageMetadataName')}
+    ${declaration('_isEncryptedDataStorageName')}
+    ${declaration('_fillCache')}
+    ${declaration('_ssProjectSyncKey')}
+    ${declaration('_ssIsProjectSyncKey')}
+    ${declaration('_ssKnownProjectSyncKeys')}
+    ${declaration('getSyncKeys')}
+    globalThis.hydrate = () => _fillCache();
+    globalThis.cacheKeys = () => Object.keys(_decCache).sort();
+    globalThis.syncKeys = () => getSyncKeys().sort();
+    globalThis.isProjectKey = key => _ssIsProjectSyncKey(key);
+  `, context);
+  await vm.runInContext('hydrate()', context);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(vm.runInContext('cacheKeys()', context))),
+    ['logs', 'spreadsheet_proj_real'],
+  );
+  assert.equal(vm.runInContext(`isProjectKey('spreadsheet_proj_real_journal_seq')`, context), false);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(vm.runInContext('syncKeys()', context))),
+    ['logs', 'spreadsheet_proj_real', 'spreadsheets'],
+  );
+});
+
+test('P0-2/P0-6: iCloud envelope contains real split projects and no journal metadata', async () => {
+  const context = contextWith({
+    _encKey: {},
+    _activePin: '123456',
+    _decCache: {
+      logs: [{ id: 'log-1', body: 'kept' }],
+      spreadsheets: { schema: 2, projects: [{ id: 'proj_real', version: 1 }] },
+      spreadsheet_proj_real: { id: 'proj_real', name: 'Schedule', activeId: 's1', sheets: [] },
+      spreadsheet_proj_real_journal_seq: 19,
+    },
+    localStorage: new MemoryStorage(),
+    SYNC_BASE_KEYS: ['logs', 'spreadsheets'],
+    _normalizeSyncValue: (_key, value) => value,
+    _aesEncryptWithKey: async plaintext => 'E:' + plaintext,
+    _wrapDataKeyWithPin: async () => 'E:wrapped-key',
+    _localPinEpoch: () => 1,
+    _validatedPinEpoch: value => value,
+    _bytesToB64: () => 'salt',
+    _deviceId: () => 'test-device',
+    PIN_KDF_ITERATIONS: 310000,
+    TMB_CLOUD_ENVELOPE_FORMAT: 'tmb-portable-backup',
+    TMB_CLOUD_ENVELOPE_VERSION: 2,
+    TMB_CLOUD_KEY_CHECK: 'music-box-cloud-key-v2',
+    INTERNAL_STORAGE_METADATA_SUFFIXES: [
+      '_local_ts', '_pending_op', '_pending_sync', '_pending_base_revision',
+      '_revision', '_cloud_deferred', '_journal_seq',
+    ],
+  });
+  vm.runInContext(`
+    ${declaration('_isInternalStorageMetadataName')}
+    ${declaration('_ssProjectSyncKey')}
+    ${declaration('_ssIsProjectSyncKey')}
+    ${declaration('_ssKnownProjectSyncKeys')}
+    ${declaration('getSyncKeys')}
+    ${declaration('_expectedSyncType')}
+    ${declaration('_buildCloudEnvelope')}
+    globalThis.buildEnvelope = () => _buildCloudEnvelope();
+  `, context);
+  const envelope = await vm.runInContext('buildEnvelope()', context);
+  assert.deepEqual(Object.keys(envelope.entries).sort(), [
+    'logs', 'spreadsheet_proj_real', 'spreadsheets',
+  ]);
+  assert.equal(envelope.entries.spreadsheet_proj_real.valueType, 'object');
+  assert.equal(envelope.entries.spreadsheet_proj_real_journal_seq, undefined);
+});
+
+test('P0-2: an encrypted legacy journal marker is repaired without becoming user data', async () => {
+  const localStorage = new MemoryStorage({
+    tmb_logs_journal_seq: 'E:encrypted-seven',
+    tmb_logs_journal_seq_pending_sync: '{"poison":true}',
+    tmb_logs_journal_seq_revision: '3',
+  });
+  const context = contextWith({
+    localStorage,
+    _encKey: {},
+    _aesDecrypt: async raw => raw === 'E:encrypted-seven' ? '7' : null,
+    _decCache: { logs_journal_seq: 7 },
+    _durableStoreSnapshots: new Map([['logs_journal_seq', 7]]),
+    _lockedStorageKeys: new Set(['logs_journal_seq']),
+    _storeWriteErrors: new Map([['logs_journal_seq', new Error('poison')]]),
+    INTERNAL_STORAGE_METADATA_SUFFIXES: [
+      '_local_ts', '_pending_op', '_pending_sync', '_pending_base_revision',
+      '_revision', '_cloud_deferred', '_journal_seq',
+    ],
+  });
+  vm.runInContext(`
+    ${declaration('_repairJournalSequenceMarkers')}
+    globalThis.repair = () => _repairJournalSequenceMarkers();
+  `, context);
+  const result = await vm.runInContext('repair()', context);
+  assert.equal(result.repaired, 1);
+  assert.equal(localStorage.getItem('tmb_logs_journal_seq'), '7');
+  assert.equal(localStorage.getItem('tmb_logs_journal_seq_pending_sync'), null);
+  assert.equal(localStorage.getItem('tmb_logs_journal_seq_revision'), null);
+  assert.equal(vm.runInContext(`Object.hasOwn(_decCache, 'logs_journal_seq')`, context), false);
+});
+
+test('P0-2: encrypted journal metadata cannot masquerade as legacy user ciphertext at first unlock', () => {
+  const init = declaration('initEncryption');
+  const legacyScan = init.slice(
+    init.indexOf('const hasLegacyCiphertext'),
+    init.indexOf('if (legacySaltB64 && hasLegacyCiphertext)'),
+  );
+  assert.match(legacyScan, /_isEncryptedDataStorageName\(name\)/,
+    'the first-unlock scan uses the authoritative metadata exclusion');
+  assert.doesNotMatch(legacyScan, /key\?\.startsWith\('tmb_'\) && localStorage/,
+    'the prefix-only scan could treat an encrypted journal marker as application data');
+});
+
+test('P0-3: every authenticated login gates rendering on journal and split-workbook recovery', async () => {
+  const calls = [];
+  const context = contextWith({
+    _encKey: {},
+    _lockedStorageKeys: new Set(),
+    _recoverFromJournal: async () => calls.push('journal'),
+    _repairJournalSequenceMarkers: async () => calls.push('metadata'),
+    _fillCache: async () => calls.push('cache'),
+    migrateSharedKeys: () => calls.push('shared'),
+    _loadPersistedSyncKey: async () => calls.push('sync-key'),
+    _ssRecoverInterruptedSplitCommit: async () => calls.push('spreadsheet'),
+  });
+  vm.runInContext(`
+    ${declaration('_prepareAuthorizedLoginData')}
+    globalThis.prepareLogin = () => _prepareAuthorizedLoginData();
+  `, context);
+  await vm.runInContext('prepareLogin()', context);
+  assert.deepEqual(calls, [
+    'journal', 'metadata', 'cache', 'shared', 'sync-key', 'spreadsheet', 'cache',
+  ]);
+
+  for (const name of ['selectLoginUser', '_checkStaffPin', 'checkPin']) {
+    const body = declaration(name);
+    const authenticate = name === 'checkPin'
+      ? body.indexOf('authenticateOwner')
+      : body.indexOf('startStaff');
+    const recover = body.indexOf('await _prepareAuthorizedLoginData()');
+    const render = body.indexOf('completeLogin(');
+    assert.ok(authenticate !== -1 && authenticate < recover && recover < render,
+      `${name} authenticates, recovers, then renders`);
+  }
 });

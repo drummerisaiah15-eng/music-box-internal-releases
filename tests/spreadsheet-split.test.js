@@ -62,6 +62,11 @@ function splitApi() {
         MAX_SPREADSHEET_GRID_CELLS = 10000, MAX_SPREADSHEET_TOTAL_CELLS = 10000,
         MAX_SPREADSHEET_TOTAL_CHARS = 400000, MAX_SPREADSHEET_SYNC_JSON_BYTES = 600000,
         MAX_SPREADSHEET_ATTRIBUTIONS = 200, MAX_SPREADSHEET_ATTRIBUTION_NAME = 80;
+    var INTERNAL_STORAGE_METADATA_SUFFIXES = [
+      '_local_ts', '_pending_op', '_pending_sync', '_pending_base_revision',
+      '_revision', '_cloud_deferred', '_journal_seq'
+    ];
+    ${declaration('_isInternalStorageMetadataName')}
     ${declaration('_mergeResolvedConflictIds')}
     ${declaration('_ssProjectSyncKey')}
     ${declaration('_ssIsProjectSyncKey')}
@@ -502,6 +507,10 @@ test('MB161-012: every project the index names is a synchronized key', () => {
   vm.runInContext(`
     var SPREADSHEET_PROJECT_KEY_PREFIX = 'spreadsheet_';
     var SPREADSHEET_PROJECT_ID_PATTERN = /^[A-Za-z0-9_-]{1,100}$/;
+    var INTERNAL_STORAGE_METADATA_SUFFIXES = [
+      '_local_ts', '_pending_op', '_pending_sync', '_pending_base_revision',
+      '_revision', '_cloud_deferred', '_journal_seq'
+    ];
     var SYNC_BASE_KEYS = ['logs', 'spreadsheets'];
     var _decCache = {
       spreadsheets: { schema: 2, activeProject: 'p1', projects: [
@@ -511,6 +520,7 @@ test('MB161-012: every project the index names is a synchronized key', () => {
       spreadsheet_p9: { id: 'p9' },
       logs: [],
     };
+    ${declaration('_isInternalStorageMetadataName')}
     ${declaration('_ssProjectSyncKey')}
     ${declaration('_ssIsProjectSyncKey')}
     ${declaration('_ssKnownProjectSyncKeys')}
@@ -552,6 +562,10 @@ function routingApi(decCache = {}) {
     var MAX_SPREADSHEET_PROJECTS = 25;
     var SPREADSHEET_PROJECT_KEY_PREFIX = 'spreadsheet_';
     var SPREADSHEET_PROJECT_ID_PATTERN = /^[A-Za-z0-9_-]{1,100}$/;
+    var INTERNAL_STORAGE_METADATA_SUFFIXES = [
+      '_local_ts', '_pending_op', '_pending_sync', '_pending_base_revision',
+      '_revision', '_cloud_deferred', '_journal_seq'
+    ];
     var MAX_SYNC_PLAINTEXT_BYTES = 620000;
     var MAX_SPREADSHEET_TOMBSTONES = 175;
     var MAX_SPREADSHEET_INDEX_RECORDS = 400;
@@ -568,6 +582,7 @@ function routingApi(decCache = {}) {
       staff_directory: 'tombstoned-record-list',
       spreadsheets: 'spreadsheet-index',
     };
+    ${declaration('_isInternalStorageMetadataName')}
     ${declaration('_ssProjectSyncKey')}
     ${declaration('_ssIsProjectSyncKey')}
     ${declaration('_ssIsLegacyWorkbook')}
@@ -984,6 +999,7 @@ function wiringApi({ store = {}, durable = {}, awaiting = false } = {}) {
     ${declaration('_ssSheetOf')}
     ${declaration('_ssCellsOf')}
     ${declaration('_ssStampAttribution')}
+    ${declaration('_ssStampCreatedCells')}
     ${declaration('_ssConflictId')}
     ${declaration('_ssAttributionActor')}
     ${declaration('_deriveSpreadsheetOperations')}
@@ -1521,6 +1537,7 @@ function mergeApi() {
     ${declaration('_ssCellIsBlank')}
     ${declaration('_ssAttributionActor')}
     ${declaration('_ssStampAttribution')}
+    ${declaration('_ssStampCreatedCells')}
     ${declaration('_ssStructureDigest')}
     ${declaration('_ssStructureWasEditedRemotely')}
     ${declaration('_deriveSpreadsheetOperations')}
@@ -2073,6 +2090,41 @@ test('P0-1: recovery is idempotent across repeated relaunches', async () => {
   }
 });
 
+test('P0-5: recovery attaches valid orphans but retains intent for an ambiguous missing document', async () => {
+  const storage = freshStorage();
+  const durable = JSON.parse(storage.__durable);
+  durable.spreadsheet_proj_b = sentinelDoc;
+  storage.__durable = JSON.stringify(durable);
+  storage.tmb__ss_commit_intent = JSON.stringify({
+    projectIds: ['proj_b', 'proj_c'],
+    at: '2026-08-13T00:00:00.000Z',
+  });
+
+  const first = crashHarness(storage, null);
+  const firstResult = await vm.runInContext('recover()', first);
+  const firstAfter = vm.runInContext('snapshot()', first);
+  assert.deepEqual(JSON.parse(JSON.stringify(firstResult)), { recovered: 1, pending: 1 });
+  assert.ok(firstAfter.index.projects.some(project => project.id === 'proj_b'));
+  assert.ok(firstAfter.intent, 'evidence for the still-ambiguous project is retained');
+
+  const afterDurable = JSON.parse(firstAfter.storage.__durable);
+  afterDurable.spreadsheet_proj_c = {
+    id: 'proj_c', name: 'C', sentinel: 'LATE DURABLE PROJECT',
+  };
+  firstAfter.storage.__durable = JSON.stringify(afterDurable);
+  const second = crashHarness(firstAfter.storage, null);
+  const secondResult = await vm.runInContext('recover()', second);
+  const secondAfter = vm.runInContext('snapshot()', second);
+  assert.deepEqual(JSON.parse(JSON.stringify(secondResult)), { recovered: 1, pending: 0 });
+  assert.equal(secondAfter.intent, null, 'intent clears only after every project is terminal');
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(secondAfter.index.projects
+      .filter(project => ['proj_b', 'proj_c'].includes(project.id))
+      .map(project => project.id).sort())),
+    ['proj_b', 'proj_c'],
+  );
+});
+
 test('P0-1: dying before the intent lands leaves nothing to recover', async () => {
   const dying = crashHarness(freshStorage(), 'intent');
   await assert.rejects(() => vm.runInContext(
@@ -2083,15 +2135,16 @@ test('P0-1: dying before the intent lands leaves nothing to recover', async () =
   assert.equal((await vm.runInContext('recover()', relaunched)).recovered, 0);
 });
 
-test('P0-1: an intent whose document never landed fabricates nothing', async () => {
+test('P0-1: an intent whose document never landed fabricates nothing and retains recovery evidence', async () => {
   const storage = freshStorage();
   storage.tmb__ss_commit_intent = JSON.stringify({ projectIds: ['proj_ghost'], at: 'then' });
   const app = crashHarness(storage, null);
   const result = await vm.runInContext('recover()', app);
   const after = vm.runInContext('snapshot()', app);
   assert.equal(result.recovered, 0);
+  assert.equal(result.pending, 1);
   assert.ok(!(after.index.projects || []).some(p => p.id === 'proj_ghost'));
-  assert.equal(after.intent, null, 'the stale intent is cleared rather than retried forever');
+  assert.ok(after.intent, 'the ambiguous intent remains available if the delayed document reappears');
 });
 
 test('P0-1: a project the index tombstones is never resurrected', async () => {

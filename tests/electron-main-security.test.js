@@ -1,6 +1,8 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const test = require('node:test');
 const vm = require('node:vm');
 
@@ -560,6 +562,7 @@ function removalHarness({ role = 'Owner', signedInAs = 'Elizabeth Chaves', vault
     const OPERATIONS_MANAGER_ROLES = new Set(['Owner', 'Operations Manager']);
     const _appSessionHasRole = allowed => !!appSession && allowed.has(appSession.role);
     ${sliceFunction(main, '_requireNotOwnerTarget')}
+    ${sliceFunction(main, '_requireRemovableProfileTarget')}
     ${sliceFunction(main, '_normalizeStaffProfileName')}
     ${sliceFunction(main, '_customStaffProfilesFromVault')}
     ${sliceFunction(main, '_profileRoleOverrides')}
@@ -571,6 +574,7 @@ function removalHarness({ role = 'Owner', signedInAs = 'Elizabeth Chaves', vault
     ${sliceFunction(main, '_allAppProfiles')}
     ${sliceFunction(main, '_ownerProfileCount')}
     ${sliceFunction(main, '_findProfileByFoldedName')}
+    const _buildStaffDirectory = () => [];
     globalThis.setRole = async request => {
       ${extractHandlerBody(main, 'app-session-set-profile-role')}
     };
@@ -615,6 +619,35 @@ test('profile removal: only the owner may remove a user', async () => {
     await assert.rejects(() => api.remove('Dana Reed'), /not authorized/, role);
     assert.deepEqual([...api.list()], ['Dana Reed', 'Sam Vega']);
   }
+});
+
+test('P1-1: Operations Manager has removal-only authority over ordinary roles', async () => {
+  const vault = {
+    app_staff_profiles_v1: [
+      { name: 'Megan', role: 'Front Desk', createdAt: 1 },
+      { name: 'Dana Front', role: 'Front Desk', createdAt: 2 },
+      { name: 'Owen Events', role: 'Front Desk', createdAt: 3 },
+      { name: 'Morgan Manager', role: 'Front Desk', createdAt: 4 },
+    ],
+    app_profile_roles_v1: {
+      Megan: 'Operations Manager',
+      'Owen Events': 'Operations & Events',
+      'Morgan Manager': 'Operations Manager',
+    },
+  };
+  const manager = removalHarness({ role: 'Operations Manager', signedInAs: 'Megan', vault });
+  assert.equal((await manager.api.remove('Dana Front')).ok, true);
+  assert.equal((await manager.api.remove('Owen Events')).ok, true);
+  await assert.rejects(() => manager.api.remove('Morgan Manager'), /cannot remove an Owner or Operations Manager/);
+  await assert.rejects(() => manager.api.remove('Elizabeth Chaves'), /cannot remove an Owner or Operations Manager/);
+  await assert.rejects(() => manager.api.remove('Megan'), /currently signed in/);
+
+  const owner = removalHarness({ role: 'Owner', signedInAs: 'Elizabeth Chaves', vault });
+  assert.equal((await owner.api.remove('Morgan Manager')).ok, true,
+    'Owner retains authority over Operations Manager profiles');
+
+  const staff = removalHarness({ role: 'Front Desk', signedInAs: 'Ana Chaves', vault });
+  await assert.rejects(() => staff.api.remove('Dana Front'), /not authorized/);
 });
 
 test('profile removal: the signed-in profile cannot delete itself', async () => {
@@ -1056,7 +1089,12 @@ test('directory: the renderer publishes on every profile change and merges on ar
     const start = renderer.indexOf(`async function ${name}(`);
     assert.notEqual(start, -1, `${name} exists`);
     const body = renderer.slice(start, renderer.indexOf('\n}\n', start) + 2);
-    assert.match(body, /publishStaffDirectory\(\)/, `${name} publishes the directory`);
+    if (name === 'removeLoginUser') {
+      assert.match(body, /_persistAuthorizedDirectorySnapshot\(result\.directory\)/,
+        'removal publishes the exact main-authorized tombstone snapshot');
+    } else {
+      assert.match(body, /publishStaffDirectory\(\)/, `${name} publishes the directory`);
+    }
   }
   // Only the owner may publish.
   const fn = renderer.slice(renderer.indexOf('async function publishStaffDirectory('));
@@ -1757,14 +1795,18 @@ test('MB161-031: Operations Manager is assignable, and can never reach the Owner
   // Owner is absent from the assignable list, so it cannot be granted at all.
   assert.ok(!/ASSIGNABLE_PROFILE_ROLES = Object\.freeze\(\[[^\]]*'Owner'/.test(main));
 
-  // Removing or demoting an Owner profile requires actually being an Owner.
+  // Removing an Owner or Operations Manager requires actually being an Owner.
   assert.match(main, /function _requireNotOwnerTarget\(target, action\)/);
   assert.match(main, /if \(target\?\.role === 'Owner' && !_appSessionHasRole\(new Set\(\['Owner'\]\)\)\)/);
-  for (const handler of ["app-session-remove-staff-profile", "app-session-set-profile-role"]) {
+  for (const handler of ["app-session-set-profile-role"]) {
     const start = main.indexOf(`_secureHandle('${handler}'`);
     const body = main.slice(start, start + 3000);
     assert.match(body, /_requireNotOwnerTarget\(target,/, `${handler} protects Owner profiles`);
   }
+  const removeBody = extractHandlerBody(main, 'app-session-remove-staff-profile');
+  assert.match(removeBody, /_requireRemovableProfileTarget\(target\)/);
+  assert.match(sliceFunction(main, '_requireRemovableProfileTarget'),
+    /target\?\.role === 'Owner' \|\| target\?\.role === 'Operations Manager'/);
 });
 
 test('MB161-031: the owner keeps everything that is about ownership or secrets', () => {
@@ -2744,6 +2786,86 @@ test('P1-2 / MB1188-084: a real crash-order check on the durable write', () => {
     'data synced, then renamed, then the directory synced');
 });
 
+test('P0-1/P0-4: main journal persists the full capsule and retires only the acknowledged operation', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'music-box-journal-test-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const sandbox = vm.createContext({
+    fs, path, crypto, process, Buffer, JSON, Object, Number, String, Error,
+    console: { warn() {} },
+    __journalRoot: root,
+  });
+  vm.runInContext(`
+    const JOURNAL_DIR = () => __journalRoot;
+    const JOURNAL_KEY_PATTERN = /^[A-Za-z0-9_-]{1,120}$/;
+    const MAX_JOURNAL_BYTES = 2 * 1024 * 1024;
+    const MAX_JOURNAL_CAPSULE_BYTES = 6 * 1024 * 1024;
+    const MAX_JOURNAL_ENTRIES = 200;
+    let _journalSeq = 0;
+    ${extractFunction(main, '_isPlainObject')}
+    ${extractFunction(main, '_atomicWriteFileSync')}
+    ${extractFunction(main, '_journalPath')}
+    ${extractFunction(main, '_readJournalFile')}
+    ${extractFunction(main, '_journalHighestSeq')}
+    globalThis.put = async request => { ${extractHandlerBody(main, 'durable-journal-put')} };
+    globalThis.ack = async request => { ${extractHandlerBody(main, 'durable-journal-ack')} };
+    globalThis.read = async () => { ${extractHandlerBody(main, 'durable-journal-read')} };
+  `, sandbox);
+
+  const pending = JSON.stringify({
+    version: 1,
+    opId: 'durable_operation_0001',
+    baseRevision: 7,
+    baseCiphertext: 'E:before',
+    localCiphertext: 'E:after',
+    supersededOpIds: [],
+    createdAt: '2026-08-13T00:00:00.000Z',
+  });
+  await sandbox.put({
+    key: 'logs', ciphertext: 'E:after', schemaVersion: 2,
+    previousCiphertext: 'E:before', pendingSync: pending,
+    revision: '7', localTimestamp: '2026-08-13T00:00:00.000Z',
+  });
+  let record = (await sandbox.read()).records[0];
+  assert.equal(record.ciphertext, 'E:after');
+  assert.equal(record.previousCiphertext, 'E:before');
+  assert.equal(record.pendingSync, pending);
+  assert.equal(record.revision, '7');
+
+  await sandbox.ack({ key: 'logs', opId: 'different_operation_9999' });
+  record = (await sandbox.read()).records[0];
+  assert.equal(record.pendingSync, pending, 'an unrelated acknowledgement changes nothing');
+
+  await sandbox.ack({ key: 'logs', opId: 'durable_operation_0001' });
+  record = (await sandbox.read()).records[0];
+  assert.equal(record.pendingSync, null, 'the exact delivered operation is retired durably');
+
+  await assert.rejects(
+    sandbox.put({ key: 'logs', ciphertext: 'plaintext', schemaVersion: 2 }),
+    /encrypted text only/,
+  );
+  await assert.rejects(
+    sandbox.put({ key: 'logs', ciphertext: 'E:x', schemaVersion: 2, pendingSync: {} }),
+    /pending operation is invalid/,
+  );
+  await assert.rejects(
+    sandbox.put({ key: 'logs', ciphertext: 'E:x', schemaVersion: 2,
+      revision: '99999999999999999999' }),
+    /revision is invalid/,
+  );
+  await assert.rejects(
+    sandbox.put({ key: 'logs', ciphertext: 'E:x', schemaVersion: 2,
+      localTimestamp: 'not-a-time' }),
+    /timestamp is invalid/,
+  );
+
+  fs.writeFileSync(path.join(root, 'forged.jrn'), JSON.stringify({
+    key: 'logs', seq: 999999, ciphertext: 'E:forged-under-the-wrong-name',
+  }));
+  assert.deepEqual(JSON.parse(JSON.stringify(
+    (await sandbox.read()).records.map(item => item.key))), ['logs'],
+    'a file whose name does not match its embedded key is ignored');
+});
+
 test('P0-3 / MB1188-081: Operations & Events outranks Front Desk', () => {
   // Equal rank meant a "non-elevating" import could move somebody from Front
   // Desk to Operations & Events — a grant of access they did not have.
@@ -2770,9 +2892,9 @@ test('P0-3 / MB1188-081: main reports what it refused to apply', () => {
 
 test("P0-2: Operations Manager removal is Isaiah's decision, not an oversight", () => {
   // Two audits have now called this a defect. It is not: asked directly on
-  // 2026-08-12, Isaiah chose to split what MB161-031 granted — adding and
-  // removing profiles is routine onboarding and stays with the Operations
-  // Manager; changing a ROLE is granting privilege and went back to the Owner.
+  // 2026-08-13, Isaiah chose a narrow split: Operations Manager may remove
+  // Front Desk or Operations & Events profiles, but cannot add users, change
+  // roles, reset passcodes, remove another manager, or remove an Owner.
   // Recorded here so the next audit argues with the decision, not the code.
   const removeBody = main.slice(main.indexOf("_secureHandle('app-session-remove-staff-profile'"));
   assert.match(removeBody.slice(0, 200), /_requireAppRole\(OPERATIONS_MANAGER_ROLES\)/,

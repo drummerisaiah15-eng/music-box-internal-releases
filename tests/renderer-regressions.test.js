@@ -1869,7 +1869,7 @@ test('MB161-037: a synced key must declare its shape, or every write is refused'
     sent_emails: 'array', ms_sent_emails: 'array', ms_sent_conv_ids: 'array',
     custom_staff: 'array', room_excluded: 'array', step_up_receipts: 'array',
     flagged_emails: 'array', comm_analyzed_ids: 'array', comm_handled_ids: 'array',
-    rc_read_convs: 'array', policies: 'array', staff_dir_overrides: 'array',
+    rc_read_convs: 'array', policies: 'array', staff_dir_overrides: 'object',
     removed_staff_dir: 'array', staff_directory: 'array',
     room_overrides: 'object', room_by_instructor: 'object',
     room_time_rules: 'object', spreadsheets: 'object', ai_spend: 'object',
@@ -1896,6 +1896,42 @@ test('MB161-037: a synced key must declare its shape, or every write is refused'
   // And the two that have actually bitten, named outright.
   assert.ok(objectKeys.includes('ai_spend'), 'ai_spend is synced, so its shape has to be declared');
   assert.ok(objectKeys.includes('staff_passcodes'), 'and so is staff_passcodes');
+});
+
+test('P1-2: staff directory overrides use a strict object-map schema and semantic saves', () => {
+  const expected = namedFunctionSource('_expectedSyncType');
+  assert.match(expected, /'staff_dir_overrides'/);
+  const validator = namedFunctionSource('_validateStaffDirectoryOverrides');
+  assert.match(validator, /\^b_\\d\{1,3\}\$/);
+  assert.match(validator, /\['name', 'email', 'role'\]/);
+  const save = namedFunctionSource('saveEditStaffMember');
+  assert.match(save, /STORE\.mutate\('staff_dir_overrides'/);
+  assert.doesNotMatch(save, /STORE\.replace\('staff_dir_overrides'/);
+});
+
+test('P1-3: every supported profile role has an exact Settings display option', () => {
+  const roleSelect = source.match(/<select id="pref-role"[\s\S]*?<\/select>/)?.[0] || '';
+  for (const role of ['Owner', 'Operations Manager', 'Operations &amp; Events', 'Front Desk']) {
+    assert.match(roleSelect, new RegExp(`<option>${role.replace('&amp;', '&amp;')}<\\/option>`));
+  }
+});
+
+test('P1-1: Operations Manager UI exposes eligible removals and no broader user controls', () => {
+  const start = script.indexOf('function renderManageProfiles()');
+  const end = script.indexOf('// ── MB1188-069:', start);
+  assert.ok(start >= 0 && end > start, 'the exact Manage Users renderer can be inspected');
+  const render = script.slice(start, end);
+  assert.match(render, /if \(!owner && !operationsManager\)/,
+    'the list is visible only to Owner and Operations Manager');
+  assert.match(render, /const roleEditable = owner && !isOwner/,
+    'only Owner receives role selectors');
+  assert.match(render, /owner && _loginProfileIsProtected/,
+    'only Owner receives passcode-reset controls');
+  assert.match(render, /const protectedFromManager = isOwner \|\| profile\.role === 'Operations Manager'/);
+  assert.match(render, /owner \? !lastOwner : !protectedFromManager/,
+    'Operations Manager receives Remove only for ordinary profiles');
+  assert.match(render, /profile\.name !== signedIn/,
+    'neither privileged role can remove the profile currently in use');
 });
 
 test('MB161-038: a task you gave yourself can be ticked off and removed', () => {
@@ -2668,24 +2704,24 @@ test('P0-2 / MB1188-078: recovery completes an interrupted commit but never resu
   const recover = namedFunctionSource('_ssRecoverInterruptedSplitCommit');
   assert.match(recover, /_ssDurableStoreValue\('spreadsheets'\)/,
     'reads the durable index, not the cache it may be mid-write on');
-  // A tombstoned project is a deliberate deletion. `named` holds every id the
-  // index mentions, live or tombstoned, and anything named is skipped.
-  assert.match(recover, /const named = new Set\(\(index\.projects \|\| \[\]\)\.map\(entry => String\(entry\.id\)\)\);/);
-  assert.match(recover, /if \(named\.has\(id\)\) continue;/);
-  assert.match(recover, /if \(!doc\) continue;/, 'a document that never landed is not invented');
+  // A tombstoned project is a deliberate deletion. A missing or malformed
+  // live document is ambiguous, so its intent is retained rather than erased.
+  assert.match(recover, /const records = new Map\(\(index\.projects \|\| \[\]\)/);
+  assert.match(recover, /if \(existing\?\._deleted\) continue;/);
+  assert.match(recover, /if \(!doc\) \{[\s\S]*?blocked\.push\(id\);/,
+    'a missing document is not invented and its recovery evidence is retained');
+  assert.match(recover, /if \(!blocked\.length\) _ssClearCommitIntent\(\);/);
   assert.match(recover, /_ssClearCommitIntent\(\);/);
-  // MB1188-080: it must NOT be reachable only through Firebase. The original
-  // call sat after `await _bootstrapSync()` inside initFirebase, so an offline
-  // or unauthenticated Mac never recovered at all.
+  // MB1188-080: it must be an awaited login gate, not a background maintenance
+  // task and not reachable only through Firebase.
   const whole = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
-  const jobs = whole.slice(whole.indexOf('async function runPostLoginMaintenance'));
-  assert.match(jobs.slice(0, 1200),
-    /\['interrupted spreadsheet save recovery', _ssRecoverInterruptedSplitCommit\]/,
-    'recovery is a post-login maintenance job, which runs before Firebase starts');
-  // And it is FIRST, so nothing else reads or publishes the workbook before it.
-  const list = jobs.slice(jobs.indexOf('const jobs = ['), jobs.indexOf('];'));
-  assert.ok(list.indexOf('interrupted spreadsheet save recovery') < list.indexOf('legacy demo cleanup'),
-    'and it runs first');
+  const prepare = namedFunctionSource('_prepareAuthorizedLoginData');
+  assert.match(prepare, /await _ssRecoverInterruptedSplitCommit\(\);/);
+  assert.ok(prepare.indexOf('await _ssRecoverInterruptedSplitCommit();') <
+    prepare.indexOf('return true;'), 'recovery is awaited before login may render');
+  const jobs = namedFunctionSource('runPostLoginMaintenance');
+  assert.doesNotMatch(jobs, /_ssRecoverInterruptedSplitCommit/,
+    'the recovery is not repeated later as background cleanup');
   const fbBlock = whole.slice(whole.indexOf('_syncBootstrapComplete = true;'));
   assert.doesNotMatch(fbBlock.slice(0, 2500), /await _ssRecoverInterruptedSplitCommit\(\)/,
     'the Firebase-gated call is gone');

@@ -78,6 +78,7 @@ contextBridge.exposeInMainWorld('electronFirebase', {
 // MB1188-085: the durability backstop. Ciphertext only — see main.
 contextBridge.exposeInMainWorld('electronJournal', {
   put:  (request) => ipcRenderer.invoke('durable-journal-put', request),
+  ack:  (request) => ipcRenderer.invoke('durable-journal-ack', request),
   read: ()        => ipcRenderer.invoke('durable-journal-read'),
 });
 
