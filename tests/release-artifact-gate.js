@@ -27,7 +27,6 @@ const FIRST_PARTY_ASAR_FILES = [
   'main.js',
   'pdf-worker.js',
   'preload.js',
-  'spreadsheet-worker.js',
 ];
 const FIRST_PARTY_RESOURCE_FILES = ['index.html'];
 const EXACT_PUBLISH_KEYS = [
@@ -679,7 +678,6 @@ function verifyPackagedPdfRuntime(appPath, listAsar = listPackage) {
     'main.js',
     'preload.js',
     'pdf-worker.js',
-    'spreadsheet-worker.js',
     'node_modules/pdf-parse/package.json',
     'node_modules/@napi-rs/canvas/package.json',
     'node_modules/@napi-rs/canvas-darwin-arm64/package.json',

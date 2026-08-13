@@ -145,8 +145,9 @@ npm run release:verify
 - The Developer ID certificate team is `MULN9RP9V5`.
 - Notarization requires internet and either the named Keychain profile or a
   complete App Store Connect API key credential set.
-- `pdf-worker.js` and `spreadsheet-worker.js` are packaged inside `app.asar`; the arm64 native canvas
-  dependency used by PDF parsing is explicitly unpacked for Electron.
+- `pdf-worker.js` is packaged inside `app.asar`; the arm64 native canvas dependency used by PDF
+  parsing is explicitly unpacked for Electron. Spreadsheet file import and its former worker have
+  been removed.
 - Auto-update payloads use the ZIP. The ZIP and `<zip>.blockmap` names are
   intentionally identical apart from the `.blockmap` suffix.
 - GitHub does not offer an atomic transaction that combines “no higher stable

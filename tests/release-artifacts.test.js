@@ -361,6 +361,15 @@ test('release gate exposes the hook shape electron-builder loads', () => {
   assert.equal(typeof releaseArtifactGate, 'function');
 });
 
+test('release source manifest matches the real checkout after file import removal', () => {
+  const manifest = createSourceContentManifest(path.join(__dirname, '..'));
+  assert.ok(manifest.files['main.js']);
+  assert.ok(manifest.files['preload.js']);
+  assert.ok(manifest.files['pdf-worker.js']);
+  assert.ok(manifest.files['index.html']);
+  assert.equal(manifest.files['spreadsheet-worker.js'], undefined);
+});
+
 test('afterPack hardening applies the required fail-closed Electron fuses', async () => {
   let receivedContext = null;
   let receivedConfig = null;
@@ -436,7 +445,6 @@ test('release verification requires the PDF worker and unpacked arm64 canvas run
     '/main.js',
     '/preload.js',
     '/pdf-worker.js',
-    '/spreadsheet-worker.js',
     '/node_modules/pdf-parse/package.json',
     '/node_modules/@napi-rs/canvas/package.json',
     '/node_modules/@napi-rs/canvas-darwin-arm64/package.json',
@@ -461,7 +469,6 @@ test('release verification binds packaged first-party bytes to the pre-build man
     ['main.js', Buffer.from('trusted main')],
     ['pdf-worker.js', Buffer.from('trusted worker')],
     ['preload.js', Buffer.from('trusted preload')],
-    ['spreadsheet-worker.js', Buffer.from('trusted spreadsheet worker')],
     ['index.html', Buffer.from('<!doctype html><title>trusted</title>')],
     ['vendor/manifest.json', Buffer.from('{"trusted":true}\n')],
     ['vendor/runtime/trusted.js', Buffer.from('globalThis.trusted = true;\n')],
@@ -486,7 +493,7 @@ test('release verification binds packaged first-party bytes to the pre-build man
   const manifest = createSourceContentManifest(sourceRoot);
   const asarContents = new Map(
     [...sourceFiles].filter(([relativePath]) =>
-      ['main.js', 'pdf-worker.js', 'preload.js', 'spreadsheet-worker.js'].includes(relativePath)),
+      ['main.js', 'pdf-worker.js', 'preload.js'].includes(relativePath)),
   );
   const extractAsarFile = (asarPath, relativePath) => {
     assert.equal(asarPath, path.join(resources, 'app.asar'));
