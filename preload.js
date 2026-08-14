@@ -76,7 +76,8 @@ contextBridge.exposeInMainWorld('electronFirebase', {
   clear:         () => ipcRenderer.invoke('firebase-clear'),
 });
 
-// iCloud Drive sync bridge — reads/writes sync.json in iCloud Drive
+// iCloud Drive backup bridge — reads the newest valid recovery point and writes
+// a new immutable per-device snapshot. Legacy sync.json remains read-only.
 // MB1188-085: the durability backstop. Ciphertext only — see main.
 contextBridge.exposeInMainWorld('electronJournal', {
   put:  (request) => ipcRenderer.invoke('durable-journal-put', request),

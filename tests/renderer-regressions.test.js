@@ -823,6 +823,12 @@ test('sync status is always visible and never sits on Connecting forever', () =>
   assert.match(setStatus, /offline:\s+\{[^}]*show: true/, 'offline is a distinct visible state');
   assert.match(setStatus, /Offline — saved on this Mac only/,
     'Settings distinguishes no-network from a broken configuration');
+  assert.match(source, /id="sync-pending-details"/,
+    'Settings has a durable place to name every affected data set');
+  assert.match(setStatus, /unsynced\.join\(', '\)/,
+    'the visible Settings diagnosis includes exact data-set names');
+  assert.match(setStatus, /Sync error — \$\{unsynced\.length\} not synced/,
+    'a connection error cannot hide the number of undelivered data sets');
 
   // Firebase auth can hang indefinitely; the badge must still resolve.
   assert.match(script, /const SYNC_CONNECT_TIMEOUT_MS = \d+/, 'the sign-in is bounded');

@@ -1252,13 +1252,16 @@ test('V159-008: a corrupt newest snapshot never hides an older good one', async 
 test('V159-008: the legacy shared sync.json is still readable but never rewritten', async () => {
   const dir = tmpDir();
   const api = snapshotHarness(dir);
-  fs.writeFileSync(path.join(dir, 'sync.json'), JSON.stringify({ legacy: true }));
+  const legacyBytes = JSON.stringify({ legacy: true });
+  fs.writeFileSync(path.join(dir, 'sync.json'), legacyBytes);
   const result = await api.read();
   assert.equal(result.legacy, true, 'the pre-existing backup is honoured');
   assert.equal(result.data.legacy, true);
   // A snapshot supersedes it once one exists.
   fs.writeFileSync(path.join(dir, api.name('aaaaaaaaaaaa', new Date())), JSON.stringify({ fresh: 1 }));
   assert.equal((await api.read()).data.fresh, 1);
+  assert.equal(fs.readFileSync(path.join(dir, 'sync.json'), 'utf8'), legacyBytes,
+    'adding a new snapshot preserves the legacy recovery point byte-for-byte');
   // The write path must never target the shared filename again.
   const writeBody = extractHandlerBody(main, 'write-sync-file');
   assert.doesNotMatch(writeBody, /ICLOUD_SYNC_PATH/,

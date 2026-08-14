@@ -1361,6 +1361,77 @@ test('MB-009: a quarantined key is reported by the per-key status model', () => 
     'the badge must never read Synced while a key is quarantined');
 });
 
+test('a delivery error cannot leave a phantom not-synced badge after its pending write is gone', () => {
+  const errors = new Map([['staff_directory', new Error('old delivery failure')]]);
+  const context = contextWith({
+    _syncBootstrapFailedKeys: new Set(),
+    _syncRecoveryRequiredKeys: new Set(),
+    _syncDeliveryChains: new Map(),
+    _syncDeliveryErrors: errors,
+    _readPendingSyncRecord: () => null,
+    getSyncKeys: () => ['staff_directory'],
+  });
+  vm.runInContext(`
+    ${declaration('_syncKeyStatus')}
+    ${declaration('_unsyncedSyncKeys')}
+    globalThis.statusApi = {
+      status: key => _syncKeyStatus(key),
+      unsynced: () => _unsyncedSyncKeys(),
+    };
+  `, context);
+
+  assert.equal(context.statusApi.status('staff_directory'), 'current');
+  assert.deepEqual([...context.statusApi.unsynced()], []);
+  assert.equal(errors.has('staff_directory'), false,
+    'the stale session-only error is retired once no undelivered write exists');
+});
+
+test('a delivery error remains failed while its encrypted pending write still exists', () => {
+  const errors = new Map([['staff_directory', new Error('delivery failed')]]);
+  const context = contextWith({
+    _syncBootstrapFailedKeys: new Set(),
+    _syncRecoveryRequiredKeys: new Set(),
+    _syncDeliveryChains: new Map(),
+    _syncDeliveryErrors: errors,
+    _readPendingSyncRecord: () => ({ opId: 'pending-profile-change' }),
+    getSyncKeys: () => ['staff_directory'],
+  });
+  vm.runInContext(`
+    ${declaration('_syncKeyStatus')}
+    ${declaration('_unsyncedSyncKeys')}
+    globalThis.statusApi = {
+      status: key => _syncKeyStatus(key),
+      unsynced: () => _unsyncedSyncKeys(),
+    };
+  `, context);
+
+  assert.equal(context.statusApi.status('staff_directory'), 'failed');
+  assert.deepEqual([...context.statusApi.unsynced()], ['staff_directory']);
+  assert.equal(errors.has('staff_directory'), true,
+    'a real undelivered profile change must remain visible');
+});
+
+test('Save All does not fail on a stale delivery error after Firebase already cleared the pending write', async () => {
+  const errors = new Map([['staff_directory', new Error('old delivery failure')]]);
+  const context = contextWith({
+    _syncBootstrapFailedKeys: new Set(),
+    _syncRecoveryRequiredKeys: new Set(),
+    _syncDeliveryErrors: errors,
+    _readPendingSyncRecord: () => null,
+    getSyncKeys: () => ['staff_directory'],
+    _retireLegacyCheckoutDeliveries: () => [],
+    _scheduleSyncDrain: async () => false,
+  });
+  vm.runInContext(`
+    ${declaration('_flushSyncDeliveries')}
+    globalThis.flushApi = { flush: () => _flushSyncDeliveries() };
+  `, context);
+
+  assert.equal(await context.flushApi.flush(), true);
+  assert.equal(errors.has('staff_directory'), false,
+    'the stale process-only diagnostic cannot poison later Save All attempts');
+});
+
 // --- V159-003/009: quarantine must survive a restart --------------------------
 
 function quarantineStoreContext(entries = {}) {
@@ -1937,6 +2008,90 @@ test('H-02: no synchronized key retains a STORE.set() call site', () => {
     }
   }
   assert.deepEqual(regressions, [], 'all sync-key STORE.set() calls must be migrated');
+});
+
+test('manual iCloud backup preserves a legacy sync.json and writes a new encrypted snapshot', async () => {
+  const legacy = { profiles: ['legacy-recovery-point'] };
+  const envelope = {
+    format: 'music-box-encrypted-backup',
+    version: 2,
+    lastUpdated: '2026-08-13T22:00:00.000Z',
+    pinEpoch: 1,
+    entries: {},
+  };
+  let written = null;
+  const storage = new MemoryStorage();
+  const context = contextWith({
+    window: {
+      electronSync: {
+        read: async () => ({ ok: true, data: legacy, source: 'sync.json', legacy: true }),
+        write: async data => {
+          written = data;
+          return { ok: true, snapshot: 'sync-device-s000000001-now.json' };
+        },
+      },
+    },
+    localStorage: storage,
+    _encKey: {},
+    _flushSpreadsheetSave: async () => {},
+    STORE: { flush: async () => {} },
+    _resumePendingPinRotation: async () => {},
+    _parsePinRotation: () => null,
+    TMB_CLOUD_ENVELOPE_FORMAT: 'music-box-encrypted-backup',
+    TMB_CLOUD_ENVELOPE_VERSION: 2,
+    _assessCloudPinEpoch: async () => ({ remoteEpoch: 1 }),
+    _localPinEpoch: () => 1,
+    _buildCloudEnvelope: async () => envelope,
+  });
+  vm.runInContext(`
+    ${declaration('syncToiCloud')}
+    globalThis.iCloudApi = { sync: () => syncToiCloud() };
+  `, context);
+
+  const result = await context.iCloudApi.sync();
+  assert.equal(result.ok, true);
+  assert.equal(result.preservedLegacy, true,
+    'the user is told the old recovery point was retained');
+  assert.equal(result.snapshot, 'sync-device-s000000001-now.json');
+  assert.equal(written, envelope, 'a new versioned encrypted envelope is written');
+  assert.deepEqual(legacy, { profiles: ['legacy-recovery-point'] },
+    'the old backup object was neither migrated in place nor changed');
+});
+
+test('manual iCloud backup shows the exact write failure instead of a generic toast', async () => {
+  const toasts = [];
+  const context = contextWith({
+    window: {
+      electronSync: {
+        read: async () => ({ ok: true, data: null }),
+        write: async () => ({ ok: false, error: 'iCloud Drive folder is unavailable' }),
+      },
+    },
+    localStorage: new MemoryStorage(),
+    _encKey: {},
+    _flushSpreadsheetSave: async () => {},
+    STORE: { flush: async () => {} },
+    _resumePendingPinRotation: async () => {},
+    _parsePinRotation: () => null,
+    TMB_CLOUD_ENVELOPE_FORMAT: 'music-box-encrypted-backup',
+    TMB_CLOUD_ENVELOPE_VERSION: 2,
+    _assessCloudPinEpoch: async () => ({ remoteEpoch: 1 }),
+    _localPinEpoch: () => 1,
+    _buildCloudEnvelope: async () => ({
+      format: 'music-box-encrypted-backup', version: 2, pinEpoch: 1, entries: {},
+    }),
+    showToast: (message, kind) => toasts.push({ message, kind }),
+  });
+  vm.runInContext(`
+    ${declaration('syncToiCloud')}
+    ${declaration('manualSyncNow')}
+    globalThis.iCloudApi = { manual: () => manualSyncNow() };
+  `, context);
+
+  assert.equal(await context.iCloudApi.manual(), false);
+  assert.equal(toasts.length, 1);
+  assert.match(toasts[0].message, /iCloud Drive folder is unavailable/);
+  assert.equal(toasts[0].kind, 'warning');
 });
 
 test('H-03: offline update gate uses _unsyncedSyncKeys() in both branches', () => {

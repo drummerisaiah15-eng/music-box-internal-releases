@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>The Music Box — Internal Operations</title>
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'sha256-b/Im/OO3KzzXhOm4NDb4aZLyg52mFuZ6yrCuSyR+UsU=' https://www.google.com/recaptcha/ https://www.gstatic.com/recaptcha/; script-src-attr 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' https://firestore.googleapis.com https://identitytoolkit.googleapis.com https://securetoken.googleapis.com https://firebaseappcheck.googleapis.com https://*.firebaseio.com wss://*.firebaseio.com https://www.google.com https://www.recaptcha.net; frame-src https://www.google.com/recaptcha/ https://recaptcha.google.com/recaptcha/ https://www.recaptcha.net/; object-src 'none'; base-uri 'none'; form-action 'none';">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'sha256-2O2znTbRRSmeevSnGKC5M9kwswVE6Re06EY9cRHqors=' https://www.google.com/recaptcha/ https://www.gstatic.com/recaptcha/; script-src-attr 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' https://firestore.googleapis.com https://identitytoolkit.googleapis.com https://securetoken.googleapis.com https://firebaseappcheck.googleapis.com https://*.firebaseio.com wss://*.firebaseio.com https://www.google.com https://www.recaptcha.net; frame-src https://www.google.com/recaptcha/ https://recaptcha.google.com/recaptcha/ https://www.recaptcha.net/; object-src 'none'; base-uri 'none'; form-action 'none';">
   <!-- Pinned, release-vendored dependencies; no runtime CDN execution. -->
   <script src="./vendor/firebase-12.15.0/firebase-app-compat.js" defer></script>
   <script src="./vendor/firebase-12.15.0/firebase-auth-compat.js" defer></script>
@@ -2329,6 +2329,7 @@
             <span>Not connected</span>
           </div>
         </div>
+        <div id="sync-pending-details" style="display:none;margin:-2px 0 10px;padding:8px 10px;border:1px solid #e0b45c;border-radius:7px;background:#fff8ec;color:#765316;font-size:11.5px;overflow-wrap:anywhere"></div>
         <div class="settings-section-desc">
           Sync operational data across authorized team devices in real time using <strong>Firebase Firestore</strong>.
           Every device must sign in to the same Firebase account and be allowlisted on the studio document.
@@ -5585,14 +5586,21 @@ function _scheduleSyncDrain(key) {
 function _syncKeyStatus(key) {
   if (_syncBootstrapFailedKeys.has(key)) return 'quarantined';
   if (_syncRecoveryRequiredKeys.has(key)) return 'recovery-required';
-  const error = _syncDeliveryErrors.get(key);
-  if (error?.code === 'SYNC_CONFLICT') return 'conflict';
-  if (error) return 'failed';
   // V160-008: unreadable pending metadata is 'corrupt', never 'current'.
   let pending;
   try { pending = _readPendingSyncRecord(key); }
   catch { return 'corrupt'; }
-  if (!pending) return 'current';
+  // Delivery errors live only in this renderer process. If the encrypted
+  // pending record is gone, there is no unsent write left for that error to
+  // describe. Keeping the old Error object made the badge claim data was still
+  // unsynced until the app restarted even after Firebase had acknowledged it.
+  if (!pending) {
+    _syncDeliveryErrors.delete(key);
+    return 'current';
+  }
+  const error = _syncDeliveryErrors.get(key);
+  if (error?.code === 'SYNC_CONFLICT') return 'conflict';
+  if (error) return 'failed';
   if (_syncDeliveryChains.has(key)) return 'delivering';
   return 'pending';
 }
@@ -5647,9 +5655,15 @@ async function _flushSyncDeliveries(keys = null) {
     if (wanted && !wanted.has(key)) return false;
     if (_syncBootstrapFailedKeys.has(key)) return true;
     if (_syncRecoveryRequiredKeys.has(key)) return true;
-    if (_syncDeliveryErrors.has(key)) return true;
-    try { return !!_readPendingSyncRecord(key); }
+    let pending;
+    try { pending = _readPendingSyncRecord(key); }
     catch { return true; } // unreadable pending state is not "nothing to do"
+    if (pending) return true;
+    // The write was acknowledged or otherwise retired. An Error object from a
+    // previous attempt is process-local diagnostic state, not durable evidence
+    // that anything remains undelivered.
+    _syncDeliveryErrors.delete(key);
+    return false;
   });
   const deliveries = targets.map(key => _scheduleSyncDrain(key));
   if (deliveries.length) await Promise.allSettled(deliveries);
@@ -7350,6 +7364,7 @@ function setSyncStatus(state) {
   const dot = document.getElementById('sync-dot');
   const label = document.getElementById('sync-label');
   const badge = document.getElementById('sync-settings-status');
+  const pendingDetails = document.getElementById('sync-pending-details');
   if (!chip) return;
 
   const styles = {
@@ -7362,15 +7377,23 @@ function setSyncStatus(state) {
     error:      { dot: '#c0392b', label: 'Sync error',   bg: '#fdf0f0',            show: true  },
   };
   let s = styles[state] || styles.off;
+  // The names contain no data values, only storage keys. Keep them visible in
+  // Settings so a person can tell whether profiles, logs, or a spreadsheet is
+  // affected without needing DevTools (which production builds disable).
+  let unsynced = [];
+  let statusReadFailed = false;
+  try { unsynced = _unsyncedSyncKeys(); }
+  catch (_) {
+    unsynced = ['unknown'];
+    statusReadFailed = true;
+  }
   // V159-003: never display "Synced" while any data set is pending, delivering,
-  // conflicted, quarantined, or failed. Show the count, never the contents.
+  // conflicted, quarantined, or failed. The top bar stays compact; Settings
+  // names the affected storage keys without exposing their contents.
   if (state === 'live') {
     // V160-008: fail CLOSED. A corrupt pending record makes
     // _readPendingSyncRecord() throw; substituting an empty list here would
     // display "Synced" over unknown state. Treat any failure as not-synced.
-    let unsynced = [];
-    try { unsynced = _unsyncedSyncKeys(); }
-    catch (_) { unsynced = ['unknown']; }
     if (unsynced.length) {
       s = {
         dot: '#c4922a',
@@ -7378,17 +7401,31 @@ function setSyncStatus(state) {
         bg: '#fff8ec',
         show: true,
       };
-      if (chip.title !== undefined) {
-        chip.title = 'Not yet in Firebase: ' + unsynced.join(', ');
-      }
-    } else if (chip.title !== undefined) {
-      chip.title = '';
     }
+  } else if (state === 'error' && unsynced.length) {
+    s = {
+      ...styles.error,
+      label: `Sync error — ${unsynced.length} not synced`,
+    };
+  }
+  if (chip.title !== undefined) {
+    chip.title = unsynced.length
+      ? 'Not yet in Firebase: ' + unsynced.join(', ')
+      : '';
   }
   chip.style.display = s.show ? 'flex' : 'none';
   chip.style.background = s.bg;
   if (dot) dot.style.background = s.dot;
   if (label) label.textContent = s.label;
+
+  if (pendingDetails) {
+    pendingDetails.style.display = unsynced.length ? '' : 'none';
+    pendingDetails.textContent = unsynced.length
+      ? (statusReadFailed
+        ? 'Not synced: status could not be read safely.'
+        : 'Not synced: ' + unsynced.join(', '))
+      : '';
+  }
 
   if (badge) {
     // V159-003: "Connected" must not imply "everything is in the cloud".
@@ -20461,7 +20498,12 @@ async function _tryUnlockFromCloud(pin) {
 }
 
 async function syncToiCloud() {
-  if (!window.electronSync?.read || !window.electronSync?.write || !_encKey) return false;
+  if (!window.electronSync?.read || !window.electronSync?.write) {
+    return { ok: false, error: 'iCloud backup is unavailable in this app session' };
+  }
+  if (!_encKey) {
+    return { ok: false, error: 'Encrypted app data must be unlocked before it can be backed up' };
+  }
   try {
     await _flushSpreadsheetSave();
     await STORE.flush();
@@ -20473,23 +20515,30 @@ async function syncToiCloud() {
     if (!existing || existing.ok === false) {
       throw new Error(existing?.error || 'iCloud backup status could not be verified');
     }
+    const preservedLegacy = existing.legacy === true;
     if (existing.data?.format === TMB_CLOUD_ENVELOPE_FORMAT &&
         existing.data?.version === TMB_CLOUD_ENVELOPE_VERSION) {
       const { remoteEpoch } = await _assessCloudPinEpoch(existing.data, { forWrite: true });
       if (remoteEpoch !== _localPinEpoch()) {
         throw new Error('iCloud passcode epoch does not match this Mac');
       }
-    } else if (existing.data) {
-      throw new Error('The existing iCloud backup format must be reviewed before it can be replaced');
     }
+    // An older `sync.json` is a recovery point, not a reason to refuse every
+    // future backup. Main writes a new immutable per-device snapshot and never
+    // targets sync.json, so the legacy bytes remain available unchanged while
+    // this build establishes a current encrypted recovery point beside them.
     const data = await _buildCloudEnvelope();
     const result = await window.electronSync.write(data);
     if (!result || result.ok === false) throw new Error(result?.error || 'iCloud write failed');
     localStorage.setItem('tmb__cloud_last_written', data.lastUpdated);
-    return true;
+    return {
+      ok: true,
+      preservedLegacy,
+      snapshot: result.snapshot || '',
+    };
   } catch (err) {
     console.warn('iCloud backup error:', err?.message || err);
-    return false;
+    return { ok: false, error: err?.message || String(err) };
   }
 }
 
@@ -20565,12 +20614,18 @@ async function loadFromiCloud() {
 }
 
 async function manualSyncNow() {
-  const ok = await syncToiCloud();
-  if (ok) {
-    showToast('Encrypted iCloud backup completed.', 'success');
+  const result = await syncToiCloud();
+  if (result.ok) {
+    showToast(
+      result.preservedLegacy
+        ? 'Encrypted iCloud backup completed. The older sync.json recovery point was preserved.'
+        : 'Encrypted iCloud backup completed.',
+      'success'
+    );
   } else {
-    showToast('iCloud backup failed — no success was recorded.', 'warning');
+    showToast('iCloud backup failed: ' + (result.error || 'no success was recorded'), 'warning');
   }
+  return result.ok;
 }
 
 function _setOrRemoveStorage(storage, key, value) {
