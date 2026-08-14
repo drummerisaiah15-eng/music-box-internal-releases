@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
@@ -29,6 +30,65 @@ function namedFunctionSource(name) {
 
 test('the complete renderer script parses', () => {
   assert.doesNotThrow(() => new vm.Script(script, { filename: 'index.html:inline.js' }));
+});
+
+test('the renderer CSP binds the application script by hash instead of allowing every inline script', () => {
+  const content = source.match(/<meta\s+http-equiv="Content-Security-Policy"\s+content="([^"]+)"/i)?.[1];
+  assert.ok(content, 'the renderer declares a CSP');
+  const directives = Object.fromEntries(content.split(';').map(part => {
+    const [name, ...values] = part.trim().split(/\s+/);
+    return [name, values];
+  }).filter(([name]) => name));
+  const digest = crypto.createHash('sha256').update(script).digest('base64');
+  assert.ok(directives['script-src']?.includes(`'sha256-${digest}'`),
+    'the exact application script is authorized');
+  assert.equal(directives['script-src']?.includes("'unsafe-inline'"), false,
+    'arbitrary inline script elements are not authorized');
+  assert.deepEqual(directives['script-src-attr'], ["'unsafe-inline'"],
+    'legacy UI event attributes are the only remaining inline-script surface');
+});
+
+test('per-profile staff-note seen state uses a journal-safe stable key and reads its legacy value', () => {
+  const context = vm.createContext({ STORE: null, Set, String, BigInt });
+  vm.runInContext(`
+    ${namedFunctionSource('_ssDigest')}
+    ${namedFunctionSource('_staffNotesSeenLegacyKey')}
+    ${namedFunctionSource('_staffNotesSeenKey')}
+    ${namedFunctionSource('_staffNotesSeenIds')}
+    globalThis.keys = names => names.map(name => _staffNotesSeenKey(name));
+    globalThis.read = (name, values) => {
+      STORE = { get: (key, fallback) => key in values ? values[key] : fallback };
+      return _staffNotesSeenIds(name);
+    };
+  `, context);
+  const names = [
+    'Elizabeth Chaves',
+    "Renée O'Connor",
+    'A name whose eighty-character limit still cannot make the journal path unsafe 123456',
+  ];
+  const keys = Array.from(context.keys(names));
+  for (const key of keys) {
+    assert.match(key, /^[A-Za-z0-9_-]{1,120}$/);
+  }
+  assert.equal(new Set(keys).size, names.length, 'different profiles do not share read state');
+  assert.equal(context.keys(['Renée O\'Connor'])[0], context.keys(['  RENÉE   O\'CONNOR  '])[0],
+    'the key follows the same case/space-insensitive profile identity');
+
+  const currentKey = keys[0];
+  assert.deepEqual(
+    Array.from(context.read('Elizabeth Chaves', {
+      [currentKey]: ['new', 2],
+      'staff_notes_seen_Elizabeth Chaves': ['old', '2'],
+    })),
+    ['new', '2', 'old'],
+    'the migration preserves both the new and legacy seen markers without duplicates',
+  );
+
+  const badge = namedFunctionSource('updateStaffBadge');
+  const mark = namedFunctionSource('markStaffNotesRead');
+  assert.match(badge, /_staffNotesSeenIds\(user\)/);
+  assert.match(mark, /_staffNotesSeenKey\(user\)/);
+  assert.doesNotMatch(mark, /'staff_notes_seen_' \+ user/);
 });
 
 test('startup tolerates features whose removed controls are no longer in the DOM', () => {

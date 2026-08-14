@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>The Music Box — Internal Operations</title>
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://www.google.com/recaptcha/ https://www.gstatic.com/recaptcha/; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' https://firestore.googleapis.com https://identitytoolkit.googleapis.com https://securetoken.googleapis.com https://firebaseappcheck.googleapis.com https://*.firebaseio.com wss://*.firebaseio.com https://www.google.com https://www.recaptcha.net; frame-src https://www.google.com/recaptcha/ https://recaptcha.google.com/recaptcha/ https://www.recaptcha.net/; object-src 'none'; base-uri 'none'; form-action 'none';">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'sha256-USmw9KOooAojC7j9M2PCGyial2BJxBcRGXPmLj+v7ms=' https://www.google.com/recaptcha/ https://www.gstatic.com/recaptcha/; script-src-attr 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' https://firestore.googleapis.com https://identitytoolkit.googleapis.com https://securetoken.googleapis.com https://firebaseappcheck.googleapis.com https://*.firebaseio.com wss://*.firebaseio.com https://www.google.com https://www.recaptcha.net; frame-src https://www.google.com/recaptcha/ https://recaptcha.google.com/recaptcha/ https://www.recaptcha.net/; object-src 'none'; base-uri 'none'; form-action 'none';">
   <!-- Pinned, release-vendored dependencies; no runtime CDN execution. -->
   <script src="./vendor/firebase-12.15.0/firebase-app-compat.js" defer></script>
   <script src="./vendor/firebase-12.15.0/firebase-auth-compat.js" defer></script>
@@ -19435,6 +19435,33 @@ async function deleteLog(id) {
 // ─────────────────────────────────────────────────────────────
 // STAFF HUB
 // ─────────────────────────────────────────────────────────────
+// Per-profile read state is local-only, but it still uses the same fsynced
+// crash journal as every encrypted record. Profile names contain spaces and
+// Unicode while main deliberately accepts only conservative filename-safe
+// journal keys. Bind the state to the profile's normalized identity through a
+// short stable digest instead of putting the display name in the file name.
+function _staffNotesSeenLegacyKey(user) {
+  return 'staff_notes_seen_' + String(user || 'guest');
+}
+
+function _staffNotesSeenKey(user) {
+  const identity = String(user || 'guest')
+    .trim()
+    .replace(/\s+/g, ' ')
+    .toLocaleLowerCase('en-US');
+  return 'staff_notes_seen_v2_' + _ssDigest(identity);
+}
+
+function _staffNotesSeenIds(user) {
+  const current = STORE.get(_staffNotesSeenKey(user), []);
+  const legacy = STORE.get(_staffNotesSeenLegacyKey(user), []);
+  const values = [
+    ...(Array.isArray(current) ? current : []),
+    ...(Array.isArray(legacy) ? legacy : []),
+  ];
+  return [...new Set(values.map(String))];
+}
+
 function updateStaffBadge() {
   const badge = document.getElementById('staff-badge');
   if (!badge) return;
@@ -19444,7 +19471,10 @@ function updateStaffBadge() {
     return;
   }
   const user = currentUser() || 'guest';
-  const seenIds = STORE.get('staff_notes_seen_' + user, []).map(String);
+  // Read both generations until old installations have naturally rewritten
+  // their marker. This makes the key migration monotonic: an upgrade cannot
+  // turn already-read notes back into unread notes.
+  const seenIds = _staffNotesSeenIds(user);
   const notes = STORE.get('staff_notes', []);
   const unseen = notes.filter(n => !seenIds.includes(String(n.id))).length;
   if (unseen > 0) { badge.textContent = unseen; badge.style.display = ''; }
@@ -19455,7 +19485,7 @@ function markStaffNotesRead() {
   const user = currentUser() || 'guest';
   const notes = STORE.get('staff_notes', []);
   persistInBackground(
-    'staff_notes_seen_' + user,
+    _staffNotesSeenKey(user),
     notes.map(n => String(n.id)),
     'Team-note read status'
   );
