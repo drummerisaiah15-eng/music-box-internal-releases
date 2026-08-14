@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>The Music Box — Internal Operations</title>
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'sha256-USmw9KOooAojC7j9M2PCGyial2BJxBcRGXPmLj+v7ms=' https://www.google.com/recaptcha/ https://www.gstatic.com/recaptcha/; script-src-attr 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' https://firestore.googleapis.com https://identitytoolkit.googleapis.com https://securetoken.googleapis.com https://firebaseappcheck.googleapis.com https://*.firebaseio.com wss://*.firebaseio.com https://www.google.com https://www.recaptcha.net; frame-src https://www.google.com/recaptcha/ https://recaptcha.google.com/recaptcha/ https://www.recaptcha.net/; object-src 'none'; base-uri 'none'; form-action 'none';">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'sha256-b/Im/OO3KzzXhOm4NDb4aZLyg52mFuZ6yrCuSyR+UsU=' https://www.google.com/recaptcha/ https://www.gstatic.com/recaptcha/; script-src-attr 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' https://firestore.googleapis.com https://identitytoolkit.googleapis.com https://securetoken.googleapis.com https://firebaseappcheck.googleapis.com https://*.firebaseio.com wss://*.firebaseio.com https://www.google.com https://www.recaptcha.net; frame-src https://www.google.com/recaptcha/ https://recaptcha.google.com/recaptcha/ https://www.recaptcha.net/; object-src 'none'; base-uri 'none'; form-action 'none';">
   <!-- Pinned, release-vendored dependencies; no runtime CDN execution. -->
   <script src="./vendor/firebase-12.15.0/firebase-app-compat.js" defer></script>
   <script src="./vendor/firebase-12.15.0/firebase-auth-compat.js" defer></script>
@@ -3117,9 +3117,13 @@ function _passcodeApplyBlocksLogin(name) {
 }
 
 async function importStaffDirectory(directory) {
-  if (!Array.isArray(directory) || !window.electronSession?.importDirectory) return false;
+  if (!Array.isArray(directory)) return false;
+  const importer = currentUser()
+    ? window.electronSession?.importDirectory
+    : window.electronSession?.importLoginDirectory;
+  if (!importer) return false;
   try {
-    const result = await window.electronSession.importDirectory(directory);
+    const result = await importer(directory);
     if (result?.ok !== true) return false;
     await refreshLoginProfiles();
     try { applyRolePermissions(); } catch (_) {}
@@ -6911,6 +6915,138 @@ async function _loadPersistedSyncKey() {
   }
 }
 
+const _firebaseAppCheckActivated = new WeakSet();
+
+function _activateFirebaseAppCheck(app) {
+  const appCheckKey = SHARED.get('firebase_app_check_key', '');
+  if (!appCheckKey || typeof firebase === 'undefined' ||
+      typeof firebase.appCheck !== 'function' || _firebaseAppCheckActivated.has(app)) {
+    return false;
+  }
+  const appCheck = firebase.appCheck(app);
+  appCheck.activate(appCheckKey, true);
+  _firebaseAppCheckActivated.add(app);
+  return true;
+}
+
+let _loginDirectorySyncPromise = null;
+let _loginDirectoryUnsubscribe = null;
+let _loginDirectorySyncStopped = false;
+
+function _waitForFirebaseAuthUser(auth, timeoutMs = 5000) {
+  if (auth?.currentUser?.uid) return Promise.resolve(auth.currentUser);
+  return new Promise(resolve => {
+    let settled = false;
+    let unsubscribe = () => {};
+    let timer = null;
+    const finish = user => {
+      if (settled) return;
+      settled = true;
+      if (timer !== null) clearTimeout(timer);
+      try { unsubscribe(); } catch (_) {}
+      resolve(user?.uid ? user : null);
+    };
+    timer = setTimeout(() => finish(null), timeoutMs);
+    try { unsubscribe = auth.onAuthStateChanged(finish, () => finish(null)); }
+    catch (_) { finish(null); }
+  });
+}
+
+async function _applyLoginDirectorySnapshot(snap) {
+  if (!snap?.exists || !window.electronSession?.importLoginDirectory) return false;
+  const remote = snap.data();
+  if (!remote || remote.value === undefined || remote.value === null) return false;
+  _syncDocumentKind(remote);
+  const directory = await _decodeSyncValue('staff_directory', remote.value);
+  const result = await window.electronSession.importLoginDirectory(directory);
+  if (result?.ok !== true) return false;
+  await refreshLoginProfiles();
+  return true;
+}
+
+function _stopLoginDirectorySync() {
+  _loginDirectorySyncStopped = true;
+  if (_loginDirectoryUnsubscribe) {
+    try { _loginDirectoryUnsubscribe(); } catch (_) {}
+    _loginDirectoryUnsubscribe = null;
+  }
+}
+
+function initLoginDirectorySync() {
+  if (_loginDirectorySyncPromise) return _loginDirectorySyncPromise;
+  _loginDirectorySyncStopped = false;
+  const work = (async () => {
+    if (!window.electronFirebase?.loginDirectoryConfig ||
+        !window.electronSession?.importLoginDirectory) return false;
+    const status = await window.electronFirebase.loginDirectoryConfig();
+    const config = status?.config;
+    const studioCode = SHARED.get('firebase_studio_code', '');
+    if (status?.ok !== true || status.configured !== true || !config?.apiKey ||
+        !config?.projectId || !studioCode) return false;
+
+    let waited = 0;
+    while (typeof firebase === 'undefined' && waited < 3000) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+      waited += 100;
+    }
+    if (typeof firebase === 'undefined' || _loginDirectorySyncStopped) return false;
+    if (!await _loadPersistedSyncKey()) return false;
+
+    const appName = 'music-box-sync';
+    const options = {
+      apiKey: config.apiKey,
+      projectId: config.projectId,
+      appId: config.appId || undefined,
+      authDomain: config.projectId + '.firebaseapp.com',
+      storageBucket: config.projectId + '.appspot.com',
+    };
+    const existing = (firebase.apps || []).find(app => app.name === appName);
+    const stale = !!existing && [
+      ['projectId', options.projectId],
+      ['apiKey', options.apiKey],
+      ['appId', options.appId],
+      ['authDomain', options.authDomain],
+    ].some(([field, value]) => (existing.options?.[field] || undefined) !== (value || undefined));
+    if (stale) await existing.delete();
+    const app = stale || !existing ? firebase.initializeApp(options, appName) : existing;
+    _firebaseApp = app;
+    try { _activateFirebaseAppCheck(app); }
+    catch (error) {
+      console.warn('[profiles] login-directory App Check could not start:', error?.message || error);
+      return false;
+    }
+
+    const auth = firebase.auth(app);
+    const user = await _waitForFirebaseAuthUser(auth);
+    if (!user || _loginDirectorySyncStopped) return false;
+    const db = firebase.firestore(app);
+    const ref = db.collection('musicbox').doc(studioCode).collection('data').doc('staff_directory');
+    const first = await ref.get();
+    if (!_loginDirectorySyncStopped) await _applyLoginDirectorySnapshot(first);
+    if (_loginDirectorySyncStopped) return false;
+    _loginDirectoryUnsubscribe = ref.onSnapshot(snap => {
+      if (_loginDirectorySyncStopped) return;
+      void _applyLoginDirectorySnapshot(snap).catch(error => {
+        console.warn('[profiles] login directory was not applied:', error?.message || error);
+      });
+    }, error => {
+      console.warn('[profiles] login directory listener stopped:', error?.message || error);
+    });
+    return true;
+  })().catch(error => {
+    // Login must remain available when the network is offline or this Mac has
+    // not been provisioned. An existing profile can still sign in and the full
+    // authenticated sync path will retry.
+    console.warn('[profiles] login directory sync unavailable:', error?.message || error);
+    return false;
+  });
+  _loginDirectorySyncPromise = work;
+  void work.then(ok => {
+    if (!ok && !_loginDirectorySyncStopped) _loginDirectorySyncPromise = null;
+  });
+  return work;
+}
+
 async function _prepareSyncEncryption() {
   const metaRef = studioRef().collection('data').doc('sync_metadata');
   let metaSnap = await metaRef.get();
@@ -7379,14 +7515,9 @@ async function _initFirebaseInner() {
     }
     if (!_firebaseApp) _firebaseApp = firebase.initializeApp(config, appName);
 
-    const appCheckKey = SHARED.get('firebase_app_check_key', '');
-    if (appCheckKey && typeof firebase.appCheck === 'function') {
-      try {
-        const appCheck = firebase.appCheck(_firebaseApp);
-        appCheck.activate(appCheckKey, true);
-      } catch (appCheckErr) {
-        throw new Error('Firebase App Check could not start: ' + (appCheckErr?.message || appCheckErr));
-      }
+    try { _activateFirebaseAppCheck(_firebaseApp); }
+    catch (appCheckErr) {
+      throw new Error('Firebase App Check could not start: ' + (appCheckErr?.message || appCheckErr));
     }
 
     _firebaseAuth = firebase.auth(_firebaseApp);
@@ -7422,6 +7553,7 @@ async function _initFirebaseInner() {
     _setRemoteAuthority(
       [..._remoteDocPresence.values()].some(Boolean) ? 'ready-present' : 'ready-absent'
     );
+    _stopLoginDirectorySync();
     subscribeToSync();
     _syncBootstrapComplete = true;
 
@@ -23391,6 +23523,7 @@ function init() {
   refreshLoginProfiles().catch(error => {
     console.warn('[profiles] protected profile list could not load:', error?.message || error);
   });
+  void initLoginDirectorySync();
   if (window.electronLifecycle?.onFlushRequested) {
     window.electronLifecycle.onFlushRequested(async () => {
       // V160-008: fail CLOSED. Returning true here is what let the updater

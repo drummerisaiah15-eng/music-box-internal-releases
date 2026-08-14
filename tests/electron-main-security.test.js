@@ -903,6 +903,7 @@ function directoryHarness({ role = 'Owner', signedInAs = 'Elizabeth Chaves', vau
     ${sliceFunction(main, '_mergeDirectoryEntries')}
     ${sliceFunction(main, '_buildStaffDirectory')}
     ${sliceFunction(main, '_validDirectoryEntry')}
+    ${sliceFunction(main, '_applyLoginDirectoryAdditions')}
     ${sliceFunction(main, '_applyStaffDirectory')}
     ${main.slice(main.indexOf('const PROFILE_ROLE_RANK'), main.indexOf('function _profileRoleOverrides'))}
     // MB1188-081: the real IPC handler body, so a two-Mac exchange can be
@@ -921,6 +922,7 @@ function directoryHarness({ role = 'Owner', signedInAs = 'Elizabeth Chaves', vau
     // is the path that may still set roles. The non-elevating path has its own
     // tests below.
     globalThis.apply = (d, opts = { elevate: true }) => _applyStaffDirectory(d, opts);
+    globalThis.applyBeforeLogin = d => _applyLoginDirectoryAdditions(d);
     globalThis.profiles = () => _allAppProfiles().map(p => p.name + ':' + p.role);
     globalThis.session = () => appSession;
   `, context);
@@ -936,6 +938,39 @@ test('directory: a published directory reproduces the owner profile set elsewher
   target.api.apply(directory);
   assert.ok([...target.api.profiles()].includes('Dana Reed:Front Desk'),
     'the added user now exists on the second Mac');
+});
+
+test('directory: a cold login screen adds new profiles without granting roles or applying removals', () => {
+  const target = directoryHarness({ vault: {} });
+  const result = target.api.applyBeforeLogin([
+    { id: 'profile:elizabeth chaves', name: 'Elizabeth Chaves', role: 'Owner', builtIn: true },
+    { id: 'profile:carrie gass', name: 'Carrie Gass', role: 'Operations & Events', builtIn: true },
+    { id: 'profile:emma minnetto', name: 'Emma Minnetto', role: 'Front Desk', builtIn: true,
+      _deleted: true },
+    { id: 'profile:kylie', name: 'Kylie', role: 'Front Desk', builtIn: false },
+    { id: 'profile:megan', name: 'Megan', role: 'Operations Manager', builtIn: false },
+  ]);
+
+  const profiles = [...target.api.profiles()];
+  assert.ok(profiles.includes('Kylie:Front Desk'),
+    'a new ordinary profile becomes available at the receiving login screen');
+  assert.ok(profiles.includes('Megan:Front Desk'),
+    'a cold-start import never grants the requested elevated role');
+  assert.ok(profiles.includes('Emma Minnetto:Front Desk'),
+    'signed-out synchronization never removes a login');
+  assert.ok(profiles.includes('Carrie Gass:Operations & Events'),
+    'an existing role is not rewritten before authentication');
+  assert.deepEqual(
+    Array.from(result.deferred, entry => `${entry.name}:${entry.reason}`).sort(),
+    ['Emma Minnetto:removal', 'Megan:role'].sort(),
+    'authority-changing work is explicitly deferred for the authenticated importer',
+  );
+
+  const saved = target.state.savedTimes;
+  target.api.applyBeforeLogin([
+    { id: 'profile:kylie', name: 'Kylie', role: 'Front Desk', builtIn: false },
+  ]);
+  assert.equal(target.state.savedTimes, saved, 'replaying the same login addition is idempotent');
 });
 
 test('directory: a role change propagates', () => {
@@ -1073,6 +1108,22 @@ test('directory: export is owner-only, import is validated in main', () => {
     /exportDirectory:\s+\(\) => ipcRenderer\.invoke\('app-session-export-directory'\)/);
   assert.match(preload,
     /importDirectory:\s+\(directory\) => ipcRenderer\.invoke\('app-session-import-directory', directory\)/);
+  assert.match(preload,
+    /importLoginDirectory:\s+\(directory\) => ipcRenderer\.invoke\('app-login-import-directory', directory\)/);
+
+  const loginImportBody = extractHandlerBody(main, 'app-login-import-directory');
+  assert.match(loginImportBody, /_applyLoginDirectoryAdditions\(directory\)/,
+    'the signed-out channel uses the addition-only importer');
+  assert.doesNotMatch(loginImportBody, /_applyStaffDirectory|_requireAppRole/,
+    'it cannot reach the role/removal importer and does not require an impossible login session');
+
+  const loginConfigBody = extractHandlerBody(main, 'firebase-login-directory-config');
+  assert.match(loginConfigBody, /apiKey: config\.apiKey/);
+  assert.match(loginConfigBody, /projectId: config\.projectId/);
+  assert.doesNotMatch(loginConfigBody, /password:\s*config\.password/,
+    'pre-login synchronization never releases the Firebase password');
+  assert.match(preload,
+    /loginDirectoryConfig:\s+\(\) => ipcRenderer\.invoke\('firebase-login-directory-config'\)/);
 });
 
 test('directory: the renderer publishes on every profile change and merges on arrival', () => {

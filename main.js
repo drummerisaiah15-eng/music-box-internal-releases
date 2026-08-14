@@ -2550,6 +2550,112 @@ function _validDirectoryEntry(entry) {
   return true;
 }
 
+// A receiving Mac can be sitting at the profile picker when another Mac adds a
+// user. Requiring an existing profile to sign in before the picker can refresh
+// creates a catch-22 for the new person. This deliberately narrow importer is
+// callable before an app session exists, and therefore may only make a login
+// less privileged: it adds missing profiles as Front Desk. Removals and role
+// changes are reported as deferred and remain on the authenticated importer.
+function _applyLoginDirectoryAdditions(entries) {
+  if (!Array.isArray(entries) || entries.length > MAX_DIRECTORY_ENTRIES) {
+    throw new Error('The staff directory is invalid.');
+  }
+
+  const vault = _loadSecretVault();
+  const currentProfiles = _allAppProfiles();
+  const currentByName = new Map(currentProfiles.map(profile => [
+    profile.name.toLocaleLowerCase('en-US'), profile,
+  ]));
+  const builtInByName = new Map(Object.keys(APP_PROFILE_ROLES).map(name => [
+    name.toLocaleLowerCase('en-US'), name,
+  ]));
+  const custom = _customStaffProfilesFromVault(vault);
+  let removedBuiltIns = _removedBuiltInProfiles(vault);
+  let removedCustom = _removedCustomProfiles(vault);
+  const overrides = { ..._profileRoleOverrides(vault) };
+  const meta = { ..._directoryMeta(vault) };
+  const added = [];
+  const deferred = [];
+  const deferredKeys = new Set();
+  let changed = false;
+
+  const defer = (name, reason) => {
+    const key = `${name.toLocaleLowerCase('en-US')}\0${reason}`;
+    if (deferredKeys.has(key)) return;
+    deferredKeys.add(key);
+    deferred.push({ name, reason });
+  };
+
+  for (const raw of entries) {
+    if (!_validDirectoryEntry(raw)) continue;
+    let requestedName;
+    try { requestedName = _normalizeStaffProfileName(raw.name); } catch { continue; }
+    const folded = requestedName.toLocaleLowerCase('en-US');
+    const builtInName = builtInByName.get(folded) || null;
+    const canonicalName = builtInName || requestedName;
+    const held = currentByName.get(folded) || null;
+
+    if (raw._deleted === true) {
+      if (held && held.role !== 'Owner') defer(held.name, 'removal');
+      continue;
+    }
+
+    const requestedRole = raw.role === 'Owner'
+      ? (builtInName && APP_PROFILE_ROLES[builtInName] === 'Owner' ? 'Owner' : 'Front Desk')
+      : (ASSIGNABLE_PROFILE_ROLES.includes(raw.role) ? raw.role : 'Front Desk');
+
+    if (held) {
+      if (requestedRole !== held.role && held.role !== 'Owner') defer(held.name, 'role');
+      continue;
+    }
+
+    if (builtInName) {
+      // Owner is structural and is never absent from a valid local vault.
+      if (APP_PROFILE_ROLES[builtInName] === 'Owner') continue;
+      const nextRemoved = removedBuiltIns.filter(name => name !== builtInName);
+      if (nextRemoved.length === removedBuiltIns.length) continue;
+      removedBuiltIns = nextRemoved;
+      if (APP_PROFILE_ROLES[builtInName] === 'Front Desk') delete overrides[builtInName];
+      else overrides[builtInName] = 'Front Desk';
+      delete meta[_directoryEntryId(builtInName)];
+      currentByName.set(folded, { name: builtInName, role: 'Front Desk', builtIn: true });
+      added.push(builtInName);
+      changed = true;
+      if (requestedRole !== 'Front Desk') defer(builtInName, 'role');
+      continue;
+    }
+
+    if (custom.length >= MAX_CUSTOM_STAFF_PROFILES) {
+      defer(canonicalName, 'capacity');
+      continue;
+    }
+    custom.push({ name: canonicalName, role: 'Front Desk', createdAt: Date.now() });
+    removedCustom = removedCustom.filter(
+      record => record.name.toLocaleLowerCase('en-US') !== folded
+    );
+    delete meta[_directoryEntryId(canonicalName)];
+    currentByName.set(folded, { name: canonicalName, role: 'Front Desk', builtIn: false });
+    added.push(canonicalName);
+    changed = true;
+    if (requestedRole !== 'Front Desk') defer(canonicalName, 'role');
+  }
+
+  if (changed) {
+    if (custom.length) vault[STAFF_PROFILES_VAULT_KEY] = custom;
+    else delete vault[STAFF_PROFILES_VAULT_KEY];
+    if (removedBuiltIns.length) vault[REMOVED_BUILTIN_PROFILES_VAULT_KEY] = removedBuiltIns;
+    else delete vault[REMOVED_BUILTIN_PROFILES_VAULT_KEY];
+    if (removedCustom.length) vault[REMOVED_CUSTOM_PROFILES_VAULT_KEY] = removedCustom;
+    else delete vault[REMOVED_CUSTOM_PROFILES_VAULT_KEY];
+    if (Object.keys(overrides).length) vault[PROFILE_ROLE_OVERRIDES_VAULT_KEY] = overrides;
+    else delete vault[PROFILE_ROLE_OVERRIDES_VAULT_KEY];
+    vault[DIRECTORY_META_VAULT_KEY] = meta;
+    _saveSecretVault(vault);
+  }
+
+  return { profiles: _allAppProfiles(), added, deferred };
+}
+
 // Apply a directory published by the owner's Mac to this Mac's vault.
 // MB1188-061: reconcile an incoming directory with what this Mac already holds.
 //
@@ -2721,6 +2827,17 @@ _secureHandle('app-session-import-directory', async (_, directory) => {
     deferred,
   });
   return { ok: true, profiles, deferred, applied: deferred.length === 0 };
+});
+
+_secureHandle('app-login-import-directory', async (_, directory) => {
+  const result = _applyLoginDirectoryAdditions(directory);
+  return {
+    ok: true,
+    profiles: result.profiles,
+    added: result.added,
+    deferred: result.deferred,
+    applied: result.deferred.length === 0,
+  };
 });
 
 // ── MB161-014: Google Sheets, read-only ─────────────────────────────────────
@@ -3349,6 +3466,24 @@ _secureHandle('firebase-config-status', async () => {
       projectId: config.projectId,
       appId: config.appId,
       email: config.email,
+    },
+  };
+});
+
+// The profile picker has to learn about a newly added Front Desk profile before
+// that person can sign in. Return only the public Firebase application
+// coordinates needed to restore Firebase Auth's already-provisioned browser
+// session. The email and password stay in main; provisioning and ordinary
+// runtime credential release remain session-gated below.
+_secureHandle('firebase-login-directory-config', async () => {
+  const config = _firebaseConfigFromVault(_loadSecretVault());
+  return {
+    ok: true,
+    configured: _validFirebaseConfig(config),
+    config: {
+      apiKey: config.apiKey,
+      projectId: config.projectId,
+      appId: config.appId,
     },
   };
 });

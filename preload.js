@@ -29,6 +29,7 @@ contextBridge.exposeInMainWorld('electronSession', {
   // every field and can never be told to grant Owner.
   exportDirectory:   () => ipcRenderer.invoke('app-session-export-directory'),
   importDirectory:   (directory) => ipcRenderer.invoke('app-session-import-directory', directory),
+  importLoginDirectory: (directory) => ipcRenderer.invoke('app-login-import-directory', directory),
   end:               () => ipcRenderer.invoke('app-session-end'),
   status:            () => ipcRenderer.invoke('app-session-status'),
   // MB1188-069: an optional 4-digit passcode for Operations Managers. Only the
@@ -70,6 +71,7 @@ contextBridge.exposeInMainWorld('electronMicrosoft', {
 contextBridge.exposeInMainWorld('electronFirebase', {
   status:        () => ipcRenderer.invoke('firebase-config-status'),
   runtimeConfig: () => ipcRenderer.invoke('firebase-runtime-config'),
+  loginDirectoryConfig: () => ipcRenderer.invoke('firebase-login-directory-config'),
   configure:     (settings) => ipcRenderer.invoke('firebase-configure', settings),
   clear:         () => ipcRenderer.invoke('firebase-clear'),
 });

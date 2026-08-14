@@ -5340,6 +5340,54 @@ test('MB1188-047: a directory that could not be applied is remembered and retrie
     'and it stays pending until it actually works');
 });
 
+test('P0: the login screen fetches and applies the encrypted staff directory before sign-in', async () => {
+  const imported = [];
+  let refreshed = 0;
+  const context = contextWith({
+    window: {
+      electronSession: {
+        importLoginDirectory: async directory => {
+          imported.push(directory);
+          return { ok: true, profiles: [], deferred: [] };
+        },
+      },
+    },
+    _syncDocumentKind: remote => remote.schemaVersion === 2 ? 'versioned' : 'legacy',
+    _decodeSyncValue: async (key, value) => ({ key, value }),
+    refreshLoginProfiles: async () => { refreshed += 1; },
+  });
+  vm.runInContext(`
+    ${declaration('_applyLoginDirectorySnapshot')}
+    globalThis.applyLoginSnapshot = snap => _applyLoginDirectorySnapshot(snap);
+  `, context);
+
+  const applied = await context.applyLoginSnapshot({
+    exists: true,
+    data: () => ({ schemaVersion: 2, revision: 9, value: { encrypted: 'directory' } }),
+  });
+
+  assert.equal(applied, true);
+  assert.deepEqual(JSON.parse(JSON.stringify(imported)), [
+    { key: 'staff_directory', value: { encrypted: 'directory' } },
+  ]);
+  assert.equal(refreshed, 1, 'the visible login list refreshes immediately');
+
+  const startup = declaration('initLoginDirectorySync');
+  assert.match(startup, /loginDirectoryConfig\(\)/,
+    'startup receives only the dedicated public Firebase configuration');
+  assert.match(startup, /_loadPersistedSyncKey\(\)/,
+    'the cloud directory stays encrypted and needs this Mac\'s persisted key');
+  assert.match(startup, /doc\('staff_directory'\)/,
+    'the pre-login listener is scoped to one document');
+  assert.match(startup, /_applyLoginDirectorySnapshot/);
+  assert.doesNotMatch(startup, /signInWithEmailAndPassword/,
+    'pre-login sync reuses Firebase\'s persisted session and never requests the password');
+
+  const initSource = declaration('init');
+  assert.match(initSource, /initLoginDirectorySync\(\)/,
+    'cold-start synchronization begins from the login screen');
+});
+
 test('MB1188-047: a Mac that is behind never publishes over the good copy', () => {
   const publish = declaration('publishStaffDirectory');
   assert.match(publish, /if \(_directoryImportPending\(\)\) \{/,
