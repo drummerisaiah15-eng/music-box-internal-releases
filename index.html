@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>The Music Box — Internal Operations</title>
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'sha256-2O2znTbRRSmeevSnGKC5M9kwswVE6Re06EY9cRHqors=' https://www.google.com/recaptcha/ https://www.gstatic.com/recaptcha/; script-src-attr 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' https://firestore.googleapis.com https://identitytoolkit.googleapis.com https://securetoken.googleapis.com https://firebaseappcheck.googleapis.com https://*.firebaseio.com wss://*.firebaseio.com https://www.google.com https://www.recaptcha.net; frame-src https://www.google.com/recaptcha/ https://recaptcha.google.com/recaptcha/ https://www.recaptcha.net/; object-src 'none'; base-uri 'none'; form-action 'none';">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'sha256-qJV+pFZgaTWx0UF1qCojSnil0eIxE5idoGkZsBdNwEA=' https://www.google.com/recaptcha/ https://www.gstatic.com/recaptcha/; script-src-attr 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' https://firestore.googleapis.com https://identitytoolkit.googleapis.com https://securetoken.googleapis.com https://firebaseappcheck.googleapis.com https://*.firebaseio.com wss://*.firebaseio.com https://www.google.com https://www.recaptcha.net; frame-src https://www.google.com/recaptcha/ https://recaptcha.google.com/recaptcha/ https://www.recaptcha.net/; object-src 'none'; base-uri 'none'; form-action 'none';">
   <!-- Pinned, release-vendored dependencies; no runtime CDN execution. -->
   <script src="./vendor/firebase-12.15.0/firebase-app-compat.js" defer></script>
   <script src="./vendor/firebase-12.15.0/firebase-auth-compat.js" defer></script>
@@ -2913,7 +2913,7 @@ async function _persistAuthorizedDirectorySnapshot(directory) {
   if (!Array.isArray(directory)) throw new Error('The protected profile update is invalid.');
   try {
     await STORE.mutate('staff_directory', current =>
-      _mergeTombstonedRecordLists(
+      _mergeVersionedDirectoryLists(
         Array.isArray(current) ? current : [],
         directory,
       ), []);
@@ -3506,18 +3506,21 @@ async function addLoginUser() {
       throw new Error(result?.error || 'The new user was not added.');
     }
     await refreshLoginProfiles();
-    // Publishing is owner-only, so adding a user from the signed-out login
-    // screen cannot reach the other Macs. Saying "added" without qualification
-    // told people the profile existed studio-wide when it existed on this Mac
-    // alone — and they only found out when the other Mac disagreed.
-    const published = await publishStaffDirectory();
+    if (!Array.isArray(result.directory)) {
+      throw new Error('The protected profile update did not include its synchronization record.');
+    }
+    // Created at the signed-out picker, so there is no app role to authorize a
+    // normal STORE publication. Main has already constrained the new profile to
+    // Front Desk and returned its authoritative versioned directory; publish it
+    // through the dedicated pre-login Firebase connection.
+    const published = await _publishLoginDirectorySnapshot(result.directory);
     hideAddLoginUserForm();
     if (published) {
       showToast(`${result.profile.name} was added with Front Desk access.`, 'success');
     } else {
       showToast(
         `${result.profile.name} was added on this Mac with Front Desk access, but not yet ` +
-        `shared with the other Macs. Elizabeth can sign in here to publish it.`,
+        `shared with the other Macs. It will retry after a connected sign-in.`,
         'warning'
       );
     }
@@ -4076,9 +4079,14 @@ function completeLogin(name, role) {
 }
 
 function switchUser() {
-  if (window.electronSession?.end) {
-    window.electronSession.end().catch(() => {});
-  }
+  // The authenticated staff-directory listener cannot apply into main after
+  // the session ends. Hand this one document back to the signed-out listener;
+  // the remaining data listeners may continue keeping the encrypted cache warm.
+  _unsubscribeSyncKey('staff_directory');
+  _stopLoginDirectorySync();
+  const ended = window.electronSession?.end
+    ? window.electronSession.end().catch(() => {})
+    : Promise.resolve();
   sessionStorage.removeItem('tmb_session_user');
   document.getElementById('login-screen').style.display = 'flex';
   document.getElementById('pin-screen').style.display = 'none';
@@ -4088,6 +4096,7 @@ function switchUser() {
   refreshLoginProfiles().catch(error => {
     console.warn('[profiles] refresh failed:', error?.message || error);
   });
+  void ended.finally(() => initLoginDirectorySync());
 }
 
 function applyRolePermissions() {
@@ -5051,7 +5060,17 @@ const SYNC_MERGE_STRATEGIES = Object.freeze({
   logs: 'tombstoned-record-list',
   // V159-005: directory entries carry stable ids, versions and tombstones, so
   // two Macs editing different profiles merge instead of clobbering.
-  staff_directory: 'tombstoned-record-list',
+  // Profile identities are reusable after removal, so deletion cannot simply
+  // win forever. Higher generation wins; a tombstone wins only at the SAME
+  // generation. That lets a deliberate re-add propagate while a stale live
+  // copy still cannot resurrect a deletion.
+  staff_directory: 'versioned-directory',
+  // Provider-derived caches are observations, not user-authored snapshots.
+  // Two Macs fetching Sent Items must union what they observed instead of
+  // failing a whole-value CAS and leaving the sync badge in conflict.
+  ms_sent_conv_ids: 'bounded-string-set',
+  ms_sent_emails: 'provider-record-list',
+  sent_emails: 'provider-record-list',
   // P0-1's operation model exists precisely for this: replay the operations this
   // Mac performed onto whichever workbook won the race, rather than choosing a
   // whole workbook and discarding the other person's afternoon. Sound without
@@ -5109,6 +5128,15 @@ function _mergeSyncValuesForKey(key, { localValue, remoteValue, baseValue }) {
   }
   if (strategy === 'versioned-record-map') {
     return _mergeVersionedRecordMaps(localValue, remoteValue);
+  }
+  if (strategy === 'versioned-directory') {
+    return _mergeVersionedDirectoryLists(localValue, remoteValue);
+  }
+  if (strategy === 'bounded-string-set') {
+    return _mergeBoundedStringSets(localValue, remoteValue);
+  }
+  if (strategy === 'provider-record-list') {
+    return _mergeProviderRecordLists(localValue, remoteValue);
   }
   if (strategy === 'spreadsheet-operations') {
     if (!baseValue) {
@@ -5369,6 +5397,75 @@ function _mergeVersionedRecordMaps(localMap, remoteMap) {
     merged[key] = _cloneJson(JSON.stringify(a) >= JSON.stringify(b) ? a : b);
   }
   return merged;
+}
+
+function _mergeVersionedDirectoryLists(localList, remoteList) {
+  const byId = new Map();
+  const consider = record => {
+    const id = String(record?.id ?? '');
+    if (!id) return;
+    const held = byId.get(id);
+    if (!held) { byId.set(id, _cloneJson(record)); return; }
+    const heldVersion = Number.isSafeInteger(held?.version) ? held.version : 1;
+    const nextVersion = Number.isSafeInteger(record?.version) ? record.version : 1;
+    if (nextVersion !== heldVersion) {
+      if (nextVersion > heldVersion) byId.set(id, _cloneJson(record));
+      return;
+    }
+    const heldDead = held?._deleted === true;
+    const nextDead = record?._deleted === true;
+    if (heldDead !== nextDead) {
+      if (nextDead) byId.set(id, _cloneJson(record));
+      return;
+    }
+    // A symmetric content tie-break is arbitrary but convergent. `updated`
+    // cannot be trusted here because clocks differ and local imports restamp.
+    if (JSON.stringify(record) > JSON.stringify(held)) {
+      byId.set(id, _cloneJson(record));
+    }
+  };
+  (Array.isArray(localList) ? localList : []).forEach(consider);
+  (Array.isArray(remoteList) ? remoteList : []).forEach(consider);
+  return [...byId.values()].sort((a, b) => String(a.id).localeCompare(String(b.id)));
+}
+
+function _mergeBoundedStringSets(localList, remoteList, limit = 300) {
+  const values = new Set();
+  for (const raw of [
+    ...(Array.isArray(localList) ? localList : []),
+    ...(Array.isArray(remoteList) ? remoteList : []),
+  ]) {
+    if (typeof raw === 'string' && raw.length > 0 && raw.length <= 500) values.add(raw);
+  }
+  // Content order, not arrival order, makes the cap deterministic on every Mac.
+  return [...values].sort().slice(-limit);
+}
+
+function _mergeProviderRecordLists(localList, remoteList, limit = 300) {
+  const byId = new Map();
+  const consider = record => {
+    if (!record || typeof record !== 'object' || Array.isArray(record)) return;
+    const id = String(record.msId ?? record.id ?? '');
+    if (!id) return;
+    const held = byId.get(id);
+    if (!held) { byId.set(id, _cloneJson(record)); return; }
+    const heldTime = Date.parse(held.sentAt || held.updatedAt || held.viewedAt || '') || 0;
+    const nextTime = Date.parse(record.sentAt || record.updatedAt || record.viewedAt || '') || 0;
+    if (nextTime > heldTime ||
+        (nextTime === heldTime && JSON.stringify(record) > JSON.stringify(held))) {
+      byId.set(id, _cloneJson(record));
+    }
+  };
+  (Array.isArray(localList) ? localList : []).forEach(consider);
+  (Array.isArray(remoteList) ? remoteList : []).forEach(consider);
+  return [...byId.values()]
+    .sort((a, b) => {
+      const time = (Date.parse(b.sentAt || b.updatedAt || b.viewedAt || '') || 0) -
+        (Date.parse(a.sentAt || a.updatedAt || a.viewedAt || '') || 0);
+      if (time !== 0) return time;
+      return String(a.msId ?? a.id).localeCompare(String(b.msId ?? b.id));
+    })
+    .slice(0, limit);
 }
 
 function _mergeTombstonedRecordLists(localList, remoteList) {
@@ -6375,6 +6472,19 @@ function persistInBackground(key, value, label = 'Background data') {
   return write;
 }
 
+function mutateInBackground(key, mutator, fallback, label = 'Background data') {
+  const write = STORE.mutate(key, mutator, fallback);
+  write.catch(error => {
+    console.warn(`[storage] ${label} was not saved:`, error?.message || error);
+    const now = Date.now();
+    if (now - (_backgroundSaveNoticeAt.get(key) || 0) >= 30000) {
+      _backgroundSaveNoticeAt.set(key, now);
+      showToast(`${label} was not saved: ${error?.message || error}`, 'warning');
+    }
+  });
+  return write;
+}
+
 // Operational values only. Historical Mass Email/contact data is left untouched
 // locally for recovery, but is inert and is never uploaded.
 const SYNC_BASE_KEYS = Object.freeze([
@@ -6946,6 +7056,9 @@ function _activateFirebaseAppCheck(app) {
 let _loginDirectorySyncPromise = null;
 let _loginDirectoryUnsubscribe = null;
 let _loginDirectorySyncStopped = false;
+let _loginDirectorySyncGeneration = 0;
+let _loginDirectoryDb = null;
+let _loginDirectoryRef = null;
 
 function _waitForFirebaseAuthUser(auth, timeoutMs = 5000) {
   if (auth?.currentUser?.uid) return Promise.resolve(auth.currentUser);
@@ -6974,21 +7087,34 @@ async function _applyLoginDirectorySnapshot(snap) {
   const directory = await _decodeSyncValue('staff_directory', remote.value);
   const result = await window.electronSession.importLoginDirectory(directory);
   if (result?.ok !== true) return false;
+  // Membership is safe to apply before login, but an arriving role elevation is
+  // deliberately deferred. Remember that debt so an Owner session applies it;
+  // otherwise the encrypted revision is consumed and the role is never retried.
+  _setDirectoryImportPending(result.applied !== true);
   await refreshLoginProfiles();
   return true;
 }
 
 function _stopLoginDirectorySync() {
+  _loginDirectorySyncGeneration += 1;
   _loginDirectorySyncStopped = true;
   if (_loginDirectoryUnsubscribe) {
     try { _loginDirectoryUnsubscribe(); } catch (_) {}
     _loginDirectoryUnsubscribe = null;
   }
+  _loginDirectoryDb = null;
+  _loginDirectoryRef = null;
+  // A resolved promise from the previous signed-out period must not prevent a
+  // fresh subscription after Log Out.
+  _loginDirectorySyncPromise = null;
 }
 
 function initLoginDirectorySync() {
   if (_loginDirectorySyncPromise) return _loginDirectorySyncPromise;
+  const generation = ++_loginDirectorySyncGeneration;
   _loginDirectorySyncStopped = false;
+  const active = () => !_loginDirectorySyncStopped &&
+    generation === _loginDirectorySyncGeneration;
   const work = (async () => {
     if (!window.electronFirebase?.loginDirectoryConfig ||
         !window.electronSession?.importLoginDirectory) return false;
@@ -7003,7 +7129,7 @@ function initLoginDirectorySync() {
       await new Promise(resolve => setTimeout(resolve, 100));
       waited += 100;
     }
-    if (typeof firebase === 'undefined' || _loginDirectorySyncStopped) return false;
+    if (typeof firebase === 'undefined' || !active()) return false;
     if (!await _loadPersistedSyncKey()) return false;
 
     const appName = 'music-box-sync';
@@ -7032,19 +7158,27 @@ function initLoginDirectorySync() {
 
     const auth = firebase.auth(app);
     const user = await _waitForFirebaseAuthUser(auth);
-    if (!user || _loginDirectorySyncStopped) return false;
+    if (!user || !active()) return false;
     const db = firebase.firestore(app);
     const ref = db.collection('musicbox').doc(studioCode).collection('data').doc('staff_directory');
+    _loginDirectoryDb = db;
+    _loginDirectoryRef = ref;
     const first = await ref.get();
-    if (!_loginDirectorySyncStopped) await _applyLoginDirectorySnapshot(first);
-    if (_loginDirectorySyncStopped) return false;
+    if (active()) await _applyLoginDirectorySnapshot(first);
+    if (!active()) return false;
     _loginDirectoryUnsubscribe = ref.onSnapshot(snap => {
-      if (_loginDirectorySyncStopped) return;
+      if (!active()) return;
       void _applyLoginDirectorySnapshot(snap).catch(error => {
         console.warn('[profiles] login directory was not applied:', error?.message || error);
       });
     }, error => {
       console.warn('[profiles] login directory listener stopped:', error?.message || error);
+      if (active()) {
+        _loginDirectoryUnsubscribe = null;
+        _loginDirectoryDb = null;
+        _loginDirectoryRef = null;
+        _loginDirectorySyncPromise = null;
+      }
     });
     return true;
   })().catch(error => {
@@ -7056,9 +7190,58 @@ function initLoginDirectorySync() {
   });
   _loginDirectorySyncPromise = work;
   void work.then(ok => {
-    if (!ok && !_loginDirectorySyncStopped) _loginDirectorySyncPromise = null;
+    if (!ok && active() && _loginDirectorySyncPromise === work) {
+      _loginDirectoryDb = null;
+      _loginDirectoryRef = null;
+      _loginDirectorySyncPromise = null;
+    }
   });
   return work;
+}
+
+// A profile is created while nobody is signed into the app. The dedicated
+// login-directory connection already has only the public Firebase config, a
+// persisted Firebase Auth session, and the studio data key; use that narrow
+// channel to publish the MAIN-authorized directory immediately. No Firebase
+// password or role-changing IPC is exposed to the login page.
+async function _publishLoginDirectorySnapshot(directory) {
+  if (!Array.isArray(directory) || !directory.length) return false;
+  try {
+    if (!await initLoginDirectorySync() || !_loginDirectoryDb || !_loginDirectoryRef) {
+      return false;
+    }
+    const local = _normalizeSyncValue('staff_directory', directory);
+    const operationId = _newOperationId();
+    await _loginDirectoryDb.runTransaction(async transaction => {
+      const snap = await transaction.get(_loginDirectoryRef);
+      let remote = [];
+      let revision = 0;
+      if (snap.exists) {
+        const data = snap.data();
+        _syncDocumentKind(data);
+        remote = await _decodeSyncValue('staff_directory', data.value);
+        revision = Number.isSafeInteger(data.revision) && data.revision >= 0
+          ? data.revision
+          : 0;
+      }
+      const merged = _mergeVersionedDirectoryLists(local, remote);
+      const value = await _encodeSyncValue('staff_directory', merged);
+      transaction.set(_loginDirectoryRef, {
+        value,
+        revision: revision + 1,
+        opId: operationId,
+        writer: _deviceId(),
+        serverUpdated: firebase.firestore.FieldValue.serverTimestamp(),
+        schemaVersion: 2,
+      });
+    });
+    _setDirectoryPublicationPending(false);
+    return true;
+  } catch (error) {
+    console.warn('[profiles] signed-out directory publication failed:', error?.message || error);
+    _setDirectoryPublicationPending(true);
+    return false;
+  }
 }
 
 async function _prepareSyncEncryption() {
@@ -7460,10 +7643,90 @@ async function initFirebase() {
   }
 }
 
+async function _finishFirebaseBootstrap(user, {
+  cloudBinding = '',
+  previousCloudBinding = '',
+  cloudChanged = false,
+} = {}) {
+  if (!user?.uid) throw new Error('Firebase authentication did not return a user');
+  const uidEl = document.getElementById('firebase-auth-uid');
+  if (uidEl) {
+    uidEl.textContent = 'Authenticated UID: ' + user.uid +
+      ' — this UID must be in the studio memberUids list.';
+  }
+
+  _firestoreDb = firebase.firestore(_firebaseApp);
+  await _resumePendingPinRotation({ includeFirebase: true, includeCloud: false });
+  await _prepareSyncEncryption();
+  _syncReady = true;
+  _setRemoteAuthority('bootstrapping');
+  await _bootstrapSync();
+  _setRemoteAuthority(
+    [..._remoteDocPresence.values()].some(Boolean) ? 'ready-present' : 'ready-absent'
+  );
+  _stopLoginDirectorySync();
+  subscribeToSync();
+  _syncBootstrapComplete = true;
+
+  // Apply before publish. A vault that failed to consume the shared directory
+  // is known stale and must never become the next writer.
+  void (async () => {
+    await flushPendingPasscodeApply();
+    await flushPendingDirectoryImport();
+    await flushPendingDirectoryPublication();
+  })().catch(error => {
+    console.warn('[profiles] pending directory work failed:', error?.message || error);
+  });
+
+  const staleRevisionKeys = _staleRevisionKeysAgainstAbsentRemote();
+  if (staleRevisionKeys.length) {
+    const reset = _resetLocalSyncRevisionsForNewCloud(staleRevisionKeys);
+    console.warn(
+      `Cloud binding changed (${previousCloudBinding || 'unrecorded'} -> ${cloudBinding || 'unknown'}); ` +
+      `cleared unsatisfiable revision expectations for ${reset.length} key(s).`
+    );
+    if (reset.length) {
+      showToast(
+        `This Mac is pointed at a different studio cloud than the one it last synced with. ` +
+        `Nothing local was deleted — ${reset.length} item${reset.length === 1 ? '' : 's'} will upload fresh.`,
+        'info'
+      );
+    }
+  } else if (cloudChanged) {
+    console.warn(`Cloud binding changed (${previousCloudBinding} -> ${cloudBinding}) but every revision was satisfiable.`);
+  }
+  if (cloudBinding) {
+    try { SHARED.set('sync_cloud_binding', cloudBinding); } catch (_) {}
+  }
+
+  try { _reevaluateSpreadsheetAuthority(); } catch (_) {}
+  try {
+    await _drainPendingSyncWrites();
+    setSyncStatus(_portablePinStale ? 'error' : 'live');
+    if (uidEl && !_portablePinStale) {
+      uidEl.textContent = 'Connected as ' + user.uid + '.';
+    }
+  } catch (pendingError) {
+    console.warn('Pending cloud writes remain after bootstrap:', pendingError?.message || pendingError);
+    setSyncStatus('error');
+    if (uidEl) {
+      uidEl.textContent =
+        'Signed in as ' + user.uid +
+        ', but uploading this Mac’s data failed: ' +
+        (pendingError?.message || String(pendingError)) +
+        (pendingError?.code ? ' (' + pendingError.code + ')' : '');
+    }
+  }
+  updateSyncTimestamp();
+  return true;
+}
+
 async function _initFirebaseInner() {
   // Staff can reuse the already-authenticated Firebase session established
   // during the required owner unlock, but cannot retrieve the saved password.
   if (!isElizabeth() && _syncReady && _firestoreDb && _firebaseAuth?.currentUser) {
+    _stopLoginDirectorySync();
+    if (!_syncKeyUnsubs.has('staff_directory')) _subscribeSyncKey('staff_directory');
     // Reusing a live session is a success, and has to say so: this path used to
     // return without touching the badge, so whatever it happened to show last
     // stayed on screen.
@@ -7477,7 +7740,12 @@ async function _initFirebaseInner() {
   const appId      = _firebaseSecret('firebase_app_id');
   const email      = _firebaseSecret('firebase_email');
   let password     = _firebaseSecret('firebase_password');
-  if (!apiKey || !projectId || !email || !password) {
+  // A staff process is never allowed to retrieve the Firebase password. On a
+  // provisioned Mac it can instead reuse the Firebase Auth session that the
+  // pre-login directory listener has already proved and restored from disk.
+  const reusePersistedStaffSession = !isElizabeth() &&
+    !!(apiKey && projectId && email) && !password;
+  if (!apiKey || !projectId || !email || (!password && !reusePersistedStaffSession)) {
     // V159-001/V159-004: distinguish "Firebase is genuinely not set up" from
     // "this staff renderer was denied the owner-only runtime credential".
     // Only the former means there is no remote data to preserve.
@@ -7559,120 +7827,41 @@ async function _initFirebaseInner() {
 
     _firebaseAuth = firebase.auth(_firebaseApp);
     _setRemoteAuthority('authenticating');
-    // Firebase auth can hang indefinitely when the network is down or the
-    // project is unreachable, leaving the badge stuck on "Connecting…" forever.
-    // Bound it so the UI always reaches a truthful state.
-    const credential = await Promise.race([
-      _firebaseAuth.signInWithEmailAndPassword(email, password),
-      new Promise((_, reject) => setTimeout(
-        () => reject(Object.assign(
-          new Error(navigator.onLine === false
-            ? 'No network connection; cloud sync is unavailable'
-            : 'Firebase did not respond; check the project settings and network'),
-          { code: navigator.onLine === false ? 'SYNC_OFFLINE' : 'SYNC_TIMEOUT' }
-        )),
-        SYNC_CONNECT_TIMEOUT_MS
-      )),
-    ]);
-    password = '';
-    if (!credential?.user?.uid) throw new Error('Firebase authentication did not return a user');
-    delete _firebaseSecretCache[FIREBASE_SECRET_KEYS.password];
-    const uidEl = document.getElementById('firebase-auth-uid');
-    if (uidEl) uidEl.textContent = 'Authenticated UID: ' + credential.user.uid + ' — this UID must be in the studio memberUids list.';
-
-    _firestoreDb = firebase.firestore(_firebaseApp);
-    await _resumePendingPinRotation({ includeFirebase: true, includeCloud: false });
-    await _prepareSyncEncryption();
-    _syncReady = true;
-    _setRemoteAuthority('bootstrapping');
-    await _bootstrapSync();
-    // V159-001: only now is remote presence authoritatively known.
-    _setRemoteAuthority(
-      [..._remoteDocPresence.values()].some(Boolean) ? 'ready-present' : 'ready-absent'
-    );
-    _stopLoginDirectorySync();
-    subscribeToSync();
-    _syncBootstrapComplete = true;
-
-    // MB1188-028: publish profiles added from the signed-out login screen.
-    //
-    // MB1188-008 put this in runPostLoginMaintenance, which was the right idea
-    // in the wrong place. completeLogin() deliberately starts Firebase only
-    // AFTER maintenance settles — `_postLoginMaintenancePromise.then(initFirebase)`
-    // — so when the flush ran, _syncReady and _syncBootstrapComplete were both
-    // still false and `cloudRunning` was false EVERY time, not occasionally.
-    // The directory was written to this Mac, announced as shared, and never
-    // sent. That is why the staff_directory document in Firestore never
-    // changed while projects synced perfectly: projects are read from the
-    // store, but a profile has to be pushed to the cloud and then applied into
-    // the other Mac's vault over IPC, and the push was never happening.
-    //
-    // Here is the first moment publishing can actually reach the cloud.
-    // MB1188-047: apply first, publish second. Both orders "work"; only this
-    // one cannot publish a vault that is known to be behind the shared copy.
-    void (async () => {
-      // MB1188-080: recovery is NOT here any more. It ran only when Firebase
-      // came up, which is the one condition it must not depend on. It is a
-      // post-login maintenance job now — see runPostLoginMaintenance.
-      await flushPendingPasscodeApply();
-      await flushPendingDirectoryImport();
-      await flushPendingDirectoryPublication();
-    })().catch(error => {
-      console.warn('[profiles] pending directory work failed:', error?.message || error);
-    });
-
-    // Repointed at a different cloud, every stored revision describes a
-    // document that is not there, and CAS fails closed on every key forever.
-    // Remote presence is authoritative only now that bootstrap has finished,
-    // so this is the first point the evidence can be trusted.
-    const staleRevisionKeys = _staleRevisionKeysAgainstAbsentRemote();
-    if (staleRevisionKeys.length) {
-      const reset = _resetLocalSyncRevisionsForNewCloud(staleRevisionKeys);
-      console.warn(
-        `Cloud binding changed (${previousCloudBinding || 'unrecorded'} -> ${cloudBinding || 'unknown'}); ` +
-        `cleared unsatisfiable revision expectations for ${reset.length} key(s).`
-      );
-      if (reset.length) {
-        showToast(
-          `This Mac is pointed at a different studio cloud than the one it last synced with. ` +
-          `Nothing local was deleted — ${reset.length} item${reset.length === 1 ? '' : 's'} will upload fresh.`,
-          'info'
+    let user;
+    if (reusePersistedStaffSession) {
+      user = await _waitForFirebaseAuthUser(_firebaseAuth);
+      if (!user) {
+        throw Object.assign(
+          new Error('This Mac has no reusable Firebase session. Elizabeth must connect sync once on this Mac.'),
+          { code: 'SYNC_CREDENTIAL_DENIED' }
         );
       }
-    } else if (cloudChanged) {
-      console.warn(`Cloud binding changed (${previousCloudBinding} -> ${cloudBinding}) but every revision was satisfiable.`);
+    } else {
+      // Firebase auth can hang indefinitely when the network is down or the
+      // project is unreachable, leaving the badge stuck on "Connecting…" forever.
+      // Bound it so the UI always reaches a truthful state.
+      const credential = await Promise.race([
+        _firebaseAuth.signInWithEmailAndPassword(email, password),
+        new Promise((_, reject) => setTimeout(
+          () => reject(Object.assign(
+            new Error(navigator.onLine === false
+              ? 'No network connection; cloud sync is unavailable'
+              : 'Firebase did not respond; check the project settings and network'),
+            { code: navigator.onLine === false ? 'SYNC_OFFLINE' : 'SYNC_TIMEOUT' }
+          )),
+          SYNC_CONNECT_TIMEOUT_MS
+        )),
+      ]);
+      user = credential?.user || null;
     }
-    if (cloudBinding) {
-      try { SHARED.set('sync_cloud_binding', cloudBinding); } catch (_) {}
-    }
-
-    // V160-002: remote authority is now known one way or the other; release the
-    // spreadsheet read-only hold in whichever direction is authoritative.
-    try { _reevaluateSpreadsheetAuthority(); } catch (_) {}
-    try {
-      await _drainPendingSyncWrites();
-      setSyncStatus(_portablePinStale ? 'error' : 'live');
-      // The passcode branch already explains itself through a toast; the
-      // connected branch should not leave a stale failure line on screen.
-      if (uidEl && !_portablePinStale) {
-        uidEl.textContent = 'Connected as ' + credential.user.uid + '.';
-      }
-    } catch (pendingError) {
-      // A red badge with no reason is the same as no badge: whoever is on
-      // shift can see that sync broke but not what to do about it, and
-      // packaged builds have no console to fall back on.
-      console.warn('Pending cloud writes remain after bootstrap:', pendingError?.message || pendingError);
-      setSyncStatus('error');
-      if (uidEl) {
-        uidEl.textContent =
-          'Signed in as ' + credential.user.uid +
-          ', but uploading this Mac’s data failed: ' +
-          (pendingError?.message || String(pendingError)) +
-          (pendingError?.code ? ' (' + pendingError.code + ')' : '');
-      }
-    }
-    updateSyncTimestamp();
-    return true;
+    password = '';
+    if (!user?.uid) throw new Error('Firebase authentication did not return a user');
+    delete _firebaseSecretCache[FIREBASE_SECRET_KEYS.password];
+    return await _finishFirebaseBootstrap(user, {
+      cloudBinding,
+      previousCloudBinding,
+      cloudChanged,
+    });
   } catch(e) {
     console.error('Firebase init error:', e);
     _syncReady = false;
@@ -18510,8 +18699,12 @@ async function fetchMsEmails() {
       });
     }));
     newMsSent.sort((a, b) => new Date(b.sentAt || 0) - new Date(a.sentAt || 0));
-    persistInBackground('ms_sent_emails', newMsSent.slice(0, 300), 'Sent-email cache');
-    persistInBackground('ms_sent_conv_ids', [...sentConvIds].slice(-300), 'Sent-email index');
+    const observedSent = newMsSent.slice(0, 300);
+    const observedConversations = [...sentConvIds];
+    mutateInBackground('ms_sent_emails', current =>
+      _mergeProviderRecordLists(current, observedSent), [], 'Sent-email cache');
+    mutateInBackground('ms_sent_conv_ids', current =>
+      _mergeBoundedStringSets(current, observedConversations), [], 'Sent-email index');
   } catch(e) { /* silently skip — non-critical */ }
 
   allEmails.sort((a, b) => new Date(b.receivedAt || 0) - new Date(a.receivedAt || 0));
@@ -19063,8 +19256,7 @@ async function _sendReplyOnce(emailId, box) {
         // The remote send is irreversible. Archive it locally before reporting
         // a fully successful result, but never invite a duplicate resend if the
         // local archive happens to fail.
-        const sent = STORE.get('sent_emails', []);
-        sent.unshift({
+        const sentRecord = {
           // AUDIT: two Macs replying in the same millisecond produced the same
           // id. This record exists because the send is irreversible, so it is
           // the last thing that should be ambiguous.
@@ -19077,9 +19269,10 @@ async function _sendReplyOnce(emailId, box) {
           from: currentUser() || 'Staff',
           time: new Date().toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }),
           sentAt: new Date().toISOString(),
-        });
+        };
         try {
-          await STORE.replace('sent_emails', sent.slice(0, 300), { authoritative: 'provider-derived sent cache' });
+          await STORE.mutate('sent_emails', current =>
+            _mergeProviderRecordLists(current, [sentRecord]), []);
           await autoCompleteEmailTodos(original);
           showToast('✅ Reply sent via Microsoft 365!', 'success');
         } catch (archiveError) {
@@ -19101,8 +19294,7 @@ async function _sendReplyOnce(emailId, box) {
     }
   } else {
     // Demo mode — log locally
-    const sent = STORE.get('sent_emails', []);
-    sent.unshift({
+    const sentRecord = {
       id: _newRecordId(),
       to: original ? original.from : 'Unknown',
       toEmail: original ? original.email : '',
@@ -19112,9 +19304,10 @@ async function _sendReplyOnce(emailId, box) {
       from: currentUser() || 'Staff',
       time: new Date().toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }),
       sentAt: new Date().toISOString(),
-    });
+    };
     try {
-      await STORE.replace('sent_emails', sent.slice(0, 300), { authoritative: 'provider-derived sent cache' });
+      await STORE.mutate('sent_emails', current =>
+        _mergeProviderRecordLists(current, [sentRecord]), []);
       await autoCompleteEmailTodos(original);
       showToast('Reply saved (demo mode — connect Microsoft 365 to send for real).', 'info');
     } catch (error) {
@@ -19136,12 +19329,11 @@ function openSentEmail(id) {
   if (String(openEmailId) === sentKey) { openEmailId = null; renderEmailList(); return; }
   openEmailId = sentKey;
   // Stamp viewedAt so 30-day retention runs from last view, not send date
-  const sent = STORE.get('sent_emails', []);
-  const entry = sent.find(s => s.id === id);
-  if (entry) {
-    entry.viewedAt = new Date().toISOString();
-    persistInBackground('sent_emails', sent, 'Sent-email view timestamp');
-  }
+  const viewedAt = new Date().toISOString();
+  mutateInBackground('sent_emails', current =>
+    (Array.isArray(current) ? current : []).map(entry =>
+      entry.id === id ? { ...entry, viewedAt } : entry
+    ), [], 'Sent-email view timestamp');
   renderEmailList();
 }
 
@@ -19154,12 +19346,11 @@ function openMergedSent(i) {
   openEmailId = key;
   if (s._type === 'local') {
     // stamp viewedAt for 30-day retention
-    const sent = STORE.get('sent_emails', []);
-    const entry = sent.find(e => e.id === s._localId);
-    if (entry) {
-      entry.viewedAt = new Date().toISOString();
-      persistInBackground('sent_emails', sent, 'Sent-email view timestamp');
-    }
+    const viewedAt = new Date().toISOString();
+    mutateInBackground('sent_emails', current =>
+      (Array.isArray(current) ? current : []).map(entry =>
+        entry.id === s._localId ? { ...entry, viewedAt } : entry
+      ), [], 'Sent-email view timestamp');
   }
   renderEmailList();
 }
@@ -24387,9 +24578,13 @@ async function commAnalyzeAndAddTodos() {
 
     // Persist updated sent emails + conv IDs so the replied-todo sweep has timestamps
     newMsSent.sort((a, b) => new Date(b.sentAt || 0) - new Date(a.sentAt || 0));
+    const observedSent = newMsSent.slice(0, 300);
+    const observedConversations = [...freshRepliedConvIds];
     await Promise.all([
-      STORE.replace('ms_sent_emails', newMsSent.slice(0, 300), { authoritative: 'provider-derived sent cache' }),
-      STORE.replace('ms_sent_conv_ids', [...freshRepliedConvIds].slice(-300), { authoritative: 'provider-derived sent cache' }),
+      STORE.mutate('ms_sent_emails', current =>
+        _mergeProviderRecordLists(current, observedSent), []),
+      STORE.mutate('ms_sent_conv_ids', current =>
+        _mergeBoundedStringSets(current, observedConversations), []),
     ]);
     candidates = candidates.filter(e => !e.conversationId || !freshRepliedConvIds.has(e.conversationId));
   } catch(e) {

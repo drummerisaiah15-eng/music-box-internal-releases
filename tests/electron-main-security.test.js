@@ -903,6 +903,7 @@ function directoryHarness({ role = 'Owner', signedInAs = 'Elizabeth Chaves', vau
     ${sliceFunction(main, '_mergeDirectoryEntries')}
     ${sliceFunction(main, '_buildStaffDirectory')}
     ${sliceFunction(main, '_validDirectoryEntry')}
+    ${sliceFunction(main, '_rememberDirectoryEntry')}
     ${sliceFunction(main, '_applyLoginDirectoryAdditions')}
     ${sliceFunction(main, '_applyStaffDirectory')}
     ${main.slice(main.indexOf('const PROFILE_ROLE_RANK'), main.indexOf('function _profileRoleOverrides'))}
@@ -940,7 +941,7 @@ test('directory: a published directory reproduces the owner profile set elsewher
     'the added user now exists on the second Mac');
 });
 
-test('directory: a cold login screen adds new profiles without granting roles or applying removals', () => {
+test('directory: a cold login screen synchronizes membership without granting roles', () => {
   const target = directoryHarness({ vault: {} });
   const result = target.api.applyBeforeLogin([
     { id: 'profile:elizabeth chaves', name: 'Elizabeth Chaves', role: 'Owner', builtIn: true },
@@ -956,21 +957,22 @@ test('directory: a cold login screen adds new profiles without granting roles or
     'a new ordinary profile becomes available at the receiving login screen');
   assert.ok(profiles.includes('Megan:Front Desk'),
     'a cold-start import never grants the requested elevated role');
-  assert.ok(profiles.includes('Emma Minnetto:Front Desk'),
-    'signed-out synchronization never removes a login');
+  assert.ok(!profiles.includes('Emma Minnetto:Front Desk'),
+    'an explicit versioned tombstone removes the login at the signed-out picker');
   assert.ok(profiles.includes('Carrie Gass:Operations & Events'),
     'an existing role is not rewritten before authentication');
   assert.deepEqual(
     Array.from(result.deferred, entry => `${entry.name}:${entry.reason}`).sort(),
-    ['Emma Minnetto:removal', 'Megan:role'].sort(),
-    'authority-changing work is explicitly deferred for the authenticated importer',
+    ['Megan:role'],
+    'only authority-granting role work is deferred for the authenticated importer',
   );
+  assert.deepEqual(Array.from(result.removed), ['Emma Minnetto']);
 
-  const saved = target.state.savedTimes;
   target.api.applyBeforeLogin([
-    { id: 'profile:kylie', name: 'Kylie', role: 'Front Desk', builtIn: false },
+    { id: 'profile:kylie', name: 'Kylie', role: 'Front Desk', builtIn: false, version: 1 },
   ]);
-  assert.equal(target.state.savedTimes, saved, 'replaying the same login addition is idempotent');
+  assert.equal([...target.api.profiles()].filter(row => row === 'Kylie:Front Desk').length, 1,
+    'replaying the same login addition is idempotent');
 });
 
 test('directory: a role change propagates', () => {
@@ -1042,8 +1044,8 @@ test('directory: malformed, duplicate and oversized payloads are rejected safely
   target.api.apply([
     { id: 'profile:elizabeth chaves', name: 'Elizabeth Chaves', role: 'Owner', builtIn: true },
     null, 42, { name: 123, role: 'Front Desk' }, { name: 'ok name', role: null },
-    { id: 'a', name: 'Dana Reed', role: 'Front Desk' },
-    { id: 'b', name: 'dana reed', role: 'Operations & Events' },
+    { id: 'profile:dana reed', name: 'Dana Reed', role: 'Front Desk' },
+    { id: 'profile:dana reed', name: 'dana reed', role: 'Operations & Events' },
   ]);
   const danas = [...target.api.profiles()].filter(p => p.toLowerCase().startsWith('dana reed:'));
   assert.equal(danas.length, 1, 'case-duplicate entries collapse to one');
@@ -1113,9 +1115,9 @@ test('directory: export is owner-only, import is validated in main', () => {
 
   const loginImportBody = extractHandlerBody(main, 'app-login-import-directory');
   assert.match(loginImportBody, /_applyLoginDirectoryAdditions\(directory\)/,
-    'the signed-out channel uses the addition-only importer');
+    'the signed-out channel uses the membership-only importer');
   assert.doesNotMatch(loginImportBody, /_applyStaffDirectory|_requireAppRole/,
-    'it cannot reach the role/removal importer and does not require an impossible login session');
+    'it cannot reach the role-elevation importer and does not require an impossible login session');
 
   const loginConfigBody = extractHandlerBody(main, 'firebase-login-directory-config');
   assert.match(loginConfigBody, /apiKey: config\.apiKey/);
@@ -1129,7 +1131,7 @@ test('directory: export is owner-only, import is validated in main', () => {
 test('directory: the renderer publishes on every profile change and merges on arrival', () => {
   const renderer = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
   assert.match(renderer, /'staff_directory',/, 'it is a synchronized key');
-  assert.match(renderer, /staff_directory: 'tombstoned-record-list'/,
+  assert.match(renderer, /staff_directory: 'versioned-directory'/,
     'two Macs editing different profiles merge instead of clobbering');
   assert.match(renderer, /if \(key === 'staff_directory'\)/, 'arrivals are applied');
   // Assert the intent, not a call count. This used to require exactly three
@@ -1143,6 +1145,9 @@ test('directory: the renderer publishes on every profile change and merges on ar
     if (name === 'removeLoginUser') {
       assert.match(body, /_persistAuthorizedDirectorySnapshot\(result\.directory\)/,
         'removal publishes the exact main-authorized tombstone snapshot');
+    } else if (name === 'addLoginUser') {
+      assert.match(body, /_publishLoginDirectorySnapshot\(result\.directory\)/,
+        'signed-out addition publishes the exact main-authorized directory');
     } else {
       assert.match(body, /publishStaffDirectory\(\)/, `${name} publishes the directory`);
     }
@@ -1436,21 +1441,21 @@ test('MB161-005: re-adding a removed name publishes it once, not alongside its d
   delete harness.state.vault.app_staff_profiles_v1;
   harness.state.vault.app_removed_custom_v1 = [{ name: 'Dana Reed', at: '2026-08-05T00:00:00.000Z' }];
   dirEntries(harness);
-  // What the add handler records: profile back, tombstone and meta cleared.
+  // What the add handler records: profile back, tombstone cleared, generation retained.
   harness.state.vault.app_staff_profiles_v1 = [{ name: 'Dana Reed', role: 'Front Desk', createdAt: 2 }];
   delete harness.state.vault.app_removed_custom_v1;
-  delete harness.state.vault.app_directory_meta_v1['profile:dana reed'];
   const matches = dirEntries(harness).filter(entry => entry.name === 'Dana Reed');
   assert.equal(matches.length, 1, 'the profile is not published alongside its own deletion');
   assert.notEqual(matches[0]._deleted, true);
-  assert.equal(matches[0].version, 1, 'the reused id does not inherit the old version');
+  assert.equal(matches[0].version, 2,
+    'the re-add advances beyond the tombstone so the old deletion cannot suppress it');
 });
 
 test('MB161-005: adding a user that could not be published says so', () => {
   const renderer = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
   const fn = renderer.slice(renderer.indexOf('async function addLoginUser'));
   const body = fn.slice(0, fn.indexOf('\nfunction ', 1));
-  assert.match(body, /const published = await publishStaffDirectory\(\);/,
+  assert.match(body, /const published = await _publishLoginDirectorySnapshot\(result\.directory\);/,
     'the publish result is read, not discarded');
   assert.match(body, /not yet[\s\S]*shared with the other Macs/,
     'and a local-only add is described as local-only');

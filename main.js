@@ -2313,11 +2313,13 @@ _secureHandle('app-session-add-staff-profile', async (_, requestedName) => {
       roles[suppressedBuiltIn] = 'Front Desk';
       vault[PROFILE_ROLE_OVERRIDES_VAULT_KEY] = roles;
     }
-    const builtInMeta = _directoryMeta(vault);
-    delete builtInMeta[_directoryEntryId(suppressedBuiltIn)];
-    vault[DIRECTORY_META_VAULT_KEY] = builtInMeta;
+    // Keep the tombstone's generation metadata. Restoring this identity is a
+    // NEW decision and must advance past the deletion that other Macs hold.
+    // Resetting to version 1 made the old tombstone win forever.
+    vault[DIRECTORY_META_VAULT_KEY] = _directoryMeta(vault);
     _saveSecretVault(vault);
-    return { ok: true, profile: { name: suppressedBuiltIn, role: 'Front Desk', builtIn: true } };
+    const profile = { name: suppressedBuiltIn, role: 'Front Desk', builtIn: true };
+    return { ok: true, profile, directory: _buildStaffDirectory() };
   }
   if (profiles.length >= MAX_CUSTOM_STAFF_PROFILES) {
     throw new Error(`This Mac already has the maximum of ${MAX_CUSTOM_STAFF_PROFILES} added users.`);
@@ -2330,13 +2332,13 @@ _secureHandle('app-session-add-staff-profile', async (_, requestedName) => {
     .filter(record => record.name.toLocaleLowerCase('en-US') !== folded);
   if (clearedTombstones.length) vault[REMOVED_CUSTOM_PROFILES_VAULT_KEY] = clearedTombstones;
   else delete vault[REMOVED_CUSTOM_PROFILES_VAULT_KEY];
-  // The id is reused, so its causality must restart rather than inherit the
-  // version the deleted profile ended on.
-  const meta = _directoryMeta(vault);
-  delete meta[_directoryEntryId(name)];
-  vault[DIRECTORY_META_VAULT_KEY] = meta;
+  // The id is reused, so keep its causality: _buildStaffDirectory advances the
+  // live record past the deletion. Starting over at version 1 made a tombstone
+  // already present in the cloud permanently suppress the re-added profile.
+  vault[DIRECTORY_META_VAULT_KEY] = _directoryMeta(vault);
   _saveSecretVault(vault);
-  return { ok: true, profile: { name, role: 'Front Desk', builtIn: false } };
+  const profile = { name, role: 'Front Desk', builtIn: false };
+  return { ok: true, profile, directory: _buildStaffDirectory() };
 });
 
 // Owner-only removal of an added Front Desk profile.
@@ -2547,20 +2549,50 @@ function _validDirectoryEntry(entry) {
   if (!_isPlainObject(entry)) return false;
   if (typeof entry.name !== 'string') return false;
   if (entry.role !== 'Owner' && !ASSIGNABLE_PROFILE_ROLES.includes(entry.role)) return false;
-  return true;
+  if (!_boundedString(entry.id, 200)) return false;
+  try {
+    return entry.id === _directoryEntryId(_normalizeStaffProfileName(entry.name));
+  } catch (_) {
+    return false;
+  }
+}
+
+// Preserve the generation that won the merge in the protected vault. Without
+// this, the next export restamped an imported tombstone or role with a smaller
+// local version, so another stale Mac could undo it.
+function _rememberDirectoryEntry(meta, source, effective) {
+  const id = effective.id;
+  const held = _isPlainObject(meta[id]) ? meta[id] : null;
+  const sourceVersion = Number.isSafeInteger(source?.version) && source.version >= 1
+    ? source.version
+    : 1;
+  const version = Math.max(sourceVersion,
+    Number.isSafeInteger(held?.version) ? held.version : 0);
+  const updated = typeof source?.updated === 'string' && source.updated
+    ? source.updated
+    : (typeof held?.updated === 'string' ? held.updated : new Date().toISOString());
+  meta[id] = {
+    digest: _directoryEntryDigest(effective),
+    version,
+    updated,
+  };
 }
 
 // A receiving Mac can be sitting at the profile picker when another Mac adds a
 // user. Requiring an existing profile to sign in before the picker can refresh
 // creates a catch-22 for the new person. This deliberately narrow importer is
-// callable before an app session exists, and therefore may only make a login
-// less privileged: it adds missing profiles as Front Desk. Removals and role
-// changes are reported as deferred and remain on the authenticated importer.
+// callable before an app session exists, and therefore may only change
+// MEMBERSHIP: it adds missing profiles as Front Desk and applies explicit,
+// versioned deletion tombstones. It never raises a role; those changes are
+// reported as deferred for the authenticated importer.
 function _applyLoginDirectoryAdditions(entries) {
   if (!Array.isArray(entries) || entries.length > MAX_DIRECTORY_ENTRIES) {
     throw new Error('The staff directory is invalid.');
   }
 
+  // Merge before applying. An absent id means "not heard of", not deletion;
+  // and a stale live record must not undo a newer tombstone already on this Mac.
+  entries = _mergeDirectoryEntries(_buildStaffDirectory(), entries);
   const vault = _loadSecretVault();
   const currentProfiles = _allAppProfiles();
   const currentByName = new Map(currentProfiles.map(profile => [
@@ -2569,12 +2601,14 @@ function _applyLoginDirectoryAdditions(entries) {
   const builtInByName = new Map(Object.keys(APP_PROFILE_ROLES).map(name => [
     name.toLocaleLowerCase('en-US'), name,
   ]));
-  const custom = _customStaffProfilesFromVault(vault);
+  let custom = _customStaffProfilesFromVault(vault);
   let removedBuiltIns = _removedBuiltInProfiles(vault);
   let removedCustom = _removedCustomProfiles(vault);
   const overrides = { ..._profileRoleOverrides(vault) };
   const meta = { ..._directoryMeta(vault) };
+  const initialMeta = JSON.stringify(meta);
   const added = [];
+  const removed = [];
   const deferred = [];
   const deferredKeys = new Set();
   let changed = false;
@@ -2596,7 +2630,43 @@ function _applyLoginDirectoryAdditions(entries) {
     const held = currentByName.get(folded) || null;
 
     if (raw._deleted === true) {
-      if (held && held.role !== 'Owner') defer(held.name, 'removal');
+      // Owner is structural and cannot be removed through synchronized data.
+      if (builtInName && APP_PROFILE_ROLES[builtInName] === 'Owner') continue;
+      if (builtInName) {
+        if (!removedBuiltIns.includes(builtInName)) {
+          removedBuiltIns = [...removedBuiltIns, builtInName];
+          changed = true;
+        }
+      } else {
+        const before = custom.length;
+        custom = custom.filter(profile =>
+          profile.name.toLocaleLowerCase('en-US') !== folded
+        );
+        if (custom.length !== before) changed = true;
+        const tombstoneAt = typeof raw._deletedAt === 'string'
+          ? raw._deletedAt
+          : (typeof raw.updated === 'string' ? raw.updated : new Date().toISOString());
+        const existing = removedCustom.find(record =>
+          record.name.toLocaleLowerCase('en-US') === folded
+        );
+        if (!existing) {
+          removedCustom = [...removedCustom, { name: canonicalName, at: tombstoneAt }].slice(-200);
+          changed = true;
+        }
+      }
+      if (Object.prototype.hasOwnProperty.call(overrides, canonicalName)) {
+        delete overrides[canonicalName];
+        changed = true;
+      }
+      if (held && held.role !== 'Owner') {
+        currentByName.delete(folded);
+        removed.push(held.name);
+      }
+      _rememberDirectoryEntry(meta, raw, {
+        id: _directoryEntryId(canonicalName), name: canonicalName,
+        role: builtInName ? APP_PROFILE_ROLES[builtInName] : 'Front Desk',
+        builtIn: !!builtInName, _deleted: true,
+      });
       continue;
     }
 
@@ -2606,6 +2676,10 @@ function _applyLoginDirectoryAdditions(entries) {
 
     if (held) {
       if (requestedRole !== held.role && held.role !== 'Owner') defer(held.name, 'role');
+      _rememberDirectoryEntry(meta, raw, {
+        id: _directoryEntryId(held.name), name: held.name, role: held.role,
+        builtIn: held.builtIn === true,
+      });
       continue;
     }
 
@@ -2617,11 +2691,14 @@ function _applyLoginDirectoryAdditions(entries) {
       removedBuiltIns = nextRemoved;
       if (APP_PROFILE_ROLES[builtInName] === 'Front Desk') delete overrides[builtInName];
       else overrides[builtInName] = 'Front Desk';
-      delete meta[_directoryEntryId(builtInName)];
       currentByName.set(folded, { name: builtInName, role: 'Front Desk', builtIn: true });
       added.push(builtInName);
       changed = true;
       if (requestedRole !== 'Front Desk') defer(builtInName, 'role');
+      _rememberDirectoryEntry(meta, raw, {
+        id: _directoryEntryId(builtInName), name: builtInName,
+        role: 'Front Desk', builtIn: true,
+      });
       continue;
     }
 
@@ -2633,14 +2710,17 @@ function _applyLoginDirectoryAdditions(entries) {
     removedCustom = removedCustom.filter(
       record => record.name.toLocaleLowerCase('en-US') !== folded
     );
-    delete meta[_directoryEntryId(canonicalName)];
     currentByName.set(folded, { name: canonicalName, role: 'Front Desk', builtIn: false });
     added.push(canonicalName);
     changed = true;
     if (requestedRole !== 'Front Desk') defer(canonicalName, 'role');
+    _rememberDirectoryEntry(meta, raw, {
+      id: _directoryEntryId(canonicalName), name: canonicalName,
+      role: 'Front Desk', builtIn: false,
+    });
   }
 
-  if (changed) {
+  if (changed || JSON.stringify(meta) !== initialMeta) {
     if (custom.length) vault[STAFF_PROFILES_VAULT_KEY] = custom;
     else delete vault[STAFF_PROFILES_VAULT_KEY];
     if (removedBuiltIns.length) vault[REMOVED_BUILTIN_PROFILES_VAULT_KEY] = removedBuiltIns;
@@ -2653,7 +2733,7 @@ function _applyLoginDirectoryAdditions(entries) {
     _saveSecretVault(vault);
   }
 
-  return { profiles: _allAppProfiles(), added, deferred };
+  return { profiles: _allAppProfiles(), added, removed, deferred };
 }
 
 // Apply a directory published by the owner's Mac to this Mac's vault.
@@ -2677,17 +2757,15 @@ function _mergeDirectoryEntries(local, incoming) {
     if (nextVersion > heldVersion) { byId.set(entry.id, entry); return; }
     if (nextVersion < heldVersion) return;
     if (heldDead !== nextDead) { if (nextDead) byId.set(entry.id, entry); return; }
-    // Same generation and both alive: the incoming copy wins, because it is
-    // considered second. That keeps this identical to the old behaviour for
-    // every id the document actually names — the change here is only that an id
-    // it does NOT name survives. Tie-breaking on `updated` was tried and is
-    // wrong: the local side is stamped at apply time, so it would always look
-    // newer and a published role change would never land.
+    // The renderer has already converged the cloud document symmetrically. At
+    // this boundary `incoming` IS that accepted cloud value, so on an equal live
+    // generation it must replace the vault copy (not be defeated by a local
+    // timestamp or lexical accident). Tombstone ties were handled above.
     byId.set(entry.id, entry);
   };
   for (const entry of local) consider(entry);
   for (const entry of incoming) consider(entry);
-  return [...byId.values()];
+  return [...byId.values()].sort((a, b) => String(a.id).localeCompare(String(b.id)));
 }
 
 // MB1188-073: `elevate` is false unless an Owner session asked for this.
@@ -2722,6 +2800,8 @@ function _applyStaffDirectory(entries, { elevate = false, deferred = [] } = {}) 
   const custom = [];
   const overrides = {};
   const removedBuiltIns = [];
+  const removedCustom = [];
+  const meta = { ..._directoryMeta(vault) };
   const seen = new Set();
 
   for (const raw of entries) {
@@ -2735,8 +2815,26 @@ function _applyStaffDirectory(entries, { elevate = false, deferred = [] } = {}) 
 
     if (raw._deleted === true) {
       // A tombstone for a built-in suppresses it here too. Custom profiles are
-      // simply omitted from the rebuilt list.
-      if (isBuiltIn && APP_PROFILE_ROLES[name] !== 'Owner') removedBuiltIns.push(name);
+      // omitted from the rebuilt list but the tombstone itself MUST remain in
+      // the vault, or this Mac's next export turns the deletion into absence and
+      // a stale peer resurrects the profile.
+      if (isBuiltIn && APP_PROFILE_ROLES[name] !== 'Owner') {
+        removedBuiltIns.push(name);
+      } else if (!isBuiltIn) {
+        removedCustom.push({
+          name,
+          at: typeof raw._deletedAt === 'string'
+            ? raw._deletedAt
+            : (typeof raw.updated === 'string' ? raw.updated : new Date().toISOString()),
+        });
+      }
+      if (!isBuiltIn || APP_PROFILE_ROLES[name] !== 'Owner') {
+        _rememberDirectoryEntry(meta, raw, {
+          id: _directoryEntryId(name), name,
+          role: isBuiltIn ? APP_PROFILE_ROLES[name] : 'Front Desk',
+          builtIn: isBuiltIn, _deleted: true,
+        });
+      }
       continue;
     }
     // Owner is never granted by import: it is proved by the owner passcode and
@@ -2764,6 +2862,10 @@ function _applyStaffDirectory(entries, { elevate = false, deferred = [] } = {}) 
       if (custom.length >= MAX_CUSTOM_STAFF_PROFILES) continue;
       custom.push({ name, role: 'Front Desk', createdAt: Date.now() });
     }
+    _rememberDirectoryEntry(meta, raw, {
+      id: _directoryEntryId(name), name, role,
+      builtIn: isBuiltIn,
+    });
   }
 
   // Refuse an import that would leave this Mac with no owner.
@@ -2778,6 +2880,9 @@ function _applyStaffDirectory(entries, { elevate = false, deferred = [] } = {}) 
   else delete vault[PROFILE_ROLE_OVERRIDES_VAULT_KEY];
   if (removedBuiltIns.length) vault[REMOVED_BUILTIN_PROFILES_VAULT_KEY] = removedBuiltIns;
   else delete vault[REMOVED_BUILTIN_PROFILES_VAULT_KEY];
+  if (removedCustom.length) vault[REMOVED_CUSTOM_PROFILES_VAULT_KEY] = removedCustom.slice(-200);
+  else delete vault[REMOVED_CUSTOM_PROFILES_VAULT_KEY];
+  vault[DIRECTORY_META_VAULT_KEY] = meta;
   _saveSecretVault(vault);
 
   // A signed-in session whose role just changed must not keep old privileges.
@@ -2835,6 +2940,7 @@ _secureHandle('app-login-import-directory', async (_, directory) => {
     ok: true,
     profiles: result.profiles,
     added: result.added,
+    removed: result.removed,
     deferred: result.deferred,
     applied: result.deferred.length === 0,
   };

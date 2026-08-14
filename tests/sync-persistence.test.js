@@ -4579,7 +4579,7 @@ function directoryPublishApi(overrides = {}) {
     isElizabeth: () => overrides.owner === true,
     showToast: (message, tone) => published.push({ toast: message, tone }),
     renderManageProfiles: () => {},
-    _mergeTombstonedRecordLists: (current, incoming) => [...current, ...incoming],
+    _mergeVersionedDirectoryLists: (current, incoming) => [...current, ...incoming],
     STORE: {
       replace: async (key, value) => { published.push({ key, value }); return true; },
       mutate: async (key, mutator, fallback) => {
@@ -5400,7 +5400,7 @@ function publishDirectoryHarness({ cloudReady }) {
     renderManageProfiles: () => {},
     showToast: () => {},
     isElizabeth: () => true,
-    _mergeTombstonedRecordLists: (current, incoming) => [...current, ...incoming],
+    _mergeVersionedDirectoryLists: (current, incoming) => [...current, ...incoming],
     STORE: {
       replace: async (key, value) => { replaced.push({ key, value }); },
       mutate: async (key, mutator, fallback) => {
@@ -5509,6 +5509,7 @@ test('P0: the login screen fetches and applies the encrypted staff directory bef
     },
     _syncDocumentKind: remote => remote.schemaVersion === 2 ? 'versioned' : 'legacy',
     _decodeSyncValue: async (key, value) => ({ key, value }),
+    _setDirectoryImportPending: () => {},
     refreshLoginProfiles: async () => { refreshed += 1; },
   });
   vm.runInContext(`
@@ -5541,6 +5542,154 @@ test('P0: the login screen fetches and applies the encrypted staff directory bef
   const initSource = declaration('init');
   assert.match(initSource, /initLoginDirectorySync\(\)/,
     'cold-start synchronization begins from the login screen');
+});
+
+test('P0: a login-screen profile is transactionally published without an app session', async () => {
+  const writes = [];
+  let publicationPending = true;
+  const ref = { key: 'staff_directory' };
+  const remoteDirectory = [
+    { id: 'profile:dana', name: 'Dana', role: 'Front Desk', builtIn: false, version: 1 },
+    { id: 'profile:nina', name: 'Nina', role: 'Front Desk', builtIn: false,
+      version: 1, _deleted: true },
+  ];
+  const context = contextWith({
+    initLoginDirectorySync: async () => true,
+    _normalizeSyncValue: (_key, value) => JSON.parse(JSON.stringify(value)),
+    _syncDocumentKind: () => 'versioned',
+    _decodeSyncValue: async (_key, value) => value,
+    _encodeSyncValue: async (_key, value) => ({ encryptedForTest: value }),
+    _newOperationId: () => 'device:login-add',
+    _deviceId: () => 'mac-a',
+    _setDirectoryPublicationPending: pending => { publicationPending = pending; },
+    firebase: { firestore: { FieldValue: { serverTimestamp: () => 'SERVER_TIME' } } },
+  });
+  vm.runInContext(`
+    ${declaration('_cloneJson')}
+    ${declaration('_mergeVersionedDirectoryLists')}
+    var _loginDirectoryRef = globalThis.__ref;
+    var _loginDirectoryDb = {
+      runTransaction: async callback => callback({
+        get: async () => ({
+          exists: true,
+          data: () => ({ value: globalThis.__remote, revision: 7, schemaVersion: 2 }),
+        }),
+        set: (target, value) => globalThis.__writes.push({ target, value }),
+      }),
+    };
+    ${declaration('_publishLoginDirectorySnapshot')}
+    globalThis.publishLoginDirectory = _publishLoginDirectorySnapshot;
+  `, Object.assign(context, { __ref: ref, __remote: remoteDirectory, __writes: writes }));
+
+  const ok = await context.publishLoginDirectory([
+    { id: 'profile:nina', name: 'Nina', role: 'Front Desk', builtIn: false, version: 2 },
+  ]);
+
+  assert.equal(ok, true);
+  assert.equal(publicationPending, false, 'the debt clears only after the transaction commits');
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0].target, ref);
+  assert.equal(writes[0].value.revision, 8);
+  assert.equal(writes[0].value.schemaVersion, 2);
+  assert.deepEqual(
+    Array.from(writes[0].value.value.encryptedForTest, row => `${row.name}:${row._deleted === true}`),
+    ['Dana:false', 'Nina:false'],
+    'the unrelated remote profile survives and the newer re-add beats the old tombstone',
+  );
+});
+
+test('P0: logging out restarts the pre-login directory listener', () => {
+  let unsubscribed = 0;
+  const context = contextWith({});
+  vm.runInContext(`
+    var _loginDirectorySyncPromise = Promise.resolve(true);
+    var _loginDirectoryUnsubscribe = () => { globalThis.__unsubscribed += 1; };
+    var _loginDirectorySyncStopped = false;
+    var _loginDirectorySyncGeneration = 4;
+    var _loginDirectoryDb = { connected: true };
+    var _loginDirectoryRef = { connected: true };
+    ${declaration('_stopLoginDirectorySync')}
+    globalThis.stopLoginDirectory = _stopLoginDirectorySync;
+    globalThis.loginState = () => ({
+      promise: _loginDirectorySyncPromise,
+      unsubscribe: _loginDirectoryUnsubscribe,
+      stopped: _loginDirectorySyncStopped,
+      generation: _loginDirectorySyncGeneration,
+      db: _loginDirectoryDb,
+      ref: _loginDirectoryRef,
+    });
+  `, Object.assign(context, { __unsubscribed: unsubscribed }));
+  context.stopLoginDirectory();
+  const state = context.loginState();
+  assert.equal(context.__unsubscribed, 1);
+  assert.equal(state.promise, null, 'the resolved old promise cannot block a new subscription');
+  assert.equal(state.unsubscribe, null);
+  assert.equal(state.db, null);
+  assert.equal(state.ref, null);
+  assert.equal(state.generation, 5);
+
+  const logout = declaration('switchUser');
+  assert.match(logout, /_unsubscribeSyncKey\('staff_directory'\)/,
+    'the authenticated listener is stopped before main loses its app session');
+  assert.match(logout, /ended\.finally\(\(\) => initLoginDirectorySync\(\)\)/,
+    'and the signed-out listener is started after logout completes');
+});
+
+test('P0: staff cold start reuses persisted Firebase Auth for full data sync', () => {
+  const init = declaration('_initFirebaseInner');
+  assert.match(init,
+    /const reusePersistedStaffSession = !isElizabeth\(\) &&[\s\S]*?!password;/,
+    'a staff renderer without the owner-only password is recognized as a persisted-session boot');
+  assert.match(init,
+    /if \(reusePersistedStaffSession\) \{[\s\S]*?user = await _waitForFirebaseAuthUser\(_firebaseAuth\)/,
+    'staff waits for Firebase to restore the authenticated user instead of stopping at local-only mode');
+  assert.match(init, /return await _finishFirebaseBootstrap\(user,/,
+    'both password and persisted-session authentication enter the same complete bootstrap');
+
+  const finish = declaration('_finishFirebaseBootstrap');
+  const bootstrap = finish.indexOf('await _bootstrapSync()');
+  const subscribe = finish.indexOf('subscribeToSync()');
+  const drain = finish.indexOf('await _drainPendingSyncWrites()');
+  assert.ok(bootstrap !== -1 && bootstrap < subscribe && subscribe < drain,
+    'staff first reconciles cloud state, then subscribes, then drains pending edits');
+  assert.match(finish, /_stopLoginDirectorySync\(\)/,
+    'the pre-login directory listener is replaced by the authenticated listener');
+  assert.match(finish, /flushPendingDirectoryImport\(\)/,
+    'profile additions and deletion tombstones pending from login are applied after bootstrap');
+});
+
+test('P0: sent-mail observations merge across Macs and heal CAS conflicts', () => {
+  const context = contextWith({});
+  vm.runInContext(`
+    ${declaration('_cloneJson')}
+    ${declaration('_mergeBoundedStringSets')}
+    ${declaration('_mergeProviderRecordLists')}
+    globalThis.mergeSentIds = _mergeBoundedStringSets;
+    globalThis.mergeSent = _mergeProviderRecordLists;
+  `, context);
+  const idsAB = Array.from(context.mergeSentIds(['conv-a'], ['conv-b']));
+  const idsBA = Array.from(context.mergeSentIds(['conv-b'], ['conv-a']));
+  assert.deepEqual(idsAB, ['conv-a', 'conv-b']);
+  assert.deepEqual(idsBA, idsAB, 'set merge is symmetric and convergent');
+
+  const a = [{ msId: 'a', sentAt: '2026-08-13T20:00:00.000Z', subject: 'A' }];
+  const b = [{ msId: 'b', sentAt: '2026-08-13T21:00:00.000Z', subject: 'B' }];
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(context.mergeSent(a, b))),
+    JSON.parse(JSON.stringify(context.mergeSent(b, a))),
+    'provider-record merge is symmetric and keeps both observations',
+  );
+
+  assert.match(script, /ms_sent_conv_ids: 'bounded-string-set'/);
+  assert.match(script, /ms_sent_emails: 'provider-record-list'/);
+  const refresh = declaration('fetchMsEmails');
+  assert.match(refresh, /mutateInBackground\('ms_sent_conv_ids'/,
+    'background refresh expresses a set-union intent, not a snapshot replacement');
+  assert.doesNotMatch(refresh, /persistInBackground\('ms_sent_conv_ids'/);
+  const analyze = declaration('commAnalyzeAndAddTodos');
+  assert.match(analyze, /STORE\.mutate\('ms_sent_conv_ids'/,
+    'the live AI reply check uses the same mergeable operation');
+  assert.doesNotMatch(analyze, /STORE\.replace\('ms_sent_conv_ids'/);
 });
 
 test('MB1188-047: a Mac that is behind never publishes over the good copy', () => {
