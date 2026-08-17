@@ -1266,9 +1266,17 @@ function _describeGoogleClientIdProblem(raw, cleaned) {
   return `${base} (received: "${cleaned}")`;
 }
 
+// MB1188-090: the suffix alphabet includes the HYPHEN.
+//
+// Google's client-ID suffix is base64url — letters, digits, underscore and
+// hyphen. This pattern allowed everything except the hyphen, so a perfectly
+// valid client ID that happened to contain one was refused outright with "that
+// does not look like a Google OAuth client ID", on a value the person had just
+// copied correctly from the console. The leading `^[0-9]{6,32}-` still anchors
+// the numeric prefix, so admitting hyphens after it introduces no ambiguity.
 function _validGoogleClientId(value) {
   return typeof value === 'string' &&
-    /^[0-9]{6,32}-[A-Za-z0-9_]{8,64}\.apps\.googleusercontent\.com$/.test(value);
+    /^[0-9]{6,32}-[A-Za-z0-9_-]{8,64}\.apps\.googleusercontent\.com$/.test(value);
 }
 
 // A desktop client secret is NOT confidential — Google's own native-app guidance
@@ -2979,14 +2987,25 @@ _secureHandle('google-set-credentials', async (_, request) => {
   // A truncated client ID still matches the shape above, and Google answers a
   // truncated one with 'Error 401: invalid_client — The OAuth client was not
   // found', which reads like a project or test-user problem rather than a typo.
-  // Every client ID Google issues has a 32-character suffix, so a different
-  // length is worth saying out loud. It is a warning, not a refusal: the length
-  // is Google's convention, not a documented guarantee.
-  const suffix = /-([A-Za-z0-9_]+)\.apps\.googleusercontent\.com$/.exec(clientId)?.[1] || '';
-  const lengthWarning = suffix.length === 32 ? null :
-    `This client ID has ${suffix.length} characters after the dash; Google issues 32. ` +
-    `If Google then says the OAuth client was not found, it was copied incompletely — ` +
-    `use the copy button in the console rather than retyping it.`;
+  // So a length that cannot plausibly be a whole client ID is worth saying out
+  // loud. It is a warning, not a refusal: the length is Google's convention,
+  // not a documented guarantee.
+  //
+  // MB1188-090: measured from the FIRST hyphen and across any hyphen inside the
+  // suffix, because the hyphen is a legal suffix character. Counting from the
+  // last one would measure only the tail and call a whole suffix short.
+  const suffix = /^[0-9]{6,32}-([A-Za-z0-9_-]+)\.apps\.googleusercontent\.com$/
+    .exec(clientId)?.[1] || '';
+  // The threshold is "implausibly short", not "not exactly 32". Google
+  // documents no length at all, and a Mac reported 29 characters on a client ID
+  // that had been pasted with the console's own copy button — so holding every
+  // value to 32 turned an ordinary save into an alarm telling the operator to
+  // re-copy something that may well have been correct. A genuinely truncated
+  // paste is far shorter than this, and still caught.
+  const lengthWarning = suffix.length >= 20 ? null :
+    `This client ID looks short — ${suffix.length} characters after the first dash, ` +
+    `where Google normally issues 32. If Google then says the OAuth client was not ` +
+    `found, it was probably copied incompletely; use the copy button in the console.`;
 
   const existing = _googleVault();
   // Changing the client identity invalidates any token issued under the old

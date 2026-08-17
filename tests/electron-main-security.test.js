@@ -2037,11 +2037,11 @@ test('Google credentials pasted with stray whitespace are accepted', () => {
 
   // The validator itself is unchanged and still strict.
   const validator = source.slice(source.indexOf('function _validGoogleClientId('));
-  const pattern = /\^\[0-9\]\{6,32\}-\[A-Za-z0-9_\]\{8,64\}\\\.apps\\\.googleusercontent\\\.com\$/;
-  assert.match(validator.slice(0, 300), pattern, 'the shape requirement still holds');
+  const pattern = /\^\[0-9\]\{6,32\}-\[A-Za-z0-9_-\]\{8,64\}\\\.apps\\\.googleusercontent\\\.com\$/;
+  assert.match(validator.slice(0, 1200), pattern, 'the shape requirement still holds');
 
   // The exact value from the report, before and after.
-  const shape = /^[0-9]{6,32}-[A-Za-z0-9_]{8,64}\.apps\.googleusercontent\.com$/;
+  const shape = /^[0-9]{6,32}-[A-Za-z0-9_-]{8,64}\.apps\.googleusercontent\.com$/;
   const pasted = '235779015004- 5m1 ddq0k4p1v4mq77lfl6513lcpbe3e. apps.googleusercontent.com';
   assert.equal(shape.test(pasted.trim()), false, 'trimming alone did not save it');
   assert.equal(shape.test(pasted.replace(/\s+/g, '')), true, 'stripping whitespace does');
@@ -2106,7 +2106,7 @@ test('a Google client ID with invisible characters is accepted', () => {
     ch(0x200B) + '-' + ch(0x200F) + ch(0x2028) + ch(0x2029) +
     ch(0x202A) + '-' + ch(0x202E) + ch(0x2060) + '-' + ch(0x206F) + ch(0xFEFF) + ']', 'g');
   const clean = v => String(v || '').replace(INVISIBLE, '').replace(/[^A-Za-z0-9._-]/g, '');
-  const shape = /^[0-9]{6,32}-[A-Za-z0-9_]{8,64}\.apps\.googleusercontent\.com$/;
+  const shape = /^[0-9]{6,32}-[A-Za-z0-9_-]{8,64}\.apps\.googleusercontent\.com$/;
   const good = '235779015004-5m1ddq0k4p1v4mq77lfl6513lcpbe3e.apps.googleusercontent.com';
   const withChar = code => '235779015004-' + ch(code) + '5m1ddq0k4p1v4mq77lfl6513lcpbe3e.apps.googleusercontent.com';
 
@@ -2147,29 +2147,118 @@ test('a refused client ID says what was wrong with it', () => {
     'a secret is never rewritten beyond removing invisible characters');
 });
 
-test('a client ID of the wrong length is saved with a warning, not silently', () => {
+test('a client ID that is implausibly short is saved with a warning, not silently', () => {
   // A truncated client ID still matches the shape check, and Google answers it
-  // with 'Error 401: invalid_client — The OAuth client was not found', which
+  // with 'Error 401: invalid_client - The OAuth client was not found', which
   // reads like a project or test-user problem rather than a character missing
   // from what was pasted. That cost an hour.
   const source = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
   const handler = source.slice(source.indexOf("_secureHandle('google-set-credentials'"));
-  assert.match(handler.slice(0, 2600), /suffix\.length === 32 \? null :/,
-    'the 32-character convention is checked');
-  assert.match(handler.slice(0, 2600), /copied incompletely/);
-  assert.match(handler.slice(0, 4000), /reconnectRequired: !sameClient, lengthWarning/,
+  assert.match(handler.slice(0, 3200), /suffix\.length >= 20 \? null :/,
+    'only a length that cannot be a whole client ID is remarked on');
+  assert.match(handler.slice(0, 3200), /copied incompletely/);
+  assert.match(handler.slice(0, 4600), /reconnectRequired: !sameClient, lengthWarning/,
     'and returned to the renderer');
-
-  // A warning, not a refusal — 32 is Google's convention, not a guarantee.
-  const suffixOf = id => /-([A-Za-z0-9_]+)\.apps\.googleusercontent\.com$/.exec(id)?.[1] || '';
-  const short = '235779015004-5m1ddq0k4p1v4mq77lfl6513lcpbe3e.apps.googleusercontent.com';
-  const full = '235779015004-5m1ddq0k4p1v4mq77lfl6513lcpbe3ex.apps.googleusercontent.com';
-  assert.equal(suffixOf(short).length, 31, 'the reported value really is one short');
-  assert.equal(suffixOf(full).length, 32);
   assert.match(source, /warning, not a refusal/, 'documented as a warning');
+
+  // Executed, using the real measurement and threshold rather than a copy.
+  const from = handler.indexOf('const suffix =');
+  const to = handler.indexOf('\n\n', handler.indexOf('const lengthWarning ='));
+  assert.ok(from !== -1 && to > from, 'the warning is where the test thinks it is');
+  const warningFor = new Function('clientId',
+    handler.slice(from, to) + '\n  return lengthWarning;');
+
+  const id = stem => `235779015004-${stem}.apps.googleusercontent.com`;
+  const full = '5m1ddq0k4p1v4mq77lfl6513lcpbe3ex';
+  assert.equal(full.length, 32, 'precondition: the control really is 32 characters');
+  assert.equal(warningFor(id(full)), null, 'a whole client ID is saved without comment');
+
+  // The reported Mac. Google documents no length, and this value was pasted
+  // with the console copy button, so the app has no business calling it wrong.
+  assert.equal(warningFor(id(full.slice(0, 29))), null,
+    '29 characters is not evidence of a bad paste');
+  assert.equal(warningFor(id(full.slice(0, 31))), null, 'nor is 31');
+
+  // What the warning is actually for: a paste that stopped early.
+  const short = warningFor(id(full.slice(0, 12)));
+  assert.ok(short, 'a clearly incomplete client ID is still remarked on');
+  assert.match(short, /looks short/);
+  assert.match(short, /12 characters/, 'and says how short, measured whole');
+  assert.doesNotMatch(short, /was copied incompletely\./,
+    'phrased as a possibility, not a verdict on what the operator did');
 
   const renderer = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
   assert.match(renderer, /result\.lengthWarning/, 'and the operator is shown it');
+});
+
+test('MB1188-090: a client ID with a hyphen in its suffix is accepted', () => {
+  // Google's suffix alphabet is base64url - letters, digits, underscore AND
+  // hyphen. The pattern allowed every one of those except the hyphen, so a
+  // client ID that happened to contain one was refused outright as "that does
+  // not look like a Google OAuth client ID", on a value the operator had just
+  // copied correctly. There is no other way to store a client ID, so on a Mac
+  // whose project issued such an ID, Google Sheets could never be connected at
+  // all. Nothing found this because every fixture in the suite was hyphen-free.
+  const source = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  const from = source.indexOf('function _validGoogleClientId(');
+  assert.notEqual(from, -1);
+  const valid = new Function(
+    source.slice(from, source.indexOf('\n}', from) + 2) +
+    '\n return _validGoogleClientId;')();
+
+  for (const [label, stem] of [
+    ['a plain 32-character suffix', '5m1ddq0k4p1v4mq77lfl6513lcpbe3ex'],
+    ['a hyphen near the front',     '5m-ddq0k4p1v4mq77lfl6513lcpbe3ex'],
+    ['a hyphen in the middle',      '5m1ddq0k4p1v4mq-7lfl6513lcpbe3ex'],
+    ['two hyphens',                 '5m-ddq0k4p1v4mq-7lfl6513lcpbe3ex'],
+    ['an underscore',               '5m1ddq0k4p1v4mq_7lfl6513lcpbe3ex'],
+    ['a trailing hyphen',           '5m1ddq0k4p1v4mq77lfl6513lcpbe3e-'],
+  ]) {
+    assert.equal(valid(`235779015004-${stem}.apps.googleusercontent.com`), true,
+      `${label} is accepted`);
+  }
+
+  // Admitting the hyphen must not admit anything else.
+  for (const junk of [
+    'not-an-id',
+    '',
+    '-5m1ddq0k4p1v4mq77lfl6513lcpbe3ex.apps.googleusercontent.com',
+    '235779015004-short.apps.googleusercontent.com',
+    '235779015004-5m1ddq0k4p1v4mq77lfl.apps.googleusercontent.com.evil.com',
+    'https://235779015004-5m1ddq0k4p1v4mq77lfl.apps.googleusercontent.com',
+    '235779015004-5m1ddq0k4p1v4mq77lfl.apps.googleusercontent.example.com',
+    '235779015004-5m1ddq0k4p1v4mq77lfl@apps.googleusercontent.com',
+  ]) {
+    assert.equal(valid(junk), false, `${JSON.stringify(junk)} is still refused`);
+  }
+  for (const notAString of [null, undefined, 123, {}, []]) {
+    assert.equal(valid(notAString), false);
+  }
+});
+
+test('MB1188-090: a hyphenated suffix is measured whole, not from its last hyphen', () => {
+  // Once the hyphen is legal, the measurement has to change with it. Counting
+  // from the LAST hyphen measures only the tail: a whole 32-character suffix
+  // carrying a hyphen at position three counts as 28 and gets reported to the
+  // operator as truncated. The measurement is anchored at the numeric prefix
+  // for exactly that reason.
+  const source = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  const handler = source.slice(source.indexOf("_secureHandle('google-set-credentials'"));
+  const from = handler.indexOf('const suffix =');
+  const to = handler.indexOf(';', handler.indexOf('.exec(clientId)', from));
+  const measure = new Function('clientId', handler.slice(from, to + 1) + '\n  return suffix;');
+
+  const whole = '5m1ddq0k4p1v4mq77lfl6513lcpbe3ex';
+  for (const stem of [whole, '5m-ddq0k4p1v4mq77lfl6513lcpbe3ex',
+                      '5m1ddq0k4p1v4mq-7lfl6513lcpbe3ex',
+                      '5m-ddq0k4p1v4mq-7lfl6513lcpbe3ex',
+                      '5m1ddq0k4p1v4mq77lfl6513lcpbe3e-']) {
+    assert.equal(measure(`235779015004-${stem}.apps.googleusercontent.com`).length, 32,
+      `${stem} is 32 characters however its hyphens fall`);
+  }
+  // The measurement never reaches past the numeric prefix into the length of
+  // the project number, which varies.
+  assert.equal(measure(`1234567890123456-${whole}.apps.googleusercontent.com`).length, 32);
 });
 
 

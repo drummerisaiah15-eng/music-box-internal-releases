@@ -11,7 +11,8 @@
     "release:build:internal": "node -e \"if (process.env.MUSIC_BOX_RELEASE_DRIVER !== '1' || process.env.GH_TOKEN || !process.env.MUSIC_BOX_SOURCE_CONTENT_MANIFEST) { console.error('Internal release build must be invoked by release.sh without GH_TOKEN and with its source-content manifest.'); process.exit(1); }\" && MUSIC_BOX_RELEASE_VERIFY=1 electron-builder --mac --publish never -c.directories.output=\"${MUSIC_BOX_RELEASE_DIR:?MUSIC_BOX_RELEASE_DIR is required; use ./release.sh}\" && node tests/release-artifact-gate.js \"$MUSIC_BOX_RELEASE_DIR\" --finalize",
     "publish": "node -e \"console.error('Direct publishing is disabled. Use npm run release.'); process.exit(1)\"",
     "release": "./release.sh",
-    "release:verify": "node tests/release-artifact-gate.js dist"
+    "release:verify": "node tests/release-artifact-gate.js dist",
+    "verify:gatekeeper": "node scripts/verify-gatekeeper.js"
   },
   "engines": {
     "node": ">=22.12.0"

@@ -1274,3 +1274,96 @@ test('superseded: App Transport Security is not claimed to be narrowed', () => {
   assert.equal(ats, undefined,
     'if this is set again, verify NSAllowsArbitraryLoads in the built Info.plist');
 });
+
+
+// ── MB1188-091: an artifact that only opens on the Mac that built it ─────────
+//
+// Reported live: a DMG handed to another Mac showed the damaged icon and would
+// not launch; the only way in was System Settings -> Privacy & Security ->
+// Open Anyway. The build was signed correctly and ran perfectly here, because
+// the copy that never left this machine was never quarantined. It had simply
+// never been notarized, and nothing anywhere said so.
+const gatekeeper = require('../scripts/verify-gatekeeper.js');
+
+// Captured from /usr/sbin/spctl on this machine, not invented.
+const SPCTL_UNNOTARIZED = [
+  'Music-Box-Internal-1.3.22-arm64.dmg: rejected',
+  'source=Unnotarized Developer ID',
+  'origin=Developer ID Application: ISAIAH LOUIS CHAVES (MULN9RP9V5)',
+].join('\n');
+const SPCTL_NOTARIZED = [
+  'Music-Box-Internal-1.3.23-arm64.dmg: accepted',
+  'source=Notarized Developer ID',
+  'origin=Developer ID Application: ISAIAH LOUIS CHAVES (MULN9RP9V5)',
+].join('\n');
+const SPCTL_REVOKED =
+  'Music Box Internal.app: notarization indicates this code has been revoked';
+const STAPLED = 'Processing: x\nThe validate action worked!';
+const NOT_STAPLED = 'Processing: x\nx does not have a ticket stapled to it.';
+
+test('MB1188-091: a signed but unnotarized build is refused, and says why', () => {
+  const verdict = gatekeeper.assess(SPCTL_UNNOTARIZED, NOT_STAPLED);
+  assert.equal(verdict.ok, false);
+  assert.equal(verdict.verdict, 'unnotarized');
+  // The whole value of this check is that it names the symptom the person on
+  // the other Mac actually sees, so nobody spends an afternoon re-downloading.
+  assert.match(verdict.advice, /damaged/);
+  assert.match(verdict.advice, /release\.sh/, 'and says what produces a good one');
+});
+
+test('MB1188-091: a notarized, stapled build is the only thing that passes', () => {
+  const verdict = gatekeeper.assess(SPCTL_NOTARIZED, STAPLED);
+  assert.equal(verdict.ok, true);
+  assert.equal(verdict.verdict, 'notarized');
+
+  // Notarized but unstapled still fails: the ticket has to travel with the
+  // artifact, or a Mac that cannot reach Apple refuses it.
+  const unstapled = gatekeeper.assess(SPCTL_NOTARIZED, NOT_STAPLED);
+  assert.equal(unstapled.ok, false);
+  assert.equal(unstapled.verdict, 'unstapled');
+  assert.match(unstapled.advice, /offline/);
+});
+
+test('MB1188-091: the check fails closed on anything it does not understand', () => {
+  // A verdict this check cannot read is not a pass. spctl not being present,
+  // an assessment accepted for a local reason that does not travel, and a
+  // revoked ticket all have to stop distribution.
+  for (const [label, spctl, stapler] of [
+    ['no output at all', '', ''],
+    ['spctl missing', '/usr/sbin/spctl could not be run: ENOENT', ''],
+    ['accepted for some other reason', 'x: accepted\nsource=No Matching Rule', STAPLED],
+    ['insufficient context', 'x: rejected\nsource=Insufficient Context', STAPLED],
+  ]) {
+    const verdict = gatekeeper.assess(spctl, stapler);
+    assert.equal(verdict.ok, false, `${label} must not pass`);
+    assert.ok(verdict.reason, `${label} explains itself`);
+  }
+
+  const revoked = gatekeeper.assess(SPCTL_REVOKED, NOT_STAPLED);
+  assert.equal(revoked.ok, false);
+  assert.equal(revoked.verdict, 'revoked');
+  assert.match(revoked.reason, /will not open on any Mac/);
+});
+
+test('MB1188-091: a disk image and an app bundle are assessed as what they are', () => {
+  // `-t open` is for documents. Asking it about an app answers
+  // "source=Insufficient Context" — a rejection that says nothing about
+  // notarization, which is exactly the false alarm this check exists to avoid.
+  const source = fs.readFileSync(
+    path.join(__dirname, '..', 'scripts', 'verify-gatekeeper.js'), 'utf8');
+  assert.match(source, /endsWith\('\.dmg'\) \? 'install' : 'exec'/);
+  assert.doesNotMatch(source, /'-t', 'open'/);
+
+  // And it is reachable without remembering the path.
+  const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+  assert.equal(pkg.scripts['verify:gatekeeper'], 'node scripts/verify-gatekeeper.js');
+});
+
+test('MB1188-091: every local build directory is ignored, so a release can run', () => {
+  // release.sh refuses to start with anything untracked in the tree. Only
+  // dist/ and dist-test/ were ignored, so each kept test build — dist-signed-*,
+  // dist-test-* — silently made the next release impossible until somebody
+  // deleted it.
+  const ignore = fs.readFileSync(path.join(__dirname, '..', '.gitignore'), 'utf8');
+  assert.match(ignore, /^dist-\*\/$/m);
+});

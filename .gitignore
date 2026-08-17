@@ -1,7 +1,10 @@
 .DS_Store
 node_modules/
 dist/
-dist-test/
+# Every local build directory, whatever it is called. release.sh refuses to run
+# with anything untracked in the tree, and a build left on disk is not a reason
+# to be unable to cut a release.
+dist-*/
 vendor/
 *.log
 
