@@ -63,6 +63,13 @@ function contextWith(values = {}) {
     _ssStampCreatedCells: structure => structure,
     // MB1188-085: the durability journal is a backstop; harnesses run without it.
     _journalCommit: async () => false,
+    // MB1188-093: records this Mac could not decrypt. Empty in a harness unless
+    // the test is about them; supplied here so every slice that consults it
+    // runs, rather than throwing a ReferenceError the assertion then reads as
+    // the behaviour under test.
+    _lockedStorageKeys: new Set(),
+    _localDataKeyFailedEntirely: () => false,
+    _unreadableLocalRecordNames: () => [],
     // Declared beside the functions in index.html, so some declaration()
     // slices carry them and some do not. Supplying them as context globals
     // works either way: a lexical declaration in the script simply shadows it.
@@ -6527,4 +6534,187 @@ test('P0-3: every authenticated login gates rendering on journal and split-workb
     assert.ok(authenticate !== -1 && authenticate < recover && recover < render,
       `${name} authenticates, recovers, then renders`);
   }
+});
+
+// MB1188-092: the merge laws, measured rather than assumed.
+//
+// Two Macs and one cloud document converge only if merging is commutative and
+// idempotent, and the SAFETY of the result — which records exist, and which are
+// deleted — must not depend on who happened to sync first. Those three are
+// asserted here over randomised in-model input.
+//
+// Measured and deliberately NOT asserted: full associativity. Roughly a third
+// of random three-way orders produce a result whose FIELDS differ — which
+// tombstone's `_deletedAt` survives, how many recoverable `_conflicts` variants
+// are carried. That is a consequence of the rule that a tombstone always wins
+// over a live record while keeping the live record's newer content, and the
+// rule is worth more than the symmetry: resurrecting a deleted record is the
+// worse failure. What must never vary is asserted below, so a future change
+// that trades this for "cleaner" merging fails here instead of in the studio.
+test('MB1188-092: which records exist, and which are deleted, never depend on sync order', () => {
+  const m = mergeApi();
+  // Deterministic PRNG — a property test that cannot be reproduced is a rumour.
+  let seed = 0x5eed1188;
+  const rand = () => {
+    seed ^= seed << 13; seed >>>= 0;
+    seed ^= seed >> 17;
+    seed ^= seed << 5;  seed >>>= 0;
+    return seed / 0x100000000;
+  };
+  const pick = n => Math.floor(rand() * n);
+  const IDS = ['a', 'b', 'c', 'd'];
+  const record = () => {
+    const r = { id: IDS[pick(IDS.length)], version: pick(4), body: 't' + pick(3),
+                created: '2026-07-0' + (1 + pick(9)) + 'T00:00:00.000Z' };
+    if (rand() < 0.35) { r._deleted = true; r._deletedAt = '2026-08-0' + (1 + pick(9)) + 'T00:00:00.000Z'; }
+    if (rand() < 0.2) r.note = 'n' + pick(3);
+    return r;
+  };
+  const list = () => {
+    const byId = new Map();
+    for (let i = 0; i < 3; i += 1) { const r = record(); byId.set(r.id, r); }
+    return [...byId.values()];
+  };
+  const ids = v => [...new Set(v.map(r => r.id))].sort().join(',');
+  const deleted = v => v.filter(r => r._deleted === true).map(r => r.id).sort().join(',');
+  const clone = v => JSON.parse(JSON.stringify(v));
+
+  let ran = 0, orderDependent = 0;
+  for (let i = 0; i < 1500; i += 1) {
+    const A = list(), B = list(), C = list();
+    const ab = m.merge(clone(A), clone(B));
+    const ba = m.merge(clone(B), clone(A));
+    assert.deepEqual(ba, ab, 'two Macs merging in opposite directions must agree');
+    assert.deepEqual(m.merge(clone(ab), clone(ab)), ab,
+      're-merging an already merged value must change nothing');
+
+    const left = m.merge(clone(ab), clone(C));
+    const right = m.merge(clone(A), clone(m.merge(clone(B), clone(C))));
+    ran += 1;
+    if (JSON.stringify(left) !== JSON.stringify(right)) orderDependent += 1;
+    assert.equal(ids(left), ids(right),
+      'a record must not exist in one sync order and be missing in the other');
+    assert.equal(deleted(left), deleted(right),
+      'a record must not be alive in one sync order and deleted in the other');
+  }
+  assert.equal(ran, 1500, 'every trial actually executed — a skipped trial is not a passing one');
+  // Recorded so the number is a measurement somebody can check, not folklore.
+  assert.ok(orderDependent > 0 && orderDependent < ran,
+    `field-level order dependence is expected and bounded (saw ${orderDependent}/${ran})`);
+});
+
+// MB1188-093: one damaged record used to shut a whole Mac down.
+//
+// `_prepareAuthorizedLoginData` threw for ANY key that failed to decrypt or
+// parse, and it sits on all three login paths. So a single unreadable record —
+// a write truncated when local storage filled, a crash mid-write, a value
+// wrapped under a key this Mac no longer has — meant nobody could sign in at
+// all: the owner saw the raw error, staff were told to ask the owner, and the
+// owner was locked out by the same record. Nothing in the app could clear it.
+//
+// The fix must not weaken the thing the check was really protecting, so both
+// halves are asserted here: a WRONG KEY still fails closed, and a damaged
+// record is quarantined rather than fatal.
+test('MB1188-093: a wrong passcode still fails closed', async () => {
+  const context = contextWith({
+    _encKey: {},
+    _lockedStorageKeys: new Set(['logs', 'staff_notes']),
+    _readableEncryptedRecords: 0,
+    _recoverFromJournal: async () => {},
+    _repairJournalSequenceMarkers: async () => {},
+    _fillCache: async () => {},
+    migrateSharedKeys: () => {},
+    _loadPersistedSyncKey: async () => {},
+    _ssRecoverInterruptedSplitCommit: async () => {},
+  });
+  vm.runInContext(`
+    ${declaration('_localDataKeyFailedEntirely')}
+    ${declaration('_unreadableLocalRecordNames')}
+    ${declaration('_prepareAuthorizedLoginData')}
+    globalThis.prepareLogin = () => _prepareAuthorizedLoginData();
+  `, context);
+  await assert.rejects(() => vm.runInContext('prepareLogin()', context),
+    /could not decrypt/,
+    'nothing decrypted means the key is wrong, and login must refuse');
+});
+
+test('MB1188-093: one unreadable record no longer locks everybody out of the Mac', async () => {
+  const warnings = [];
+  const context = contextWith({
+    _encKey: {},
+    _lockedStorageKeys: new Set(['logs']),
+    _readableEncryptedRecords: 11,
+    _recoverFromJournal: async () => {},
+    _repairJournalSequenceMarkers: async () => {},
+    _fillCache: async () => {},
+    migrateSharedKeys: () => {},
+    _loadPersistedSyncKey: async () => {},
+    _ssRecoverInterruptedSplitCommit: async () => {},
+    console: { warn: (...args) => warnings.push(args.join(' ')), error() {}, log() {} },
+  });
+  vm.runInContext(`
+    ${declaration('_localDataKeyFailedEntirely')}
+    ${declaration('_unreadableLocalRecordNames')}
+    ${declaration('_prepareAuthorizedLoginData')}
+    globalThis.prepareLogin = () => _prepareAuthorizedLoginData();
+  `, context);
+  const result = await vm.runInContext('prepareLogin()', context);
+  assert.equal(result, true, 'the other ten records are readable, so the person signs in');
+  assert.ok(warnings.some(line => /quarantined/.test(line) && /logs/.test(line)),
+    'and the damaged record is named rather than silently dropped');
+});
+
+test('MB1188-093: a record this Mac cannot read is never written over', async () => {
+  const context = contextWith({
+    _lockedStorageKeys: new Set(['logs']),
+    _aesEncrypt: async () => 'E:new',
+    isSyncKey: () => true,
+    _newOperationId: () => 'op',
+    _journalCommit: async () => true,
+    _storeWriteErrors: new Map(),
+    _durableStoreSnapshots: new Map(),
+    _decCache: {},
+    _writePendingSyncRecord: () => {},
+    _setOrRemoveStorage: () => {},
+    localStorage: new MemoryStorage(),
+  });
+  vm.runInContext(`
+    ${declaration('_cloneJson')}
+    ${declaration('_commitEncryptedSnapshot')}
+    globalThis.commit = (k, opts) => _commitEncryptedSnapshot(k, '[]', [], opts);
+  `, context);
+
+  // An ordinary edit is derived from a cache the record is missing from, so
+  // committing it would replace the only copy with an empty one.
+  await assert.rejects(() => vm.runInContext('commit("logs", { sync: true })', context),
+    /preserved exactly as it is/,
+    'a local write to an unreadable record is refused, not silently applied');
+  assert.equal(context.localStorage.getItem('tmb_logs'), null,
+    'and nothing was written on the way to refusing');
+
+  // The cloud copy is the shared truth, so applying it is the repair.
+  await vm.runInContext('commit("logs", { sync: false, repairsUnreadable: true })', context);
+  assert.equal(context.localStorage.getItem('tmb_logs'), 'E:new');
+  assert.equal(context.__lockedAfter = context._lockedStorageKeys.has('logs'), false,
+    'a repaired record stops being quarantined');
+});
+
+test('MB1188-093: an unreadable record is never delivered to Firebase', async () => {
+  const context = contextWith({
+    _syncReady: true,
+    _syncBootstrapComplete: true,
+    _syncBootstrapFailedKeys: new Set(),
+    _syncRecoveryRequiredKeys: new Set(),
+    _lockedStorageKeys: new Set(['logs']),
+    _readPendingSyncRecord: () => ({ opId: 'op', baseRevision: 1 }),
+    _syncDeliveryChains: new Map(),
+    _syncDeliveryErrors: new Map(),
+    _drainSyncKey: async () => { throw new Error('a quarantined key must never be drained'); },
+  });
+  vm.runInContext(`
+    ${declaration('_scheduleSyncDrain')}
+    globalThis.schedule = key => _scheduleSyncDrain(key);
+  `, context);
+  assert.equal(await vm.runInContext('schedule("logs")', context), false,
+    'whatever is pending for it was written before it became unreadable');
 });

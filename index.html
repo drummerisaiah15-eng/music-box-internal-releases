@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>The Music Box — Internal Operations</title>
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'sha256-qJV+pFZgaTWx0UF1qCojSnil0eIxE5idoGkZsBdNwEA=' https://www.google.com/recaptcha/ https://www.gstatic.com/recaptcha/; script-src-attr 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' https://firestore.googleapis.com https://identitytoolkit.googleapis.com https://securetoken.googleapis.com https://firebaseappcheck.googleapis.com https://*.firebaseio.com wss://*.firebaseio.com https://www.google.com https://www.recaptcha.net; frame-src https://www.google.com/recaptcha/ https://recaptcha.google.com/recaptcha/ https://www.recaptcha.net/; object-src 'none'; base-uri 'none'; form-action 'none';">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'sha256-Q5/C7XF0SOqXFPfdUc/lCOdOEL54/uZaNih6jOmZ5yU=' https://www.google.com/recaptcha/ https://www.gstatic.com/recaptcha/; script-src-attr 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' https://firestore.googleapis.com https://identitytoolkit.googleapis.com https://securetoken.googleapis.com https://firebaseappcheck.googleapis.com https://*.firebaseio.com wss://*.firebaseio.com https://www.google.com https://www.recaptcha.net; frame-src https://www.google.com/recaptcha/ https://recaptcha.google.com/recaptcha/ https://www.recaptcha.net/; object-src 'none'; base-uri 'none'; form-action 'none';">
   <!-- Pinned, release-vendored dependencies; no runtime CDN execution. -->
   <script src="./vendor/firebase-12.15.0/firebase-app-compat.js" defer></script>
   <script src="./vendor/firebase-12.15.0/firebase-auth-compat.js" defer></script>
@@ -2393,6 +2393,9 @@
         </div>
         <div id="sync-last-updated" style="font-size:11.5px;color:var(--text-muted);margin-top:8px"></div>
         <div id="sync-quarantine-actions" style="display:none;margin-top:12px;padding:12px;border:1px solid #c0392b;border-radius:8px;background:#fdf0f0;font-size:12.5px"></div>
+        <!-- MB1188-093: records this Mac cannot read. Named here because the
+             alternative was a Mac that simply refused to let anybody sign in. -->
+        <div id="sync-unreadable-records" style="display:none;margin-top:12px;padding:12px;border:1px solid #c0392b;border-radius:8px;background:#fdf0f0;font-size:12.5px"></div>
         <div id="sync-recovery-hold" style="display:none;margin-top:12px;padding:12px;border:1px solid #c0392b;border-radius:8px;background:#fdf0f0;font-size:12.5px"></div>
         <div id="sync-conflict-actions" style="display:none;margin-top:12px;padding:12px;border:1px solid #e0b45c;border-radius:8px;background:#fff8ec">
           <div id="sync-conflict-summary" style="font-size:12.5px;font-weight:600;margin-bottom:8px"></div>
@@ -4138,6 +4141,33 @@ let _activePin = null; // owner PIN is held only in memory for portable backup/k
 let _decCache = Object.create(null); // Decrypted value cache — STORE.get reads this synchronously
 const _durableStoreSnapshots = new Map();
 const _lockedStorageKeys = new Set();
+// MB1188-093: how many encrypted records the current key actually read.
+//
+// `_lockedStorageKeys` alone cannot distinguish the two situations that produce
+// it, and they call for opposite responses:
+//
+//   nothing decrypted   -> the KEY is wrong. Refuse; this is the only signal
+//                          that separates a wrong passcode from a right one.
+//   some decrypted      -> the key is right and specific RECORDS are damaged —
+//                          a write truncated by a full disk or a storage quota,
+//                          a crash mid-write, a record wrapped under a key this
+//                          Mac no longer has. Refusing here locked every
+//                          profile out of the Mac over one bad record, with no
+//                          way out from inside the app and a message telling
+//                          staff to ask an owner who was equally locked out.
+//
+// The damaged records are quarantined instead: excluded from the cache, never
+// written over, never delivered to Firebase, and named on screen.
+let _readableEncryptedRecords = 0;
+
+// True only when the key itself is wrong, so login must refuse.
+function _localDataKeyFailedEntirely() {
+  return _lockedStorageKeys.size > 0 && _readableEncryptedRecords === 0;
+}
+
+function _unreadableLocalRecordNames() {
+  return [..._lockedStorageKeys].sort();
+}
 const _storeWriteChains = new Map();
 const _storeWriteErrors = new Map();
 const _keyMutationChains = new Map();
@@ -4307,6 +4337,7 @@ async function _repairJournalSequenceMarkers() {
 async function _fillCache() {
   const nextCache = Object.create(null);
   _lockedStorageKeys.clear();
+  _readableEncryptedRecords = 0;
   for (let i = 0; i < localStorage.length; i++) {
     const lsKey = localStorage.key(i);
     if (!lsKey?.startsWith('tmb_')) continue;
@@ -4322,7 +4353,7 @@ async function _fillCache() {
         _lockedStorageKeys.add(k);
         continue;
       }
-      try { nextCache[k] = JSON.parse(dec); }
+      try { nextCache[k] = JSON.parse(dec); _readableEncryptedRecords += 1; }
       catch { _lockedStorageKeys.add(k); }
     } else if (raw !== null) {
       try { nextCache[k] = JSON.parse(raw); } catch {}
@@ -4658,7 +4689,12 @@ async function loadEncKeyFromSession() {
     const sessionKey = stored || await _exportKeyB64(key);
     sessionStorage.setItem('tmb_sk', sessionKey);
     await _fillCache();
-    if (_lockedStorageKeys.size) {
+    // MB1188-093: nothing decrypted means the KEY is wrong, and that must still
+    // fail closed — it is what separates a right passcode from a wrong one.
+    // Some records failing while others succeeded means the key is right and
+    // those records are damaged; they are quarantined further in, not treated
+    // as a bad key.
+    if (_localDataKeyFailedEntirely()) {
       _encKey = null;
       _decCache = Object.create(null);
       _durableStoreSnapshots.clear();
@@ -4682,8 +4718,24 @@ async function _prepareAuthorizedLoginData() {
   await _recoverFromJournal();
   await _repairJournalSequenceMarkers();
   await _fillCache();
-  if (_lockedStorageKeys.size) {
+  if (_localDataKeyFailedEntirely()) {
     throw new Error(`The stored key could not decrypt ${_lockedStorageKeys.size} local record(s)`);
+  }
+  // MB1188-093: a damaged record no longer shuts the Mac down.
+  //
+  // This threw for any locked key, on all three login paths, so one unreadable
+  // record — a write truncated when local storage filled, a crash mid-write —
+  // meant nobody could sign in at all. The owner saw the raw error and staff
+  // were told to ask the owner, who was locked out by the same record. Nothing
+  // in the app could clear it.
+  //
+  // The record is not lost and is not repaired by guessing: its ciphertext is
+  // left exactly as it is, writes to it are refused so it can never be replaced
+  // by an empty value derived from a cache it is missing from, it is never
+  // delivered to Firebase, and it is named on screen. Everything else works.
+  if (_lockedStorageKeys.size) {
+    console.warn('[storage] quarantined unreadable local record(s):',
+      _unreadableLocalRecordNames().join(', '));
   }
   migrateSharedKeys();
   await _loadPersistedSyncKey();
@@ -5642,8 +5694,11 @@ function _scheduleSyncDrain(key) {
   // MB-009: Keys quarantined during bootstrap are not drained — their local and
   // remote data are preserved untouched until a recovery action is taken.
   // V160-003: a key awaiting poisoned-client recovery must never auto-deliver.
+  // MB1188-093: a record this Mac cannot read is never delivered. Whatever is
+  // pending for it was written before the record became unreadable, and pushing
+  // it would publish this Mac's confusion to the other one.
   if (!_syncReady || !_syncBootstrapComplete || _syncBootstrapFailedKeys.has(key) ||
-      _syncRecoveryRequiredKeys.has(key) ||
+      _syncRecoveryRequiredKeys.has(key) || _lockedStorageKeys.has(key) ||
       !_readPendingSyncRecord(key)) {
     return Promise.resolve(false);
   }
@@ -5773,10 +5828,14 @@ async function _flushSyncDeliveries(keys = null) {
   // Force Sync, and the sync badge claim data had reached Firebase when it had
   // not. Report every undelivered key explicitly instead.
   const quarantined = targets.filter(key => _syncBootstrapFailedKeys.has(key));
+  const unreadable = targets.filter(key =>
+    !_syncBootstrapFailedKeys.has(key) && _lockedStorageKeys.has(key));
   const recovery = targets.filter(key =>
-    !_syncBootstrapFailedKeys.has(key) && _syncRecoveryRequiredKeys.has(key));
+    !_syncBootstrapFailedKeys.has(key) && !_lockedStorageKeys.has(key) &&
+    _syncRecoveryRequiredKeys.has(key));
   const stillPending = targets.filter(key =>
     !_syncBootstrapFailedKeys.has(key) &&
+    !_lockedStorageKeys.has(key) &&
     !_syncRecoveryRequiredKeys.has(key) &&
     !_syncDeliveryErrors.has(key) &&
     !!_readPendingSyncRecord(key)
@@ -5785,6 +5844,8 @@ async function _flushSyncDeliveries(keys = null) {
     ...errors.map(([key, err]) => `${key}: ${err.message}`),
     ...quarantined.map(key =>
       `${key}: quarantined after a failed cloud bootstrap — the local copy is preserved but has NOT been delivered to Firebase`),
+    ...unreadable.map(key =>
+      `${key}: this Mac cannot read its own copy, so it is preserved untouched and NOT delivered to Firebase. Sign in on the other Mac, or use Force Sync there, to restore it.`),
     ...recovery.map(key =>
       `${key}: held for recovery — this Mac has an unsent copy that was created before it saw the cloud, and delivering it could overwrite real data. Choose Use Cloud or Keep This Mac.`),
     ...stillPending.map(key => `${key}: still pending delivery to Firebase`),
@@ -5991,7 +6052,26 @@ async function _commitEncryptedSnapshot(k, serialized, snapshot, options = {}) {
     // A rebase supplies its own base: the remote value it merged onto, which is
     // not the same as the local value being overwritten here.
     mergeBaseCiphertext = null,
+    // MB1188-093: set only where the incoming value is authoritative and
+    // complete — a value read from the cloud, or a recovery snapshot. Those may
+    // replace an unreadable record, because they REPAIR it.
+    repairsUnreadable = false,
   } = options;
+  // MB1188-093: a record this Mac cannot read is never written over.
+  //
+  // Its plaintext is missing from the cache, so any value derived from the
+  // cache is derived from its absence: an ordinary edit would serialize an
+  // empty list and replace the only copy of the real one. The ciphertext may
+  // still be recoverable — from the other Mac, from the cloud, from a snapshot
+  // — and none of that survives an overwrite. Refusing is visible and
+  // reversible; overwriting is neither.
+  if (!repairsUnreadable && _lockedStorageKeys.has(k)) {
+    throw new Error(
+      `"${k}" could not be read on this Mac, so it is preserved exactly as it is ` +
+      `rather than replaced. Sign in on the other Mac, or use Force Sync, to restore ` +
+      `it from the cloud copy.`
+    );
+  }
   const enc = await _aesEncrypt(serialized);
   if (!enc) throw new Error('encryption key unavailable');
   const prefix = 'tmb_' + k;
@@ -8163,6 +8243,10 @@ async function _persistRemoteValue(key, value, remoteRevision = 0, options = {})
     preserveTimestamp: true,
     operationId,
     remoteRevision,
+    // MB1188-093: this value came from the cloud, which is the shared truth for
+    // a synchronized key. Applying it over a record this Mac cannot read is the
+    // repair, so it is the one write that is allowed to replace one.
+    repairsUnreadable: true,
   });
   localStorage.setItem('tmb_' + key + '_local_ts', new Date().toISOString());
   if (propagateToFirebase && _syncReady && _syncBootstrapComplete) {
@@ -8966,6 +9050,29 @@ function _updateSyncConflictActions() {
           </div>
         `).join('')}
       `;
+    }
+  }
+
+  // MB1188-093: records this Mac cannot read. It can still be signed into and
+  // used; these specific records are preserved untouched and left out of sync
+  // until a readable copy arrives. Names only, never contents — and no button,
+  // because the honest action is on the OTHER Mac, not this one.
+  const unreadableWrap = document.getElementById('sync-unreadable-records');
+  if (unreadableWrap) {
+    const unreadable = typeof _unreadableLocalRecordNames === 'function'
+      ? _unreadableLocalRecordNames() : [];
+    unreadableWrap.style.display = unreadable.length ? '' : 'none';
+    if (unreadable.length) {
+      unreadableWrap.innerHTML = `
+        <div style="font-weight:600;margin-bottom:6px">
+          ⚠ ${unreadable.length} record(s) on this Mac could not be read
+        </div>
+        <div style="margin-bottom:6px">${unreadable.map(key => `<strong>${escHtml(key)}</strong>`).join(', ')}</div>
+        <div style="color:var(--text-muted)">
+          They are being preserved exactly as they are: nothing writes over them, and
+          they are not sent to the cloud. Sign in on the other Mac and use Force Sync
+          there — its copy will restore them here on the next sync.
+        </div>`;
     }
   }
 
