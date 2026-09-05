@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>The Music Box — Internal Operations</title>
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'sha256-Q5/C7XF0SOqXFPfdUc/lCOdOEL54/uZaNih6jOmZ5yU=' https://www.google.com/recaptcha/ https://www.gstatic.com/recaptcha/; script-src-attr 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' https://firestore.googleapis.com https://identitytoolkit.googleapis.com https://securetoken.googleapis.com https://firebaseappcheck.googleapis.com https://*.firebaseio.com wss://*.firebaseio.com https://www.google.com https://www.recaptcha.net; frame-src https://www.google.com/recaptcha/ https://recaptcha.google.com/recaptcha/ https://www.recaptcha.net/; object-src 'none'; base-uri 'none'; form-action 'none';">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'sha256-09MJNy5mXwcb0+YlluJgphh85Li3fuWUpzgTocHo8EU=' https://www.google.com/recaptcha/ https://www.gstatic.com/recaptcha/; script-src-attr 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' https://firestore.googleapis.com https://identitytoolkit.googleapis.com https://securetoken.googleapis.com https://firebaseappcheck.googleapis.com https://*.firebaseio.com wss://*.firebaseio.com https://www.google.com https://www.recaptcha.net; frame-src https://www.google.com/recaptcha/ https://recaptcha.google.com/recaptcha/ https://www.recaptcha.net/; object-src 'none'; base-uri 'none'; form-action 'none';">
   <!-- Pinned, release-vendored dependencies; no runtime CDN execution. -->
   <script src="./vendor/firebase-12.15.0/firebase-app-compat.js" defer></script>
   <script src="./vendor/firebase-12.15.0/firebase-auth-compat.js" defer></script>
@@ -1229,6 +1229,11 @@
         <button class="pin-key" onclick="pinKey('0')">0</button>
         <button class="pin-key delete" onclick="pinBackspace()">⌫</button>
       </div>
+      <!-- MB1188-094: shown only when this Mac does not know how long the owner
+           passcode is, so a 4-digit one can still be submitted. Hidden whenever
+           entry completes itself, which is every other case. -->
+      <button class="btn btn-primary btn-sm" id="pin-submit" style="display:none;margin-top:14px"
+              onclick="pinSubmit()" disabled>Unlock</button>
       <div class="pin-error" id="pin-error"></div>
     </div>
   </div>
@@ -3549,6 +3554,12 @@ function getUserRole(name) {
 
 let _pinBuffer = '';
 let _pinTargetLength = 6;
+// MB1188-094: the fewest digits the keypad will let somebody submit. Normally
+// the same as the target, so entry still completes itself. It drops to
+// MIN_OWNER_PIN_LENGTH only when this Mac does not know how long the owner
+// passcode is — see _applyOwnerPinKeypadMode.
+const MIN_OWNER_PIN_LENGTH = 4;
+let _pinMinLength = 6;
 let _firstRunPinConfirmation = null;
 // MB1188-069: the keypad is shared. 'owner' is the passcode that also unlocks
 // this Mac's data key; 'staff' is an Operations Manager's optional 4-digit one,
@@ -3556,10 +3567,62 @@ let _firstRunPinConfirmation = null;
 let _pinMode = 'owner';
 let _pinStaffName = null;
 
+// MB1188-094: honour whatever length was recorded, not only 6.
+//
+// This read `explicit === 6`, so a Mac that had recorded a 4-digit passcode had
+// that record ignored and fell through to the legacy-key guess below. The
+// record could never say "4", which is the one thing it needed to say.
 function _storedPinLength() {
   const explicit = Number(localStorage.getItem('tmb__pin_length'));
-  if (explicit === 6) return 6;
+  if (Number.isInteger(explicit) && explicit >= MIN_OWNER_PIN_LENGTH && explicit <= 12) {
+    return explicit;
+  }
   return localStorage.getItem(ELIZABETH_PIN_KEY) ? 4 : 6;
+}
+
+// Does THIS Mac actually know the length, or is 6 just the fallback?
+//
+// The length is recorded on the Mac where the passcode was set. A second Mac
+// unlocking the same account from the portable backup has no record, so it
+// guessed 6 — and because the keypad only submitted at exactly the expected
+// length, an owner with a legacy 4-digit passcode could enter four digits and
+// have nothing happen at all. No error, no button, no way in, on every Mac
+// except the one where the passcode was created.
+function _ownerPinLengthIsKnown() {
+  const explicit = Number(localStorage.getItem('tmb__pin_length'));
+  if (Number.isInteger(explicit) && explicit >= MIN_OWNER_PIN_LENGTH && explicit <= 12) {
+    return true;
+  }
+  return !!localStorage.getItem(ELIZABETH_PIN_KEY);
+}
+
+// Sets the keypad up for the owner. When the length is known, entry completes
+// itself exactly as before. When it is not, the keypad accepts 4 to 6 digits
+// and an Unlock button does the submitting.
+function _applyOwnerPinKeypadMode() {
+  const known = _ownerPinLengthIsKnown();
+  _pinTargetLength = _storedPinLength();
+  _pinMinLength = known ? _pinTargetLength : MIN_OWNER_PIN_LENGTH;
+  const label = document.getElementById('pin-label');
+  if (label) {
+    label.textContent = known
+      ? `Enter your ${_pinTargetLength}-digit passcode`
+      : 'Enter your passcode — 4 to 6 digits — then press Unlock';
+  }
+  updatePinDots();
+}
+
+function _updatePinSubmitButton() {
+  const button = document.getElementById('pin-submit');
+  if (!button) return;
+  const needed = _pinMode === 'owner' && _pinMinLength < _pinTargetLength;
+  button.style.display = needed ? '' : 'none';
+  button.disabled = _pinBuffer.length < _pinMinLength;
+}
+
+function pinSubmit() {
+  if (_pinBuffer.length < _pinMinLength) return;
+  checkPin();
 }
 
 function _pinLockRemainingMs() {
@@ -3661,6 +3724,7 @@ function _openStaffPasscodeKeypad(name) {
   _pinMode = 'staff';
   _pinStaffName = name;
   _pinTargetLength = 4;
+  _pinMinLength = 4;
   _pinBuffer = '';
   _firstRunPinConfirmation = null;
   document.getElementById('user-pick-screen').style.display = 'none';
@@ -3712,13 +3776,8 @@ function selectLoginUser(name, role) {
     document.getElementById('pin-screen').style.display = 'block';
     _pinBuffer = '';
     _firstRunPinConfirmation = null;
-    _pinTargetLength = _storedPinLength();
-    updatePinDots();
+    _applyOwnerPinKeypadMode();
     document.getElementById('pin-error').textContent = '';
-    const label = document.getElementById('pin-label');
-    if (label) label.textContent = localStorage.getItem(ELIZABETH_PIN_KEY)
-      ? `Enter your ${_pinTargetLength}-digit passcode`
-      : `Create a new ${_pinTargetLength}-digit owner passcode`;
   } else {
     // Show loading state on the button so the user knows it's working
     const btns = document.querySelectorAll('.login-user-btn');
@@ -3804,8 +3863,7 @@ function backToUserPick() {
   // attempt cannot be left half-armed behind the profile list.
   _pinMode = 'owner';
   _pinStaffName = null;
-  _pinTargetLength = _storedPinLength();
-  updatePinDots();
+  _applyOwnerPinKeypadMode();
 }
 
 function pinKey(digit) {
@@ -3829,6 +3887,7 @@ function updatePinDots() {
     dot.style.display = i < _pinTargetLength ? '' : 'none';
     dot.classList.toggle('filled', i < _pinBuffer.length);
   }
+  _updatePinSubmitButton();
 }
 
 async function checkPin() {
@@ -3868,6 +3927,18 @@ async function checkPin() {
       pinCorrect = cloudUnlock.unlocked;
       if (!pinCorrect) {
         if (_firstRunPinConfirmation === null) {
+          // MB1188-094: the keypad used to enforce this by refusing to submit
+          // anything but six digits. Now that it accepts four so an existing
+          // passcode can be entered, the rule has to be stated where the new
+          // passcode is actually created — otherwise relaxing the keypad would
+          // have quietly allowed weaker new passcodes.
+          if (!/^\d{6}$/.test(_pinBuffer)) {
+            document.getElementById('pin-error').textContent =
+              'A new owner passcode must be 6 digits.';
+            _pinBuffer = '';
+            updatePinDots();
+            return;
+          }
           _firstRunPinConfirmation = _pinBuffer;
           _pinBuffer = '';
           updatePinDots();
@@ -3909,6 +3980,10 @@ async function checkPin() {
 
     if (pinCorrect) {
       _clearPinFailures();
+      // MB1188-094: whatever just worked is the length this Mac should expect
+      // from now on, so the keypad completes itself on every later sign-in.
+      try { localStorage.setItem('tmb__pin_length', String(_pinBuffer.length)); }
+      catch (_) {}
       await initEncryption(_pinBuffer);
       if (!window.electronSession?.authenticateOwner) {
         throw new Error('Secure owner-session authorization is unavailable.');

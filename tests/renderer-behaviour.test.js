@@ -3684,3 +3684,143 @@ test('MB1188-059: an explicit flush never waits out the typing backoff', () => {
   assert.ok(released < flush.indexOf('const staged = await pending;'),
     'and before the result is awaited');
 });
+
+// ── MB1188-094: the owner keypad on a Mac that has never seen the passcode ───
+//
+// Reported live: Elizabeth's 4-digit passcode stopped working on the newer
+// Macs. The keypad decides how many digits to expect from what is stored on
+// THAT Mac, and the length is only recorded where the passcode was set. A
+// second Mac unlocking the same account from the portable backup has no record,
+// so it fell back to 6 — and since entry only submitted when the buffer length
+// EQUALLED the expectation, four digits produced nothing at all. No error, no
+// button, no way in. Every Mac except the one that created the passcode.
+
+function pinKeypad({ storage = {} } = {}) {
+  const store = new Map(Object.entries(storage));
+  const document = makeDocument(['pin-label', 'pin-submit', 'pin-error',
+    'pd0', 'pd1', 'pd2', 'pd3', 'pd4', 'pd5']);
+  const checked = [];
+  const context = vm.createContext({
+    console: { warn() {}, error() {}, log() {} },
+    Number, String, Boolean, Object, JSON, Math, RegExp,
+    document,
+    ELIZABETH_PIN_KEY: 'tmb_owner_pin',
+    localStorage: {
+      getItem: key => (store.has(key) ? store.get(key) : null),
+      setItem: (key, value) => store.set(key, String(value)),
+      removeItem: key => store.delete(key),
+    },
+    setTimeout: fn => { checked.push('auto'); fn(); },
+    checkPin: () => checked.push('submitted'),
+  });
+  vm.runInContext(`
+    const MIN_OWNER_PIN_LENGTH = 4;
+    let _pinBuffer = '';
+    let _pinTargetLength = 6;
+    let _pinMinLength = 6;
+    let _pinMode = 'owner';
+    ${declaration('_storedPinLength')}
+    ${declaration('_ownerPinLengthIsKnown')}
+    ${declaration('_applyOwnerPinKeypadMode')}
+    ${declaration('_updatePinSubmitButton')}
+    ${declaration('pinSubmit')}
+    ${declaration('pinKey')}
+    ${declaration('pinBackspace')}
+    ${declaration('updatePinDots')}
+    globalThis.api = {
+      open: () => _applyOwnerPinKeypadMode(),
+      type: digits => { for (const d of String(digits)) pinKey(d); },
+      press: () => pinSubmit(),
+      back: () => pinBackspace(),
+      state: () => ({ target: _pinTargetLength, min: _pinMinLength, buffer: _pinBuffer }),
+    };
+  `, context);
+  return { api: context.api, document, checked, store };
+}
+
+test('MB1188-094: a Mac that has never seen the passcode still lets a 4-digit owner in', () => {
+  const { api, document, checked } = pinKeypad({ storage: {} });
+  api.open();
+  const state = api.state();
+  assert.equal(state.target, 6, 'six dots are still offered — the passcode may well be six');
+  assert.equal(state.min, 4, 'but four is enough to submit, because this Mac is guessing');
+
+  const submit = document.getElementById('pin-submit');
+  assert.notEqual(submit.style.display, 'none', 'an explicit way to submit appears');
+  assert.equal(submit.disabled, true, 'and is refused until there is enough to send');
+
+  api.type('123');
+  assert.equal(document.getElementById('pin-submit').disabled, true, 'three digits is not enough');
+  assert.deepEqual(checked, [], 'and nothing has been submitted yet');
+
+  api.type('4');
+  assert.equal(document.getElementById('pin-submit').disabled, false,
+    'at four digits she can act — this is the exact point where the app used to go silent');
+  assert.deepEqual(checked, [], 'still not submitted on its own, because six is also possible');
+
+  api.press();
+  assert.deepEqual(checked, ['submitted'], 'pressing Unlock submits the four digits');
+
+  assert.match(document.getElementById('pin-label').textContent, /4 to 6 digits/,
+    'and the screen says so rather than showing six dots with no explanation');
+});
+
+test('MB1188-094: a six-digit passcode on that same Mac still completes itself', () => {
+  const { api, checked } = pinKeypad({ storage: {} });
+  api.open();
+  api.type('123456');
+  assert.deepEqual(checked, ['auto', 'submitted'],
+    'reaching six submits without waiting for the button');
+});
+
+test('MB1188-094: a recorded length of four is honoured, not ignored', () => {
+  // The old test for this could never have failed: the reader was
+  // `explicit === 6`, so the one value the record needed to carry — 4 — was
+  // the one value it threw away.
+  const { api, document, checked } = pinKeypad({
+    storage: { tmb__pin_length: '4', tmb_owner_pin: 'H:whatever' },
+  });
+  api.open();
+  assert.deepEqual({ ...api.state() }, { target: 4, min: 4, buffer: '' });
+  assert.equal(document.getElementById('pin-submit').style.display, 'none',
+    'a known length needs no button — entry completes itself as it always did');
+  api.type('1234');
+  assert.deepEqual(checked, ['auto', 'submitted']);
+  assert.match(document.getElementById('pin-label').textContent, /4-digit/);
+});
+
+test('MB1188-094: a Mac that knows the passcode is six asks for exactly six', () => {
+  const { api, document } = pinKeypad({
+    storage: { tmb__pin_length: '6', tmb_owner_pin: 'H:whatever' },
+  });
+  api.open();
+  assert.deepEqual({ ...api.state() }, { target: 6, min: 6, buffer: '' });
+  assert.equal(document.getElementById('pin-submit').style.display, 'none');
+});
+
+test('MB1188-094: backspacing below the minimum takes the submit away again', () => {
+  const { api, document } = pinKeypad({ storage: {} });
+  api.open();
+  api.type('1234');
+  assert.equal(document.getElementById('pin-submit').disabled, false);
+  api.back();
+  assert.equal(document.getElementById('pin-submit').disabled, true,
+    'three digits can no longer be submitted');
+  assert.equal(api.state().buffer, '123');
+});
+
+test('MB1188-094: creating a NEW owner passcode still requires six digits', () => {
+  // The keypad used to enforce this by refusing to submit anything shorter.
+  // Now that it accepts four so an EXISTING passcode can be entered, the rule
+  // has to be stated where a new passcode is actually created, or relaxing the
+  // keypad would have quietly allowed weaker new passcodes.
+  const source = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+  const setup = source.slice(source.indexOf('_firstRunPinConfirmation === null'));
+  assert.match(setup.slice(0, 700), /\/\^\\d\{6\}\$\/\.test\(_pinBuffer\)/,
+    'the six-digit rule is checked before the new passcode is accepted');
+  assert.match(setup.slice(0, 700), /must be 6 digits/, 'and says so plainly');
+
+  // And the length that actually worked is remembered, so a Mac asks once.
+  const success = source.slice(source.indexOf('if (pinCorrect) {'));
+  assert.match(success.slice(0, 600), /tmb__pin_length', String\(_pinBuffer\.length\)/);
+});

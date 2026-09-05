@@ -588,9 +588,31 @@ test('§8: the owner passcode UI states the real length requirement', () => {
     'no UI text promises a length the backend will reject');
   assert.match(source, /minlength="6" maxlength="6" placeholder="New 6-digit code"/,
     'the settings field matches the rule it is validated against');
-  // The first-run label must follow the actual target length, not a literal.
-  assert.match(script, /Create a new \$\{_pinTargetLength\}-digit owner passcode/,
-    'the creation prompt tracks the length actually collected');
+  // MB1188-094 changed what this assertion should say, and it is worth being
+  // explicit about why rather than quietly deleting it.
+  //
+  // The creation prompt used to interpolate _pinTargetLength, because that was
+  // the only thing enforcing the length: the keypad simply would not submit
+  // anything shorter. That is exactly what locked an owner with a legacy
+  // 4-digit passcode out of every Mac except the one where it was set — the
+  // keypad demanded six, and four did nothing at all.
+  //
+  // The keypad now accepts 4 to 6 when a Mac does not know the length, so the
+  // six-digit rule for a NEW passcode can no longer live in the dots. It lives
+  // in the code that creates one, and the prompt states it as the fixed fact it
+  // is. Both are asserted here.
+  const firstRun = script.slice(script.indexOf('_firstRunPinConfirmation === null'));
+  assert.match(firstRun.slice(0, 700), /\/\^\\d\{6\}\$\/\.test\(_pinBuffer\)/,
+    'creating a new passcode checks the six-digit rule itself');
+  assert.match(firstRun.slice(0, 700), /must be 6 digits/,
+    'and says so rather than silently refusing');
+  assert.match(script, /Create a new 6-digit owner passcode/,
+    'the creation prompt states the rule it enforces');
+  assert.match(script, /Repeat the new 6-digit passcode/);
+
+  // And the relaxation is scoped to unlocking, never to creating.
+  assert.match(script, /_pinMinLength = known \? _pinTargetLength : MIN_OWNER_PIN_LENGTH/,
+    'four digits is accepted only where this Mac does not know the length');
 });
 
 // --- P1-2 / P1-7 / P1-8 / P1-9 ----------------------------------------------
