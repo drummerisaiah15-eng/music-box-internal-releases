@@ -1,0 +1,7 @@
+{
+  "name": "ai-ea",
+  "version": "1.0.0",
+  "description": "A virtual executive assistant that runs day-to-day execution across calendar, inbox, projects, finance admin and research — with a commitment ledger so nothing drops, an authority model so nothing goes out unapproved, and a verification standard so nothing gets forwarded as fact that isn't one.",
+  "keywords": ["executive assistant", "chief of staff", "operations", "bookkeeping", "research"],
+  "license": "UNLICENSED"
+}
