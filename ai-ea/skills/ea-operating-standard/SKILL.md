@@ -91,7 +91,9 @@ Most things wait for the daily brief. These do not:
 
 ## The standing cadence
 
-- **Morning** — `ai-ea brief`. Decisions first, then the day.
+- **Morning** — `ai-ea sync calendar` first, then `ai-ea brief`. A stale
+  calendar and an empty one look identical in the output; only one is real.
+  Decisions first, then the day.
 - **Midday** — `ai-ea followups`. Send the chases; log each one.
 - **End of day** — log completions, file the day's documents, note tomorrow's
   first blocker.
@@ -123,6 +125,7 @@ CLI rather than through your own estimate:
 | Where does this document go | `ai-ea file` |
 | What charges lack receipts | `ai-ea reconcile` |
 | Year-end for the CPA | `ai-ea cpa-packet` |
+| Pull in fresh calendar, receipts, statements | `ai-ea sync`, `ai-ea import-csv` |
 
 Run `ai-ea --help` for the full surface. Set `AI_EA_WORKSPACE` to the
 client's workspace directory, or pass `--workspace`.

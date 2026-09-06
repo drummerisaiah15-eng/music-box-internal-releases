@@ -18,7 +18,7 @@ Three claims, each enforced by tested code rather than by prompt text:
 ```
 ai-ea/
   src/                 the engine — judgement-free, tested, deterministic
-  tests/               161 tests, no dependencies beyond Node
+  tests/               222 tests, no dependencies beyond Node
   skills/              how the assistant works: doctrine and per-area craft
   commands/            /ea-brief, /ea-triage, /ea-research, /ea-week, …
   agents/              deep research and backlog-sweep subagents
@@ -35,7 +35,7 @@ drafting and explanation. The engine supplies the arithmetic and the rules.
 ## Quick start
 
 ```bash
-npm test                                    # 161 tests, no install needed
+npm test                                    # 222 tests, no install needed
 
 node src/cli.js init -w ~/clients/acme --client acme
 $EDITOR ~/clients/acme/client.json          # authority limits, entities, voice
@@ -46,7 +46,17 @@ Then, each morning:
 
 ```bash
 export AI_EA_WORKSPACE=~/clients/acme
+node src/cli.js sync calendar --source gcal --mode full --json "$(fetch_events)"
 node src/cli.js brief
+```
+
+Fetching is deliberately not the engine's job — that needs network, auth and a
+live connector, none of which can be tested or replayed. Claude holds the
+connectors and produces the records; the engine owns the merge, which is where
+the hard problems are. Bank data needs no connector at all:
+
+```bash
+node src/cli.js import-csv ~/Downloads/amex-march.csv --account amex-1005
 ```
 
 ```
@@ -87,6 +97,8 @@ For Dana Reyes.
 | `decide` | Weighted comparison, plus whether the winner survives reweighting |
 | `file` / `audit-files` | Canonical name and folder; audit an existing archive |
 | `reconcile` / `cpa-packet` | Match charges to documents; year-end packet with its own gap list |
+| `sync` / `import-csv` | Merge fetched records or a bank export in, preserving your own edits |
+| `sync-status` | When each source last ran, and what it did |
 
 Every command takes `--format json` for scripting and `--now` to freeze the
 clock, which makes output reproducible. Full surface: `node src/cli.js --help`.
@@ -116,6 +128,21 @@ reports honestly when the answer is a leading candidate rather than a decision.
 
 **Syndication is not corroboration.** Six outlets running one wire story count
 as one source. `verify` counts distinct origins, not links.
+
+**A sync never overwrites a decision.** Categories, business purposes and
+entity assignments are merged three-way: the engine remembers what the feed
+last supplied, so a field a person has since changed is theirs forever, while
+an untouched field still improves when extraction does. A material change
+underneath somebody's classification is reported rather than applied silently.
+
+**Only a full sync can conclude something was deleted.** An incremental fetch
+returns what changed, so absence means nothing — treating it as deletion would
+silently empty a calendar. Withdrawn records are marked, never removed, and
+drop out of briefs and reconciliations while staying in the file as history.
+
+**An ambiguous statement is refused, not guessed.** `03/04/2026` is either
+3 April or 4 March, and no row in the file may prove which. The importer says
+so and names the remedy rather than picking one and misfiling a quarter.
 
 ## Selling it
 

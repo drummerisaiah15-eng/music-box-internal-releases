@@ -76,11 +76,21 @@ function normalizeStatementLine(input, index) {
   if (!input || Object.getPrototypeOf(input) !== Object.prototype) {
     fail(`statement line ${index} must be an object`);
   }
+  const amountCents = parseMoney(input.amountCents ?? input.amount, `statement line ${index} amount`);
+  if (input.direction !== undefined && !['debit', 'credit'].includes(input.direction)) {
+    fail(`statement line ${index} direction must be "debit" or "credit"`);
+  }
   return {
     id: input.id ? String(input.id) : `line-${index}`,
     date: requireDateString(input.date, `statement line ${index} date`),
     description: typeof input.description === 'string' ? input.description.trim() : '',
-    amountCents: parseMoney(input.amountCents ?? input.amount, `statement line ${index} amount`),
+    amountCents,
+    // Only money leaving the account needs a receipt behind it. A card payment,
+    // a transfer in, or an interest credit counted as "unreceipted exposure"
+    // inflates the one number this whole exercise reports, so the direction is
+    // carried explicitly when the importer knows it and inferred from the sign
+    // when it does not.
+    direction: input.direction ?? (amountCents > 0 ? 'credit' : 'debit'),
     account: input.account ? String(input.account) : 'unspecified',
   };
 }
@@ -202,8 +212,10 @@ function reconcile(statementLines, documents, options = {}) {
     });
   }
 
-  const unreceipted = lines
-    .filter(line => !takenLines.has(line.id))
+  const unmatchedLines = lines.filter(line => !takenLines.has(line.id));
+
+  const unreceipted = unmatchedLines
+    .filter(line => line.direction === 'debit')
     .map(line => ({
       lineId: line.id,
       date: line.date,
@@ -211,6 +223,20 @@ function reconcile(statementLines, documents, options = {}) {
       amountCents: line.amountCents,
       account: line.account,
       exposure: 'money left the account with no document behind it',
+    }));
+
+  // Money in with nothing attached is not an audit exposure. Still reported,
+  // because an unexplained credit is worth a look, just not as a missing
+  // receipt.
+  const unmatchedCredits = unmatchedLines
+    .filter(line => line.direction === 'credit')
+    .map(line => ({
+      lineId: line.id,
+      date: line.date,
+      description: line.description,
+      amountCents: line.amountCents,
+      account: line.account,
+      note: 'money in — no receipt expected, but confirm what it was',
     }));
 
   const unmatchedDocuments = docs
@@ -223,21 +249,31 @@ function reconcile(statementLines, documents, options = {}) {
       exposure: 'document with no matching statement line — paid another way, duplicated, or dated wrong',
     }));
 
-  const totalLineCents = lines.reduce((sum, line) => sum + Math.abs(line.amountCents), 0);
-  const matchedCents = matched.reduce((sum, row) => sum + Math.abs(row.amountCents), 0);
+  // Coverage is measured over spending only. Including credits in the
+  // denominator would let a large card payment flatter the percentage without
+  // a single extra receipt being found.
+  const debits = lines.filter(line => line.direction === 'debit');
+  const matchedDebitIds = new Set(matched.map(row => row.lineId));
+  const debitCents = debits.reduce((sum, line) => sum + Math.abs(line.amountCents), 0);
+  const matchedDebitCents = debits
+    .filter(line => matchedDebitIds.has(line.id))
+    .reduce((sum, line) => sum + Math.abs(line.amountCents), 0);
+  const matchedDebitCount = debits.filter(line => matchedDebitIds.has(line.id)).length;
 
   return {
     matched,
     unreceipted,
+    unmatchedCredits,
     unmatchedDocuments,
     coverage: {
-      lines: lines.length,
-      matchedLines: matched.length,
+      lines: debits.length,
+      matchedLines: matchedDebitCount,
+      creditLines: lines.length - debits.length,
       // Dollar coverage is the number that matters for audit exposure; a single
       // missing five-figure receipt outweighs forty missing coffee receipts.
-      byCount: lines.length === 0 ? 1 : Number((matched.length / lines.length).toFixed(4)),
-      byDollars: totalLineCents === 0 ? 1 : Number((matchedCents / totalLineCents).toFixed(4)),
-      unreceiptedCents: totalLineCents - matchedCents,
+      byCount: debits.length === 0 ? 1 : Number((matchedDebitCount / debits.length).toFixed(4)),
+      byDollars: debitCents === 0 ? 1 : Number((matchedDebitCents / debitCents).toFixed(4)),
+      unreceiptedCents: debitCents - matchedDebitCents,
     },
   };
 }

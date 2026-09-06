@@ -26,6 +26,10 @@ function workspace(profileOverrides = {}) {
   return dir;
 }
 
+function readJson(dir, file) {
+  return JSON.parse(fs.readFileSync(path.join(dir, file), 'utf8'));
+}
+
 function write(dir, file, data) {
   fs.writeFileSync(path.join(dir, file), JSON.stringify(data, null, 2));
 }
@@ -268,6 +272,104 @@ test('a command needing input says so rather than guessing', () => {
 test('malformed JSON is reported as such', () => {
   const dir = workspace();
   assert.throws(() => run(['authority', '--workspace', dir, '--json', '{oops']), /not valid JSON/);
+});
+
+// --- sync ---
+
+test('a fetched batch merges into a collection and records a watermark', () => {
+  const dir = workspace();
+  const result = run(['sync', 'calendar', '--workspace', dir, '--source', 'gcal', '--mode', 'full',
+    '--now', NOW, '--json', JSON.stringify([
+      { sourceId: 'ev-1', title: 'Standup', start: '2026-09-06T15:00:00Z', end: '2026-09-06T16:00:00Z' },
+    ])]);
+  assert.match(result.text, /1 added/);
+  assert.equal(readJson(dir, 'calendar.json').length, 1);
+  assert.equal(run(['sync-status', '--workspace', dir, '--format', 'json']).data.sources.gcal.lastMode, 'full');
+});
+
+test('re-syncing the same batch is a no-op', () => {
+  const dir = workspace();
+  const batch = JSON.stringify([{ sourceId: 'ev-1', title: 'Standup', start: '2026-09-06T15:00:00Z', end: '2026-09-06T16:00:00Z' }]);
+  const args = ['sync', 'calendar', '--workspace', dir, '--source', 'gcal', '--now', NOW, '--json', batch];
+  run(args);
+  assert.match(run(args).text, /0 added, 0 updated, 1 unchanged/);
+  assert.equal(readJson(dir, 'calendar.json').length, 1);
+});
+
+test('a withdrawn record stays in the file but leaves the brief', () => {
+  const dir = workspace();
+  const two = [
+    { sourceId: 'ev-1', title: 'Kept', start: '2026-09-06T15:00:00Z', end: '2026-09-06T16:00:00Z' },
+    { sourceId: 'ev-2', title: 'Cancelled', start: '2026-09-06T17:00:00Z', end: '2026-09-06T18:00:00Z' },
+  ];
+  run(['sync', 'calendar', '--workspace', dir, '--source', 'gcal', '--mode', 'full', '--now', NOW, '--json', JSON.stringify(two)]);
+  run(['sync', 'calendar', '--workspace', dir, '--source', 'gcal', '--mode', 'full', '--now', NOW, '--json', JSON.stringify([two[0]])]);
+
+  assert.equal(readJson(dir, 'calendar.json').length, 2, 'history is kept');
+  const text = run(['brief', '--workspace', dir, '--now', NOW]).text;
+  assert.match(text, /Kept/);
+  assert.doesNotMatch(text, /Cancelled/, 'a cancelled meeting must not read as current');
+});
+
+test('sync needs a source, a known collection, and an array', () => {
+  const dir = workspace();
+  assert.throws(() => run(['sync', 'calendar', '--workspace', dir, '--json', '[]']), /--source/);
+  assert.throws(() => run(['sync', 'invoices', '--workspace', dir, '--source', 'x', '--json', '[]']), /unknown collection/);
+  assert.throws(() => run(['sync', 'calendar', '--workspace', dir, '--source', 'x', '--json', '{}']), /array of records/);
+});
+
+// --- import-csv ---
+
+test('a bank CSV imports and is idempotent on re-import', () => {
+  const dir = workspace();
+  const file = path.join(dir, 'statement.csv');
+  fs.writeFileSync(file, 'Date,Description,Amount\n2026-03-14,SWEETWATER SOUND,-1284.99\n2026-03-02,BLUE BOTTLE,-42.10\n');
+
+  assert.match(run(['import-csv', file, '--workspace', dir, '--account', 'amex', '--now', NOW]).text, /2 added/);
+  assert.match(run(['import-csv', file, '--workspace', dir, '--account', 'amex', '--now', NOW]).text, /0 added, 0 updated, 2 unchanged/);
+  assert.equal(readJson(dir, 'statements.json').length, 2);
+});
+
+// A statement export covers a date range. Treating it as the whole picture
+// would withdraw every transaction outside that range.
+test('a CSV import never withdraws transactions outside its date range', () => {
+  const dir = workspace();
+  const march = path.join(dir, 'march.csv');
+  const april = path.join(dir, 'april.csv');
+  fs.writeFileSync(march, 'Date,Description,Amount\n2026-03-14,SWEETWATER,-1284.99\n');
+  fs.writeFileSync(april, 'Date,Description,Amount\n2026-04-02,HALVORSEN,-850.00\n');
+
+  run(['import-csv', march, '--workspace', dir, '--account', 'amex', '--now', NOW]);
+  run(['import-csv', april, '--workspace', dir, '--account', 'amex', '--now', NOW]);
+  const lines = run(['reconcile', '--workspace', dir, '--format', 'json']).data;
+  assert.equal(lines.coverage.lines, 2, 'March must survive the April import');
+});
+
+test('an ambiguous statement is refused rather than guessed at', () => {
+  const dir = workspace();
+  const file = path.join(dir, 'ambiguous.csv');
+  fs.writeFileSync(file, 'Date,Description,Amount\n03/04/2026,SWEETWATER,-1284.99\n');
+
+  assert.throws(() => run(['import-csv', file, '--workspace', dir, '--now', NOW]), /ambiguous/);
+  const forced = run(['import-csv', file, '--workspace', dir, '--date-format', 'day-first', '--now', NOW]);
+  assert.match(forced.text, /1 added/);
+  assert.equal(readJson(dir, 'statements.json')[0].date, '2026-04-03');
+});
+
+test('a card payment is not reported as a missing receipt', () => {
+  const dir = workspace();
+  const file = path.join(dir, 'card.csv');
+  fs.writeFileSync(file, 'Date,Description,Amount\n2026-03-14,SWEETWATER,-1284.99\n2026-03-02,BLUE BOTTLE,-42.10\n2026-03-20,PAYMENT THANK YOU,1500.00\n');
+  run(['import-csv', file, '--workspace', dir, '--account', 'amex', '--now', NOW]);
+
+  const result = run(['reconcile', '--workspace', dir, '--format', 'json']).data;
+  assert.equal(result.unreceipted.length, 2);
+  assert.equal(result.unmatchedCredits.length, 1);
+  assert.equal(result.coverage.unreceiptedCents, 132709, 'the $1,500 payment must not inflate exposure');
+});
+
+test('sync-status says so plainly before anything has been synced', () => {
+  assert.match(run(['sync-status', '--workspace', workspace()]).text, /Nothing has been synced/);
 });
 
 test('an unknown command points at the help rather than failing obscurely', () => {

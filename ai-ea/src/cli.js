@@ -23,6 +23,8 @@ const finance = require('./finance');
 const research = require('./research');
 const client = require('./client');
 const brief = require('./brief');
+const sync = require('./sync');
+const csv = require('./csv');
 
 const LEDGER_FILE = 'ledger.jsonl';
 const CLIENT_FILE = 'client.json';
@@ -30,6 +32,7 @@ const DOCUMENTS_FILE = 'documents.json';
 const STATEMENTS_FILE = 'statements.json';
 const CALENDAR_FILE = 'calendar.json';
 const APPROVALS_FILE = 'approvals.json';
+const SYNC_STATE_FILE = 'sync-state.json';
 
 class UsageError extends Error {}
 
@@ -48,6 +51,10 @@ function readJson(file, fallback) {
 // The ledger is JSON Lines so appending a single event is an atomic append
 // rather than a read-modify-write of the whole history. Two processes filing
 // commitments at once cannot lose each other's work.
+function writeJson(file, value) {
+  fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+}
+
 function readLedger(workspace) {
   const file = path.join(workspace, LEDGER_FILE);
   if (!fs.existsSync(file)) return [];
@@ -79,6 +86,17 @@ function appendEvent(workspace, event) {
   ledger.reduceEvents([...history, event]);
   fs.appendFileSync(path.join(workspace, LEDGER_FILE), `${JSON.stringify(event)}\n`, 'utf8');
   return event;
+}
+
+/**
+ * Read a synced collection, dropping anything withdrawn at its source.
+ *
+ * A cancelled meeting and a receipt that vanished from Drive both stay in the
+ * file as history, and both would be wrong to show in today's brief or count
+ * in a reconciliation.
+ */
+function readCollection(workspace, file) {
+  return sync.liveRecords(readJson(path.join(workspace, file), []));
 }
 
 function loadProfile(workspace) {
@@ -204,7 +222,7 @@ const COMMANDS = {
       now,
       profile: loadProfile(workspace),
       commitments: loadState(workspace),
-      calendar: readJson(path.join(workspace, CALENDAR_FILE), []),
+      calendar: readCollection(workspace, CALENDAR_FILE),
       pendingApprovals: readJson(path.join(workspace, APPROVALS_FILE), []),
       financeSnapshot: financeSnapshot(workspace, values),
     });
@@ -237,8 +255,8 @@ const COMMANDS = {
 
   reconcile(workspace, { values }) {
     const result = finance.reconcile(
-      readJson(path.join(workspace, STATEMENTS_FILE), []),
-      readJson(path.join(workspace, DOCUMENTS_FILE), []),
+      readCollection(workspace, STATEMENTS_FILE),
+      readCollection(workspace, DOCUMENTS_FILE),
       values.window ? { dayWindow: Number(values.window) } : undefined,
     );
     const lines = [
@@ -257,11 +275,99 @@ const COMMANDS = {
     const packet = finance.cpaPacket({
       taxYear: Number(values.year ?? new Date().getFullYear()),
       entity: values.entity ?? profile.entities[0].code,
-      documents: readJson(path.join(workspace, DOCUMENTS_FILE), []),
-      statementLines: readJson(path.join(workspace, STATEMENTS_FILE), []),
+      documents: readCollection(workspace, DOCUMENTS_FILE),
+      statementLines: readCollection(workspace, STATEMENTS_FILE),
       preparedOn: values.now?.slice(0, 10),
     });
     return { text: renderPacket(packet), data: packet };
+  },
+
+  sync(workspace, { values, positionals, io }) {
+    const collection = positionals[0] ?? values.collection;
+    if (!collection) throw new UsageError(`sync needs a collection: ${sync.COLLECTION_NAMES.join(', ')}`);
+    const source = values.source;
+    if (!source) throw new UsageError('sync needs --source naming where the records came from (e.g. gcal, gmail)');
+
+    const spec = sync.COLLECTIONS[collection];
+    if (!spec) throw new UsageError(`unknown collection "${collection}"; expected ${sync.COLLECTION_NAMES.join(', ')}`);
+
+    const incoming = payloadFrom(values, positionals.slice(1), io);
+    if (!Array.isArray(incoming)) throw new UsageError('sync expects a JSON array of records');
+
+    const file = path.join(workspace, spec.file);
+    const at = values.now ?? new Date().toISOString();
+    const { records, report } = sync.merge({
+      collection,
+      source,
+      mode: values.mode ?? 'incremental',
+      now: at,
+      existing: readJson(file, []),
+      incoming,
+    });
+
+    writeJson(file, records);
+    writeJson(
+      path.join(workspace, SYNC_STATE_FILE),
+      sync.recordSyncState(readJson(path.join(workspace, SYNC_STATE_FILE), {}), {
+        source, collection, at, mode: report.mode, report, cursor: values.cursor ?? null,
+      }),
+    );
+    return { text: sync.summariseReport(report), data: report };
+  },
+
+  'import-csv': (workspace, { values, positionals }) => {
+    const file = positionals[0] ?? values.input;
+    if (!file) throw new UsageError('import-csv needs a path to the statement export');
+
+    const text = fs.readFileSync(path.resolve(file), 'utf8');
+    const { records, report } = csv.importStatementCsv(text, {
+      account: values.account,
+      dateFormat: values['date-format'],
+      delimiter: values.delimiter,
+    });
+
+    const target = path.join(workspace, STATEMENTS_FILE);
+    const at = values.now ?? new Date().toISOString();
+    const source = values.source ?? `csv:${values.account ?? path.basename(file)}`;
+
+    // Always incremental. A statement export covers a date range, so treating
+    // it as the full picture would mark every transaction outside that range as
+    // withdrawn — silently emptying the year.
+    const merged = sync.merge({
+      collection: 'statements', source, mode: 'incremental', now: at,
+      existing: readJson(target, []), incoming: records,
+    });
+
+    writeJson(target, merged.records);
+    writeJson(
+      path.join(workspace, SYNC_STATE_FILE),
+      sync.recordSyncState(readJson(path.join(workspace, SYNC_STATE_FILE), {}), {
+        source, collection: 'statements', at, mode: 'incremental', report: merged.report,
+      }),
+    );
+    return {
+      text: `${csv.summariseImport(report)}\n\n${sync.summariseReport(merged.report)}`,
+      data: { import: report, merge: merged.report },
+    };
+  },
+
+  'sync-status': (workspace) => {
+    const state = readJson(path.join(workspace, SYNC_STATE_FILE), {});
+    const sources = Object.entries(state.sources ?? {});
+    if (sources.length === 0) {
+      return { text: 'Nothing has been synced into this workspace yet.', data: state };
+    }
+    const lines = sources
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([source, info]) => {
+        const counts = info.lastCounts
+          ? ` — ${info.lastCounts.added} added, ${info.lastCounts.updated} updated`
+            + `${info.lastCounts.conflicts ? `, ${info.lastCounts.conflicts} needing eyes` : ''}`
+            + `${info.lastCounts.rejected ? `, ${info.lastCounts.rejected} rejected` : ''}`
+          : '';
+        return `${source} → ${info.collection}: last ${info.lastMode} sync ${info.lastSyncAt}${counts}`;
+      });
+    return { text: lines.join('\n'), data: state };
   },
 
   verify(workspace, { values, positionals, io }) {
@@ -290,8 +396,8 @@ const COMMANDS = {
 };
 
 function financeSnapshot(workspace, values) {
-  const documents = readJson(path.join(workspace, DOCUMENTS_FILE), []);
-  const statements = readJson(path.join(workspace, STATEMENTS_FILE), []);
+  const documents = readCollection(workspace, DOCUMENTS_FILE);
+  const statements = readCollection(workspace, STATEMENTS_FILE);
   if (documents.length === 0 && statements.length === 0) return null;
   const result = finance.reconcile(statements, documents);
   const gaps = finance.findGaps(documents);
@@ -341,6 +447,13 @@ const OPTIONS = {
   year: { type: 'string' },
   root: { type: 'string' },
   window: { type: 'string' },
+  source: { type: 'string' },
+  mode: { type: 'string' },
+  collection: { type: 'string' },
+  cursor: { type: 'string' },
+  account: { type: 'string' },
+  'date-format': { type: 'string' },
+  delimiter: { type: 'string' },
   format: { type: 'string', short: 'f' },
   force: { type: 'boolean', default: false },
   help: { type: 'boolean', short: 'h', default: false },
@@ -371,6 +484,18 @@ Records
   audit-files [paths]  Check an existing archive against the convention
   reconcile            Match statement lines to documents
   cpa-packet           Year-end packet with its own gap list
+
+Sync
+  sync <collection>    Merge fetched records in, preserving your own edits
+                         calendar | documents | statements
+                         --source NAME   where they came from (required)
+                         --mode full     the batch is the complete picture,
+                                         so absences mean withdrawn
+  import-csv <file>    Import a bank or card statement export
+                         --account NAME  which account it is
+                         --date-format   day-first | month-first, when the
+                                         file is genuinely ambiguous
+  sync-status          When each source last ran, and what it did
 
 Options
   -w, --workspace DIR  Client workspace (default: $AI_EA_WORKSPACE or .)
