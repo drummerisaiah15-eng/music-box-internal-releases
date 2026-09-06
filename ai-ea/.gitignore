@@ -1,0 +1,11 @@
+node_modules/
+*.log
+.DS_Store
+
+# Client workspaces hold real inbox, calendar and financial records. They must
+# never be committed, whatever they are named or wherever they are created.
+clients/
+workspaces/
+*.workspace/
+client.json
+ledger.jsonl
