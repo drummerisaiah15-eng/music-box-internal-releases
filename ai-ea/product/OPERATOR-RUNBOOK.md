@@ -22,7 +22,7 @@ computed, not estimated.
 
 ```bash
 git clone git@github.com:drummerisaiah15-eng/ai-ea.git ~/ai-ea
-cd ~/ai-ea && npm test          # 228 tests, nothing to install
+cd ~/ai-ea && npm test          # 273 tests, nothing to install
 
 cp -r skills/*   ~/.claude/skills/
 cp -r commands/* ~/.claude/commands/
@@ -208,17 +208,59 @@ could not resolve" gets answered in one.
 
 ## Running it unattended
 
-The engine is deterministic and scriptable, so the mechanical half can run on a
-schedule and land in your inbox:
+Declare the fetchers once per client in `fetchers.json`, then let cron drive it:
 
-```cron
-0 6  * * 1-5  cd ~/clients/northside && ai-ea brief     | mail -s "Brief" you@…
-0 12 * * 1-5  cd ~/clients/northside && ai-ea followups | mail -s "Chases" you@…
-0 17 * * 5    cd ~/clients/northside && ai-ea reconcile | mail -s "Weekly" you@…
+```json
+{
+  "sources": {
+    "gcal": {
+      "collection": "calendar", "mode": "full", "everyMinutes": 60,
+      "command": ["claude", "-p",
+        "Fetch this calendar between {{since}} and {{until}}. Print ONLY a JSON array of {sourceId,title,start,end,location}."]
+    },
+    "gmail-receipts": {
+      "collection": "documents", "everyMinutes": 240,
+      "command": ["claude", "-p",
+        "Find receipts in mail between {{since}} and {{until}}. Print ONLY a JSON array of {sourceId,date,entity,docType,counterparty,amountCents,extension}. Do not guess a category."]
+    },
+    "statement-drop": {
+      "collection": "statements", "kind": "file-drop", "everyMinutes": 1440,
+      "directory": "~/Dropbox/northside", "account": "amex-1005", "entity": "NMS"
+    }
+  }
+}
 ```
 
-What cron cannot do is the judgement: reading mail, drafting, adding the
-recommendation to each decision. That is the part you or Claude does.
+```cron
+*/30 * * * *   cd ~/clients/northside && ai-ea fetch
+0 6  * * 1-5   cd ~/clients/northside && ai-ea brief      | mail -s "Brief"  you@…
+0 12 * * 1-5   cd ~/clients/northside && ai-ea followups  | mail -s "Chases" you@…
+0 8  * * *     cd ~/clients/northside && ai-ea fetch-status | grep -q STALE && \
+                 ai-ea fetch-status | mail -s "Feeds gone quiet" you@…
+0 17 * * 5     cd ~/clients/northside && ai-ea reconcile  | mail -s "Weekly" you@…
+```
+
+`ai-ea fetch` only runs what is due, so a half-hourly cron is cheap. Each source
+has its own interval, and a failing one backs off rather than filling the log.
+
+Three things worth understanding before you trust it:
+
+**A failure never advances the watermark.** The window is anchored on the last
+*successful* fetch, so a run of failures widens it instead of leaving a hole.
+Nothing is skipped over silently — which is the whole reason this is worth
+building rather than a `while true` loop.
+
+**Windows overlap on purpose.** Each fetch re-asks for a couple of hours before
+the last success, because sources backdate: an email arrives timestamped
+yesterday, someone edits a meeting that already happened. The merge is
+idempotent, so the overlap costs nothing.
+
+**The file-drop adapter needs no credentials.** The client exports a CSV into a
+shared folder and it is read on the next run. This is often the best statement
+route: nothing to authorise, nothing to revoke, and it is the bank's own record.
+
+What cron still cannot do is the judgement — reading mail properly, drafting,
+adding the recommendation to each decision. That remains yours.
 
 ## Two honest limits
 
@@ -236,7 +278,9 @@ but a long-running import will make a simultaneous brief wait a moment.
 
 | Symptom | First check |
 |---|---|
-| Brief looks suspiciously thin | `ai-ea sync-status` — a stale calendar and an empty one look the same |
+| Brief looks suspiciously thin | `ai-ea fetch-status` — a stale feed and an empty one look identical |
+| A fetcher keeps failing | The error is in `fetch-status`. It backs off, it is never given up on |
+| A dropped statement was not imported | It is still in the folder; imported ones move to `imported/` |
 | Reconciliation coverage dropped | Did the statement import cover the whole period? Imports are incremental by design |
 | A category you set has reverted | It cannot. Check you are looking at the right entity's records |
 | Everything is being escalated | `ai-ea readiness` — the profile is probably incomplete |

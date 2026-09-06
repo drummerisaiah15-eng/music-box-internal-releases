@@ -13,7 +13,9 @@
 // Claude Code can call the same commands from cron, and the deliverables are
 // identical.
 
+const childProcess = require('node:child_process');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const { parseArgs } = require('node:util');
 
@@ -25,6 +27,7 @@ const client = require('./client');
 const brief = require('./brief');
 const sync = require('./sync');
 const csv = require('./csv');
+const fetcher = require('./fetch');
 
 const LEDGER_FILE = 'ledger.jsonl';
 const CLIENT_FILE = 'client.json';
@@ -33,6 +36,7 @@ const STATEMENTS_FILE = 'statements.json';
 const CALENDAR_FILE = 'calendar.json';
 const APPROVALS_FILE = 'approvals.json';
 const SYNC_STATE_FILE = 'sync-state.json';
+const FETCHERS_FILE = 'fetchers.json';
 
 class UsageError extends Error {}
 
@@ -214,6 +218,37 @@ const CLIENT_TEMPLATE = {
   voice: { register: 'direct, warm, brief', signOff: 'Thanks,', avoid: [] },
 };
 
+// Commented by example rather than left empty: the shape of a fetcher is the
+// thing people get wrong, and `enabled: false` means the template cannot run
+// until someone has actually read it.
+const FETCHERS_TEMPLATE = {
+  sources: {
+    gcal: {
+      enabled: false,
+      collection: 'calendar',
+      mode: 'full',
+      everyMinutes: 60,
+      horizonDays: 14,
+      command: ['claude', '-p', 'Fetch this calendar between {{since}} and {{until}} and print ONLY a JSON array of {sourceId,title,start,end,location}.'],
+    },
+    'gmail-receipts': {
+      enabled: false,
+      collection: 'documents',
+      everyMinutes: 240,
+      command: ['claude', '-p', 'Find receipts and invoices in mail between {{since}} and {{until}}. Print ONLY a JSON array of {sourceId,date,entity,docType,counterparty,amountCents,extension}. Do not guess a category.'],
+    },
+    'statement-drop': {
+      enabled: false,
+      collection: 'statements',
+      kind: 'file-drop',
+      directory: '~/Dropbox/statements',
+      account: 'REPLACE-ME',
+      entity: 'REPLACE-ME',
+      everyMinutes: 1440,
+    },
+  },
+};
+
 const COMMANDS = {
   init(workspace, { values }) {
     fs.mkdirSync(workspace, { recursive: true });
@@ -225,6 +260,7 @@ const COMMANDS = {
     fs.writeFileSync(clientPath, `${JSON.stringify(profile, null, 2)}\n`, 'utf8');
     for (const [file, seed] of [
       [DOCUMENTS_FILE, []], [STATEMENTS_FILE, []], [CALENDAR_FILE, []], [APPROVALS_FILE, []],
+      [FETCHERS_FILE, FETCHERS_TEMPLATE],
     ]) {
       const target = path.join(workspace, file);
       if (!fs.existsSync(target)) fs.writeFileSync(target, `${JSON.stringify(seed, null, 2)}\n`, 'utf8');
@@ -425,6 +461,97 @@ const COMMANDS = {
     };
   },
 
+  fetch(workspace, { values, positionals }) {
+    const sources = fetcher.normalizeConfig(readJson(path.join(workspace, FETCHERS_FILE), { sources: {} }));
+    if (sources.length === 0) {
+      return {
+        text: `No fetchers configured. Add them to ${FETCHERS_FILE} — see product/OPERATOR-RUNBOOK.md.`,
+        data: { due: [], skipped: [], results: [] },
+      };
+    }
+
+    const at = values.now ?? new Date().toISOString();
+    const state = readJson(path.join(workspace, SYNC_STATE_FILE), {});
+    const plan = fetcher.duePlan(sources, { sources: state.fetchers ?? {} }, at, {
+      force: Boolean(values.force),
+      only: positionals[0] ?? values.source ?? null,
+    });
+
+    const only = positionals[0] ?? values.source ?? null;
+    if (only && plan.due.length === 0 && plan.skipped.length === 0) {
+      throw new UsageError(
+        `no fetcher matches "${only}". Configured: ${sources.map(source => source.name).join(', ')}.`,
+      );
+    }
+
+    const results = [];
+    for (const { source, window } of plan.due) {
+      // The subprocess runs OUTSIDE the workspace lock. A fetcher can take
+      // minutes, and holding the lock across it would block the brief someone
+      // is waiting on for no reason — nothing is being written yet.
+      const outcome = source.kind === 'file-drop'
+        ? runFileDrop(source, workspace)
+        : runCommand(source, window);
+
+      if (!outcome.ok) {
+        writeState(workspace, previous => fetcher.recordAttempt(previous, {
+          source, at, ok: false, reason: outcome.reason, window,
+        }));
+        results.push({ source: source.name, ok: false, reason: outcome.reason });
+        continue;
+      }
+
+      // Merging and the watermark move together, under the lock.
+      const merged = withWorkspaceLock(workspace, () => {
+        const file = path.join(workspace, sync.COLLECTIONS[source.collection].file);
+        const result = sync.merge({
+          collection: source.collection,
+          source: source.name,
+          mode: source.mode,
+          now: at,
+          existing: readJson(file, []),
+          incoming: outcome.records,
+        });
+        writeJson(file, result.records);
+        writeJson(
+          path.join(workspace, SYNC_STATE_FILE),
+          fetcher.recordAttempt(
+            sync.recordSyncState(readJson(path.join(workspace, SYNC_STATE_FILE), {}), {
+              source: source.name, collection: source.collection, at, mode: source.mode, report: result.report,
+            }),
+            {
+              source,
+              at,
+              ok: true,
+              window,
+              counts: { added: result.report.added.length, updated: result.report.updated.length },
+            },
+          ),
+        );
+        return result;
+      });
+
+      results.push({ source: source.name, ok: true, report: merged.report, note: outcome.note ?? null });
+    }
+
+    return { text: renderFetch(plan, results), data: { plan, results } };
+  },
+
+  'fetch-status': (workspace, { values }) => {
+    const sources = fetcher.normalizeConfig(readJson(path.join(workspace, FETCHERS_FILE), { sources: {} }));
+    if (sources.length === 0) return { text: 'No fetchers configured.', data: [] };
+    const state = readJson(path.join(workspace, SYNC_STATE_FILE), {});
+    const health = fetcher.healthReport(sources, state, values.now ?? new Date().toISOString());
+    const lines = health.map(row =>
+      `${row.stale ? '[STALE] ' : '        '}${row.name} → ${row.collection}: ${row.note}`
+      + (row.lastError ? `\n          last error: ${row.lastError}` : ''));
+    const stale = health.filter(row => row.stale).length;
+    lines.push('', stale === 0
+      ? 'All sources are current.'
+      : `${stale} source${stale === 1 ? ' has' : 's have'} gone quiet — a stale feed and an empty one look identical in the brief.`);
+    return { text: lines.join('\n'), data: health };
+  },
+
   'sync-status': (workspace) => {
     const state = readJson(path.join(workspace, SYNC_STATE_FILE), {});
     const sources = Object.entries(state.sources ?? {});
@@ -468,6 +595,116 @@ const COMMANDS = {
     return { text: lines.join('\n'), data: result };
   },
 };
+
+/**
+ * Run a configured fetcher and read its records off stdout.
+ *
+ * `shell: false` is the important part: the command is an argv array from the
+ * workspace's own config, and window values are ISO timestamps this process
+ * generated, so there is no shell for anything to be injected into.
+ */
+function runCommand(source, window) {
+  const argv = fetcher.renderCommand(source, window);
+  const result = childProcess.spawnSync(argv[0], argv.slice(1), {
+    encoding: 'utf8',
+    timeout: source.timeoutSeconds * 1000,
+    cwd: source.cwd ?? undefined,
+    shell: false,
+    maxBuffer: 64 * 1024 * 1024,
+    env: { ...process.env, ...fetcher.fetchEnvironment(source, window) },
+  });
+
+  return fetcher.interpretOutput({
+    status: result.status,
+    stdout: result.stdout,
+    stderr: result.stderr,
+    timedOut: result.error?.code === 'ETIMEDOUT' || result.signal === 'SIGTERM',
+    error: result.error && result.error.code !== 'ETIMEDOUT' ? result.error.message : null,
+  });
+}
+
+/**
+ * Import every statement export dropped into a watched folder.
+ *
+ * The adapter that needs no credentials at all: a client exports a CSV, drops
+ * it in a shared folder, and it is read on the next run. Imported files are
+ * moved to an archive rather than deleted, because a statement that was read
+ * wrongly has to be re-readable.
+ */
+function runFileDrop(source, workspace) {
+  const directory = path.resolve(workspace, source.directory.replace(/^~(?=\/|$)/, os.homedir()));
+  if (!fs.existsSync(directory)) {
+    return { ok: false, reason: `the watched folder does not exist: ${directory}` };
+  }
+
+  const files = fs.readdirSync(directory)
+    .filter(name => /\.(csv|tsv|txt)$/i.test(name))
+    .sort();
+  if (files.length === 0) return { ok: true, records: [], note: 'nothing new in the folder' };
+
+  const archive = path.resolve(directory, source.archiveTo);
+  const records = [];
+  const imported = [];
+  const problems = [];
+
+  for (const name of files) {
+    const file = path.join(directory, name);
+    try {
+      const result = csv.importStatementCsv(fs.readFileSync(file, 'utf8'), {
+        account: source.account,
+        entity: source.entity ?? undefined,
+        dateFormat: source.dateFormat ?? undefined,
+      });
+      records.push(...result.records);
+      imported.push(`${name} (${result.records.length} rows, ${result.report.signConvention})`);
+      fs.mkdirSync(archive, { recursive: true });
+      fs.renameSync(file, path.join(archive, name));
+    } catch (error) {
+      // One unreadable export must not stop the others, and the file stays put
+      // so it can be looked at rather than vanishing into an archive.
+      problems.push(`${name}: ${error.message}`);
+    }
+  }
+
+  if (records.length === 0 && problems.length > 0) {
+    return { ok: false, reason: problems.join('; ') };
+  }
+  return {
+    ok: true,
+    records,
+    note: [imported.length ? `imported ${imported.join(', ')}` : null,
+      problems.length ? `left in place: ${problems.join('; ')}` : null].filter(Boolean).join('; '),
+  };
+}
+
+function writeState(workspace, update) {
+  return withWorkspaceLock(workspace, () => {
+    const file = path.join(workspace, SYNC_STATE_FILE);
+    const next = update(readJson(file, {}));
+    writeJson(file, next);
+    return next;
+  });
+}
+
+function renderFetch(plan, results) {
+  const lines = [];
+  for (const result of results) {
+    if (!result.ok) {
+      lines.push(`FAILED  ${result.source}: ${result.reason}`);
+      continue;
+    }
+    lines.push(sync.summariseReport(result.report));
+    if (result.note) lines.push(`        ${result.note}`);
+  }
+  for (const skip of plan.skipped) lines.push(`skipped ${skip.name}: ${skip.reason}`);
+  if (lines.length === 0) lines.push('Nothing was due.');
+  const failed = results.filter(result => !result.ok).length;
+  if (failed > 0) {
+    lines.push('', `${failed} fetcher${failed === 1 ? '' : 's'} failed. Nothing was skipped over — `
+      + 'the window is anchored on the last success, so the next run asks for the same period again.');
+  }
+  return lines.join('\n');
+}
 
 function financeSnapshot(workspace, values) {
   const documents = readCollection(workspace, DOCUMENTS_FILE);
@@ -558,6 +795,12 @@ Records
   audit-files [paths]  Check an existing archive against the convention
   reconcile            Match statement lines to documents
   cpa-packet           Year-end packet with its own gap list
+
+Unattended
+  fetch [source]       Run the fetchers that are due and merge what they return
+                         --force         run even if not due
+                         --source NAME   just this one
+  fetch-status         Which sources have gone quiet, and why
 
 Sync
   sync <collection>    Merge fetched records in, preserving your own edits

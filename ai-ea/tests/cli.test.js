@@ -410,6 +410,172 @@ test('the lock is released even when the operation fails', () => {
     JSON.stringify({ id: 'ok', title: 'x', lane: 'project', source: 's' })]));
 });
 
+// --- unattended fetch ---
+
+function script(dir, name, body) {
+  const file = path.join(dir, name);
+  fs.writeFileSync(file, body, { mode: 0o755 });
+  return file;
+}
+
+function fetchers(dir, sources) {
+  fs.writeFileSync(path.join(dir, 'fetchers.json'), JSON.stringify({ sources }, null, 2));
+}
+
+test('a command fetcher runs and its records are merged', () => {
+  const dir = workspace();
+  const bin = script(dir, 'f.sh', '#!/bin/sh\necho \'[{"sourceId":"ev-1","title":"Standup","start":"2026-09-06T15:00:00Z","end":"2026-09-06T16:00:00Z"}]\'\n');
+  fetchers(dir, { gcal: { collection: 'calendar', mode: 'full', command: [bin] } });
+
+  const result = run(['fetch', '--workspace', dir, '--now', NOW]);
+  assert.match(result.text, /1 added/);
+  assert.equal(readJson(dir, 'calendar.json').length, 1);
+  assert.match(run(['brief', '--workspace', dir, '--now', NOW]).text, /Standup/);
+});
+
+test('the fetcher receives the window as arguments and environment', () => {
+  const dir = workspace();
+  const bin = script(dir, 'f.sh', '#!/bin/sh\necho "[{\\"sourceId\\":\\"$1|$AI_EA_COLLECTION\\",\\"title\\":\\"T\\",\\"start\\":\\"2026-09-06T15:00:00Z\\",\\"end\\":\\"2026-09-06T16:00:00Z\\"}]"\n');
+  fetchers(dir, { gcal: { collection: 'calendar', command: [bin, '{{since}}'] } });
+
+  run(['fetch', '--workspace', dir, '--now', NOW]);
+  const id = readJson(dir, 'calendar.json')[0]._sync.sourceId;
+  assert.match(id, /^2026-.*\|calendar$/);
+});
+
+// The rule the fetch layer exists to keep.
+test('a failing fetcher does not advance the watermark', () => {
+  const dir = workspace();
+  const bin = script(dir, 'f.sh', '#!/bin/sh\necho "token expired" >&2\nexit 3\n');
+  fetchers(dir, { gcal: { collection: 'calendar', command: [bin] } });
+
+  const result = run(['fetch', '--workspace', dir, '--now', NOW]);
+  assert.match(result.text, /FAILED\s+gcal/);
+  assert.match(result.text, /token expired/);
+
+  const state = readJson(dir, 'sync-state.json');
+  assert.equal(state.fetchers.gcal.lastSuccessAt, null);
+  assert.equal(state.fetchers.gcal.consecutiveFailures, 1);
+  assert.equal(readJson(dir, 'calendar.json').length, 0);
+});
+
+test('a fetcher printing junk fails cleanly rather than writing it', () => {
+  const dir = workspace();
+  const bin = script(dir, 'f.sh', '#!/bin/sh\necho "not json at all"\n');
+  fetchers(dir, { gcal: { collection: 'calendar', command: [bin] } });
+
+  assert.match(run(['fetch', '--workspace', dir, '--now', NOW]).text, /not JSON/);
+  assert.equal(readJson(dir, 'calendar.json').length, 0);
+});
+
+test('a missing executable is reported, not thrown as a stack trace', () => {
+  const dir = workspace();
+  fetchers(dir, { gcal: { collection: 'calendar', command: ['/nonexistent/fetcher'] } });
+  assert.match(run(['fetch', '--workspace', dir, '--now', NOW]).text, /FAILED\s+gcal/);
+});
+
+test('a fetcher that exceeds its timeout is killed and reported', () => {
+  const dir = workspace();
+  const bin = script(dir, 'f.sh', '#!/bin/sh\nsleep 5\n');
+  fetchers(dir, { gcal: { collection: 'calendar', command: [bin], timeoutSeconds: 1 } });
+  const result = run(['fetch', '--workspace', dir, '--now', NOW]);
+  assert.match(result.text, /FAILED\s+gcal/);
+  assert.equal(readJson(dir, 'sync-state.json').fetchers.gcal.consecutiveFailures, 1);
+});
+
+test('a second run inside the interval does nothing', () => {
+  const dir = workspace();
+  const bin = script(dir, 'f.sh', '#!/bin/sh\necho \'[{"sourceId":"ev-1","title":"T","start":"2026-09-06T15:00:00Z","end":"2026-09-06T16:00:00Z"}]\'\n');
+  fetchers(dir, { gcal: { collection: 'calendar', command: [bin], everyMinutes: 60 } });
+
+  run(['fetch', '--workspace', dir, '--now', NOW]);
+  const again = run(['fetch', '--workspace', dir, '--now', '2026-09-06T14:01:00Z']);
+  assert.match(again.text, /not due until/);
+  assert.match(run(['fetch', '--workspace', dir, '--now', '2026-09-06T14:01:00Z', '--force']).text, /unchanged/);
+});
+
+test('a watched folder imports statements and archives what it read', () => {
+  const dir = workspace();
+  const drop = path.join(dir, 'drop');
+  fs.mkdirSync(drop);
+  fs.writeFileSync(path.join(drop, 'march.csv'),
+    'Date,Description,Amount\n2026-03-14,SWEETWATER,-1284.99\n2026-03-09,DELTA AIR,-612.40\n');
+  fetchers(dir, { drop: { collection: 'statements', kind: 'file-drop', directory: drop, account: 'amex', entity: 'BIZ' } });
+
+  const result = run(['fetch', '--workspace', dir, '--now', NOW]);
+  assert.match(result.text, /2 added/);
+  assert.equal(fs.existsSync(path.join(drop, 'march.csv')), false, 'the file is moved, not left to re-import');
+  assert.equal(fs.existsSync(path.join(drop, 'imported', 'march.csv')), true, 'and archived, not deleted');
+  assert.equal(readJson(dir, 'statements.json')[0].entity, 'BIZ');
+});
+
+test('an unreadable export is left in place for a human to look at', () => {
+  const dir = workspace();
+  const drop = path.join(dir, 'drop');
+  fs.mkdirSync(drop);
+  fs.writeFileSync(path.join(drop, 'bad.csv'), 'Date,Description,Amount\n03/04/2026,X,-10.00\n');
+  fetchers(dir, { drop: { collection: 'statements', kind: 'file-drop', directory: drop, account: 'amex' } });
+
+  assert.match(run(['fetch', '--workspace', dir, '--now', NOW]).text, /FAILED/);
+  assert.equal(fs.existsSync(path.join(drop, 'bad.csv')), true);
+});
+
+test('an empty watched folder is a success, not a failure', () => {
+  const dir = workspace();
+  const drop = path.join(dir, 'drop');
+  fs.mkdirSync(drop);
+  fetchers(dir, { drop: { collection: 'statements', kind: 'file-drop', directory: drop, account: 'amex' } });
+  run(['fetch', '--workspace', dir, '--now', NOW]);
+  assert.equal(readJson(dir, 'sync-state.json').fetchers.drop.consecutiveFailures, 0);
+});
+
+test('fetch-status separates a stale feed from a healthy one', () => {
+  const dir = workspace();
+  const bin = script(dir, 'f.sh', '#!/bin/sh\necho \'[{"sourceId":"e","title":"T","start":"2026-09-06T15:00:00Z","end":"2026-09-06T16:00:00Z"}]\'\n');
+  fetchers(dir, { gcal: { collection: 'calendar', command: [bin], everyMinutes: 60 } });
+  run(['fetch', '--workspace', dir, '--now', NOW]);
+
+  assert.match(run(['fetch-status', '--workspace', dir, '--now', '2026-09-06T14:30:00Z']).text, /All sources are current/);
+  const later = run(['fetch-status', '--workspace', dir, '--now', '2026-09-07T14:00:00Z']);
+  assert.match(later.text, /\[STALE\]/);
+  assert.match(later.text, /gone quiet/);
+});
+
+test('one broken fetcher does not stop the others', () => {
+  const dir = workspace();
+  const good = script(dir, 'good.sh', '#!/bin/sh\necho \'[{"sourceId":"e","title":"T","start":"2026-09-06T15:00:00Z","end":"2026-09-06T16:00:00Z"}]\'\n');
+  const bad = script(dir, 'bad.sh', '#!/bin/sh\nexit 1\n');
+  fetchers(dir, {
+    gcal: { collection: 'calendar', command: [good] },
+    mail: { collection: 'documents', command: [bad] },
+  });
+  const result = run(['fetch', '--workspace', dir, '--now', NOW]);
+  assert.match(result.text, /1 added/);
+  assert.match(result.text, /FAILED\s+mail/);
+  assert.equal(readJson(dir, 'calendar.json').length, 1);
+});
+
+test('naming a fetcher that does not exist is an error, not silence', () => {
+  const dir = workspace();
+  fetchers(dir, { gcal: { collection: 'calendar', command: ['/bin/true'] } });
+  assert.throws(() => run(['fetch', '--workspace', dir, '--source', 'nope', '--now', NOW]), /no fetcher matches/);
+});
+
+test('a workspace with no fetchers says so rather than failing', () => {
+  const dir = workspace();
+  fs.writeFileSync(path.join(dir, 'fetchers.json'), JSON.stringify({ sources: {} }));
+  assert.match(run(['fetch', '--workspace', dir, '--now', NOW]).text, /No fetchers configured/);
+});
+
+test('the scaffolded fetchers are disabled until someone reads them', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'virtual-ea-'));
+  run(['init', '--workspace', dir]);
+  const config = readJson(dir, 'fetchers.json');
+  for (const [name, entry] of Object.entries(config.sources)) {
+    assert.equal(entry.enabled, false, `${name} would run against a template`);
+  }
+});
+
 test('an unknown command points at the help rather than failing obscurely', () => {
   assert.throws(() => run(['teleport']), /unknown command "teleport"/);
 });

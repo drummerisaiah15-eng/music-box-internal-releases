@@ -110,6 +110,57 @@ shape you are producing is wrong, so fix the fetch rather than the data.
 usually fine. For a receipt it means a document disappeared from the client's
 storage, which is worth a question.
 
+## Running it without you
+
+`ai-ea fetch` runs the configured fetchers that are due and merges what they
+return. A fetcher is any command that prints a JSON array to stdout, declared
+in the workspace's `fetchers.json`:
+
+```json
+{
+  "sources": {
+    "gcal": {
+      "collection": "calendar", "mode": "full", "everyMinutes": 60,
+      "command": ["claude", "-p",
+        "Fetch this calendar between {{since}} and {{until}}. Print ONLY a JSON array of {sourceId,title,start,end,location}."]
+    },
+    "statement-drop": {
+      "collection": "statements", "kind": "file-drop", "everyMinutes": 1440,
+      "directory": "~/Dropbox/northside", "account": "amex-1005", "entity": "NMS"
+    }
+  }
+}
+```
+
+`{{since}}` and `{{until}}` are substituted into the arguments, and also arrive
+as `AI_EA_SINCE` / `AI_EA_UNTIL`. The window starts a little before the last
+**successful** fetch, so records that arrive backdated — an email timestamped
+yesterday, an edit to a meeting that already happened — are still picked up.
+
+**When you are the fetcher, print only the array.** A log line before it is
+tolerated, but anything else is refused rather than half-read. Set `sourceId`
+to the source's own id for every record; without it the same receipt lands
+again every run.
+
+The `file-drop` kind needs no credentials at all: a client exports a CSV into a
+shared folder and it is read on the next run, then moved to `imported/` rather
+than deleted, because a statement read wrongly has to be re-readable.
+
+### What a failure means
+
+A failed fetch does not advance the watermark, so the next run asks for the
+same period again — nothing is quietly skipped. Repeated failures back off
+exponentially so a revoked token stops filling the log, and `ai-ea fetch-status`
+names anything that has gone quiet:
+
+```
+[STALE] gcal → calendar: last success 19 hours ago, expected every 1 hour
+          last error: the fetcher exited 3: token expired
+```
+
+Check that before trusting a thin brief. A stale feed and an empty one produce
+exactly the same output, and only one of them is real.
+
 ## Cadence
 
 - **Calendar** — before every brief. It is the fastest-moving thing you hold.

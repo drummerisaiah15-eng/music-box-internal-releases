@@ -18,7 +18,7 @@ Three claims, each enforced by tested code rather than by prompt text:
 ```
 ai-ea/
   src/                 the engine — judgement-free, tested, deterministic
-  tests/               228 tests, no dependencies beyond Node
+  tests/               273 tests, no dependencies beyond Node
   skills/              how the assistant works: doctrine and per-area craft
   commands/            /ea-brief, /ea-triage, /ea-research, /ea-week, …
   agents/              deep research and backlog-sweep subagents
@@ -35,7 +35,7 @@ drafting and explanation. The engine supplies the arithmetic and the rules.
 ## Quick start
 
 ```bash
-npm test                                    # 228 tests, no install needed
+npm test                                    # 273 tests, no install needed
 
 node src/cli.js init -w ~/clients/acme --client acme
 $EDITOR ~/clients/acme/client.json          # authority limits, entities, voice
@@ -51,12 +51,21 @@ node src/cli.js brief
 ```
 
 Fetching is deliberately not the engine's job — that needs network, auth and a
-live connector, none of which can be tested or replayed. Claude holds the
-connectors and produces the records; the engine owns the merge, which is where
-the hard problems are. Bank data needs no connector at all:
+live connector, none of which can be tested or replayed. So a *fetcher* is any
+command that prints JSON records to stdout, declared in the workspace's
+`fetchers.json`. Claude running headlessly is one; a watched folder a client
+drops statements into is another and needs no credentials at all:
 
 ```bash
-node src/cli.js import-csv ~/Downloads/amex-march.csv --account amex-1005
+node src/cli.js fetch          # runs whatever is due, merges what comes back
+node src/cli.js fetch-status   # what has gone quiet, and why
+```
+
+Put `ai-ea fetch` on a half-hourly cron and the mechanical half runs itself.
+Bank data can also go in directly:
+
+```bash
+node src/cli.js import-csv ~/Downloads/amex-march.csv --account amex-1005 --entity NMS
 ```
 
 ```
@@ -99,6 +108,7 @@ For Dana Reyes.
 | `reconcile` / `cpa-packet` | Match charges to documents; year-end packet with its own gap list |
 | `sync` / `import-csv` | Merge fetched records or a bank export in, preserving your own edits |
 | `sync-status` | When each source last ran, and what it did |
+| `fetch` / `fetch-status` | Run the fetchers that are due; report anything gone quiet |
 
 Every command takes `--format json` for scripting and `--now` to freeze the
 clock, which makes output reproducible. Full surface: `node src/cli.js --help`.
@@ -134,6 +144,11 @@ entity assignments are merged three-way: the engine remembers what the feed
 last supplied, so a field a person has since changed is theirs forever, while
 an untouched field still improves when extraction does. A material change
 underneath somebody's classification is reported rather than applied silently.
+
+**A failed fetch never advances the watermark.** The window is anchored on the
+last *successful* fetch, so failures widen it rather than leaving a hole. A
+reconciliation gap caused by a fetch that quietly failed three weeks ago is
+exactly the error this exists not to make.
 
 **Only a full sync can conclude something was deleted.** An incremental fetch
 returns what changed, so absence means nothing — treating it as deletion would
