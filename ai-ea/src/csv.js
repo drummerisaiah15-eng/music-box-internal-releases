@@ -348,6 +348,8 @@ function importStatementCsv(text, options = {}) {
       // it is left unset here and inferred below from the file as a whole.
       direction: usedDebitCredit ? (cents < 0 ? 'debit' : 'credit') : undefined,
       account: options.account ?? 'unspecified',
+      // Which set of books this account belongs to, when the caller knows.
+      entity: options.entity,
     });
   });
 

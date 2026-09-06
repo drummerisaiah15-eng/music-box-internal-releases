@@ -340,6 +340,9 @@ const COMMANDS = {
     const packet = finance.cpaPacket({
       taxYear: Number(values.year ?? new Date().getFullYear()),
       entity: values.entity ?? profile.entities[0].code,
+      // The profile knows how many sets of books exist, so it decides whether
+      // an unattributed account is genuinely ambiguous.
+      knownEntities: profile.entities.map(record => record.code),
       documents: readCollection(workspace, DOCUMENTS_FILE),
       statementLines: readCollection(workspace, STATEMENTS_FILE),
       preparedOn: values.now?.slice(0, 10),
@@ -390,6 +393,7 @@ const COMMANDS = {
     const text = fs.readFileSync(path.resolve(file), 'utf8');
     const { records, report } = csv.importStatementCsv(text, {
       account: values.account,
+      entity: values.entity,
       dateFormat: values['date-format'],
       delimiter: values.delimiter,
     });

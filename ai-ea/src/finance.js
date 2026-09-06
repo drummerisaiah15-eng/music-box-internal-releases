@@ -85,6 +85,10 @@ function normalizeStatementLine(input, index) {
     date: requireDateString(input.date, `statement line ${index} date`),
     description: typeof input.description === 'string' ? input.description.trim() : '',
     amountCents,
+    // Which set of books this account belongs to. Optional because a CSV export
+    // does not say, but a line without it cannot be attributed to an entity and
+    // is reported as such rather than silently counted against one.
+    entity: input.entity ? slug(String(input.entity), `statement line ${index} entity`, { maxLength: 24 }).toUpperCase() : null,
     // Only money leaving the account needs a receipt behind it. A card payment,
     // a transfer in, or an interest credit counted as "unreceipted exposure"
     // inflates the one number this whole exercise reports, so the direction is
@@ -383,21 +387,48 @@ function findGaps(documents) {
  * what is still missing. A packet that hides its own gaps wastes a billable
  * hour and a round trip.
  */
-function cpaPacket({ taxYear, entity, documents = [], statementLines = [], preparedOn }, options = {}) {
+function cpaPacket({ taxYear, entity, documents = [], statementLines = [], preparedOn, knownEntities = null }, options = {}) {
   if (!Number.isInteger(taxYear)) fail('cpaPacket requires an integer taxYear');
   const entityCode = slug(entity ?? 'ENTITY', 'entity', { maxLength: 24 }).toUpperCase();
   const preparedDate = requireDateString(preparedOn ?? new Date().toISOString().slice(0, 10), 'preparedOn');
 
-  const inYear = documents.filter(doc => normalizeDocument(doc).taxYear === taxYear);
-  const linesInYear = statementLines.filter(line =>
-    Number(requireDateString(line.date, 'statement line date').slice(0, 4)) === taxYear);
+  // Scope is tax year AND entity. Filtering on the year alone would put a
+  // personal receipt into the business packet, which is precisely the mixing
+  // that declaring entities exists to prevent — and it would do it silently,
+  // inflating a business total with money that was never the business's.
+  const inYear = documents.filter(doc => {
+    const record = normalizeDocument(doc);
+    return record.taxYear === taxYear && record.entity === entityCode;
+  });
+
+  // A statement line that names an entity is filtered the same way. One that
+  // does not is still included, because an unattributed account holding real
+  // spending is exposure, and dropping it would hide that. It is reported
+  // instead, so the answer is "tell me whose account this is", not silence.
+  const allLinesInYear = statementLines
+    .map((line, index) => normalizeStatementLine(line, index))
+    .filter(line => Number(line.date.slice(0, 4)) === taxYear);
+  const linesInYear = allLinesInYear.filter(line => line.entity === null || line.entity === entityCode);
+  const unattributedLines = linesInYear.filter(line => line.entity === null);
 
   const reconciliation = reconcile(linesInYear, inYear, options);
   const summary = categorySummary(inYear);
   const gaps = findGaps(inYear);
 
-  const blocking = gaps.filter(gap => gap.severity === 'blocking').length;
+  // An unattributed account is only a question when there is more than one
+  // answer. A client with a single set of books has nowhere else the charges
+  // could belong, and asking anyway is the kind of noise that teaches people to
+  // skim the open questions — which is where the real ones live.
+  const attributionIsAmbiguous = Array.isArray(knownEntities) && knownEntities.length > 1;
+  const accountsNeedingAttribution = attributionIsAmbiguous
+    ? [...new Set(unattributedLines.map(line => line.account))]
+    : [];
+  const blocking = gaps.filter(gap => gap.severity === 'blocking').length
+    + accountsNeedingAttribution.length;
   const openQuestions = [
+    ...accountsNeedingAttribution.map(account =>
+      `Account "${account}" is not attributed to an entity, so its charges are being counted `
+      + `against ${entityCode} by default — confirm whose books it belongs to.`),
     ...gaps.filter(gap => gap.severity === 'blocking').map(gap => `${gap.issue} — ${gap.ask}`),
     ...reconciliation.unreceipted.slice(0, 25).map(row =>
       `${row.date} ${row.description || '(no description)'} ${formatMoney(Math.abs(row.amountCents))} has no receipt — locate it or confirm it was personal.`),
@@ -420,6 +451,11 @@ function cpaPacket({ taxYear, entity, documents = [], statementLines = [], prepa
       + 'conclusion has been reached here.',
     documentCount: inYear.length,
     statementLineCount: linesInYear.length,
+    excludedOtherEntity: {
+      documents: documents.length - inYear.length,
+      statementLines: allLinesInYear.length - linesInYear.length,
+    },
+    unattributedAccounts: accountsNeedingAttribution,
     totals: {
       businessTotal: formatMoney(summary.businessTotalCents),
       businessTotalCents: summary.businessTotalCents,

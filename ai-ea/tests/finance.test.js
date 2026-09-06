@@ -185,6 +185,60 @@ test('a clean file reports itself ready', () => {
   assert.equal(packet.readiness, 100);
 });
 
+// Filtering on the year alone put a personal receipt into the business packet
+// and inflated the business total with money that was never the business's.
+test('the packet is scoped to one entity, not just one year', () => {
+  const packet = cpaPacket({
+    taxYear: 2026,
+    entity: 'MBX',
+    documents: [
+      doc({ id: 'biz', entity: 'MBX', amountCents: 100000, category: 'equipment' }),
+      doc({ id: 'personal', entity: 'PERS', amountCents: 50000, category: 'meals', businessPurpose: 'x', attendees: ['y'] }),
+    ],
+    statementLines: [],
+    preparedOn: '2026-09-06',
+  });
+  assert.equal(packet.documentCount, 1);
+  assert.equal(packet.totals.businessTotalCents, 100000, 'the personal receipt must not reach the business total');
+  assert.equal(packet.excludedOtherEntity.documents, 1);
+});
+
+test('statement lines are scoped by entity when they declare one', () => {
+  const packet = cpaPacket({
+    taxYear: 2026,
+    entity: 'MBX',
+    documents: [],
+    statementLines: [
+      { id: 'ours', date: '2026-03-14', description: 'A', amount: '-10.00', entity: 'MBX' },
+      { id: 'theirs', date: '2026-03-14', description: 'B', amount: '-99.00', entity: 'PERS' },
+    ],
+    preparedOn: '2026-09-06',
+  });
+  assert.equal(packet.statementLineCount, 1);
+  assert.equal(packet.excludedOtherEntity.statementLines, 1);
+});
+
+// Dropping an unattributed account would hide real spending; counting it
+// silently would misattribute it. It is counted and asked about.
+test('an unattributed account is asked about when the client has several entities', () => {
+  const args = {
+    taxYear: 2026,
+    entity: 'MBX',
+    documents: [],
+    statementLines: [{ id: 'l', date: '2026-03-14', description: 'A', amount: '-10.00', account: 'amex-1005' }],
+    preparedOn: '2026-09-06',
+  };
+  const ambiguous = cpaPacket({ ...args, knownEntities: ['MBX', 'PERS'] });
+  assert.equal(ambiguous.statementLineCount, 1, 'still counted, not dropped');
+  assert.deepEqual(ambiguous.unattributedAccounts, ['amex-1005']);
+  assert.match(ambiguous.openQuestions.join(' '), /confirm whose books it belongs to/);
+  assert.equal(ambiguous.readyToSend, false);
+
+  // One set of books means there is no other answer, so no question.
+  const unambiguous = cpaPacket({ ...args, knownEntities: ['MBX'] });
+  assert.deepEqual(unambiguous.unattributedAccounts, []);
+});
+
 test('documents from another tax year are excluded from the packet', () => {
   const packet = cpaPacket({
     taxYear: 2026,

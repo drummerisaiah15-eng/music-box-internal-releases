@@ -18,7 +18,7 @@ Three claims, each enforced by tested code rather than by prompt text:
 ```
 ai-ea/
   src/                 the engine — judgement-free, tested, deterministic
-  tests/               222 tests, no dependencies beyond Node
+  tests/               228 tests, no dependencies beyond Node
   skills/              how the assistant works: doctrine and per-area craft
   commands/            /ea-brief, /ea-triage, /ea-research, /ea-week, …
   agents/              deep research and backlog-sweep subagents
@@ -35,7 +35,7 @@ drafting and explanation. The engine supplies the arithmetic and the rules.
 ## Quick start
 
 ```bash
-npm test                                    # 222 tests, no install needed
+npm test                                    # 228 tests, no install needed
 
 node src/cli.js init -w ~/clients/acme --client acme
 $EDITOR ~/clients/acme/client.json          # authority limits, entities, voice
@@ -140,6 +140,12 @@ returns what changed, so absence means nothing — treating it as deletion would
 silently empty a calendar. Withdrawn records are marked, never removed, and
 drop out of briefs and reconciliations while staying in the file as history.
 
+**A packet is scoped to one entity, not just one year.** Filtering on the year
+alone put a personal receipt into the business packet and inflated the business
+total with money that was never the business's — the exact mixing that
+declaring entities exists to prevent. An account that names no entity is still
+counted, because dropping it would hide real spending, and asked about instead.
+
 **An ambiguous statement is refused, not guessed.** `03/04/2026` is either
 3 April or 4 March, and no row in the file may prove which. The importer says
 so and names the remedy rather than picking one and misfiling a quarter.
@@ -157,6 +163,9 @@ so and names the remedy rather than picking one and misfiling a quarter.
   directory. This is the document that closes security-conscious buyers.
 - **`OFFER.md`** — positioning, tiering, pricing logic, the demo that actually
   closes, and answers to the objections that come up every time.
+- **`OPERATOR-RUNBOOK.md`** — how to actually run it: install, per-client setup,
+  the daily and weekly rhythm, what survives a re-sync, and what to check first
+  when something looks wrong.
 
 ## Scope boundary
 
