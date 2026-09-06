@@ -51,6 +51,67 @@ function readJson(file, fallback) {
 // The ledger is JSON Lines so appending a single event is an atomic append
 // rather than a read-modify-write of the whole history. Two processes filing
 // commitments at once cannot lose each other's work.
+const LOCK_FILE = '.workspace.lock';
+const LOCK_TIMEOUT_MS = 5000;
+const LOCK_STALE_MS = 30000;
+
+/**
+ * Hold an exclusive lock while reading, validating and writing a workspace file.
+ *
+ * Every mutation here is read-modify-write, and validation happens against what
+ * was read. Two processes interleaving inside that window — a scheduled sync
+ * and an interactive session, say — could each validate a change as consistent
+ * and then both write, producing exactly the duplicate-id log that cannot be
+ * read back and can only be repaired by hand.
+ *
+ * `wx` fails if the file already exists, which is atomic on every platform that
+ * matters, so it is the lock. A lock left behind by a killed process is
+ * reclaimed once it is clearly stale rather than blocking the workspace
+ * forever.
+ */
+function withWorkspaceLock(workspace, operation) {
+  const lockPath = path.join(workspace, LOCK_FILE);
+  const deadline = Date.now() + LOCK_TIMEOUT_MS;
+  const idle = new Int32Array(new SharedArrayBuffer(4));
+  let handle;
+
+  for (;;) {
+    try {
+      handle = fs.openSync(lockPath, 'wx');
+      break;
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      try {
+        if (Date.now() - fs.statSync(lockPath).mtimeMs > LOCK_STALE_MS) {
+          fs.unlinkSync(lockPath);
+          continue;
+        }
+      } catch {
+        continue;   // it vanished under us; try to take it
+      }
+      if (Date.now() > deadline) {
+        throw new UsageError(
+          `another process is writing to ${workspace} and did not finish within `
+          + `${LOCK_TIMEOUT_MS / 1000}s. Retry, or remove ${LOCK_FILE} if nothing else is running.`,
+        );
+      }
+      Atomics.wait(idle, 0, 0, 25);
+    }
+  }
+
+  try {
+    fs.writeSync(handle, `${process.pid}`);
+    return operation();
+  } finally {
+    fs.closeSync(handle);
+    try {
+      fs.unlinkSync(lockPath);
+    } catch {
+      // Already gone (reclaimed as stale); nothing to undo.
+    }
+  }
+}
+
 function writeJson(file, value) {
   fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
 }
@@ -72,6 +133,10 @@ function readLedger(workspace) {
 }
 
 function appendEvent(workspace, event) {
+  return withWorkspaceLock(workspace, () => appendEventLocked(workspace, event));
+}
+
+function appendEventLocked(workspace, event) {
   // Validate against the state the event will actually land in, not just its
   // own shape. The consistency rules — the commitment must exist, it must not
   // already be closed, a drop must state a reason, an id must be unique — live
@@ -296,22 +361,25 @@ const COMMANDS = {
 
     const file = path.join(workspace, spec.file);
     const at = values.now ?? new Date().toISOString();
-    const { records, report } = sync.merge({
-      collection,
-      source,
-      mode: values.mode ?? 'incremental',
-      now: at,
-      existing: readJson(file, []),
-      incoming,
-    });
 
-    writeJson(file, records);
-    writeJson(
-      path.join(workspace, SYNC_STATE_FILE),
-      sync.recordSyncState(readJson(path.join(workspace, SYNC_STATE_FILE), {}), {
-        source, collection, at, mode: report.mode, report, cursor: values.cursor ?? null,
-      }),
-    );
+    const report = withWorkspaceLock(workspace, () => {
+      const merged = sync.merge({
+        collection,
+        source,
+        mode: values.mode ?? 'incremental',
+        now: at,
+        existing: readJson(file, []),
+        incoming,
+      });
+      writeJson(file, merged.records);
+      writeJson(
+        path.join(workspace, SYNC_STATE_FILE),
+        sync.recordSyncState(readJson(path.join(workspace, SYNC_STATE_FILE), {}), {
+          source, collection, at, mode: merged.report.mode, report: merged.report, cursor: values.cursor ?? null,
+        }),
+      );
+      return merged.report;
+    });
     return { text: sync.summariseReport(report), data: report };
   },
 
@@ -333,18 +401,20 @@ const COMMANDS = {
     // Always incremental. A statement export covers a date range, so treating
     // it as the full picture would mark every transaction outside that range as
     // withdrawn — silently emptying the year.
-    const merged = sync.merge({
-      collection: 'statements', source, mode: 'incremental', now: at,
-      existing: readJson(target, []), incoming: records,
+    const merged = withWorkspaceLock(workspace, () => {
+      const result = sync.merge({
+        collection: 'statements', source, mode: 'incremental', now: at,
+        existing: readJson(target, []), incoming: records,
+      });
+      writeJson(target, result.records);
+      writeJson(
+        path.join(workspace, SYNC_STATE_FILE),
+        sync.recordSyncState(readJson(path.join(workspace, SYNC_STATE_FILE), {}), {
+          source, collection: 'statements', at, mode: 'incremental', report: result.report,
+        }),
+      );
+      return result;
     });
-
-    writeJson(target, merged.records);
-    writeJson(
-      path.join(workspace, SYNC_STATE_FILE),
-      sync.recordSyncState(readJson(path.join(workspace, SYNC_STATE_FILE), {}), {
-        source, collection: 'statements', at, mode: 'incremental', report: merged.report,
-      }),
-    );
     return {
       text: `${csv.summariseImport(report)}\n\n${sync.summariseReport(merged.report)}`,
       data: { import: report, merge: merged.report },

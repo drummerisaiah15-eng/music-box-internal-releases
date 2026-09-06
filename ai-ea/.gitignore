@@ -9,3 +9,6 @@ workspaces/
 *.workspace/
 client.json
 ledger.jsonl
+
+# Held only while a command is mid-write.
+*.lock

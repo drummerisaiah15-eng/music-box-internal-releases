@@ -372,6 +372,44 @@ test('sync-status says so plainly before anything has been synced', () => {
   assert.match(run(['sync-status', '--workspace', workspace()]).text, /Nothing has been synced/);
 });
 
+// Every mutation is read-modify-write and validated against what was read. Two
+// processes interleaving inside that window could each judge a change
+// consistent and both write, producing the duplicate-id log that cannot be read
+// back at all.
+test('a stale lock is reclaimed rather than blocking the workspace forever', () => {
+  const dir = workspace();
+  const lock = path.join(dir, '.workspace.lock');
+  fs.writeFileSync(lock, '999999');
+  fs.utimesSync(lock, new Date(Date.now() - 120000), new Date(Date.now() - 120000));
+
+  assert.doesNotThrow(() => run(['add', '--workspace', dir, '--at', '2026-09-01T09:00:00Z', '--json',
+    JSON.stringify({ id: 'c1', title: 'x', lane: 'project', source: 's' })]));
+  assert.equal(fs.existsSync(lock), false, 'the lock is released afterwards');
+});
+
+test('a live lock is respected and reported, not silently ignored', () => {
+  const dir = workspace();
+  const lock = path.join(dir, '.workspace.lock');
+  fs.writeFileSync(lock, '1');   // fresh mtime: a process is mid-write
+
+  assert.throws(
+    () => run(['add', '--workspace', dir, '--at', '2026-09-01T09:00:00Z', '--json',
+      JSON.stringify({ id: 'c1', title: 'x', lane: 'project', source: 's' })]),
+    /another process is writing/,
+  );
+  fs.unlinkSync(lock);
+  assert.equal(fs.readFileSync(path.join(dir, 'ledger.jsonl'), 'utf8').trim(), '', 'nothing was written');
+});
+
+test('the lock is released even when the operation fails', () => {
+  const dir = workspace();
+  assert.throws(() => run(['add', '--workspace', dir, '--json',
+    JSON.stringify({ id: 'bad', title: 'x', lane: 'nope', source: 's' })]));
+  assert.equal(fs.existsSync(path.join(dir, '.workspace.lock')), false);
+  assert.doesNotThrow(() => run(['add', '--workspace', dir, '--at', '2026-09-01T09:00:00Z', '--json',
+    JSON.stringify({ id: 'ok', title: 'x', lane: 'project', source: 's' })]));
+});
+
 test('an unknown command points at the help rather than failing obscurely', () => {
   assert.throws(() => run(['teleport']), /unknown command "teleport"/);
 });
