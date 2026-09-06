@@ -2610,7 +2610,12 @@ test('MB1188-069: the sync delivery channel needs a signed-in session', () => {
   // proved who they are.
   assert.match(handler, /_requireAppRole\(COMMUNICATION_ROLES\);/);
   assert.match(handler, /if \(!_boundedString\(rawName, 120\) \|\| !_validStaffAuthRecord\(record\)\) continue;/);
-  assert.match(handler, /if \(!_incomingStaffAuthRecordWins\(record, records\[key\]\)\) continue;/);
+  // MB1188-096 moved the version comparison into consider(), because a signed-in
+  // session is now necessary but no longer sufficient: winning on version gets a
+  // record considered, and taking a passcode AWAY additionally needs the owner or
+  // the person themselves. The rule is asserted by execution further down.
+  assert.match(handler, /_incomingStaffAuthRecordWins\(record, records\[key\]\)/);
+  assert.match(handler, /_staffAuthRecordRelaxesProtection\(record, records\[key\]\) &&/);
 });
 
 test('MB1188-069: wrong passcodes are rate-limited, and a right one clears the count', () => {
@@ -3132,4 +3137,166 @@ test('P0-3: retrying the same directory after an Owner signs in settles it', () 
   const again = owner.api.importDirectory(published);
   assert.equal(again.applied, true);
   assert.equal(owner.api.roleOf('Ana Chaves'), 'Operations Manager');
+});
+
+// ── MB1188-096: a signed-in profile could strip somebody else's passcode ─────
+//
+// Found by Codex, reproduced here before it was changed. The DIRECT removal
+// handler has always required the owner, or the person themselves with their
+// current passcode. The synchronized handler required only a signed-in session
+// of any role, and applied whatever record won on version — so a Front Desk
+// session could post {version: n+1, cleared: true} for an Operations Manager
+// and then sign in as that manager with nothing.
+//
+// A brace matcher that understands comments, because the handler this slices
+// contains apostrophes inside them and the file's older extractor would run
+// straight past the end of the function.
+function bodyAfter(source, from) {
+  let i = source.indexOf('{', from);
+  let depth = 0;
+  for (; i < source.length; i += 1) {
+    const c = source[i];
+    const n = source[i + 1];
+    if (c === '/' && n === '/') { i = source.indexOf('\n', i); if (i === -1) break; continue; }
+    if (c === '/' && n === '*') { i = source.indexOf('*/', i + 2) + 1; continue; }
+    if (c === '"' || c === "'" || c === '`') {
+      const q = c; i += 1;
+      for (; i < source.length; i += 1) {
+        if (source[i] === '\\') { i += 1; continue; }
+        if (source[i] === q) break;
+      }
+      continue;
+    }
+    if (c === '{') depth += 1;
+    else if (c === '}') { depth -= 1; if (depth === 0) return source.slice(source.indexOf('{', from) + 1, i); }
+  }
+  throw new Error('unterminated handler body');
+}
+
+function passcodeSyncApi(startingVault) {
+  let vault = JSON.parse(JSON.stringify(startingVault));
+  const context = vm.createContext({
+    console: { warn() {}, error() {}, log() {} },
+    JSON, Object, Number, String, Boolean, Array, Math, Date, Error, Set, Buffer,
+    OWNER_AUTH_ITERATIONS: 310000,
+    STAFF_AUTH_VAULT_KEY: 'app_staff_auth_v1',
+    STAFF_AUTH_DEFERRED_VAULT_KEY: 'app_staff_auth_deferred_v1',
+    MAX_DEFERRED_STAFF_AUTH_RECORDS: 64,
+    MAX_STAFF_AUTH_VERSION: 1000000000,
+    COMMUNICATION_ROLES: new Set(
+      ['Owner', 'Operations Manager', 'Operations & Events', 'Front Desk']),
+    session: null,
+    _requireAppRole(allowed) {
+      const active = context.session;
+      if (!active || !allowed.has(active.role)) throw new Error('Sign in first.');
+      return active;
+    },
+    _isPlainObject: v => !!v && typeof v === 'object' && !Array.isArray(v),
+    _boundedString: (v, n) => typeof v === 'string' && v.length > 0 && v.length <= n,
+    _loadSecretVault: () => JSON.parse(JSON.stringify(vault)),
+    _saveSecretVault: next => { vault = JSON.parse(JSON.stringify(next)); },
+    _staffAuthRecords: v => ({ ...(v.app_staff_auth_v1 || {}) }),
+    _normalizeStaffProfileName: n => String(n || '').trim().replace(/\s+/g, ' '),
+  });
+  const start = main.indexOf("_secureHandle('app-session-apply-staff-passcodes'");
+  assert.notEqual(start, -1);
+  vm.runInContext(`
+    ${extractFunction(main, '_incomingStaffAuthRecordWins')}
+    ${extractFunction(main, '_validOwnerVerifier')}
+    ${extractFunction(main, '_validStaffAuthRecord')}
+    ${extractFunction(main, '_staffAuthName')}
+    ${extractFunction(main, '_staffAuthRecordRelaxesProtection')}
+    ${extractFunction(main, '_sessionMayRelaxStaffPasscode')}
+    ${extractFunction(main, '_deferredStaffAuthRecords')}
+    this.apply = async (as, incoming) => {
+      this.session = as;
+      const _ = null;
+      ${bodyAfter(main, main.indexOf('=>', start))}
+    };
+  `, context);
+  return {
+    apply: (as, incoming) => context.apply(as, incoming),
+    passcodes: () => vault.app_staff_auth_v1 || {},
+    heldRecords: () => vault.app_staff_auth_deferred_v1 || {},
+  };
+}
+
+// Shaped exactly as _validOwnerVerifier demands: a 16-byte salt and a 32-byte
+// verifier. A fixture the validator would reject proves nothing about a handler
+// whose first act is to validate.
+const VERIFIER = Object.freeze({
+  salt: Buffer.alloc(16, 7).toString('base64'),
+  verifier: Buffer.alloc(32, 9).toString('base64'),
+  iterations: 310000,
+});
+const PROTECTED = {
+  app_staff_auth_v1: { 'megan hart': { version: 3, active: { ...VERIFIER } } },
+};
+const OWNER = { name: 'Elizabeth Chaves', role: 'Owner' };
+const FRONT_DESK = { name: 'Ana Chaves', role: 'Front Desk' };
+const MEGAN = { name: 'Megan Hart', role: 'Operations Manager' };
+const REMOVAL = { 'megan hart': { version: 4, cleared: true } };
+
+test('MB1188-096: a Front Desk session cannot strip a manager passcode through sync', async () => {
+  const api = passcodeSyncApi(PROTECTED);
+  const result = await api.apply(FRONT_DESK, REMOVAL);
+  assert.equal(result.applied, 0, 'the removal is not applied');
+  assert.equal(api.passcodes()['megan hart'].cleared, undefined,
+    'and Megan is still protected — this is the escalation itself');
+  assert.ok(api.passcodes()['megan hart'].active, 'her verifier is untouched');
+});
+
+test('MB1188-096: the owner and the person themselves still can', async () => {
+  const asOwner = passcodeSyncApi(PROTECTED);
+  assert.equal((await asOwner.apply(OWNER, REMOVAL)).applied, 1);
+  assert.equal(asOwner.passcodes()['megan hart'].cleared, true);
+
+  const asSelf = passcodeSyncApi(PROTECTED);
+  assert.equal((await asSelf.apply(MEGAN, REMOVAL)).applied, 1,
+    'removing your own passcode from your own session is the ordinary path');
+  assert.equal(asSelf.passcodes()['megan hart'].cleared, true);
+});
+
+test('MB1188-096: a removal it may not apply is held, not dropped', async () => {
+  // Dropping it would leave the two Macs disagreeing forever about whether
+  // somebody has a passcode. It waits for a session that may settle it.
+  const api = passcodeSyncApi(PROTECTED);
+  const first = await api.apply(FRONT_DESK, REMOVAL);
+  assert.equal(first.held, 1, 'kept aside');
+  assert.deepEqual(Object.keys(api.heldRecords()), ['megan hart']);
+
+  // Another Front Desk sync changes nothing either way.
+  await api.apply(FRONT_DESK, {});
+  assert.equal(api.passcodes()['megan hart'].cleared, undefined, 'still protected');
+
+  // Megan signs in — with the passcode that is still in force — and it settles.
+  const settled = await api.apply(MEGAN, {});
+  assert.equal(settled.applied, 1, 'the held removal is applied now that she is here');
+  assert.equal(api.passcodes()['megan hart'].cleared, true);
+  assert.deepEqual(api.heldRecords(), {}, 'and nothing is left waiting');
+});
+
+test('MB1188-096: SETTING a passcode still applies under any session', async () => {
+  // It can only ever take access away, so it needs no special authority — and
+  // gating it would leave the other Mac unprotected until an owner appeared.
+  const api = passcodeSyncApi({ app_staff_auth_v1: {} });
+  const result = await api.apply(FRONT_DESK, {
+    'megan hart': { version: 1, active: { ...VERIFIER } },
+  });
+  assert.equal(result.applied, 1);
+  assert.ok(api.passcodes()['megan hart'].active);
+});
+
+test('MB1188-096: a tombstone over a profile with no passcode is not a privilege change', async () => {
+  // Nothing is in force, so applying it grants nobody anything — and refusing
+  // it would stall convergence over a record that changes no access at all.
+  const api = passcodeSyncApi({ app_staff_auth_v1: {} });
+  const result = await api.apply(FRONT_DESK, REMOVAL);
+  assert.equal(result.applied, 1);
+  assert.equal(api.passcodes()['megan hart'].cleared, true);
+});
+
+test('MB1188-096: signed out, the sync channel still refuses everything', async () => {
+  const api = passcodeSyncApi(PROTECTED);
+  await assert.rejects(() => api.apply(null, REMOVAL), /Sign in first/);
 });

@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>The Music Box — Internal Operations</title>
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'sha256-09MJNy5mXwcb0+YlluJgphh85Li3fuWUpzgTocHo8EU=' https://www.google.com/recaptcha/ https://www.gstatic.com/recaptcha/; script-src-attr 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' https://firestore.googleapis.com https://identitytoolkit.googleapis.com https://securetoken.googleapis.com https://firebaseappcheck.googleapis.com https://*.firebaseio.com wss://*.firebaseio.com https://www.google.com https://www.recaptcha.net; frame-src https://www.google.com/recaptcha/ https://recaptcha.google.com/recaptcha/ https://www.recaptcha.net/; object-src 'none'; base-uri 'none'; form-action 'none';">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'sha256-J2aagEBp4cuE9eTNZhDPzAaY6x5+InY78fp6HIWNzUQ=' https://www.google.com/recaptcha/ https://www.gstatic.com/recaptcha/; script-src-attr 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' https://firestore.googleapis.com https://identitytoolkit.googleapis.com https://securetoken.googleapis.com https://firebaseappcheck.googleapis.com https://*.firebaseio.com wss://*.firebaseio.com https://www.google.com https://www.recaptcha.net; frame-src https://www.google.com/recaptcha/ https://recaptcha.google.com/recaptcha/ https://www.recaptcha.net/; object-src 'none'; base-uri 'none'; form-action 'none';">
   <!-- Pinned, release-vendored dependencies; no runtime CDN execution. -->
   <script src="./vendor/firebase-12.15.0/firebase-app-compat.js" defer></script>
   <script src="./vendor/firebase-12.15.0/firebase-auth-compat.js" defer></script>
@@ -7567,6 +7567,24 @@ function _validateSyncRecordList(key, list) {
     const seenKey = state + '\u0000' + idText;
     if (seen.has(seenKey)) throw new Error(`${where} repeats ${identity} "${idText}"`);
     seen.add(seenKey);
+    // MB1188-097: a field the app iterates has to be something it can iterate.
+    //
+    // `tags: {unexpected: 'object'}` satisfied every check here — it has an id,
+    // no duplicate, no oversized string — and then took the whole Daily Log
+    // down: three separate read sites do `(l.tags || []).map`, `.join`, and a
+    // spread, and an object is truthy, so `|| []` never rescues any of them.
+    // One malformed record arriving through sync, import or a partial write
+    // made the page unrenderable. Refusing here quarantines the incoming value
+    // and leaves the local one intact, which is this validator's whole contract.
+    // Inlined rather than read from a constant beside this function: four test
+    // harnesses slice this function on its own, and a module-level binding is
+    // invisible to every one of them.
+    for (const field of ['tags']) {
+      const fieldValue = record[field];
+      if (fieldValue !== undefined && fieldValue !== null && !Array.isArray(fieldValue)) {
+        throw new Error(`${where} has a "${field}" that is not a list`);
+      }
+    }
     for (const [field, fieldValue] of Object.entries(record)) {
       if (typeof fieldValue === 'string' && fieldValue.length > MAX_SYNC_FIELD_CHARS) {
         throw new Error(`${where} has an oversized "${field}"`);
@@ -8488,7 +8506,47 @@ async function _reconcileRemoteSnapshot(key, snap) {
       _syncDeliveryErrors.delete(key);
       return { exists: true, accepted: false };
     }
-    return { exists: true, accepted: false, localPending: true };
+    // MB1188-095: an unreadable record with an unsent change could not move.
+    //
+    // MB1188-093 quarantines a record this Mac cannot decrypt: nothing writes
+    // over it and it is never delivered. If such a record ALSO had a pending
+    // operation, the two guards locked against each other — the pending
+    // operation stopped the cloud copy that would have repaired it, and the
+    // quarantine stopped the delivery that would have retired the pending
+    // operation. The instruction on screen, to use Force Sync on the other Mac,
+    // could not resolve it either: that Mac's write is just another operation
+    // this early return refuses. Codex reproduced the deadlock; this is the way
+    // out of it.
+    //
+    // The unsent edit is not discarded to escape. Both ciphertexts and the
+    // incoming value go into a recovery snapshot FIRST, and if that snapshot
+    // cannot be written the deadlock is preferred to a silent loss.
+    const repairsUnreadableRecord = _lockedStorageKeys.has(key) &&
+      remoteRevision >= localRevision;
+    if (!repairsUnreadableRecord) {
+      return { exists: true, accepted: false, localPending: true };
+    }
+    let unsentEditPreserved = false;
+    try {
+      _createSyncConflictBackup([key], 'unreadable-record-repair', {
+        requirePending: false,
+        remoteSnapshots: new Map([[key, { rawValue: remote.value, revision: remoteRevision }]]),
+      });
+      unsentEditPreserved = true;
+    } catch (backupError) {
+      console.warn(`[sync] ${key} could not be read here and its unsent change could ` +
+        'not be copied anywhere safe, so nothing was touched:',
+        backupError?.message || backupError);
+    }
+    if (!unsentEditPreserved) {
+      return { exists: true, accepted: false, localPending: true, unreadable: true };
+    }
+    localStorage.removeItem(_pendingSyncStorageKey(key));
+    showToast(
+      `"${key}" could not be read on this Mac, so the cloud copy has replaced it. ` +
+      'An unsent change was saved to a recovery snapshot first — nothing was thrown away.',
+      'warning');
+    // Falls through: the incoming copy is now free to repair the record.
   }
   if (remoteRevision < localRevision) {
     if (hasLocal) _ensureCurrentValuePending(key);
@@ -19633,7 +19691,7 @@ function editLog(id) {
   _logEditVersion = l.version ?? 0;
   document.getElementById('log-date').value = l.date;
   document.getElementById('log-body').value = l.body;
-  document.getElementById('log-tags').value = (l.tags || []).join(', ');
+  document.getElementById('log-tags').value = _recordTags(l).join(', ');
   document.getElementById('log-editing-id').value = id;
   document.getElementById('log-save-btn').textContent = 'Update Entry';
   document.getElementById('log-cancel-edit-btn').style.display = '';
@@ -19682,6 +19740,19 @@ function getRecoverableDeletedLogs() {
     .filter(l => l?._deleted && Array.isArray(l._conflicts) && l._conflicts.length);
 }
 
+// MB1188-097: the one way to read a record's tags.
+//
+// _validateSyncRecordList refuses malformed tags at the door from now on, but a
+// record that arrived BEFORE it did is already on disk, and a rendering path
+// that throws takes the whole page with it. This returns something safe to
+// iterate whatever it is handed, so a bad record costs its own tags rather
+// than everybody's Daily Log. It never rewrites what is stored.
+function _recordTags(record) {
+  const tags = record?.tags;
+  if (!Array.isArray(tags)) return [];
+  return tags.filter(tag => typeof tag === 'string' || typeof tag === 'number');
+}
+
 function renderLogs() {
   // MB161-008: the log page renders array order. Sort here too rather than
   // trusting whatever order storage happens to be in — an older record list
@@ -19710,7 +19781,7 @@ function renderLogs() {
   const filtered = logs.filter(l => {
     if (authorFilter && l.author !== authorFilter) return false;
     if (!terms.length) return true;
-    const haystack = [l.body, l.author, ...(l.tags || [])].join(' ').toLowerCase();
+    const haystack = [l.body, l.author, ..._recordTags(l)].join(' ').toLowerCase();
     return terms.every(t => haystack.includes(t));
   });
   const visibleLogs = filtered.slice(0, 100);
@@ -19749,7 +19820,7 @@ function renderLogs() {
   document.getElementById('log-entries').innerHTML = visibleLogs.map(l => {
     const bodyHtml   = _logHighlight(escHtml(l.body), terms);
     const authorHtml = _logHighlight(escHtml(l.author), terms);
-    const tagsHtml   = (l.tags || []).map(t =>
+    const tagsHtml   = _recordTags(l).map(t =>
       `<span class="log-tag">#${_logHighlight(escHtml(t), terms)}</span>`
     ).join('');
     return `
@@ -23351,7 +23422,7 @@ async function policyAskQuestion() {
       .slice(0, 60);
     if (recentLogs.length) {
       logContext = recentLogs.map(l =>
-        `[${String(l.date || '').slice(0, 40)}${l.author ? ' – ' + String(l.author).slice(0, 120) : ''}]${l.tags?.length ? ' #' + l.tags.map(tag => String(tag).slice(0, 80)).join(' #') : ''}\n${String(l.body || '').slice(0, 4000)}`
+        `[${String(l.date || '').slice(0, 40)}${l.author ? ' – ' + String(l.author).slice(0, 120) : ''}]${_recordTags(l).length ? ' #' + _recordTags(l).map(tag => String(tag).slice(0, 80)).join(' #') : ''}\n${String(l.body || '').slice(0, 4000)}`
       ).join('\n\n').slice(0, 50000);
     }
   } catch (_) {}

@@ -1942,6 +1942,23 @@ function _ownerAuthRecord(vault) {
 // Only ever the PBKDF2 verifier — the passcode itself is never stored, synced,
 // or written anywhere.
 const STAFF_AUTH_VAULT_KEY = 'app_staff_auth_v1';
+// MB1188-096: synchronized passcode records that this session may not apply.
+//
+// A record that REMOVES a passcode is a privilege change: applying it makes an
+// Operations Manager signable-into with nothing. The direct removal handler has
+// always required the owner, or the person themselves with their current
+// passcode. The sync channel required only a signed-in session of any role — so
+// a Front Desk session could post {version: n+1, cleared: true} for a manager
+// and then sign in as that manager. Codex reproduced exactly that, and it was
+// reproduced again here before this was changed.
+//
+// Records are no longer dropped or trusted blindly. One that this session has
+// no authority to apply is HELD here and applied the moment an authorized
+// session appears — the owner, or the person the record is about. That keeps
+// the two Macs converging without letting any signed-in profile relax somebody
+// else's protection.
+const STAFF_AUTH_DEFERRED_VAULT_KEY = 'app_staff_auth_deferred_v1';
+const MAX_DEFERRED_STAFF_AUTH_RECORDS = 64;
 const STAFF_AUTH_ROLE = 'Operations Manager';
 // Named rather than written out at the call site: three hand-written copies of
 // a role list have already gone stale in this file (MB161-045).
@@ -2067,6 +2084,33 @@ function _incomingStaffAuthRecordWins(incoming, held) {
   const heldCleared = held.cleared === true;
   if (incomingCleared !== heldCleared) return incomingCleared;
   return JSON.stringify(incoming) > JSON.stringify(held);
+}
+
+// Does applying `incoming` take protection away that is in force right now?
+// Setting a passcode, or a tombstone over a profile that already has none,
+// grants nobody anything and needs no special authority.
+function _staffAuthRecordRelaxesProtection(incoming, held) {
+  return incoming.cleared === true && !!held && held.cleared !== true;
+}
+
+// Who may take a passcode away: the owner, or its owner. The same rule the
+// direct handler enforces, applied to the synchronized path.
+function _sessionMayRelaxStaffPasscode(session, key) {
+  if (!session) return false;
+  if (session.role === 'Owner') return true;
+  return _staffAuthName(session.name) === key;
+}
+
+function _deferredStaffAuthRecords(vault) {
+  const held = vault[STAFF_AUTH_DEFERRED_VAULT_KEY];
+  if (!_isPlainObject(held)) return {};
+  const clean = {};
+  for (const [key, record] of Object.entries(held)) {
+    // Same forgiving read as the live list: one malformed entry must never
+    // stop the rest from being applied (MB1188-060).
+    if (_boundedString(key, 120) && _validStaffAuthRecord(record)) clean[key] = record;
+  }
+  return clean;
 }
 
 function _recordStaffAuthFailure(key) {
@@ -2253,28 +2297,73 @@ _secureHandle('app-session-clear-staff-passcode', async (_, request) => {
 // newer decision wins whichever Mac made it and a stale copy can never restore
 // a passcode that was removed.
 _secureHandle('app-session-apply-staff-passcodes', async (_, incoming) => {
-  // COMMUNICATION_ROLES is every role main defines, so this reads as "any
-  // signed-in session" — which is exactly the requirement. Sync only runs after
-  // sign-in, so nothing legitimate is turned away, and the login screen, which
-  // holds no session, can no longer post a tombstone that would strip a
-  // passcode before anybody has proved who they are.
-  _requireAppRole(COMMUNICATION_ROLES);
+  // A signed-in session is necessary and, since MB1188-096, no longer
+  // sufficient. The login screen holds no session, so it still cannot post a
+  // tombstone before anybody has proved who they are; and a session that IS
+  // signed in still cannot take somebody else's passcode away — see below.
+  const session = _requireAppRole(COMMUNICATION_ROLES);
   if (!_isPlainObject(incoming)) return { ok: true, applied: 0 };
   const vault = _loadSecretVault();
   const records = _staffAuthRecords(vault);
+  const deferred = _deferredStaffAuthRecords(vault);
   let applied = 0;
-  for (const [rawName, record] of Object.entries(incoming)) {
-    if (!_boundedString(rawName, 120) || !_validStaffAuthRecord(record)) continue;
-    const key = String(rawName).toLocaleLowerCase('en-US');
-    if (!_incomingStaffAuthRecordWins(record, records[key])) continue;
+  let held = 0;
+
+  // MB1188-096: apply what this session is allowed to apply; HOLD the rest.
+  //
+  // Setting a passcode is applied under any session — it can only ever take
+  // access away. Removing one is a privilege change and needs the same
+  // authority the direct handler demands: the owner, or the person themselves.
+  const consider = (key, record) => {
+    if (!_incomingStaffAuthRecordWins(record, records[key])) return;
+    if (_staffAuthRecordRelaxesProtection(record, records[key]) &&
+        !_sessionMayRelaxStaffPasscode(session, key)) {
+      // Kept, not discarded: dropping it would leave the two Macs permanently
+      // disagreeing about whether somebody has a passcode.
+      if (_incomingStaffAuthRecordWins(record, deferred[key])) {
+        deferred[key] = record;
+        held += 1;
+      }
+      return;
+    }
     records[key] = record;
     applied += 1;
+    delete deferred[key];
+  };
+
+  for (const [rawName, record] of Object.entries(incoming)) {
+    if (!_boundedString(rawName, 120) || !_validStaffAuthRecord(record)) continue;
+    consider(String(rawName).toLocaleLowerCase('en-US'), record);
   }
-  if (applied) {
+
+  // Anything held earlier that THIS session may now apply — the owner signing
+  // in, or the person the record is about — settles here.
+  for (const [key, record] of Object.entries({ ...deferred })) {
+    if (!_sessionMayRelaxStaffPasscode(session, key)) continue;
+    if (_incomingStaffAuthRecordWins(record, records[key])) {
+      records[key] = record;
+      applied += 1;
+    }
+    delete deferred[key];
+  }
+
+  const heldKeys = Object.keys(deferred);
+  if (heldKeys.length > MAX_DEFERRED_STAFF_AUTH_RECORDS) {
+    // Bounded like every other list main persists. Oldest by version first.
+    heldKeys.sort((a, b) => (deferred[a].version || 0) - (deferred[b].version || 0));
+    for (const key of heldKeys.slice(0, heldKeys.length - MAX_DEFERRED_STAFF_AUTH_RECORDS)) {
+      delete deferred[key];
+    }
+  }
+
+  if (applied || held || heldKeys.length !== Object.keys(
+    _deferredStaffAuthRecords(vault)).length) {
     vault[STAFF_AUTH_VAULT_KEY] = { ...records };
+    if (Object.keys(deferred).length) vault[STAFF_AUTH_DEFERRED_VAULT_KEY] = { ...deferred };
+    else delete vault[STAFF_AUTH_DEFERRED_VAULT_KEY];
     _saveSecretVault(vault);
   }
-  return { ok: true, applied };
+  return { ok: true, applied, held: Object.keys(deferred).length };
 });
 
 _secureHandle('app-session-list-profiles', async () => ({

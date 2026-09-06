@@ -6718,3 +6718,153 @@ test('MB1188-093: an unreadable record is never delivered to Firebase', async ()
   assert.equal(await vm.runInContext('schedule("logs")', context), false,
     'whatever is pending for it was written before it became unreadable');
 });
+
+// ── MB1188-095: the quarantine deadlock Codex found ─────────────────────────
+//
+// MB1188-093 quarantines a record this Mac cannot decrypt: nothing writes over
+// it, and it is never delivered. When such a record ALSO carried an unsent
+// change, the two guards locked against each other — the pending operation made
+// _reconcileRemoteSnapshot return early, so the cloud copy that would have
+// repaired it never landed; and the quarantine made _scheduleSyncDrain refuse,
+// so the pending operation could never retire. Force Sync on the other Mac does
+// not help: that Mac's write is just another operation this early return
+// refuses.
+function reconcileApi({ locked = true, backupFails = false } = {}) {
+  const events = [];
+  const storage = new MemoryStorage();
+  storage.setItem('tmb_staff_notes_revision', '4');
+  storage.setItem('tmb_staff_notes_pending_sync', JSON.stringify({ opId: 'local-op' }));
+  const context = contextWith({
+    localStorage: storage,
+    _decCache: {},
+    _lockedStorageKeys: new Set(locked ? ['staff_notes'] : []),
+    _syncDeliveryErrors: new Map(),
+    _syncDocumentKind: () => 'versioned',
+    _localSyncRevision: () => 4,
+    _readPendingSyncRecord: key =>
+      (storage.getItem('tmb_' + key + '_pending_sync')
+        ? JSON.parse(storage.getItem('tmb_' + key + '_pending_sync')) : null),
+    _pendingSyncStorageKey: key => 'tmb_' + key + '_pending_sync',
+    _acknowledgePendingSyncRecord: () => events.push('acknowledged'),
+    _ensureCurrentValuePending: () => events.push('kept-local-pending'),
+    _createSyncConflictBackup: (keys, reason) => {
+      if (backupFails) throw new Error('local storage is full');
+      events.push(`backup:${keys.join(',')}:${reason}`);
+      return 'backup-id';
+    },
+    _decodeSyncValue: async () => ([{ id: 'n1', body: 'the cloud copy' }]),
+    _persistRemoteValue: async (key, value, revision) => {
+      events.push(`persisted:${key}:${revision}`);
+      context._lockedStorageKeys.delete(key);
+    },
+    _refreshForSyncKey: () => events.push('refreshed'),
+    updateSyncTimestamp: () => events.push('stamped'),
+    showToast: message => events.push(`toast:${message}`),
+  });
+  vm.runInContext(`
+    ${declaration('_reconcileRemoteSnapshot')}
+    globalThis.reconcile = (key, snap) => _reconcileRemoteSnapshot(key, snap);
+  `, context);
+  const snapshot = {
+    exists: true,
+    data: () => ({ value: { format: 'tmb-sync-aes-gcm-v2' }, revision: 9, opId: 'remote-op' }),
+  };
+  return { context, events, storage, run: () => context.reconcile('staff_notes', snapshot) };
+}
+
+test('MB1188-095: the cloud copy repairs an unreadable record that has an unsent change', async () => {
+  const api = reconcileApi();
+  const result = await api.run();
+
+  assert.equal(result.accepted, true, 'the incoming copy is applied instead of refused');
+  assert.ok(api.events.some(e => e.startsWith('backup:staff_notes:unreadable-record-repair')),
+    'and the unsent change is copied somewhere safe FIRST');
+  assert.ok(api.events.some(e => e === 'persisted:staff_notes:9'));
+  assert.equal(api.storage.getItem('tmb_staff_notes_pending_sync'), null,
+    'the pending operation that had nowhere to go is retired');
+  assert.equal(api.context._lockedStorageKeys.has('staff_notes'), false,
+    'and the record is readable again — the deadlock is broken');
+  assert.ok(api.events.some(e => /toast:.*recovery snapshot/.test(e)),
+    'the person is told an unsent change was set aside, not silently dropped');
+});
+
+test('MB1188-095: if the unsent change cannot be preserved, nothing is touched', async () => {
+  // The deadlock is bad. Losing somebody's work to escape it is worse.
+  const api = reconcileApi({ backupFails: true });
+  const result = await api.run();
+
+  assert.equal(result.accepted, false);
+  assert.equal(result.localPending, true);
+  assert.equal(result.unreadable, true, 'and it says why, rather than looking like an ordinary hold');
+  assert.ok(api.storage.getItem('tmb_staff_notes_pending_sync'),
+    'the unsent change is still there');
+  assert.equal(api.context._lockedStorageKeys.has('staff_notes'), true,
+    'and the damaged record is still preserved exactly as it was');
+});
+
+test('MB1188-095: a readable record with a pending change is still held, as before', async () => {
+  // The relaxation is scoped to the quarantined case. An ordinary unsent edit
+  // must still win against an incoming copy, or a rebase would be skipped.
+  const api = reconcileApi({ locked: false });
+  const result = await api.run();
+  assert.equal(result.accepted, false);
+  assert.equal(result.localPending, true);
+  assert.ok(api.storage.getItem('tmb_staff_notes_pending_sync'), 'the edit is untouched');
+  assert.equal(api.events.some(e => e.startsWith('backup:')), false, 'and nothing was set aside');
+});
+
+// ── MB1188-097: one malformed record took down the whole Daily Log ──────────
+test('MB1188-097: a record whose tags are not a list is refused at the door', () => {
+  const context = contextWith({});
+  vm.runInContext(`
+    const MAX_SYNC_RECORDS_PER_KEY = 20000;
+    const MAX_SYNC_FIELD_CHARS = 200000;
+    const SYNC_RECORD_IDENTITY = { logs: 'id', staff_notes: 'id' };
+    ${declaration('_validateSyncRecordList')}
+    globalThis.check = (key, list) => {
+      try { _validateSyncRecordList(key, list); return 'accepted'; }
+      catch (error) { return error.message; }
+    };
+  `, context);
+
+  assert.match(context.check('logs', [{ id: 'l1', tags: { unexpected: 'object' } }]),
+    /has a "tags" that is not a list/,
+    'the shape Codex reproduced is refused, which quarantines the incoming value');
+  assert.match(context.check('logs', [{ id: 'l1', tags: 'front-desk' }]), /not a list/);
+  assert.equal(context.check('logs', [{ id: 'l1', tags: ['front-desk'] }]), 'accepted');
+  assert.equal(context.check('logs', [{ id: 'l1' }]), 'accepted', 'no tags at all is fine');
+  assert.equal(context.check('logs', [{ id: 'l1', tags: null }]), 'accepted');
+});
+
+test('MB1188-097: a malformed record already on disk costs its own tags, not the page', () => {
+  // The validator only guards what arrives from now on. A record written before
+  // it existed is still there, and three separate read sites — the tag chips,
+  // the search filter and the edit form — each threw on it.
+  const context = contextWith({});
+  vm.runInContext(`
+    ${declaration('_recordTags')}
+    globalThis.read = record => {
+      const tags = _recordTags(record);
+      return {
+        chips: tags.map(t => String(t)),
+        search: [record.body, ...tags].join(' '),
+        form: tags.join(', '),
+      };
+    };
+  `, context);
+
+  for (const [label, record] of [
+    ['an object', { body: 'b', tags: { unexpected: 'object' } }],
+    ['a string', { body: 'b', tags: 'front-desk' }],
+    ['a number', { body: 'b', tags: 7 }],
+    ['null', { body: 'b', tags: null }],
+    ['missing', { body: 'b' }],
+  ]) {
+    const out = context.read(record);
+    assert.deepEqual([...out.chips], [], `${label} yields no tags rather than throwing`);
+    assert.equal(out.form, '');
+  }
+  const good = context.read({ body: 'b', tags: ['front-desk', 'urgent'] });
+  assert.deepEqual([...good.chips], ['front-desk', 'urgent'], 'real tags still render');
+  assert.equal(good.form, 'front-desk, urgent');
+});
