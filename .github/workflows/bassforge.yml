@@ -1,0 +1,97 @@
+name: BassForge plug-in
+
+# Builds the BassForge bass effects plug-in for macOS (universal VST3 + AU +
+# standalone app) and Windows (VST3 + standalone), runs its test suite, and
+# uploads ready-to-install zips as workflow artifacts.
+
+on:
+  push:
+    paths:
+      - "BassForge/**"
+      - ".github/workflows/bassforge.yml"
+  pull_request:
+    paths:
+      - "BassForge/**"
+      - ".github/workflows/bassforge.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS (universal)
+            os: macos-latest
+            targets: BassForge_VST3 BassForge_AU BassForge_Standalone BassForgeTests
+          - name: Windows
+            os: windows-latest
+            targets: BassForge_VST3 BassForge_Standalone BassForgeTests
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: BassForge
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DBASSFORGE_COPY_AFTER_BUILD=OFF
+
+      - name: Build
+        run: cmake --build build --config Release --parallel 4 --target ${{ matrix.targets }}
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Validate the Audio Unit (auval)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p ~/Library/Audio/Plug-Ins/Components
+          cp -R build/BassForge_artefacts/Release/AU/BassForge.component ~/Library/Audio/Plug-Ins/Components/
+          killall -9 AudioComponentRegistrar 2>/dev/null || true
+          auval -v aufx Bfrg TMbx
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          out="$GITHUB_WORKSPACE/dist"
+          mkdir -p "$out"
+          cd build/BassForge_artefacts/Release
+          # Ad-hoc sign so Apple Silicon will load the bundles. They are not
+          # notarised; see BassForge/README.md for the one-time unblock step.
+          for bundle in VST3/BassForge.vst3 AU/BassForge.component Standalone/BassForge.app; do
+            codesign --force --deep --sign - "$bundle"
+          done
+          ditto -c -k --keepParent VST3/BassForge.vst3 "$out/BassForge-macOS-VST3.zip"
+          ditto -c -k --keepParent AU/BassForge.component "$out/BassForge-macOS-AU.zip"
+          ditto -c -k --keepParent Standalone/BassForge.app "$out/BassForge-macOS-Standalone.zip"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $out = "$env:GITHUB_WORKSPACE/dist"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Compress-Archive -Path build/BassForge_artefacts/Release/VST3/BassForge.vst3 -DestinationPath "$out/BassForge-Windows-VST3.zip"
+          Compress-Archive -Path build/BassForge_artefacts/Release/Standalone/BassForge.exe -DestinationPath "$out/BassForge-Windows-Standalone.zip"
+
+      - name: Upload plug-ins
+        uses: actions/upload-artifact@v4
+        with:
+          name: BassForge-${{ runner.os }}
+          path: dist/*.zip
+
+      - name: Upload editor screenshots
+        if: always() && runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: BassForge-screenshots
+          path: BassForge/build/screenshots/*.png
+          if-no-files-found: ignore

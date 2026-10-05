@@ -1,0 +1,4 @@
+# Build output (any build directory name)
+build/
+build-*/
+cmake-build-*/
