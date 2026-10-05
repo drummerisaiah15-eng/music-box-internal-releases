@@ -228,9 +228,22 @@ I did all of the following on Linux x86_64 (Ubuntu 24.04, GCC 13.3) with JUCE
    - background-thread state
    - opening the editor while processing
    - bus enable/disable
-4. **CI on macOS and Windows:** see the workflow runs on the
-   `bassforge-plugin` branch. The handoff message records the result of the
-   first run.
+4. **CI on macOS and Windows.**
+   - **Windows:** the first runs passed: MSVC build, all tests, and
+     packaging.
+   - **macOS:** the first run built cleanly and every behavioural check
+     passed, but 8 null-test checks failed. "Mix 0% is an exact delay" nulled
+     at −138.1 dB instead of exactly.
+   - **Cause:** the Output knob's 0 dB default round-trips through its
+     normalised 0..1 value. On Apple Silicon the compiler fuses that
+     multiply-add (FMA), which leaves about 7×10⁻⁷ dB, a gain of 1 + 1 ulp.
+     I confirmed the arithmetic: it predicts −138.5 dB.
+   - **Reproduction:** I reproduced the identical failure on Linux by
+     building with `-mfma -ffp-contract=fast`.
+   - **Fix:** `dbToGain` now returns exact unity for |dB| < 1e-4.
+   - **Result:** the suite now passes with and without FMA contraction
+     (−300 dB nulls), and pluginval still passes. The CI status of the
+     latest commit on the branch is the reference result.
 
 What I could **not** do from a Linux container: load the plug-in in Ableton
 Live, listen to it, or run `auval` locally. CI covers `auval`; the Live and

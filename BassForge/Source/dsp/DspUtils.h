@@ -9,7 +9,14 @@ namespace bf
 constexpr int maxChannels = 2;
 constexpr float pi = 3.14159265358979323846f;
 
-inline float dbToGain (float db) noexcept     { return std::pow (10.0f, db * 0.05f); }
+/** A knob at 0 dB must be exactly unity. A parameter's round trip through its
+    0..1 normalised value can land a hair off zero (about 7e-7 dB when the
+    compiler fuses the multiply-add, as on Apple Silicon), which would otherwise
+    turn into a gain of 1 + 1 ulp and stop "0 dB" from nulling bit-exactly. */
+inline float dbToGain (float db) noexcept
+{
+    return std::abs (db) < 1.0e-4f ? 1.0f : std::pow (10.0f, db * 0.05f);
+}
 inline float gainToDb (float gain) noexcept   { return 20.0f * std::log10 (std::max (gain, 1.0e-9f)); }
 
 /** One-pole coefficient for a time constant in milliseconds. */
